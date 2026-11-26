@@ -1,5 +1,6 @@
 import type { Check } from '../driver/types.ts';
 import type { ProfileInfo } from '../kernel/profiles.ts';
+import type { RulesFile } from '../kernel/rules.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { CloseResult, OpResult, OpenResult, StepResult, Tallies } from '../shared/protocol.ts';
@@ -114,8 +115,24 @@ export function formatStatus(r: StatusResult): string {
     `会话 ${r.sessions.length} 个`,
     ...r.sessions.map((s) => `  ${inline(s.session)} ${inline(s.name)} 闲置 ${s.idleSec} 秒 ${inline(s.url)}`),
     ...(r.profiles ?? []).map(profileLine),
+    r.rules.hash === null ? `规则 ${r.rules.count} 条` : `规则 ${r.rules.count} 条 ${inline(r.rules.hash)}`,
+    ...(r.rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(r.rules.error)}`]),
   ];
   return lines.join('\n');
+}
+
+// `rule list` 的结果：规则文件现在的样子，由 CLI 自己读，不经内核。
+export interface RuleListResult extends RulesFile { path: string }
+
+export function formatRuleList(r: RuleListResult): string {
+  if (r.error !== null) return [`规则文件 ${inline(r.path)}`, inline(r.error)].join('\n');
+  if (r.hash === null) return '没有 rules.json，所有域名都是默认模式';
+  return [
+    `规则文件 ${inline(r.path)}`,
+    ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode)}`)),
+    `loginHosts  ${r.loginHosts.length === 0 ? '（无）' : r.loginHosts.map(inline).join(', ')}`,
+    `hash  ${inline(r.hash)}`,
+  ].join('\n');
 }
 
 export function formatChecks(c: Check[]): string {

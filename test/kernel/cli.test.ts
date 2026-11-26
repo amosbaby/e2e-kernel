@@ -436,6 +436,111 @@ test('status prints a profile line; --json carries profiles[0].state and lastLog
   assert.match(t.outText(), /^profile default (?:目录还不存在|没启动过|用过)，最近一次 login (?:无|\S+ \S+)$/m);
 });
 
+const GOOD_RULES = JSON.stringify({ version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'default' }], loginHosts: ['sso.example.com'] });
+
+async function withRules(text: string | null, fn: (h: ReturnType<typeof makeTmpHome>) => Promise<void>): Promise<void> {
+  const h = makeTmpHome();
+  try {
+    if (text !== null) writeFileSync(h.home.rulesFile, text);
+    await fn(h);
+  } finally { h.cleanup(); }
+}
+
+test('rule list without a rules file: says every host is default, exit 0, and creates nothing', async () => {
+  await withRules(null, async (h) => {
+    rmSync(h.home.root, { recursive: true });
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    assert.equal(t.outText(), '没有 rules.json，所有域名都是默认模式');
+    assert.ok(!existsSync(h.home.root));
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], hash: null, error: null });
+  });
+});
+
+test('rule list prints one line per rule, the login hosts and the hash; does not need the kernel', async () => {
+  await withRules(GOOD_RULES, async (h) => {
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    const out = t.outText();
+    assert.match(out, /^\*\.example\.com {2}readonly$/m); assert.match(out, /^app\.example\.com {2}default$/m);
+    assert.match(out, /^loginHosts {2}sso\.example\.com$/m); assert.match(out, /^hash {2}sha256:[0-9a-f]{16}$/m);
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    const r = JSON.parse(j.outText()) as { path: string; rules: unknown[]; loginHosts: string[]; hash: string; error: null };
+    assert.equal(r.path, h.home.rulesFile); assert.deepEqual(r.rules, [{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'default' }]);
+    assert.deepEqual(r.loginHosts, ['sso.example.com']); assert.match(r.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(r.error, null);
+    assert.ok(out.includes(r.hash));
+  });
+});
+
+test('rule list on a bad file: prints the parse error and exits 2; --json carries it in error', async () => {
+  await withRules('{"version":1,"rules":null}', async (h) => {
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 2);
+    assert.match(t.outText(), /规则文件格式有误：rules must be an array/);
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 2);
+    const r = JSON.parse(j.outText()) as { rules: unknown[]; hash: unknown; error: string };
+    assert.match(r.error, /rules must be an array/); assert.deepEqual(r.rules, []); assert.equal(r.hash, null);
+  });
+  await withRules('not json', async (h) => { assert.equal(await main(['rule', 'list'], io({ env: h.env })), 2); });
+});
+
+test('rule: needs the list subcommand and takes no extra arguments; help lists it', async () => {
+  assert.equal(await main(['rule'], io()), 2);
+  assert.equal(await main(['rule', 'add'], io()), 2);
+  assert.equal(await main(['rule', 'list', 'x'], io()), 2);
+  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /rule list \[--json\]/);
+});
+
+test('rule list prints host names without control characters', async () => {
+  await withRules(JSON.stringify({ version: 1, rules: [{ match: 'a.example.com', mode: 'readonly' }] }), async (h) => {
+    const t = io({ env: h.env }); await main(['rule', 'list'], t);
+    assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(t.outText()));
+  });
+});
+
+test('status carries rules; the text format adds a line only when the file is broken', async () => {
+  await withRules(GOOD_RULES, async (h) => {
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }) });
+    try {
+      const j = io({ env: h.env }); assert.equal(await main(['status', '--json'], j), 0);
+      const r = JSON.parse(j.outText()) as { rules: { count: number; hash: string; error: unknown } };
+      assert.equal(r.rules.count, 2); assert.match(r.rules.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(r.rules.error, null);
+      const t = io({ env: h.env }); await main(['status'], t);
+      assert.match(t.outText(), /^规则 2 条 sha256:[0-9a-f]{16}$/m); assert.ok(!t.outText().includes('规则文件有错'));
+      writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');   // status 之前会先重读文件
+      const bad = io({ env: h.env }); assert.equal(await main(['status'], bad), 0);
+      assert.match(bad.outText(), /^规则文件有错，open 会被拒绝：规则文件格式有误：rules must be an array$/m);
+      const bj = io({ env: h.env }); await main(['status', '--json'], bj);
+      const br = JSON.parse(bj.outText()) as { rules: { count: number; hash: string; error: string } };
+      assert.equal(br.rules.count, 2); assert.match(br.rules.error, /rules must be an array/);   // 仍用上一份好的
+    } finally { await kk.stop(); }
+  });
+});
+
+test('status without a rules file says there are none', async () => {
+  const t = io(); assert.equal(await main(['status'], t), 0);
+  assert.match(t.outText(), /^规则 0 条$/m);
+});
+
+test('doctor reports the domain rules even when the kernel is not running', async () => {
+  await withRules(null, async (h) => {
+    const { code, checks } = await doctorChecks(h.env);
+    const c = checks.find((x) => x.name === 'rules');
+    assert.equal(c?.ok, true); assert.match(c?.detail ?? '', /没有规则/); assert.equal(code, 22);   // 22 只来自内核没在跑
+  });
+  await withRules(GOOD_RULES, async (h) => {
+    const c = (await doctorChecks(h.env)).checks.find((x) => x.name === 'rules');
+    assert.equal(c?.ok, true); assert.equal(c?.detail, '2 条规则');
+  });
+});
+
+test('doctor fails the rules check on a bad file, with a fix that points at rule list', async () => {
+  await withRules('{"version":1,"rules":null}', async (h) => {
+    const { code, checks } = await doctorChecks(h.env);
+    const c = checks.find((x) => x.name === 'rules');
+    assert.equal(c?.ok, false); assert.match(c?.detail ?? '', /rules must be an array/);
+    assert.equal(c?.fix, '改好 $E2K_HOME/rules.json，或运行 node bin/e2k.js rule list 看错误'); assert.equal(code, 22);
+  });
+});
+
 test('doctor without a kernel says how to start one', async () => {
   const t = io({ env: emptyEnv });
   assert.equal(await main(['doctor', '--json'], t), 22);
@@ -444,7 +549,7 @@ test('doctor without a kernel says how to start one', async () => {
   assert.equal(running?.ok, false); assert.equal(running?.fix, 'node bin/e2k.js start');
   assert.equal(checks.find((c) => c.name === 'kernel-version')?.ok, true);
   assert.deepEqual(checks.map((c) => c.name),
-    ['node-version', 'platform', 'home-permissions', 'socket-path-length', 'profile-default', 'fake', 'kernel-running', 'kernel-version']);
+    ['node-version', 'platform', 'home-permissions', 'socket-path-length', 'profile-default', 'rules', 'fake', 'kernel-running', 'kernel-version']);
 });
 
 test('start runs until the stop signal and cleans up', async () => {

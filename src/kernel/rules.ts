@@ -152,6 +152,46 @@ function contentHash(text: string): string {
   return 'sha256:' + createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16);
 }
 
+type Loaded = { kind: 'absent' } | { kind: 'bad'; error: string } | { kind: 'text'; text: string; hash: string };
+
+// 读规则文件的原文：没有文件、读不了或超限，都在这里变成说明。resolver 和 readRulesFile 共用。
+function loadFile(file: string, io: RulesIo): Loaded {
+  try {
+    const st = io.stat(file);
+    if (st === null) return { kind: 'absent' };   // 没有文件 = 没有规则
+    if (!st.isFile) return { kind: 'bad', error: '规则文件不是普通文件' };
+    if (st.size > MAX_FILE_BYTES) return { kind: 'bad', error: '规则文件超过 256 KB' };
+    let text: string;
+    try {
+      text = io.read(file);
+    } catch {
+      return { kind: 'bad', error: '规则文件读不了' };
+    }
+    if (Buffer.byteLength(text, 'utf8') > MAX_FILE_BYTES) return { kind: 'bad', error: '规则文件超过 256 KB' };
+    return { kind: 'text', text, hash: contentHash(text) };
+  } catch {
+    return { kind: 'bad', error: '规则文件读不了' };
+  }
+}
+
+function parseError(e: unknown): string {
+  return `规则文件格式有误：${e instanceof E2kError ? e.message : '无法解析'}`;
+}
+
+// 规则文件现在的样子（不碰任何缓存），给 `rule list` 用。error 非 null 时 rules 和 loginHosts 为空、hash 为 null。
+export interface RulesFile { rules: Rule[]; loginHosts: string[]; hash: string | null; error: string | null }
+
+export function readRulesFile(file: string, io: RulesIo = defaultIo): RulesFile {
+  const loaded = loadFile(file, io);
+  if (loaded.kind === 'absent') return { rules: [], loginHosts: [], hash: null, error: null };
+  if (loaded.kind === 'bad') return { rules: [], loginHosts: [], hash: null, error: loaded.error };
+  try {
+    return { ...parseRules(loaded.text), hash: loaded.hash, error: null };
+  } catch (e) {
+    return { rules: [], loginHosts: [], hash: null, error: parseError(e) };
+  }
+}
+
 // 规则缓存。构造时读一次；之后只有 refresh() 碰文件。每次 refresh 都读文件比内容哈希（不看 mtime/大小）。
 // 缓存是全局的：合法的新规则在任何一次 refresh 之后对所有会话生效；只有「改坏了」时才继续用上一份好的。
 export function createRulesResolver(file: string, io: RulesIo = defaultIo): ModeResolver {
@@ -160,30 +200,17 @@ export function createRulesResolver(file: string, io: RulesIo = defaultIo): Mode
   let error: string | null = null;
 
   const refresh = (): void => {
+    const loaded = loadFile(file, io);
+    if (loaded.kind === 'absent') {
+      current = { rules: [], loginHosts: [] }; hash = null; error = null;
+      return;
+    }
+    if (loaded.kind === 'bad') { error = loaded.error; return; }
+    if (loaded.hash === hash) { error = null; return; }   // 内容没变（含「改坏后又改回」）
     try {
-      const st = io.stat(file);
-      if (st === null) {   // 没有文件 = 没有规则
-        current = { rules: [], loginHosts: [] }; hash = null; error = null;
-        return;
-      }
-      if (!st.isFile) { error = '规则文件不是普通文件'; return; }
-      if (st.size > MAX_FILE_BYTES) { error = '规则文件超过 256 KB'; return; }
-      let text: string;
-      try {
-        text = io.read(file);
-      } catch {
-        error = '规则文件读不了'; return;
-      }
-      if (Buffer.byteLength(text, 'utf8') > MAX_FILE_BYTES) { error = '规则文件超过 256 KB'; return; }
-      const h = contentHash(text);
-      if (h === hash) { error = null; return; }   // 内容没变（含「改坏后又改回」）
-      try {
-        current = parseRules(text); hash = h; error = null;
-      } catch (e) {
-        error = `规则文件格式有误：${e instanceof E2kError ? e.message : '无法解析'}`;
-      }
-    } catch {
-      error = '规则文件读不了';
+      current = parseRules(loaded.text); hash = loaded.hash; error = null;
+    } catch (e) {
+      error = parseError(e);
     }
   };
 

@@ -164,6 +164,23 @@ test('status reports pid, driver and sessions, and no key in it is a sensitive k
   assert.equal(statSync(home.logFile).mode & 0o777, 0o600);
 });
 
+test('status reports the rules state, rereads the file first, and its keys are not sensitive', async () => {
+  const h = tmpHome();
+  await started({ home: h, driver: new FakeDriver() });
+  const rules = async (): Promise<StatusResult['rules']> => {
+    const r = await call(h, 'status', {}); assert.ok(r.ok); return (r.result as StatusResult).rules;
+  };
+  assert.deepEqual(await rules(), { count: 0, hash: null, error: null });
+  writeFileSync(h.rulesFile, '{"version":1,"rules":[{"match":"*.example.com","mode":"readonly"}]}');
+  const good = await rules();
+  assert.equal(good.count, 1); assert.match(good.hash ?? '', /^sha256:[0-9a-f]{16}$/); assert.equal(good.error, null);
+  writeFileSync(h.rulesFile, '{"version":1,"rules":null}');
+  const bad = await rules();
+  assert.equal(bad.count, 1); assert.equal(bad.hash, good.hash); assert.match(bad.error ?? '', /rules must be an array/);
+  const raw = await call(h, 'status', {});
+  assert.deepEqual(keysOf(raw).filter(isSensitiveKey), []);
+});
+
 test('a second start on the same home is refused while the first is alive', async () => {
   await assert.rejects(startKernel({ home, driver: new FakeDriver() }), /内核已在运行/);
   assert.ok((await call(home, 'status', {})).ok);                       // 第一个不受影响

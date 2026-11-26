@@ -2,6 +2,7 @@ import { basename, relative } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import type { Driver } from '../driver/types.ts';
+import { readRulesFile } from '../kernel/rules.ts';
 import { listenerErrorLogger, startKernel } from '../kernel/server.ts';
 import type { KernelHandle } from '../kernel/server.ts';
 import type { StatusResult } from '../kernel/server.ts';
@@ -12,13 +13,15 @@ import { resolveHome } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
 import { ExitCode, MAX_OPS_BYTES, exitCodeFor, validateParams } from '../shared/protocol.ts';
 import type { CloseResult, Method, OpenResult, StepResult } from '../shared/protocol.ts';
+import { redactText } from '../shared/redact.ts';
 import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { runDoctor } from './doctor.ts';
-import { formatChecks, formatClose, formatError, formatOpen, formatStatus, formatStep } from './format.ts';
+import { formatChecks, formatClose, formatError, formatOpen, formatRuleList, formatStatus, formatStep } from './format.ts';
+import type { RuleListResult } from './format.ts';
 
 // e2k 命令行（设计 5.9）。只做校验和转发：参数先用和内核同一套 validateParams 校验，再经 socket 发给内核。
-// 这一版没有 run、save-case、rule，也没有任何批准类的命令。
+// 这一版没有 run、save-case，rule 只有只读的 list，也没有任何批准类的命令。
 // 报错不回显调用方给的值：参数解析、JSON 解析的原始错误消息都不打印。
 
 export interface Io {
@@ -49,8 +52,9 @@ function helpText(selfCmd: string): string {
     `用法：${selfCmd} <命令>`,
     '',
     '  start                                  前台运行内核（Ctrl-C 或 SIGTERM 停止）',
-    '  status [--json]                        版本、驱动、浏览器、会话和 profile（含最近一次 login）',
-    '  doctor [--json]                        自检（含 profile 状态；只读）',
+    '  status [--json]                        版本、驱动、浏览器、会话、profile（含最近一次 login）和域名规则',
+    '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
+    '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则（只读，不需要内核；规则文件只由人维护）',
     '  open <url> [--viewport <宽>x<高>] [--touch] [--name <名字>] [--json]',
     '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
     '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
@@ -174,6 +178,24 @@ async function doctor(ctx: Ctx, args: string[]): Promise<number> {
   return checks.every((c) => c.ok) ? ExitCode.OK : ExitCode.NEEDS_HUMAN;
 }
 
+// 规则文件由 CLI 自己读，不需要内核。文件有错：照样打印（--json 里在 error 字段），退出码 2。
+async function rule(ctx: Ctx, args: string[]): Promise<number> {
+  const [sub, ...rest] = args;
+  if (sub !== 'list') throw usage(sub === undefined ? '缺少子命令' : '没有这个子命令', `${ctx.io.selfCmd} help 查看可用命令`);
+  positionals(ctx, parse(ctx, rest, JSON_OPTION), 0, '无');
+  const home = resolveHome(ctx.io.env);
+  const f = readRulesFile(home.rulesFile);
+  // 主机写法进输出前和别的命令一样先脱敏。
+  const result: RuleListResult = {
+    path: home.rulesFile,
+    rules: f.rules.map((x) => ({ match: redactText(x.match), mode: x.mode })),
+    loginHosts: f.loginHosts.map((x) => redactText(x)),
+    hash: f.hash, error: f.error,
+  };
+  print(ctx, result, formatRuleList);
+  return f.error === null ? ExitCode.OK : ExitCode.USAGE;
+}
+
 async function open(ctx: Ctx, args: string[]): Promise<number> {
   const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' } });
   const [url] = positionals(ctx, p, 1, '<url>');
@@ -259,6 +281,7 @@ async function run(ctx: Ctx, argv: string[]): Promise<number> {
     case 'start': return start(ctx, rest);
     case 'status': return status(ctx, rest);
     case 'doctor': return doctor(ctx, rest);
+    case 'rule': return rule(ctx, rest);
     case 'open': return open(ctx, rest);
     case 'step': return step(ctx, rest);
     case 'close': return close(ctx, rest);

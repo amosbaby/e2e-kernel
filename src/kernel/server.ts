@@ -12,6 +12,7 @@ import { KERNEL_SKIP_KEYS, MAX_LINE_BYTES, PROTOCOL_VERSION, parseRequest, valid
 import type { Request, Response, SessionInfo } from '../shared/protocol.ts';
 import { redactDeep, redactText, safely } from '../shared/redact.ts';
 import { kernelVersion } from '../shared/version.ts';
+import type { RulesState } from './mode.ts';
 import { createRulesResolver } from './rules.ts';
 import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
 import type { ProfileInfo } from './profiles.ts';
@@ -27,7 +28,7 @@ export interface KernelOptions {
 // abort()：关停进行中时再来一次停止信号用——不再等任何期限，直接停浏览器实例、断开连接、清理文件。
 export interface KernelHandle { stop(): Promise<void>; abort(): Promise<void> }
 export interface StatusResult { version: string; pid: number; home: string;
-  driver: { name: string; capabilities: Capabilities }; instance: 'stopped' | 'running'; sessions: SessionInfo[]; profiles: ProfileInfo[] }
+  driver: { name: string; capabilities: Capabilities }; instance: 'stopped' | 'running'; sessions: SessionInfo[]; profiles: ProfileInfo[]; rules: RulesState }
 
 const DEFAULT_IDLE_MS = 15 * 60_000;
 const DEFAULT_KEEP_RUNS = 20;
@@ -264,11 +265,15 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   const connections = new Set<Socket>();
   const answering = new Set<Promise<void>>();
 
-  const status = (): StatusResult => ({
-    version, pid: process.pid, home: home.root, driver: { name: driver.name, capabilities: { ...driver.capabilities } },
-    instance: sessions.instanceState(), sessions: sessions.list(),
-    profiles: [profileInfo(home, DEFAULT_PROFILE)],
-  });
+  // 先重读规则文件再报：status 看到的是此刻磁盘上的状态（改坏了会带 error）。
+  const status = (): StatusResult => {
+    modes.refresh();
+    return {
+      version, pid: process.pid, home: home.root, driver: { name: driver.name, capabilities: { ...driver.capabilities } },
+      instance: sessions.instanceState(), sessions: sessions.list(),
+      profiles: [profileInfo(home, DEFAULT_PROFILE)], rules: modes.state(),
+    };
+  };
 
   const dispatch = async (req: Request): Promise<unknown> => {
     switch (req.method) {

@@ -5,6 +5,7 @@ import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
 import { PROFILE_STATE_TEXT, lastLoginText } from './format.ts';
 import { DEFAULT_PROFILE, profileInfo } from '../kernel/profiles.ts';
+import { createRulesResolver } from '../kernel/rules.ts';
 import { E2kError } from '../shared/errors.ts';
 import { assertSocketPathFits, ensurePrivateDir } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
@@ -85,6 +86,14 @@ function profileCheck(home: Home): Check {
   return { name, ok: true, detail: `profiles/${DEFAULT_PROFILE} ${PROFILE_STATE_TEXT[info.state]}；${login}` };
 }
 
+// 域名规则：自己读文件，不要内核在跑。没有文件不算失败；文件有错 open 会被拒绝，所以算失败。
+function rulesCheck(home: Home, selfCmd: string): Check {
+  const name = 'rules';
+  const s = createRulesResolver(home.rulesFile).state();
+  if (s.error !== null) return { name, ok: false, detail: s.error, fix: `改好 $E2K_HOME/rules.json，或运行 ${selfCmd} rule list 看错误` };
+  return { name, ok: true, detail: s.hash === null ? '没有规则' : `${s.count} 条规则` };
+}
+
 async function kernelChecks(home: Home, selfCmd: string): Promise<Check[]> {
   let status: StatusResult;
   try {
@@ -117,6 +126,7 @@ export async function runDoctor(home: Home, driver: Driver, selfCmd = 'e2k'): Pr
     homeCheck(home),
     socketCheck(home),
     profileCheck(home),
+    rulesCheck(home, selfCmd),
     ...await driver.selfCheck(),
     ...await kernelChecks(home, selfCmd),
   ];
