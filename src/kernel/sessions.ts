@@ -19,7 +19,7 @@ import type { ModeResolver } from './mode.ts';
 import { DEFAULT_PROFILE, recordLogin } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
-import type { WritePolicy } from './write-policy.ts';
+import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
 
 // 会话管理（设计 5.2、5.5、5.6）：实例的懒启动和复用、会话的开、执行、收尾、闲置超时、关停。
 // 「主机」一律指 URL.hostname（不带端口）。
@@ -577,23 +577,24 @@ export class SessionManager {
       const host = hostOf(req.url);
       const targetMode = this.deps.modes.resolve(host);
       // 这个版本只实现了「默认」模式（open 时也这样把关）：顶层页面或请求目标有一边不是默认模式，就中止，不交给策略。
-      const decision: Decision = mode !== 'default' || targetMode !== 'default' ? { action: 'abort' } : this.deps.policy.decide(req, { mode }).decision;
-      s.recorder.addRequest(req, decision, targetMode, this.deps.now());
+      const verdict: PolicyVerdict = mode !== 'default' || targetMode !== 'default' ? { decision: { action: 'abort' }, reason: 'method' } : this.deps.policy.decide(req, { mode });
+      s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
       if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
-      return decision;
+      return verdict.decision;
     }
     // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）。
-    const decision = this.deps.policy.decideUnattributed(req, { anyReadonly: false }).decision;   // Task 12 接上真值
-    if (isWrite(req.method)) {
-      this.unattributed.push(toWriteRecord(req, decision, this.deps.modes.resolve(hostOf(req.url)), this.deps.now()));
+    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly: false });   // Task 12 接上真值
+    if (isWrite(req.method) || verdict.reason !== null) {
+      const targetMode = this.deps.modes.resolve(hostOf(req.url));
+      this.unattributed.push(toWriteRecord(req, verdict, { mode: targetMode, targetMode }, this.deps.now()));
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
     }
-    return decision;
+    return verdict.decision;
   }
 
   private onRequestDone(e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }): void {
     for (const s of this.sessions.values()) {
-      if (s.recorder.completeRequest(e.id, e.status, e.failed)) return;
+      if (s.recorder.completeRequest(e.id, e.status, e.failed, e.redirectRefused)) return;
     }
     for (let i = this.unattributed.length - 1; i >= 0; i--) {
       const w = this.unattributed[i];

@@ -23,7 +23,7 @@ function act(op: Op['op'], outcome: Outcome, extra: Partial<ActionRecord> = {}):
 }
 function write(method: string, url: string, status: number | null, extra: Partial<WriteRecord> = {}): WriteRecord {
   return { id: `r${++seq}`, at: '2026-11-26T15:30:06.000Z', method, url, status, failed: false, body: null, bodyOmitted: false, pageUrl: null,
-    decision: 'allowed', targetMode: 'default', host: new URL(url).hostname, graphql: null, ...extra };
+    decision: 'allowed', targetMode: 'default', host: new URL(url).hostname, graphql: null, reason: null, mode: 'default', ...extra };
 }
 function driverWith(caps: Partial<Capabilities> = {}): RunInput['driver'] {
   return { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'covered', nativeFormSubmit: 'covered', sharedWorkers: 'covered',

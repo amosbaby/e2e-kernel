@@ -1,8 +1,9 @@
-import type { Decision, RequestInfo, Stable } from '../driver/types.ts';
+import type { RequestInfo, Stable } from '../driver/types.ts';
 import type { Op, Target } from '../shared/ops.ts';
 import type { Mode, Outcome, RequestSummary } from '../shared/protocol.ts';
 import { graphqlKind } from './graphql.ts';
 import type { GraphqlKind } from './graphql.ts';
+import type { BlockReason, PolicyVerdict } from './write-policy.ts';
 import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
 
 // 会话的记录（设计 5.7、5.8）：动作、写、请求摘要、到过的域名。进记录之前先脱敏。
@@ -18,7 +19,11 @@ export interface WriteRecord { id: string; at: string; method: string; url: stri
   body: string | null; bodyOmitted: boolean; pageUrl: string | null; decision: 'allowed' | 'blocked'; targetMode: Mode;
   // 主机名：取自原始 url、单独脱敏（和 addHost 一样），汇总按它分组；取不到是 REDACTED。
   // graphql：null 表示不是 GraphQL；从原始请求体算，请求体不记录时照样算；拿不准是 'unknown'。
-  host: string; graphql: GraphqlKind | null }
+  host: string; graphql: GraphqlKind | null;
+  // reason：被拦的原因，放行是 null；mode：判定当时的有效模式（targetMode 是请求目标主机自己的模式，两者可以不同）。
+  reason: BlockReason | null; mode: Mode }
+// 模式变更时间线（设计 5.2）：host 已脱敏；rulesHash 是规则文件的摘要，没有规则文件是 null。
+export interface ModeChange { at: string; host: string; mode: Mode; reason: 'rule' | 'forced' | 'no-rule'; rulesHash: string | null }
 
 const MAX_REQUESTS = 200;
 
@@ -42,7 +47,7 @@ function classify(req: RequestInfo): GraphqlKind | null {
   }
 }
 
-export function toWriteRecord(req: RequestInfo, decision: Decision, targetMode: Mode, at: Date): WriteRecord {
+export function toWriteRecord(req: RequestInfo, verdict: PolicyVerdict, ctx: { mode: Mode; targetMode: Mode }, at: Date): WriteRecord {
   const { body, contentType, topUrl } = req;
   // 失败关闭：只有明确判断出「没有密码框」（false）才记体；true 和判断不出（null）都不记。
   const omit = body !== null && req.fromLoginForm !== false;
@@ -56,10 +61,12 @@ export function toWriteRecord(req: RequestInfo, decision: Decision, targetMode: 
     body: body === null || omit ? null : safely(() => redactBody(body, contentType) ?? REDACTED),
     bodyOmitted: omit,
     pageUrl: topUrl === null ? null : safely(() => redactUrl(topUrl)),
-    decision: decision.action === 'continue' ? 'allowed' : 'blocked',
-    targetMode,
+    decision: verdict.decision.action === 'continue' ? 'allowed' : 'blocked',
+    targetMode: ctx.targetMode,
     host: hostOf(req.url),
     graphql: classify(req),
+    reason: verdict.reason,
+    mode: ctx.mode,
   };
 }
 
@@ -68,6 +75,8 @@ export class Recorder {
   readonly writes: WriteRecord[] = [];
   readonly requests: RequestSummary[] = [];          // 只留最近 MAX_REQUESTS 条
   readonly hosts: { host: string; mode: Mode }[] = [];
+  readonly modes: ModeChange[] = [];
+  private blocked = 0;                                // 单调递增，供 read-only 的拦截计数用
   private seq = 0;
   private requestSeq = 0;
   // 按驱动给的请求 id 找回记录。摘要表和 requests 一起只留最近 MAX_REQUESTS 条；写和 writes 一样不删。
@@ -83,8 +92,20 @@ export class Recorder {
     this.actions.push(r);
   }
 
-  // 每个请求都进 requests；写方法另进 writes。摘要的 id 由这里生成：它在脱敏的跳过键 id 下面，不能用外来的串。
-  addRequest(req: RequestInfo, decision: Decision, targetMode: Mode, at: Date): void {
+  // 和上一条的模式相同就不记；host 在这里脱敏。
+  noteMode(c: ModeChange): void {
+    const last = this.modes[this.modes.length - 1];
+    if (last !== undefined && last.mode === c.mode) return;
+    this.modes.push({ ...c, host: safely(() => redactText(c.host)) });
+  }
+
+  // 被拦的写（addRequest 记下一条被拦的、或 completeRequest 把一条放行的改成被拦）的累计次数，只增不减。
+  blockedEvents(): number {
+    return this.blocked;
+  }
+
+  // 每个请求都进 requests；写方法或被拦的请求（不管方法）另进 writes。摘要的 id 由这里生成：它在脱敏的跳过键 id 下面，不能用外来的串。
+  addRequest(req: RequestInfo, verdict: PolicyVerdict, ctx: { mode: Mode; targetMode: Mode }, at: Date): void {
     const summary: RequestSummary = {
       id: `n${++this.requestSeq}`,
       method: safely(() => redactText(req.method)),
@@ -99,21 +120,28 @@ export class Recorder {
       const oldest = this.summaryByRequest.keys().next();
       if (oldest.done !== true) this.summaryByRequest.delete(oldest.value);
     }
-    if (isWrite(req.method)) {
-      const write = toWriteRecord(req, decision, targetMode, at);
+    if (isWrite(req.method) || verdict.reason !== null) {
+      const write = toWriteRecord(req, verdict, ctx, at);
       this.writes.push(write);
       this.writeByRequest.set(req.id, write);
+      if (write.decision === 'blocked') this.blocked++;
     }
   }
 
   // 这个 id 是自己记的才返回 true。摘要已被挤出、又不是写的请求认不出来，返回 false。
-  completeRequest(id: string, status: number | null, failed: boolean): boolean {
+  // redirectRefused：驱动在首跳 3xx 时中止了重定向；那条写其实没有跟过去，改记成被拦的 redirected-write。
+  completeRequest(id: string, status: number | null, failed: boolean, redirectRefused?: boolean): boolean {
     const summary = this.summaryByRequest.get(id);
     const write = this.writeByRequest.get(id);
     if (summary !== undefined) summary.status = status;
     if (write !== undefined) {
       write.status = status;
       write.failed = failed;
+      if (redirectRefused === true && write.decision !== 'blocked') {
+        write.decision = 'blocked';
+        write.reason = 'redirected-write';
+        this.blocked++;
+      }
     }
     return summary !== undefined || write !== undefined;
   }
