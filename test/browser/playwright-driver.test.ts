@@ -360,6 +360,64 @@ test('a redirect target is not shown to the handler (known gap, recorded not fix
   assert.ok(server.hits.slice(before).some(h => h.path === '/api/sink'), 'the redirect target reached the server');
 });
 
+// followRedirects: false（design 5.10）：驱动自己发首跳（route.fetch maxRedirects:0），不跟随重定向，后续跳到不了服务端。
+type Done = { id: string; status: number | null; failed: boolean; redirectRefused?: true };
+const noRedirect = (r: RequestInfo, path: string): Decision =>
+  r.method === 'POST' && r.url.endsWith(path) ? { action: 'continue', followRedirects: false } : { action: 'continue' };
+
+test('followRedirects: false refuses a redirected write at the first hop and reports it once', { timeout: 60_000 }, async () => {
+  const done: Done[] = [];
+  inst.onRequestDone(e => { done.push(e); });
+  const before = server.hits.length;
+  decide = r => noRedirect(r, '/r307');
+  const outcome = await page.evaluate(`fetch('/r307', { method: 'POST', body: 'x' }).then(() => 'sent', () => 'blocked')`);
+  await settle();
+  assert.equal(outcome, 'blocked');
+  const mine = server.hits.slice(before);
+  assert.equal(mine.filter(h => h.path === '/r307').length, 1, 'the first hop was sent exactly once');
+  assert.ok(!mine.some(h => h.path === '/api/sink'), 'the redirect target must not be reached');
+  const req = seen.find(r => r.method === 'POST' && r.url.endsWith('/r307'))!;
+  assert.deepEqual(done.filter(e => e.id === req.id), [{ id: req.id, status: 307, failed: true, redirectRefused: true }]);
+});
+
+test('without followRedirects: false the same redirected write reaches its target', { timeout: 60_000 }, async () => {
+  const before = server.hits.length;
+  decide = () => ({ action: 'continue' });
+  await page.evaluate(`fetch('/r307', { method: 'POST', body: 'x' })`); await settle();
+  assert.ok(server.hits.slice(before).some(h => h.path === '/api/sink' && h.method === 'POST'));
+});
+
+test('followRedirects: false on a write that answers 200 passes the response through', { timeout: 60_000 }, async () => {
+  const done: Done[] = [];
+  inst.onRequestDone(e => { done.push(e); });
+  const before = server.hits.length;
+  decide = r => noRedirect(r, '/api/echo');
+  const out = await page.evaluate(`fetch('/api/echo', { method: 'POST', body: 'payload' }).then(async r => r.status + ':' + await r.text())`);
+  assert.equal(out, '200:{"ok":true}');
+  const hit = server.hits.slice(before).find(h => h.path === '/api/echo')!;
+  assert.equal(hit.body, 'payload');
+  await settle();
+  const req = seen.find(r => r.method === 'POST' && r.url.endsWith('/api/echo'))!;
+  assert.deepEqual(done.filter(e => e.id === req.id), [{ id: req.id, status: 200, failed: false }]);
+});
+
+test('followRedirects: false still sends the browser cookies and hands Set-Cookie back to the browser', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/login.html'); await settle();   // 服务端在这里设 fixture_login=1
+  const first = server.cookieSeen.length;
+  decide = r => noRedirect(r, '/api/cookie');
+  const out = await page.evaluate(`fetch('/api/cookie', { method: 'POST', body: 'x' }).then(r => r.status)`);
+  assert.equal(out, 200);
+  assert.equal(server.cookieSeen.length, first + 1);
+  assert.match(server.cookieSeen.at(-1) ?? '', /fixture_login=1/);
+  assert.match(String(await page.evaluate('document.cookie')), /\bk=v\b/);
+});
+
+test('followRedirects: false decodes a gzip response body', { timeout: 60_000 }, async () => {
+  decide = r => noRedirect(r, '/api/gzip');
+  const out = await page.evaluate(`fetch('/api/gzip', { method: 'POST', body: 'x' }).then(r => r.text())`);
+  assert.equal(out, '{"gzip":"decoded"}');
+});
+
 test('a throwing handler aborts the request', { timeout: 60_000 }, async () => {
   const before = server.hits.length;
   decide = () => { throw new Error('boom'); };

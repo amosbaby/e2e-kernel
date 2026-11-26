@@ -231,7 +231,7 @@ class FakeInstance implements Instance {
   readonly initScripts: string[] = [];
   requestHandler: ((r: RequestInfo) => Decision | Promise<Decision>) | undefined;
   readonly closedListeners: (() => void)[] = [];
-  readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean }) => void)[] = [];
+  readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void)[] = [];
   readonly pageOpenedListeners: ((page: Page, openerId: string | null) => void)[] = [];
   private readonly openPageImpl: (o: { viewport?: Viewport }) => Promise<Page>;
 
@@ -266,7 +266,7 @@ class FakeInstance implements Instance {
     this.requestHandler = h;
   }
 
-  onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean }) => void): void {
+  onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void): void {
     this.requestDoneListeners.push(listener);
   }
 
@@ -288,6 +288,7 @@ export class FakeDriver implements Driver {
   readonly name = 'fake';
   readonly capabilities: Capabilities;
   readonly calls: Call[] = [];
+  readonly noRedirectIds: string[] = [];   // handler 回了 continue 且带 followRedirects: false 的请求 id
   launches = 0;
   lastProfile: { name: string; userDataDir: string } | null = null;
 
@@ -341,14 +342,18 @@ export class FakeDriver implements Driver {
     };
     if (inst.requestHandler === undefined) return { action: 'abort' };
     try {
-      return await inst.requestHandler(info);
+      const decision = await inst.requestHandler(info);
+      if (decision.action === 'continue' && decision.followRedirects === false) this.noRedirectIds.push(info.id);
+      return decision;
     } catch {
       return { action: 'abort' };
     }
   }
 
-  emitRequestDone(id: string, status: number): void {
-    for (const l of this.running().requestDoneListeners) l({ id, status, failed: false });
+  // 真驱动在重定向首跳被拒时发 { status: 首跳状态, failed: true, redirectRefused: true }。
+  emitRequestDone(id: string, status: number | null, opts: { failed?: boolean; redirectRefused?: true } = {}): void {
+    const e = { id, status, failed: opts.failed ?? opts.redirectRefused === true, ...(opts.redirectRefused === true ? { redirectRefused: true as const } : {}) };
+    for (const l of this.running().requestDoneListeners) l(e);
   }
 
   emitPopup(openerId: string, url: string): Page {

@@ -134,6 +134,25 @@ test('emitRequest fills in RequestInfo and emitRequestDone reaches listeners', a
   assert.deepEqual(done, [{ id: r.id, status: 200, failed: false }]);
 });
 
+test('emitRequestDone carries failed and redirectRefused, and a continue with followRedirects: false is recorded', async () => {
+  const { d, inst, page } = await setup({});
+  inst.setRequestHandler((r) => (r.url.endsWith('/w') ? { action: 'continue', followRedirects: false } : { action: 'continue' }));
+  const w = await d.emitRequest({ pageId: page.id, method: 'POST', url: 'http://localhost/w' });
+  await d.emitRequest({ pageId: page.id, method: 'POST', url: 'http://localhost/other' });
+  assert.deepEqual(w, { action: 'continue', followRedirects: false });
+  assert.equal(d.noRedirectIds.length, 1);
+  const done: unknown[] = [];
+  inst.onRequestDone((e) => done.push(e));
+  d.emitRequestDone('a', 307, { redirectRefused: true });
+  d.emitRequestDone('b', null, { failed: true });
+  d.emitRequestDone('c', 200);
+  assert.deepEqual(done, [
+    { id: 'a', status: 307, failed: true, redirectRefused: true },
+    { id: 'b', status: null, failed: true },
+    { id: 'c', status: 200, failed: false },
+  ]);
+});
+
 // 约定：{ ms } 真的睡这么久，其他条件立刻成功，都记下 (cond, timeoutMs)。
 test('waitFor sleeps for ms conditions and succeeds immediately otherwise', async () => {
   const { d, page } = await setup({});

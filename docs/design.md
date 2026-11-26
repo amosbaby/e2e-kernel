@@ -265,6 +265,8 @@ agent 面    CLI（主）      薄 MCP 壳      使用说明（一份短文档�
 
 **能力不够就不让用在对应的模式上**：驱动做不到网络层拦截时，内核拒绝用它打开「只读」和「不允许」的域名，只能用于「默认」模式；驱动共用用户日常 profile 时，报告里如实标出。
 
+拦截回调的决定是 `continue`（可带 `followRedirects: false`）、`fulfill`（直接回一个响应）或 `abort`。`followRedirects: false` 用于放行的写：Playwright 的路由回调只见重定向链的第一个 URL，307 / 308 的第二跳带着原方法和请求体绕过内核的判断，所以驱动用 `route.fetch({ maxRedirects: 0 })` 自己发首跳。首跳是 3xx 就中止请求，并通知 `onRequestDone({ id, status: 首跳状态, failed: true, redirectRefused: true })`（通知在中止之前发，驱动对每个请求只通知一次，先到为准）；不是 3xx 就把响应原样交给页面。请求完成通知的形状是 `{ id, status: number | null, failed: boolean, redirectRefused?: true }`。这样发出的请求由 Node 代发：不信任系统额外安装的根证书。
+
 v1 只有 Playwright 驱动。验收标准之一：内核代码里除驱动目录外不出现 Playwright 的类型或调用；另有一个测试用的假驱动实现同一份协议。
 
 ## 6. 里程碑

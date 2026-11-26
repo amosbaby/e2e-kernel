@@ -142,6 +142,14 @@ Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调�
 
 结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；README Known gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定）。
 
+M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里 `followRedirects: false` 的几条）：驱动对放行且带 `followRedirects: false` 的请求走 `route.fetch({ maxRedirects: 0 })`。
+- `maxRedirects: 0` **不抛错**，返回 3xx 响应本身（307 带 `location`）。驱动据此先通知 `redirectRefused`、再 `route.abort()`；服务端只收到首跳一次，目标地址一次也没收到，页面的 `fetch` 被拒。若 fetch 抛的错误消息含 `redirect`，按同样处理（实测没触发过）。
+- Cookie：`route.fetch` 带上浏览器的 cookie（先访问设 cookie 的页面，服务端在这个写请求里看到了它），响应的 `Set-Cookie` 经 `route.fulfill({ response })` 回到浏览器（页面 `document.cookie` 随后含新值）。
+- gzip：服务端回 `content-encoding: gzip`，`fulfill({ response })` 原样转发正文和头，页面读到的正文正确解码。
+- 非 3xx（例如 200）原样交给页面，状态和正文不变。
+
+结论：四条在 1.65.1 下都做得到，不需要降级。代价：这样发出的请求由 Node 代发，不信任系统额外安装的根证书（README Known gaps）。
+
 ## 9.6 写请求时探测密码框
 
 内核要知道「发出写请求的页面有没有密码框」，好决定记不记请求体。驱动在路由回调里对发出请求的 frame 和它所在页面的顶层文档各做一次 `locator(...).count()`（跑在 Playwright 的隔离环境里，页面改写不了 `querySelector`，CSS 选择器穿透 open shadow root；只数有没有 `input[type=password]` 或 `autocomplete` 含 `current-password` / `new-password` / `one-time-code` 的元素），与 300 ms 定时器竞速；超时、抛错、或探测前后 frame 或顶层的地址变了，都给 `null`，内核按失败关闭不记体。

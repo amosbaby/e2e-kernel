@@ -9,6 +9,9 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../shared/ops.ts';
 // - 页面 id 和 RequestInfo.id 在驱动对象的整个生命期内唯一：不按实例、不按每次 launch 重置。
 // - 动作失败抛 DriverError；其余异常内核一律当内部错误。
 // - setRequestHandler 的回调抛错时，驱动中止这个请求（失败时偏向拦住），不放行。
+// - Decision.continue 带 followRedirects: false 时，驱动只发首跳、不跟随重定向（Playwright 的路由 handler 只见重定向链的
+//   第一个 URL，后续跳绕过内核的判断）：首跳是 3xx 就先通知 onRequestDone { status: 首跳状态, failed: true, redirectRefused: true }
+//   （去重以先到为准，所以通知在前），再中止请求；不是 3xx 就把响应原样交给页面。
 // - setRequestHandler 之前到来的请求，驱动一律中止（失败关闭），不放行也不记录。
 // - read 不等待：text、css 的目标不存在立刻抛 DriverError('not-found')；count 返回 0；visible 返回 false。
 // - describe 对选择器写法的目标返回 { selector: 原样, via: 'given' }；对引用返回解析出的稳定选择器，
@@ -59,7 +62,7 @@ export interface RequestInfo {
 }
 
 export type Decision =
-  | { action: 'continue' }
+  | { action: 'continue'; followRedirects?: false }
   | { action: 'fulfill'; status: number; contentType: string; body: string }
   | { action: 'abort' };
 
@@ -89,7 +92,7 @@ export interface Instance {
   // 浏览器没了：被关、崩了，也包括调用方自己 stop()。任何一种关闭都触发；自己发起关闭的调用方要自己忽略这次事件。
   onClosed(listener: () => void): void;
   setRequestHandler(h: (r: RequestInfo) => Decision | Promise<Decision>): void;      // 拦截：请求回调，导航请求也走这里
-  onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean }) => void): void;
+  onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void): void;
   addInitScript(source: string): Promise<void>;                                      // 拦截：页面脚本之前的注入脚本
   onPageOpened(listener: (page: Page, openerId: string | null) => void): void;       // 弹窗和新标签页
   openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page>;              // 页面：打开一个空白页，由内核再 goto；touch 只对这一页模拟触屏（不能模拟就抛错，不留页）

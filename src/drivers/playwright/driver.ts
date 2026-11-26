@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
-import type { BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
+import type { APIResponse, BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
 import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../driver/types.ts';
@@ -701,7 +701,7 @@ class PlaywrightInstance implements Instance, Host {
   private readonly navigating = new WeakMap<Frame, { request: PwRequest; at: number }>();
   private readonly reportListenerError: (e: unknown) => void;
   private readonly closedListeners: (() => void)[] = [];
-  private readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean }) => void)[] = [];
+  private readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void)[] = [];
   private readonly pageOpenedListeners: ((page: Page, openerId: string | null) => void)[] = [];
   private handler: ((r: RequestInfo) => Decision | Promise<Decision>) | undefined;
   private closed = false;
@@ -769,7 +769,7 @@ class PlaywrightInstance implements Instance, Host {
     this.handler = h;
   }
 
-  onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean }) => void): void {
+  onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void): void {
     this.requestDoneListeners.push(listener);
   }
 
@@ -982,7 +982,8 @@ class PlaywrightInstance implements Instance, Host {
     try {
       switch (decision.action) {
         case 'continue':
-          await route.continue();
+          if (decision.followRedirects === false) await this.sendWithoutRedirects(route);
+          else await route.continue();
           break;
         case 'fulfill':
           await route.fulfill({ status: decision.status, contentType: decision.contentType, body: decision.body });
@@ -993,12 +994,35 @@ class PlaywrightInstance implements Instance, Host {
     } catch { /* 页面或浏览器在回答之前就没了，没有什么可答的了 */ }
   }
 
+  // 放行但不跟随重定向：由 Node 代发首跳（Playwright 的路由 handler 只见重定向链的第一个 URL，后续跳绕过内核的判断）。
+  // 首跳是 3xx、或 fetch 因重定向而抛错：先通知 redirectRefused（去重以先到为准，abort 之后的 requestfailed 会被忽略），再中止。
+  // 其他错误也中止（失败关闭）。不是 3xx：原样交给页面。
+  private async sendWithoutRedirects(route: Route): Promise<void> {
+    const request = route.request();
+    let response: APIResponse;
+    try {
+      response = await route.fetch({ maxRedirects: 0, timeout: NAVIGATION_TIMEOUT_MS });
+    } catch (e) {
+      if (/redirect/i.test(e instanceof Error ? e.message : String(e))) this.requestDone(request, null, true, true);
+      await route.abort();
+      return;
+    }
+    const status = response.status();
+    if (status >= 300 && status < 400) {
+      this.requestDone(request, status, true, true);
+      await response.dispose().catch(() => {});
+      await route.abort();
+      return;
+    }
+    await route.fulfill({ response });
+  }
+
   // 每个请求只通知一次：先到的事件为准，之后的 requestfinished / requestfailed 一律忽略。
-  private requestDone(request: PwRequest, status: number | null, failed: boolean): void {
+  private requestDone(request: PwRequest, status: number | null, failed: boolean, redirectRefused = false): void {
     const id = this.requestIds.get(request);
     if (id === undefined || this.requestsDone.has(request)) return;
     this.requestsDone.add(request);
-    emit(this.reportListenerError, this.requestDoneListeners, { id, status, failed });
+    emit(this.reportListenerError, this.requestDoneListeners, redirectRefused ? { id, status, failed, redirectRefused: true } : { id, status, failed });
   }
 
   // 正常情况下 response 事件已经通知过了；没收到响应事件就读响应，读不到（页面没了）状态为 null。

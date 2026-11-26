@@ -1,6 +1,7 @@
 import { createHash, randomInt } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import http from 'node:http';
+import { gzipSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
@@ -12,7 +13,10 @@ export interface FixtureServer {
   origin: string;      // http://127.0.0.1:<port>
   altOrigin: string;   // http://localhost:<port>（同一个服务，另一个站点）
   port: number;
+  // 写端点（/api/ 下的 POST、PUT、PATCH、DELETE）的请求；另外 POST /r307 的首跳也记一条（path 为 '/r307'），
+  // 用来数重定向的首跳到了几次。
   hits: FixtureHit[];
+  cookieSeen: (string | null)[];   // POST /api/cookie 每次到达时请求头里的 cookie
   fake: { bearer: string; jwt: string; password: string; email: string; formToken: string };   // 每次启动随机生成的假值
   close(): Promise<void>;
 }
@@ -98,6 +102,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 export async function startFixtureServer(): Promise<FixtureServer> {
   const fake = makeFakes();
   const hits: FixtureHit[] = [];
+  const cookieSeen: (string | null)[] = [];
   const upgraded = new Set<Duplex>();
   let altOrigin = '';
 
@@ -110,7 +115,8 @@ export async function startFixtureServer(): Promise<FixtureServer> {
 
     // 只用来记录重定向的后续跳是否经过路由 handler：任何方法都 307 到写端点，浏览器会带着方法和请求体再来一次。
     if (url.pathname === '/r307') {
-      await readBody(req);
+      const body = await readBody(req);
+      hits.push({ method, path: '/r307', query: Object.fromEntries(url.searchParams), body, contentType: req.headers['content-type'] ?? null });
       res.writeHead(307, { location: '/api/sink', 'cache-control': 'no-store' });
       res.end();
       return;
@@ -153,6 +159,19 @@ export async function startFixtureServer(): Promise<FixtureServer> {
       const contentType = req.headers['content-type'] ?? null;
       const body = await readBody(req);
       hits.push({ method, path: url.pathname, query: Object.fromEntries(url.searchParams), body, contentType });
+      // POST /api/cookie：记下请求头里的 cookie，并回一个 Set-Cookie。
+      if (url.pathname === '/api/cookie') {
+        cookieSeen.push(req.headers.cookie ?? null);
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store', 'set-cookie': 'k=v; Path=/' });
+        res.end('{"ok":true}');
+        return;
+      }
+      // /api/gzip：回 content-encoding: gzip 的正文。
+      if (url.pathname === '/api/gzip') {
+        res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip', 'cache-control': 'no-store' });
+        res.end(gzipSync('{"gzip":"decoded"}'));
+        return;
+      }
       if (isForm(contentType)) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
         res.end('<!doctype html><title>Received</title><p id="done">received</p>');
@@ -234,6 +253,7 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     altOrigin,
     port,
     hits,
+    cookieSeen,
     fake,
     async close() {
       for (const s of upgraded) s.destroy();

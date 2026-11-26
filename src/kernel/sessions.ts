@@ -591,7 +591,7 @@ export class SessionManager {
     return decision;
   }
 
-  private onRequestDone(e: { id: string; status: number | null; failed: boolean }): void {
+  private onRequestDone(e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }): void {
     for (const s of this.sessions.values()) {
       if (s.recorder.completeRequest(e.id, e.status, e.failed)) return;
     }

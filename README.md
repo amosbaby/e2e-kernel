@@ -145,7 +145,8 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 - A write made from inside a SharedWorker does not pass through the request handler (Playwright's `context.route` does not see it), so it is neither judged nor recorded. Dedicated Workers are covered. Measured in docs/m0-findings (section 9.9); the fix is to remove `SharedWorker` from every page, planned for M2.
 - Service workers are always blocked, so that the write policy sees every request (`coverage.serviceWorkers: "blocked"` in `result.json`). A page that relies on one, such as a local dev server that mocks its API with a service worker, behaves differently under the kernel.
 - The single-instance lock has a millisecond-scale race.
-- A redirect's follow-up hops do not pass through the request handler (Playwright calls a route handler only for the first URL of a redirect chain), so a write that is redirected, for example by a 307, is judged and recorded only at its first hop. Recorded by a test, not fixed; see docs/m0-findings.md.
+- A redirect's follow-up hops do not pass through the request handler (Playwright calls a route handler only for the first URL of a redirect chain), so a write that is redirected, for example by a 307, is judged and recorded only at its first hop. The driver can now send an allowed write without following redirects (`followRedirects: false`, refused at a 3xx first hop; see docs/m0-findings.md), but the kernel does not use it yet, so for now this is still the behaviour.
+- A request sent without following redirects (an allowed GraphQL query in read-only mode, once that mode is enforced) is sent by Node, so it does not trust root certificates installed on the system in addition to Node's own.
 
 ## Not in this version
 
