@@ -1058,12 +1058,23 @@ test('session: a top-level form POST converges the main page to its initiator ho
 
 // ---- initiatorUrl 为 null（主框架在 about:blank / 错误页，或归属判断失败）时的退路 ----
 
-test('session: with no initiator address, an allowed navigation that never commits still keeps the cross-host form POST blocked (pending hosts)', async () => {
-  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
-  assert.equal((await nav({ fake }, pageId, 'GET', 'http://example.org/file.zip', null)).action, 'continue');
-  assert.deepEqual([inner(sm, r.session).topHost, [...inner(sm, r.session).pendingHosts]], ['example.com', ['example.org']]);
+test('session: with no initiator address, an allowed navigation to a read-only host that never commits keeps a form POST back to the default host blocked (pending hosts)', async () => {
+  // 起点和 POST 目标都是默认主机：能拦下它的只有待定的只读主机（pendingHosts）
+  const { sm, fake } = setupRo(['example.com']); const r = await sm.open({ url: 'http://localhost:5173/' }); const pageId = fake.openPages().at(-1)!;
+  assert.equal(r.mode, 'default');
+  assert.equal((await nav({ fake }, pageId, 'GET', 'http://example.com/file.zip', null)).action, 'continue');
+  assert.deepEqual([inner(sm, r.session).topHost, [...inner(sm, r.session).pendingHosts]], ['localhost', ['example.com']]);
   assert.equal((await nav({ fake }, pageId, 'POST', 'http://localhost:5173/submit', null)).action, 'fulfill');
-  assert.equal(inner(sm, r.session).topHost, 'example.com');
+  assert.equal(inner(sm, r.session).topHost, 'localhost');
+});
+
+test('login: with no initiator address, an allowed navigation to a read-only host that never commits keeps a form POST back to the default host blocked (pending hosts)', async () => {
+  // 起点和 POST 目标都是默认主机：能拦下它的只有登录页待定的只读主机（place.pending）
+  const D = 'http://localhost:5173/login'; const R = 'http://app.example.com/file.zip';
+  const c = await loginSetup(['app.example.com'], D); const { sm, loginId, loginPageId } = c;
+  assert.equal((await nav(c, loginPageId, 'GET', R, D)).action, 'continue');                     // 下载或 204：页面其实还在 D 上
+  assert.equal((await nav(c, loginPageId, 'POST', 'http://localhost:5173/submit', null)).action, 'fulfill');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
 });
 
 test('login: a popup of a login-host page with no initiator address starts from its opener host, so its callback form POST goes through', async () => {
