@@ -1,4 +1,4 @@
-// 写请求里的 GraphQL 分类（只用来给报告分组，不做拦截）。输入是驱动给的原始请求体（已被截到 MAX_BODY 字节）。
+// 写请求里的 GraphQL 分类：`graphqlKind` 只给报告分组；拦截只用 `isStrictQuery`（和 `isPersistedOnly`，它只决定拦截的原因）。输入是驱动给的原始请求体（已被截到 MAX_BODY 字节）。
 // 原则：拿不准一律给 'unknown'，绝不把拿不准的判成 'query'；返回值只是这四个词或 null，不带体里的任何内容。
 
 export type GraphqlKind = 'query' | 'mutation' | 'subscription' | 'unknown';
@@ -182,4 +182,53 @@ function graphqlOfBody(body: string | null, contentType: string | null, url: str
   })();
   if (kind !== 'mutation' && Buffer.byteLength(body, 'utf8') >= MAX_BODY_BYTES && (isDoc || jsonLike)) return 'unknown';
   return kind;
+}
+
+// 只带持久化查询哈希、没有查询文档的请求：服务端会按哈希去取一份我们看不到的文档，无法判断是不是 mutation。
+// JSON 对象，或数组里任一项，带 extensions.persistedQuery 且没有字符串 query。读不出来一律 false（别的判断会照样拦住它）。
+export function isPersistedOnly(body: string | null): boolean {
+  if (body === null) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  const items = Array.isArray(value) ? value : [value];
+  return items.some((o) => isRecord(o) && isRecord(o.extensions) && Object.hasOwn(o.extensions, 'persistedQuery') && typeof o.query !== 'string');
+}
+
+// 注释只从 `#` 删到行尾，不分字符串里外：多删只会让「含 `{`」更难成立，只会更严，不会更松。
+function hasSelectionSet(doc: string): boolean {
+  return doc.replace(/#[^\r\n]*/g, '').includes('{');
+}
+
+// 每个操作的文档：application/graphql 且体不是 JSON 时是整个体；JSON 时是每个操作的 query 字符串（有一个不是字符串就读不出来，返回 null）。
+function documentsOf(body: string, isDoc: boolean): string[] | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return isDoc ? [body] : null;
+  }
+  const items = Array.isArray(value) ? value : [value];
+  if (items.length === 0) return null;
+  const docs: string[] = [];
+  for (const o of items) {
+    if (!isRecord(o) || typeof o.query !== 'string') return null;
+    docs.push(o.query);
+  }
+  return docs;
+}
+
+// 只读模式里唯一放行的写：方法 POST，Content-Type 的 MIME 是 application/json 或 application/graphql，
+// graphqlKind 判成 'query'（批量、subscription、unknown 都不行），并且每个操作的文档去掉注释后含 `{`
+// （挡住 `query builder` 这种当不了操作的文本）。url 可选：给了就连 URL 的 query 参数一起判（有这个参数就不放行，失败关闭）。
+export function isStrictQuery(method: string, body: string | null, contentType: string | null, url = ''): boolean {
+  if (method.toUpperCase() !== 'POST' || body === null) return false;
+  const mime = (contentType ?? '').split(';')[0]!.trim().toLowerCase();
+  if (mime !== 'application/json' && mime !== 'application/graphql') return false;
+  if (graphqlKind(body, contentType, url) !== 'query') return false;
+  const docs = documentsOf(body, mime === 'application/graphql');
+  return docs !== null && docs.every(hasSelectionSet);
 }

@@ -11,7 +11,7 @@ import { DEFAULT_PROFILE, profileInfo } from '../../src/kernel/profiles.ts';
 import { SessionManager } from '../../src/kernel/sessions.ts';
 import type { SessionDeps } from '../../src/kernel/sessions.ts';
 import { allowAllPolicy } from '../../src/kernel/write-policy.ts';
-import type { WritePolicy } from '../../src/kernel/write-policy.ts';
+import type { PolicyVerdict, WritePolicy } from '../../src/kernel/write-policy.ts';
 import { RUN_DIR_RE, runDirName } from '../../src/report/store.ts';
 import type { RunResult } from '../../src/report/result.ts';
 import { E2kError } from '../../src/shared/errors.ts';
@@ -20,6 +20,8 @@ import type { Mode } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
+
+const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null };
 
 const HOME_PAGE: FakePageSpec = {
   snapshot: '- button "Add" [ref=e2]',
@@ -232,7 +234,7 @@ test('fails closed when the resolver returns a non-default mode', async () => {
 
 test('a session request that touches a non-default host is aborted without asking the policy (fail closed)', async () => {
   const asked: string[] = [];
-  const spy: WritePolicy = { decide: (r) => { asked.push(r.url); return { action: 'continue' }; }, decideUnattributed: () => ({ action: 'continue' }) };
+  const spy: WritePolicy = { decide: (r) => { asked.push(r.url); return CONTINUE; }, decideUnattributed: () => CONTINUE };
   const modes = { ...defaultOnlyResolver, resolve: (host: string): Mode => (host === 'example.com' ? 'readonly' : 'default') };
   const { sm, fake } = setup({ policy: spy, modes }); const { session, runDir, pageId } = await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' }), { action: 'abort' });
@@ -337,7 +339,7 @@ test('writes from unknown pages are allowed in M1 but reported as unattributed',
 });
 
 test('the policy can refuse unattributed requests', async () => {
-  const deny: WritePolicy = { decide: () => ({ action: 'continue' }), decideUnattributed: () => ({ action: 'abort' }) };
+  const deny: WritePolicy = { decide: () => CONTINUE, decideUnattributed: () => ({ decision: { action: 'abort' }, reason: 'unattributed' }) };
   const { sm, fake } = setup({ policy: deny }); await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api/x' }), { action: 'abort' });
 });
@@ -427,14 +429,14 @@ test('the kernel closing its own pages and instance never reports a session twic
 });
 
 test('session requests: the mode check uses the top URL and falls back to the request URL; top-frame navigations add hosts', async () => {
-  const seen: { mode: string; topHost: string | null }[] = [];
-  const spy: WritePolicy = { decide: (_r, ctx) => { seen.push(ctx); return { action: 'continue' }; }, decideUnattributed: () => ({ action: 'continue' }) };
+  const seen: { mode: string }[] = [];
+  const spy: WritePolicy = { decide: (_r, ctx) => { seen.push(ctx); return CONTINUE; }, decideUnattributed: () => CONTINUE };
   const { sm, fake } = setup({ policy: spy }); const { session, runDir, pageId } = await opened(sm, fake);
   await fake.emitRequest({ pageId, method: 'GET', url: 'http://127.0.0.1:5173/x', topUrl: null });
   await fake.emitRequest({ pageId, method: 'GET', url: 'http://localhost:5173/y', topUrl: 'http://example.com/' });
   await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' });
   await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.net/frame', isNavigation: true, topFrame: false });
-  assert.deepEqual(seen.map((c) => c.topHost), ['127.0.0.1', 'example.com', 'example.org', 'localhost']);
+  assert.deepEqual(seen.map((c) => c.mode), ['default', 'default', 'default', 'default']);
   await sm.close({ session });
   assert.deepEqual(readResult(runDir).hosts.map((h) => h.host), ['localhost', 'example.org']);
 });

@@ -17,7 +17,7 @@ import { createRulesResolver } from './rules.ts';
 import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
 import type { ProfileInfo } from './profiles.ts';
 import { SessionManager } from './sessions.ts';
-import { allowAllPolicy } from './write-policy.ts';
+import { policy } from './write-policy.ts';
 
 // 内核进程（设计 5.1）：单实例、只给当前用户用的 Unix socket、一条连接一问一答，请求交给 SessionManager。
 
@@ -258,7 +258,7 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   // 唯一组装 SessionDeps 的地方：M2 换掉 modes 和 policy 就接上了。
   const modes = createRulesResolver(home.rulesFile);
   const sessions = new SessionManager({
-    driver: trackInstances(driver, instances), home, modes, policy: allowAllPolicy,
+    driver: trackInstances(driver, instances), home, modes, policy,
     idleMs: o.idleMs ?? DEFAULT_IDLE_MS, keepRuns: o.keepRuns ?? DEFAULT_KEEP_RUNS, now: () => new Date(),
     kernelVersion: version, log: (line) => { log.write(line); },
   });

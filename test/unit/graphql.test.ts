@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { graphqlKind } from '../../src/kernel/graphql.ts';
+import { graphqlKind, isPersistedOnly, isStrictQuery } from '../../src/kernel/graphql.ts';
 
 const JSON_CT = 'application/json';
 const URL_GQL = 'http://localhost/graphql';
@@ -218,4 +218,61 @@ test('the cut-off check counts bytes, not characters', () => {
   assert.ok(cut.endsWith('�') && cut.length < 64 * 1024 && Buffer.byteLength(cut, 'utf8') >= 64 * 1024);
   assert.ok(!cut.includes('mutation'), 'the mutation is past the cut');
   assert.equal(kind(cut, DOC), 'unknown');
+});
+
+// ---- isPersistedOnly / isStrictQuery ----
+
+test('isPersistedOnly: a persistedQuery extension without a string query', () => {
+  const ext = { persistedQuery: { version: 1, sha256Hash: 'x' } };
+  assert.equal(isPersistedOnly(j({ extensions: ext })), true);
+  assert.equal(isPersistedOnly(j({ query: 5, extensions: ext })), true);
+  assert.equal(isPersistedOnly(j([{ query: 'query{a}' }, { extensions: ext }])), true);
+  assert.equal(isPersistedOnly(j({ query: 'query{a}', extensions: ext })), false, 'the document is in the body');
+  assert.equal(isPersistedOnly(j({ query: 'query{a}' })), false);
+  assert.equal(isPersistedOnly(j({ extensions: { other: 1 } })), false);
+  assert.equal(isPersistedOnly(j([])), false);
+  assert.equal(isPersistedOnly(j('x')), false);
+  assert.equal(isPersistedOnly('{"extensions":{"persistedQuery":'), false);
+  assert.equal(isPersistedOnly('query { a }'), false);
+  assert.equal(isPersistedOnly(null), false);
+});
+
+test('isStrictQuery: accepts only a POST query with a selection set in a known content type', () => {
+  const q = j({ query: 'query{a}' });
+  assert.equal(isStrictQuery('POST', q, JSON_CT), true);
+  assert.equal(isStrictQuery('post', q, 'Application/JSON; charset=utf-8'), true);
+  assert.equal(isStrictQuery('POST', j({ query: '{a}' }), JSON_CT), true);
+  assert.equal(isStrictQuery('POST', '{ a }', 'application/graphql'), true);
+  assert.equal(isStrictQuery('POST', '# c\nquery Q { a }', 'application/graphql; charset=utf-8'), true);
+  assert.equal(isStrictQuery('POST', j([{ query: 'query{a}' }, { query: '{b}' }]), JSON_CT), true);
+  assert.equal(isStrictQuery('GET', q, JSON_CT), false);
+  assert.equal(isStrictQuery('DELETE', q, JSON_CT), false);
+  assert.equal(isStrictQuery('POST', q, 'text/plain'), false);
+  assert.equal(isStrictQuery('POST', q, null), false);
+  assert.equal(isStrictQuery('POST', q, 'application/x-www-form-urlencoded'), false);
+  assert.equal(isStrictQuery('POST', null, JSON_CT), false);
+});
+
+test('isStrictQuery: a query without a selection set, a mutation, a subscription, a batch with one bad item, or garbage is rejected', () => {
+  assert.equal(isStrictQuery('POST', j({ query: 'query builder' }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ query: 'query Q($a: Int)' }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ query: 'query Q # {\n' }), JSON_CT), false, 'a brace inside a comment does not count');
+  assert.equal(isStrictQuery('POST', 'query Q # {\n', 'application/graphql'), false);
+  assert.equal(isStrictQuery('POST', j({ query: 'mutation{a}' }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ query: 'subscription{a}' }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j([{ query: 'query{a}' }, { query: 'mutation{b}' }]), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j([{ query: 'query{a}' }, { query: 'query builder' }]), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j([{ query: 'query{a}' }, { x: 1 }]), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ query: 1 }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', '{"query":"query{', JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ extensions: { persistedQuery: { sha256Hash: 'x' } } }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ a: 1 }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', 'a=1', JSON_CT), false);
+});
+
+test('isStrictQuery: an optional url makes a query parameter count too', () => {
+  const q = j({ query: 'query{a}' });
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql'), true);
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?query=query%7Ba%7D'), false, 'a url query parameter is ambiguous, so it fails closed');
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?query=mutation%7Ba%7D'), false);
 });

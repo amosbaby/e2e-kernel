@@ -577,13 +577,13 @@ export class SessionManager {
       const host = hostOf(req.url);
       const targetMode = this.deps.modes.resolve(host);
       // 这个版本只实现了「默认」模式（open 时也这样把关）：顶层页面或请求目标有一边不是默认模式，就中止，不交给策略。
-      const decision: Decision = mode !== 'default' || targetMode !== 'default' ? { action: 'abort' } : this.deps.policy.decide(req, { mode, topHost });
+      const decision: Decision = mode !== 'default' || targetMode !== 'default' ? { action: 'abort' } : this.deps.policy.decide(req, { mode }).decision;
       s.recorder.addRequest(req, decision, targetMode, this.deps.now());
       if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
       return decision;
     }
     // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）。
-    const decision = this.deps.policy.decideUnattributed(req);
+    const decision = this.deps.policy.decideUnattributed(req, { anyReadonly: false }).decision;   // Task 12 接上真值
     if (isWrite(req.method)) {
       this.unattributed.push(toWriteRecord(req, decision, this.deps.modes.resolve(hostOf(req.url)), this.deps.now()));
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
