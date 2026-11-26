@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { REDACTED, isSensitiveKey, redactBody, redactDeep, redactText, redactUrl } from '../../src/shared/redact.ts';
+import { REDACTED, isSensitiveKey, redactBody, redactDeep, redactSelector, redactText, redactUrl } from '../../src/shared/redact.ts';
 
 // token 形态的串都在运行时拼，不写成字面量。
 const jwt = 'eyJ' + 'a'.repeat(21) + '.' + 'b'.repeat(24) + '.' + 'c'.repeat(24);
@@ -279,4 +279,46 @@ test('sensitive header lines: non-ascii, symbol-only, line separators, underscor
   assert.equal(redactText('api_key: v1'), 'api_key: [REDACTED]');
   assert.equal(redactText('client_secret: v1\nok: 1'), 'client_secret: [REDACTED]\nok: 1');
   assert.equal(redactText('Authorization: Bearer [REDACTED]'), 'Authorization: Bearer [REDACTED]');
+});
+
+test('redactSelector: an unquoted attribute value ends at its closing bracket, so the rest of the selector survives', () => {
+  assert.equal(redactSelector('[data-auth=primary][type=button]'), `[data-auth=${REDACTED}][type=button]`);
+  assert.equal(redactSelector('div[data-token-state=ready] > span'), `div[data-token-state=${REDACTED}] > span`);
+  assert.equal(redactSelector('[data-auth="primary"][type=button]'), `[data-auth="${REDACTED}"][type=button]`);
+  assert.equal(redactSelector('input[type=password]'), 'input[type=password]');
+  assert.equal(redactSelector(`text=${jwt}`), `text=${REDACTED}`);
+  // 值里成对的方括号算值的一部分：已脱敏的结果再过一遍不变，`[REDACTED]` 后面藏的东西也一起换掉。
+  for (const sel of ['[data-auth=primary][type=button]', '[token=a[b]c]', '[token=[REDACTED]tail][x=1]']) {
+    const once = redactSelector(sel);
+    assert.equal(redactSelector(once), once, sel);
+  }
+  assert.equal(redactSelector('[token=[REDACTED]tail][x=1]'), `[token=${REDACTED}][x=1]`);
+  // CSS 转义：反斜杠连同下一个字符算进值，`\\]` 不结束值。
+  assert.equal(redactSelector('[data-token=ab\\]cd][x=1]'), `[data-token=${REDACTED}][x=1]`);
+  assert.equal(redactSelector('[token=a\\[b][x=1]'), `[token=${REDACTED}][x=1]`);
+  assert.equal(redactSelector('[token=a\\'), `[token=${REDACTED}`);
+  for (const esc of [' ', '"', '#', '&', '<', '>']) assert.equal(redactSelector(`[data-token=ab\\${esc}cd][x=1]`), `[data-token=${REDACTED}][x=1]`, esc);
+  assert.equal(redactSelector(redactSelector('[data-token=ab\\]cd][x=1]')), `[data-token=${REDACTED}][x=1]`);
+  // 找不到配对的 `]`：照旧换到值的正常结尾（失败关闭）。
+  assert.equal(redactSelector('[token=a[b'), `[token=${REDACTED}`);
+  // 自由文本不受影响：`]` 不结束值。
+  assert.equal(redactText('[data-auth=primary][type=button]'), `[data-auth=${REDACTED}`);
+});
+
+test('redactDeep selectorKeys: strings under those keys (also nested, also in arrays) use the selector rule', () => {
+  const v = { target: '[data-auth=a][b=c]', mask: ['[data-auth=a][b=c]'], other: '[data-auth=a][b=c]', t: { given: '[data-auth=a][b=c]' },
+    given: { note: '[data-auth=a][b=c]' } };
+  const out = redactDeep(v, { selectorKeys: ['target', 'mask', 'given'] });
+  // 只看字符串所在的键（数组沿用键）：选择器键下面的对象里，别的键照常按自由文本处理。
+  assert.deepEqual(out, { target: `[data-auth=${REDACTED}][b=c]`, mask: [`[data-auth=${REDACTED}][b=c]`], other: `[data-auth=${REDACTED}`,
+    t: { given: `[data-auth=${REDACTED}][b=c]` }, given: { note: `[data-auth=${REDACTED}` } });
+  assert.equal(redactDeep({ target: 'Ab1'.repeat(14) }, { selectorKeys: ['target'] }).target, REDACTED);
+});
+
+test('redactSelector stays fast on adversarial input', () => {
+  const inputs = ['[token=' + '['.repeat(1e5), '[token=['.repeat(30000), '[token=]'.repeat(30000), '[a=['.repeat(30000),
+    '[token=' + '[]'.repeat(50000), '[token=' + ']'.repeat(1e5), '[token=a'.repeat(30000) + ']', '[token=' + '\\'.repeat(1e5), '[token=\\'.repeat(30000)];
+  const start = performance.now();
+  for (const s of inputs) redactSelector(s);
+  assert.ok(performance.now() - start < 2000);
 });

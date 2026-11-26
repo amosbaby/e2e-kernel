@@ -3,7 +3,7 @@ import { safely } from '../kernel/recorder.ts';
 import { escapeHtml } from '../shared/escape.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { Outcome, VerdictValue } from '../shared/protocol.ts';
-import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts';
+import { REDACTED, redactBody, redactSelector, redactText, redactUrl } from '../shared/redact.ts';
 import type { ClosedBy, RunResult, SupersededEntry } from './result.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。
@@ -32,6 +32,11 @@ function clip(s: string, max: number): string {
 // 页面内容：脱敏 → 截断 → 转义。非字符串进 redactText 会抛错，同样落到固定标记。
 function page(v: unknown, max = DISPLAY_MAX): string {
   return escapeHtml(clip(safely(() => redactText(v as string)), max));
+}
+
+// 选择器：同样脱敏 → 截断 → 转义，只是按选择器的规则（`[名字=值]` 不吞掉后面的选择器）。
+function pageSelector(v: unknown): string {
+  return escapeHtml(clip(safely(() => redactSelector(v as string)), DISPLAY_MAX));
 }
 
 function pageUrl(v: unknown): string {
@@ -146,7 +151,7 @@ function recoveries(r: RunResult): SupersededEntry[] {
 }
 
 function opWithTarget(seq: unknown, op: unknown, target: unknown): string {
-  return `序号 ${own(seq)} ${own(op)}${typeof target === 'string' ? ` <code>${page(target)}</code>` : ''}`;
+  return `序号 ${own(seq)} ${own(op)}${typeof target === 'string' ? ` <code>${pageSelector(target)}</code>` : ''}`;
 }
 
 function recoveredItem(e: SupersededEntry, sharedBy: number): string {

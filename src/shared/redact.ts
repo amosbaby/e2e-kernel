@@ -83,7 +83,10 @@ function redactCookieLine(line: string): string {
 // 自由文本里的 URL 参数，线性扫描：名字敏感时，值从 `=` 后一直到第一个 `&`、`#`、空白、`"`、`<`、`>` 或结尾
 // （`?` 不结束值，空值也换掉），换成 [REDACTED] 后从值的结尾接着找；名字不敏感时从 `=` 后接着找，
 // 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
-function redactParamsInText(s: string): string {
+// selector 为真时（只用于选择器），`[名字=值]` 里不带引号的值另外在配对的 `]` 处结束：值里成对的方括号算值的一部分，
+// 所以已换成 [REDACTED] 的值再过一遍不变，`[REDACTED]` 后面跟的内容也一起换掉；反斜杠转义的字符算进值；找不到配对的 `]` 就照旧到正常结尾。
+// 已知的边界：值里有不成对、也没转义的 `]`（比如 Playwright 正则值 `[token=/a]b/]`）时，`]` 之后的部分不换。
+function redactParamsInText(s: string, selector = false): string {
   const re = new RegExp(URL_PARAM_NAME.source, 'g');
   let out = '';
   let copied = 0;
@@ -107,7 +110,20 @@ function redactParamsInText(s: string): string {
       continue;
     }
     let end = start;
-    while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) end++;
+    let depth = 0;
+    const bracketed = selector && m[1] === '[';
+    while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) {
+      // CSS 转义：反斜杠连同下一个字符（含空白、引号）算进值（`ab\]cd`、`ab\ cd` 整个是值）。
+      if (bracketed && s[end] === '\\' && end + 1 < s.length) {
+        end += 2;
+        continue;
+      }
+      if (bracketed && s[end] === ']') {
+        if (depth === 0) break;
+        depth--;
+      } else if (bracketed && s[end] === '[') depth++;
+      end++;
+    }
     out += s.slice(copied, start) + REDACTED;
     copied = end;
     re.lastIndex = end;
@@ -155,13 +171,23 @@ function redactHeaderLines(s: string): string {
 }
 
 export function redactText(s: string): string {
+  return redactTextWith(s, false);
+}
+
+// 选择器（agent 给的目标、内核生成的稳定选择器）专用：和 redactText 一样，只是 `[名字=值]` 不带引号的值在配对的 `]` 处结束，
+// 不把后面的选择器一起吞掉。自由文本仍用 redactText。
+export function redactSelector(s: string): string {
+  return redactTextWith(s, true);
+}
+
+function redactTextWith(s: string, selector: boolean): string {
   let out = s.replace(JWT, REDACTED);
   out = out.replace(AUTH_SCHEME, (_m, scheme: string, gap: string) => `${scheme}${gap}${REDACTED}`);
   out = out.replace(USERINFO, `://${REDACTED}@`);     // 先于邮箱：`://用户名:密码@主机` 要整段换掉
   out = out.replace(EMAIL, REDACTED);
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
-  out = redactParamsInText(out);
+  out = redactParamsInText(out, selector);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);
   out = redactHeaderLines(out);
@@ -277,23 +303,24 @@ function setOwn(o: Record<string, unknown>, k: string, v: unknown): void {
 // 嵌套超过这么多层的对象或数组整个换成 REDACTED：页面可以给出很深的 JSON，不能让递归爆栈。
 const MAX_DEPTH = 64;
 
-function walk(v: unknown, extra: ReadonlySet<string>, skip: ReadonlySet<string>, depth: number): unknown {
-  if (typeof v === 'string') return tokenShaped(v) ? REDACTED : redactText(v);
+function walk(v: unknown, extra: ReadonlySet<string>, skip: ReadonlySet<string>, sel: ReadonlySet<string>, inSel: boolean, depth: number): unknown {
+  if (typeof v === 'string') return tokenShaped(v) ? REDACTED : inSel ? redactSelector(v) : redactText(v);
   if (typeof v !== 'object' || v === null) return v;
   if (depth >= MAX_DEPTH) return REDACTED;
-  if (Array.isArray(v)) return v.map((x: unknown) => walk(x, extra, skip, depth + 1));
+  if (Array.isArray(v)) return v.map((x: unknown) => walk(x, extra, skip, sel, inSel, depth + 1));
   const out: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(v)) {
     if (isSensitiveKey(k) || extra.has(k.toLowerCase())) setOwn(out, k, REDACTED);
     else if (skip.has(k) && typeof val === 'string') setOwn(out, k, val);
-    else setOwn(out, k, walk(val, extra, skip, depth + 1));
+    else setOwn(out, k, walk(val, extra, skip, sel, sel.has(k), depth + 1));
   }
   return out;
 }
 
 // 递归处理 JSON 形态的对象和数组，返回新值，不改入参。嵌套超过 MAX_DEPTH 层的子树整个换成 REDACTED。敏感键优先于 skipKeys；extraKeys 不分大小写，skipKeys 精确匹配。
-export function redactDeep<T>(v: T, o?: { extraKeys?: readonly string[]; skipKeys?: readonly string[] }): T {
+// 值是字符串、或字符串数组的 selectorKeys（精确匹配）用 redactSelector，其余用 redactText；选择器键下面的对象里，别的键照常用 redactText。
+export function redactDeep<T>(v: T, o?: { extraKeys?: readonly string[]; skipKeys?: readonly string[]; selectorKeys?: readonly string[] }): T {
   const extra = new Set((o?.extraKeys ?? []).map((k) => k.toLowerCase()));
   const skip = new Set(o?.skipKeys ?? []);
-  return walk(v, extra, skip, 0) as T;
+  return walk(v, extra, skip, new Set(o?.selectorKeys ?? []), false, 0) as T;
 }

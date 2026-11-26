@@ -485,6 +485,23 @@ test('selectors are redacted on disk (op target, given, stable selector, wait ta
   assert.equal(j.actions[2].target.stable.selector, plain);
 });
 
+test('an unquoted sensitive attribute value in a selector is redacted on disk without eating the rest of the selector', () => {
+  const sel = '[data-auth=primary][type=button]';
+  const want = `[data-auth=${REDACTED}][type=button]`;
+  const out = writeRun(join(tmp, 'r-sel2'), buildResult(input({ superseded: [{ failed: 1, by: 2 }], actions: [
+    act('click', 'failed', { seq: 1, op: { op: 'click', target: sel }, target: { given: sel, stable: null } }),
+    act('screenshot', 'ok', { seq: 2, op: { op: 'screenshot', target: sel, mask: [sel] } }),
+    act('click', 'failed', { seq: 3, op: { op: 'click', target: sel }, target: { given: sel, stable: null } }),
+  ] })));
+  const j = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.equal(j.actions[0].op.target, want); assert.equal(j.actions[0].target.given, want);
+  assert.equal(j.actions[1].op.target, want); assert.deepEqual(j.actions[1].op.mask, [want]);
+  assert.equal(j.superseded[0].failedTarget, want);
+  const failures = section(readFileSync(out.reportPath, 'utf8'), 'failures');
+  assert.ok(failures.includes(`序号 1 click <code>${want}</code> → 由 序号 2 screenshot`), failures);
+  assert.ok(failures.includes(`序号 3 click <code>${want}</code>（执行失败）`), failures);
+});
+
 test('runDirName is UTC and matches RUN_DIR_RE', () => {
   const name = runDirName(new Date('2026-11-26T15:30:05Z'), 's-a41f00');
   assert.equal(name, '20261126-153005-s-a41f00'); assert.match(name, RUN_DIR_RE);
