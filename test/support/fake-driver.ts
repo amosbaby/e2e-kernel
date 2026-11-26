@@ -21,6 +21,7 @@ const DEFAULT_CAPABILITIES: Capabilities = {
   networkInterception: true,
   crossProcessIframes: 'covered',
   nativeFormSubmit: 'covered',
+  sharedWorkers: 'covered',
   sharesUserProfile: false,
   canHeadless: true,
   selectorDialect: 'playwright',

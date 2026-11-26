@@ -207,7 +207,7 @@ M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里
 - 能堵的办法（已实测）：`addInitScript(() => { delete globalThis.SharedWorker })`。页面里 `new SharedWorker()` 抛错，服务端一条也没收到，路由也看不到 `/sw.js`。
 - 探针按上面的结论断言，结果不一致时退出码为 1：Playwright 或 Chromium 升级后行为变了，就要重做本节。
 
-结论：默认模式下 SharedWorker 的写不经路由，也不进记录，这是 M1 已有的缺口（README Known gaps 里有同一条）。Dedicated Worker 已覆盖，归属也能拿到。**M2a 起驱动在所有页面删掉 `SharedWorker`**（页面脚本之前注入的 init script），让只读上下文里没有这条旁路。`Capabilities` 里相应记 `sharedWorkers: 'not-covered'`，报告据此说明。
+结论：默认模式下 SharedWorker 的写不经路由，也不进记录，这是 M1 已有的缺口（README Known gaps 里有同一条）。Dedicated Worker 已覆盖，归属也能拿到。**M2a 起驱动在所有页面删掉 `SharedWorker`**（`attach` 里在 `context.route` 之前装的 init script `delete globalThis.SharedWorker`），让只读上下文里没有这条旁路。驱动测试（`test/browser/playwright-driver.test.ts`）在带驱动路由的真实 Chromium 里实测了五处，`typeof SharedWorker` 都是 `'undefined'`：顶层页面（`new SharedWorker()` 抛错，等 1 秒服务端也没收到 SharedWorker 的 POST）、带 `src` 的同源 iframe、脚本同步建出的 `about:blank` iframe、`window.open('')` 同步返回的窗口、Dedicated Worker（本来就没有，钉住）。所以 `Capabilities` 记 `sharedWorkers: 'covered'`；驱动若做不到这一点，应记 `'not-covered'`，报告的覆盖说明会据此提示。
 
 ## 9.10 原生对话框
 

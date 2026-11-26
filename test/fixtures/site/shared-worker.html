@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture SharedWorker</title>
+</head>
+<body>
+<script>
+  // 试着建一个 SharedWorker：建得出来，它在连接时就会往写端点 POST（sw-shared.js）。
+  var result = 'none';
+  try {
+    var w = new SharedWorker('/sw-shared.js');
+    w.port.start();
+    result = 'constructed';
+  } catch (e) {
+    result = 'threw';
+  }
+  document.documentElement.dataset.shared = result;
+</script>
+</body>
+</html>

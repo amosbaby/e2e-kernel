@@ -119,7 +119,7 @@ export function formatStatus(r: StatusResult): string {
     `版本 ${inline(r.version)}  pid ${r.pid}`,
     `状态目录 ${inline(r.home)}`,
     `驱动 ${inline(r.driver.name)}（网络拦截 ${c.networkInterception ? '能' : '不能'}，跨进程 iframe ${inline(c.crossProcessIframes)}，` +
-      `原生表单提交 ${inline(c.nativeFormSubmit)}，选择器 ${inline(c.selectorDialect)}）`,
+      `原生表单提交 ${inline(c.nativeFormSubmit)}，SharedWorker ${inline(c.sharedWorkers ?? 'unknown')}，选择器 ${inline(c.selectorDialect)}）`,
     `浏览器 ${r.instance === 'running' ? '在运行' : '未启动'}`,
     `会话 ${r.sessions.length} 个`,
     ...r.sessions.map((s) => `  ${inline(s.session)} ${inline(s.name)} 闲置 ${s.idleSec} 秒 ${inline(s.url)}`),

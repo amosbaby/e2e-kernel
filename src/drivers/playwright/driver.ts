@@ -21,6 +21,7 @@ const CAPABILITIES: Capabilities = {
   networkInterception: true,
   crossProcessIframes: 'covered',   // docs/m0-findings.md §4
   nativeFormSubmit: 'covered',      // docs/m0-findings.md §4
+  sharedWorkers: 'covered',         // docs/m0-findings.md §9.9：init script 在所有页面删掉 SharedWorker
   sharesUserProfile: false,
   canHeadless: true,
   selectorDialect: 'playwright',
@@ -747,6 +748,9 @@ class PlaywrightInstance implements Instance, Host {
     this.context.on('response', (r) => { this.flightEnded(r.request()); });
     this.context.on('requestfinished', (r) => { this.flightEnded(r); this.navigationEnded(r); void this.requestFinished(r); });
     this.context.on('requestfailed', (r) => { this.flightEnded(r); this.navigationEnded(r); this.requestDone(r, null, true); });
+    // SharedWorker 发出的请求不经 context.route（docs/m0-findings.md §9.9），所以在所有页面、所有 frame 里把构造函数删掉；
+    // 要赶在路由之前装好，页面脚本才碰不到它。
+    await this.context.addInitScript('try { delete globalThis.SharedWorker; } catch (e) {}');
     await this.context.route('**/*', (route) => this.handleRoute(route));
   }
 

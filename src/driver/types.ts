@@ -28,6 +28,7 @@ export interface Capabilities {
   networkInterception: boolean;        // 能否网络层拦截
   crossProcessIframes: Coverage;       // 能否覆盖跨进程 iframe
   nativeFormSubmit: Coverage;          // 能否拦住原生表单提交
+  sharedWorkers: Coverage;             // SharedWorker 发出的请求是否都经过路由（不经路由就得在页面里删掉它）
   sharesUserProfile: boolean;          // 是否共用用户日常的 profile
   canHeadless: boolean;                // 能否无头
   selectorDialect: string;             // 选择器方言

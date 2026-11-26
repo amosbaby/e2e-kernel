@@ -59,6 +59,9 @@ function coverageNotes(input: RunInput): string[] {
   if (caps.nativeFormSubmit !== 'covered') {
     notes.push('页面原生的表单提交不一定被写策略拦住，详见 docs/m0-findings.md');
   }
+  if (caps.sharedWorkers !== 'covered') {
+    notes.push('SharedWorker 发出的请求不一定被写策略拦住，详见 docs/m0-findings.md');
+  }
   return notes;
 }
 

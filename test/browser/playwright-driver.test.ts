@@ -116,10 +116,55 @@ test('capabilities follow the measured facts', { timeout: 60_000 }, () => {
     crossProcessIframes: 'covered',
     nativeFormSubmit: 'covered',
     sharesUserProfile: false,
+    sharedWorkers: 'covered',
     canHeadless: true,
     selectorDialect: 'playwright',
   });
   assert.equal(driver.name, 'playwright');
+});
+
+// SharedWorker 发出的请求不经 context.route（docs/m0-findings.md §9.9），所以驱动在所有页面里把它删掉。
+test('SharedWorker is gone from the page, so it cannot make a write that bypasses routing', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/shared-worker.html');
+  assert.equal(await page.evaluate(`document.documentElement.dataset.shared`), 'threw');
+  assert.equal(await page.evaluate(`typeof SharedWorker`), 'undefined');
+  await sleep(1000);
+  assert.ok(!server.hits.some(h => h.path === '/api/sink' && h.query.case === 'shared-worker'), 'no write from a SharedWorker reached the server');
+});
+
+test('SharedWorker is gone from a same-origin iframe with a src', { timeout: 60_000 }, async () => {
+  const typeOf = await page.evaluate(`new Promise((resolve) => {
+    const f = document.createElement('iframe');
+    f.onload = () => resolve(typeof f.contentWindow.SharedWorker);
+    f.src = '/frame-child.html';
+    document.body.appendChild(f);
+  })`);
+  assert.equal(typeOf, 'undefined');
+});
+
+test('SharedWorker is gone from a blank iframe the script creates synchronously', { timeout: 60_000 }, async () => {
+  assert.equal(await page.evaluate(`(() => {
+    const f = document.createElement('iframe');
+    document.body.appendChild(f);
+    return typeof f.contentWindow.SharedWorker;
+  })()`), 'undefined');
+});
+
+test('SharedWorker is gone from a window opened with window.open(\'\')', { timeout: 60_000 }, async () => {
+  assert.equal(await page.evaluate(`(() => {
+    const w = window.open('');
+    const t = typeof w.SharedWorker;
+    w.close();
+    return t;
+  })()`), 'undefined');
+});
+
+test('a Dedicated Worker has no SharedWorker either', { timeout: 60_000 }, async () => {
+  assert.equal(await page.evaluate(`new Promise((resolve, reject) => {
+    const w = new Worker(URL.createObjectURL(new Blob(['postMessage(typeof SharedWorker)'], { type: 'text/javascript' })));
+    w.onmessage = (e) => resolve(e.data);
+    w.onerror = () => reject(new Error('worker failed'));
+  })`), 'undefined');
 });
 
 test('selfCheck reports the bundled chromium', { timeout: 60_000 }, async () => {

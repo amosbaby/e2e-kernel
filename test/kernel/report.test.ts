@@ -26,7 +26,7 @@ function write(method: string, url: string, status: number | null, extra: Partia
     decision: 'allowed', targetMode: 'default', host: new URL(url).hostname, graphql: null, ...extra };
 }
 function driverWith(caps: Partial<Capabilities> = {}): RunInput['driver'] {
-  return { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'covered', nativeFormSubmit: 'covered',
+  return { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'covered', nativeFormSubmit: 'covered', sharedWorkers: 'covered',
     sharesUserProfile: false, canHeadless: false, selectorDialect: 'css', ...caps } };
 }
 function input(o: Partial<RunInput> = {}): RunInput {
@@ -167,6 +167,16 @@ test('coverage notes and next', () => {
   assert.equal(buildResult(input({ closedBy: 'browser-gone' })).next, '浏览器已关闭，需要时重新 open');
   assert.equal(buildResult(input({ closedBy: 'page-gone' })).next, '会话的页面被关闭，需要时重新 open');
   assert.equal(buildResult(input({ closedBy: 'agent' })).next, null);
+});
+
+test('a driver that does not cover SharedWorker adds a coverage note; one that does, does not', () => {
+  const note = 'SharedWorker 发出的请求不一定被写策略拦住，详见 docs/m0-findings.md';
+  for (const c of ['not-covered', 'unknown'] as const) {
+    assert.ok(buildResult(input({ driver: driverWith({ sharedWorkers: c }) })).coverage.notes.includes(note), c);
+  }
+  const covered = buildResult(input({ driver: driverWith({ sharedWorkers: 'covered' }) }));
+  assert.ok(!covered.coverage.notes.some((n) => n.includes('SharedWorker')));
+  assert.ok(renderReport(covered).includes('SharedWorker：covered'));
 });
 
 test('html escapes everything that came from the page', () => {

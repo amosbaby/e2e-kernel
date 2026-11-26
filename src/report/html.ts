@@ -189,7 +189,7 @@ function envSection(r: RunResult): string {
   const hosts = r.hosts.map((h) => `<li>${page(h.host)}：${own(h.mode)}</li>`);
   const capLines = [
     `网络层拦截：${own(caps.networkInterception)}`, `跨进程 iframe：${own(caps.crossProcessIframes)}`,
-    `原生表单提交：${own(caps.nativeFormSubmit)}`, `共用用户 profile：${own(caps.sharesUserProfile)}`,
+    `原生表单提交：${own(caps.nativeFormSubmit)}`, `SharedWorker：${own(caps.sharedWorkers)}`, `共用用户 profile：${own(caps.sharesUserProfile)}`,
     `可无头：${own(caps.canHeadless)}`, `选择器方言：${own(caps.selectorDialect)}`,
   ];
   const notes = [`Service Worker：${own(r.coverage.serviceWorkers)}`, `WebSocket 连接数：${own(r.coverage.webSockets)}`,
