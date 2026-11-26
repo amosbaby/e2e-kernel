@@ -236,7 +236,8 @@ agent 面    CLI（主）      薄 MCP 壳      使用说明（一份短文档�
 
 ### 5.9 agent 面
 
-- **CLI**（暂名 `e2k`）：`start`、`open`、`step`、`close`、`run`、`save-case`、`login`、`status`、`doctor`、`rule`（查看和修改域名规则、域名组）。默认输出给 agent 读的紧凑文本，`--json` 出结构化结果。退出码区分：通过、不符、动作执行失败、等登录、等批准、要人处理、用法或内部错误。退出码只反映代码判的 `assert` 和执行情况；agent 写的语义结论（含「存在 / 不存在 / 无法判断」）在输出和 `result.json` 里，不映射成退出码。
+- **CLI**（暂名 `e2k`）：`start`、`open`、`step`、`close`、`run`、`save-case`、`login`、`status`、`doctor`、`rule`（查看和修改域名规则、域名组）。默认输出给 agent 读的紧凑文本，`--json` 出结构化结果。退出码区分：通过、不符、动作执行失败、等登录、等批准、要人处理、用法或内部错误。退出码只反映代码判的 `assert` 和执行情况（加上下一条的登录墙）；agent 写的语义结论（含「存在 / 不存在 / 无法判断」）在输出和 `result.json` 里，不映射成退出码。
+- **退出码 20 已启用（内置启发式）**：`open` 和 `step` 结束时，会话主页面的顶层文档里有可见的密码类字段（`type=password`，或 `autocomplete` 含 `current-password` / `one-time-code`，不含 `new-password`；不进 iframe，穿透 open shadow DOM）就返回 20，并在 `blocked` / `next` 里提示人运行 `login`。20 优先于 10 和 11。它只是提示：会话不暂停、不关闭，也不写进 `result.json`；查不出就不报。域名组里的登录主机识别、跳转到登录主机时的暂停和 `result.json` 的 `blocked`，仍是 M2 的事。
 - CLI 里改规则的子命令只是提交一份待批准的改动，批准前不生效。
 - **MCP 壳**：一个 stdio MCP 服务，暴露 `open`、`step`、`close`、`run`、`save-case`、`status`、`doctor` 和只读的规则查询。`login`、`start`、改规则不经 MCP，由人在终端里做。
 - **使用说明**：一份短文档，讲三个动作、退出码、遇到阻断怎么办。不为某个 agent 写专用 hook。

@@ -57,8 +57,12 @@ export interface OpResult {
 }
 export interface Tallies { ok: number; match: number; mismatch: number; failed: number; notRun: number }
 export interface SessionInfo { session: string; name: string; url: string; idleSec: number }
-export interface OpenResult { session: string; name: string; url: string; title: string; mode: Mode; runDir: string; snapshot: string }
-export interface StepResult { session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 }
+export interface OpenResult {
+  session: string; name: string; url: string; title: string; mode: Mode; runDir: string; snapshot: string; blocked: 'login' | null; next: string | null;
+}
+export interface StepResult {
+  session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 | 20; blocked: 'login' | null; next: string | null;
+}
 export interface CloseResult {
   session: string; runDir: string; reportPath: string; resultPath: string; tallies: Tallies; consistency: 'ok' | 'conflict'; exit: 0 | 10;
 }

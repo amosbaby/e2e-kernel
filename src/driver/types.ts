@@ -109,5 +109,6 @@ export interface Page {
   read(q: { kind: AssertKind; target?: Target; property?: string }): Promise<string | number | boolean>;
   evaluate(js: string): Promise<unknown>;                                            // 页面内执行脚本
   describe(target: Target): Promise<Described>;
+  hasVisiblePasswordField(): Promise<boolean>;                                       // 主 frame（含 open shadow DOM、不含 iframe）里有没有可见的密码类字段
   close(): Promise<void>;                                                            // 收尾
 }

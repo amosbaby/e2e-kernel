@@ -125,7 +125,7 @@ test('the kernel refuses to type into a password field', { timeout: 180_000 }, a
   // 目标是 label、label 里的文字或文字选择器时，Playwright 会改填 label 的 control，也就是同一个密码框
   for (const target of ['#lab', '#sp', 'text=Password']) runs.push(await e2k('step', sid, JSON.stringify([{ op: 'fill', target, value: 'not-a-real-password' }])));
   for (const r of runs) {
-    assert.equal(r.code, 11);
+    assert.equal(r.code, 20, 'a login wall (20) beats the refused fill (11)');
     assert.match(r.out, /password-field/);
     assert.ok(!r.out.includes('not-a-real-password') && !r.err.includes('not-a-real-password'));
   }
@@ -136,7 +136,7 @@ test('the kernel refuses to type into a password field', { timeout: 180_000 }, a
 test('requests from a page with a password field leave no body; other pages are recorded as before', { timeout: 180_000 }, async () => {
   const { email, password, formToken } = server.fake;
   // 跨主机的 sso 页：假账号密码经 stdin 填进去（不进 argv），再提交原生表单。这一步之后的退出码不是本测试要断言的，只看记录。
-  await e2kIn(JSON.stringify([{ op: 'goto', url: server.altOrigin + '/sso.html' }]), 'step', sid, '--stdin');
+  assert.equal((await e2kIn(JSON.stringify([{ op: 'goto', url: server.altOrigin + '/sso.html' }]), 'step', sid, '--stdin')).code, 20, 'a visible password field is a login wall');
   const fill = [{ op: 'click', target: '#send-ids' },
     { op: 'eval', js: `document.querySelector('#user').value = ${JSON.stringify(email)}; document.querySelector('#pw').value = ${JSON.stringify(password)}; document.querySelector('#sso').requestSubmit(); 'submitted'` }];
   await e2kIn(JSON.stringify(fill), 'step', sid, '--stdin');

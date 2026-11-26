@@ -62,12 +62,17 @@ function opLine(r: OpResult): string {
   return r.output === undefined ? line : `${line}\n${outputText(r.output)}`;
 }
 
+function waitLine(r: { blocked: 'login' | null; next: string | null }): string[] {
+  return r.blocked === 'login' && r.next !== null ? [`等登录：${inline(r.next)}`] : [];
+}
+
 export function formatOpen(r: OpenResult): string {
-  return [`${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`, block(r.snapshot)].join('\n');
+  return [`${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`,
+    ...waitLine(r), block(r.snapshot)].join('\n');
 }
 
 export function formatStep(r: StepResult): string {
-  return [`${inline(r.session)} ${tallyText(r.tallies)}`, ...r.results.map(opLine)].join('\n');
+  return [`${inline(r.session)} ${tallyText(r.tallies)}`, ...waitLine(r), ...r.results.map(opLine)].join('\n');
 }
 
 export function formatClose(r: CloseResult): string {

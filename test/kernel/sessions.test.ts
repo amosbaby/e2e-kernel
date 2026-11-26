@@ -29,11 +29,11 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) await c();
 });
 
-function setup(overrides: Partial<SessionDeps> & { launchDelayMs?: number; failOpenWith?: Error } = {}) {
-  const { launchDelayMs, failOpenWith, ...depsOverrides } = overrides;
+function setup(overrides: Partial<SessionDeps> & { launchDelayMs?: number; failOpenWith?: Error; extraPages?: Record<string, FakePageSpec> } = {}) {
+  const { launchDelayMs, failOpenWith, extraPages, ...depsOverrides } = overrides;
   const fake = new FakeDriver({
     pages: { 'http://localhost:5173/': HOME_PAGE, 'http://localhost:5173/down': { gotoFailWith: 'timeout' },
-      'http://localhost:5173/login-down': { gotoFailWith: 'other' } },
+      'http://localhost:5173/login-down': { gotoFailWith: 'other' }, ...extraPages },
     ...(launchDelayMs === undefined ? {} : { launchDelayMs }),
     ...(failOpenWith === undefined ? {} : { failOpenWith }),
   });
@@ -492,4 +492,64 @@ test('shutdown stops the browser only after an in-flight open has settled', asyn
   await assert.rejects(pending, (e: E2kError) => e.code === 'busy');
   assert.ok(!logs.some((l) => l.includes('关页面')));                // 页面是在实例停掉之前、好好关掉的
   assert.deepEqual(fake.openPages(), []);
+});
+
+const WALL = 'http://localhost:5173/wall';
+const WALL_PAGES: Record<string, FakePageSpec> = {
+  [WALL]: { snapshot: '- textbox "Password"', passwordField: true },
+  'http://localhost:5173/wall-err': { passwordField: true, passwordFieldFailWith: 'other' },
+};
+
+test('open reports a login wall when the top page has a visible password field, and the session stays usable', async () => {
+  const { sm } = setup({ extraPages: WALL_PAGES });
+  const plain = await sm.open({ url: 'http://localhost:5173/' });
+  assert.equal(plain.blocked, null); assert.equal(plain.next, null);
+  const wall = await sm.open({ url: WALL });
+  assert.equal(wall.blocked, 'login');
+  assert.equal(wall.next, `页面停在登录页（有可见的密码框）：请人运行 login ${WALL} 登录后重试；若这是预期页面（如修改密码页）可忽略。会话仍开着，用完请 close`);
+  // 会话没被暂停也没被关掉：照常能 step、能 close
+  const r = await sm.step({ session: wall.session, ops: [{ op: 'snapshot' }] });
+  assert.equal(r.tallies.failed, 0);
+  await sm.close({ session: wall.session });
+});
+
+test('the redacted start url is what the login-wall hint shows', async () => {
+  const token = ['tk', crypto.randomBytes(12).toString('hex')].join('_');
+  const url = `${WALL}?token=${token}`;
+  const { sm } = setup({ extraPages: { [url]: { passwordField: true } } });
+  const wall = await sm.open({ url });
+  assert.equal(wall.blocked, 'login');
+  assert.ok(wall.next!.includes('[REDACTED]')); assert.ok(!wall.next!.includes(token)); assert.ok(!wall.url.includes(token));
+  const r = await sm.step({ session: wall.session, ops: [{ op: 'snapshot' }] });
+  assert.equal(r.blocked, 'login'); assert.ok(r.next!.includes('[REDACTED]')); assert.ok(!r.next!.includes(token));
+});
+
+test('step reports exit 20 on a login wall; 20 beats 11 and 10; tallies stay as they were', async () => {
+  const { sm } = setup({ extraPages: WALL_PAGES });
+  const wall = await sm.open({ url: WALL });
+  const ok = await sm.step({ session: wall.session, ops: [{ op: 'snapshot' }] });
+  assert.deepEqual([ok.exit, ok.blocked], [20, 'login']);
+  assert.deepEqual(ok.tallies, { ok: 1, match: 0, mismatch: 0, failed: 0, notRun: 0 });
+  const failing = await sm.step({ session: wall.session, ops: [{ op: 'click', target: '#nope' }, { op: 'snapshot' }] });
+  assert.equal(failing.exit, 20); assert.equal(failing.tallies.failed, 1); assert.equal(failing.tallies.notRun, 1);
+  const { sm: sm2 } = setup();
+  const s = await sm2.open({ url: 'http://localhost:5173/' });
+  const clean = await sm2.step({ session: s.session, ops: [{ op: 'snapshot' }] });
+  assert.deepEqual([clean.exit, clean.blocked, clean.next], [0, null, null]);
+});
+
+test('a step that navigates onto a login wall reports it, and one that leaves it stops reporting', async () => {
+  const { sm } = setup({ extraPages: WALL_PAGES });
+  const s = await sm.open({ url: 'http://localhost:5173/' });
+  assert.equal((await sm.step({ session: s.session, ops: [{ op: 'goto', url: WALL }] })).exit, 20);
+  const back = await sm.step({ session: s.session, ops: [{ op: 'goto', url: 'http://localhost:5173/' }] });
+  assert.deepEqual([back.exit, back.blocked], [0, null]);
+});
+
+test('when the probe itself fails, no login wall is claimed (a hint only)', async () => {
+  const { sm } = setup({ extraPages: WALL_PAGES });
+  const o = await sm.open({ url: 'http://localhost:5173/wall-err' });
+  assert.deepEqual([o.blocked, o.next], [null, null]);
+  const r = await sm.step({ session: o.session, ops: [{ op: 'snapshot' }] });
+  assert.deepEqual([r.exit, r.blocked, r.next], [0, null, null]);
 });

@@ -44,6 +44,8 @@ function pages(): Record<string, FakePageSpec> {
     'http://localhost:5173/': HOME_PAGE,
     'http://localhost:5173/down': { gotoFailWith: 'timeout' },
     'http://localhost:5173/login-down': { gotoFailWith: 'other' },
+    'http://localhost:5173/wall': { snapshot: '- textbox "Password"', passwordField: true,
+      elements: { '#status': { text: 'Added' }, '#gone': { failWith: 'not-found' } } },
   };
 }
 
@@ -124,6 +126,14 @@ test('open prints the session id and snapshot; --json prints one JSON object', a
   assert.equal(JSON.parse(j.outText()).mode, 'default');
 });
 
+test('open exits 20 on a login wall and prints the full hint; a normal page exits 0', async () => {
+  const t = io(); assert.equal(await main(['open', 'http://localhost:5173/wall'], t), 20);
+  assert.match(t.outText(), /^等登录：页面停在登录页（有可见的密码框）：请人运行 login http:\/\/localhost:5173\/wall 登录后重试；若这是预期页面（如修改密码页）可忽略。会话仍开着，用完请 close$/m);
+  const j = io(); assert.equal(await main(['open', 'http://localhost:5173/wall', '--json'], j), 20);
+  assert.equal(JSON.parse(j.outText()).blocked, 'login');
+  assert.equal(await main(['open', 'http://localhost:5173/'], io()), 0);
+});
+
 test('open exits 11 when the first navigation fails', async () => {
   assert.equal(await main(['open', 'http://localhost:5173/down'], io()), 11);
 });
@@ -148,6 +158,19 @@ describe('with a session', () => {
     const t = io(); assert.equal(await main(['step', sid, '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"}]'], t), 10);
     assert.match(t.outText(), /不符 实测=Added 期望=Nope/);
     assert.equal(await main(['step', sid, '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"},{"op":"click","target":"#gone"},{"op":"snapshot"}]'], io()), 11);
+  });
+
+  test('step exit 20 on a login wall beats 11 and 10, and the output says what to do', async () => {
+    const wall = await call(kernelTmp.home, 'open', { url: 'http://localhost:5173/wall' });
+    assert.ok(wall.ok); const wsid = (wall.result as OpenResult).session;
+    const t = io(); assert.equal(await main(['step', wsid, '[{"op":"snapshot"}]'], t), 20);
+    assert.match(t.outText(), /等登录：页面停在登录页（有可见的密码框）：请人运行 login http:\/\/localhost:5173\/wall 登录后重试；若这是预期页面（如修改密码页）可忽略。会话仍开着，用完请 close/);
+    const mismatch = io();
+    assert.equal(await main(['step', wsid, '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"}]'], mismatch), 20);
+    assert.match(mismatch.outText(), /不符 1/);
+    const mixed = io();
+    assert.equal(await main(['step', wsid, '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"},{"op":"click","target":"#gone"},{"op":"snapshot"}]'], mixed), 20);
+    assert.match(mixed.outText(), /执行失败 1/);
   });
 
   test('step text output: tallies line, one line per op, read output indented', async () => {

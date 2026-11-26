@@ -12,7 +12,8 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/op
 export interface FakeElement { text?: string; visible?: boolean; css?: Record<string, string>; count?: number;
   password?: boolean; kind?: Described['kind']; stable?: Stable | null; failWith?: 'not-found' | 'timeout'; describeFails?: number }
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
-  console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other' }
+  console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other';
+  passwordField?: boolean; passwordFieldFailWith?: 'timeout' | 'other' }
 
 const DEFAULT_CAPABILITIES: Capabilities = {
   networkInterception: true,
@@ -175,6 +176,13 @@ class FakePage implements Page {
   async evaluate(js: string): Promise<unknown> {
     this.enter('evaluate', [js]);
     return this.spec.evalResult;
+  }
+
+  // 规格里写了 passwordField 才为 true；写了 passwordFieldFailWith 就抛 DriverError（模拟查不出）。
+  async hasVisiblePasswordField(): Promise<boolean> {
+    this.enter('hasVisiblePasswordField', []);
+    if (this.spec.passwordFieldFailWith !== undefined) throw new DriverError(this.spec.passwordFieldFailWith, 'password field probe failed');
+    return this.spec.passwordField === true;
   }
 
   // 规格里写了 stable 就原样返回（含 null）；没写时选择器给 given，引用给 null。kind 规格没写就是 'other'（往保守处判）。

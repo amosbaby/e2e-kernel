@@ -32,6 +32,7 @@ function pages(): Record<string, FakePageSpec> {
     'http://localhost:5173/': HOME_PAGE,
     'http://localhost:5173/down': { gotoFailWith: 'timeout' },
     'http://localhost:5173/login-down': { gotoFailWith: 'other' },
+    'http://localhost:5173/wall': { snapshot: '- textbox "Password"', passwordField: true },
     'http://localhost:5173/leak?token=abc123': {
       title: `<b>${jwt}</b>`,
       elements: { '#leak': { text: jwt }, '#markup': { text: `<img src=x onerror=alert(1)><b>${jwt}</b>` } },
@@ -201,6 +202,18 @@ test('open, step, close round trip writes the report', async () => {
   const log = readFileSync(home.logFile, 'utf8');
   for (const method of ['open', 'step', 'close']) assert.match(log, new RegExp(`^\\S+ ${method} [0-9a-f-]{36} ok \\d+ms$`, 'm'));
   assert.ok(!log.includes('localhost:5173'));                            // 不记参数和响应内容
+});
+
+test('a login wall comes back as blocked + next, and neither key is sensitive', async () => {
+  const open = await call(home, 'open', { url: 'http://localhost:5173/wall' });
+  assert.ok(open.ok); const o = open.result as OpenResult;
+  assert.equal(o.blocked, 'login'); assert.match(o.next ?? '', /^页面停在登录页.*login http:\/\/localhost:5173\/wall 登录后重试；若这是预期页面（如修改密码页）可忽略。会话仍开着，用完请 close$/);
+  const step = await call(home, 'step', { session: o.session, ops: [{ op: 'snapshot' }] });
+  assert.ok(step.ok); const r = step.result as StepResult;
+  assert.deepEqual([r.exit, r.blocked], [20, 'login']);
+  const keys = [...keysOf(open), ...keysOf(step)];
+  assert.ok(keys.includes('blocked') && keys.includes('next'));
+  for (const key of keys) assert.ok(!isSensitiveKey(key), key);
 });
 
 test('responses are redacted but kernel identifiers survive', async () => {

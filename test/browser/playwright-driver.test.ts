@@ -193,6 +193,47 @@ test('fromLoginForm sees a password field inside an open shadow root, and a page
   assert.equal(seen.find(r => r.method === 'POST' && r.url.endsWith('/api/ids'))?.fromLoginForm, true);
 });
 
+test('hasVisiblePasswordField: true only for a visible, current-password-like field on the top page', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/login.html');
+  assert.equal(await page.hasVisiblePasswordField(), true);
+  await page.goto(server.origin + '/index.html');
+  assert.equal(await page.hasVisiblePasswordField(), false);
+  const add = async (html: string): Promise<boolean> => {
+    await page.goto(server.origin + '/index.html');
+    await page.evaluate(`document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(html)}); 1`);
+    return page.hasVisiblePasswordField();
+  };
+  assert.equal(await add('<input type="password" style="display:none">'), false, 'a display:none field is not a wall');
+  assert.equal(await add('<div hidden><input type="PASSWORD"></div>'), false, 'a field inside a hidden container is not a wall');
+  assert.equal(await add('<input type="password">'), true);
+  assert.equal(await add('<input type="PassWord">'), true, 'type is matched case-insensitively');
+  assert.equal(await add('<input type="text" autocomplete="current-password">'), true);
+  assert.equal(await add('<input type="text" autocomplete="section-x one-time-code">'), true, 'autocomplete is matched per token');
+  assert.equal(await add('<input type="text" autocomplete="new-password">'), false, 'a sign-up field is not a wall');
+  assert.equal(await add('<input type="text" autocomplete="not-current-password-ish">'), false);
+});
+
+test('hasVisiblePasswordField sees an open shadow root, but not an iframe', { timeout: 60_000 }, async () => {
+  await page.evaluate(`(() => { const host = document.createElement('div'); document.body.append(host); const root = host.attachShadow({ mode: 'open' });
+    const i = document.createElement('input'); i.type = 'password'; root.append(i); })()`);
+  assert.equal(await page.hasVisiblePasswordField(), true);
+  await page.goto(server.origin + '/index.html');
+  await page.evaluate(`new Promise(res => { const f = document.createElement('iframe'); f.src = '/login.html'; f.onload = () => res(1); document.body.append(f); })`);
+  assert.equal(await page.hasVisiblePasswordField(), false, 'a field only inside an iframe does not count');
+});
+
+test('hasVisiblePasswordField cannot be fooled by a page that patches querySelector', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/login.html');
+  await page.evaluate(`document.querySelector = () => null; Document.prototype.querySelector = () => null; Document.prototype.querySelectorAll = () => []; 1`);
+  assert.equal(await page.hasVisiblePasswordField(), true);
+});
+
+test('hasVisiblePasswordField on a closed page is a DriverError', { timeout: 60_000 }, async () => {
+  const gone = await inst.openPage({});
+  await gone.close();
+  await assert.rejects(gone.hasVisiblePasswordField(), (e: DriverError) => e instanceof DriverError);
+});
+
 // 请求发出后页面立刻换掉文档：探测不能落到新文档上得出一个错的 false。窗口取决于时序，所以只断言「不是 false」。
 test('fromLoginForm is not false when the page navigates away right after sending', { timeout: 60_000 }, async () => {
   await page.goto(server.origin + '/sso.html');

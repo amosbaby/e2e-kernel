@@ -82,6 +82,9 @@ export interface DriverOptions {
 const PASSWORD_FIELD_SELECTOR =
   'input[type="password" i], [autocomplete*="current-password" i], [autocomplete*="new-password" i], [autocomplete*="one-time-code" i]';
 
+// 登录墙：只认可见的、「当前密码」类的字段（不含 new-password，免得把注册页当登录页）。
+const LOGIN_WALL_SELECTOR = 'input[type=password i], input[autocomplete~="current-password" i], input[autocomplete~="one-time-code" i]';
+
 const PROBE_TIMEOUT_MS = 300;
 const NAVIGATION_PENDING_MS = 10_000;
 
@@ -409,6 +412,12 @@ class PlaywrightPage implements Page {
       if (target.startsWith('f')) return { stable: null, isPassword, kind };
       return { stable: await this.firstStable(loc, info), isPassword, kind };
     });
+  }
+
+  // 主 frame（不进 iframe）里有没有可见的登录用密码类字段。用 locator 数：跑在 Playwright 自己的隔离环境里，
+  // 页面改写不了 DOM 的方法，CSS 选择器默认穿透 open shadow root。数不出（页面关了、导航中断）抛 DriverError，由内核当「没有」。
+  hasVisiblePasswordField(): Promise<boolean> {
+    return this.run(async () => (await this.page.locator(LOGIN_WALL_SELECTOR).filter({ visible: true }).count()) > 0);
   }
 
   private async firstStable(loc: Locator, info: ElementInfo): Promise<Stable | null> {

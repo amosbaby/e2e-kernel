@@ -41,6 +41,8 @@ echo '[{"op":"snapshot"}]' | node bin/e2k.js step s-1a2b3c --stdin
 
 `target` is either a ref from the latest snapshot (such as `e7`) or a selector string. A failed action stops the batch (the rest is reported as not run); an assertion mismatch is recorded and the batch goes on. Selectors are Playwright selectors, plus `role=<role>[name="..."]` for a role with an exact accessible name (for example `role=textbox[name="New item"]`). In the text output `#n` is the 1-based position of the operation in the batch.
 
+After `open` and after every `step`, the kernel checks whether the top document of the session's main page (not iframes) shows a visible password-like field (`type` is `password`, or `autocomplete` contains `current-password` or `one-time-code`; `new-password` is not counted, so a sign-up page is not taken for a login page). If it does, the command exits 20 and prints a line starting with `等登录`, asking a person to run `login <start url>`. This is a built-in heuristic and a hint only: the session keeps running (it is not paused or closed), the records are unchanged, and a page that is meant to hold a password field (such as a change-password page) can be ignored. If the check itself fails, no wall is reported. The same answer is in the JSON as `blocked: "login"` and `next`.
+
 4. Close the session. This writes the report. `--verdict` is one of `pass`, `fail`, `exists`, `absent`, `undetermined`; `--because` gives the reason; `--findings` and `--not-done` take a JSON array.
 
 ```sh
@@ -84,12 +86,12 @@ Supported `css` assertion forms:
 
 | code | meaning |
 |---|---|
-| 0 | no assertion mismatched and no action failed (`close` only looks at mismatches, so it reports 0 or 10) |
+| 0 | no assertion mismatched, no action failed, and no login wall (`close` only looks at mismatches, so it reports 0 or 10) |
 | 1 | internal error |
 | 2 | usage error, unknown session, or the kernel is busy (including a kernel that is shutting down) |
 | 10 | at least one assertion mismatched |
-| 11 | an action failed (a batch with both a mismatch and a failed action reports 11); a refused password fill is also 11 |
-| 20 | waiting for a login (reserved, not used in M1) |
+| 11 | an action failed (a batch with both a mismatch and a failed action reports 11); a refused password fill is also 11 (but 20 when the page is a login wall) |
+| 20 | after `open` or `step`, the top page shows a visible password-like field; a person should run `login`. Takes precedence over 10 and 11 |
 | 21 | waiting for an approval (reserved, not used in M1) |
 | 22 | needs a person: no kernel running, or a command that must be run by a person in a terminal |
 
@@ -100,7 +102,7 @@ Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` wi
 
 ## Safety
 
-- The kernel never types a password. `fill` into a password-like field is refused (exit 11, "a person must log in"). A field counts as password-like when its `type` is `password`, or its `autocomplete` attribute contains `current-password`, `new-password` or `one-time-code`. If the kernel cannot tell, it does not fill. Log in with `login`.
+- The kernel never types a password. `fill` into a password-like field is refused (exit 11, or 20 when the page is a login wall; "a person must log in"). A field counts as password-like when its `type` is `password`, or its `autocomplete` attribute contains `current-password`, `new-password` or `one-time-code`. If the kernel cannot tell, it does not fill. Log in with `login`.
 - Fill values are kept in records only when the target is a confirmed non-password `<input>` of type text, email, search, tel, url or number, or a `<textarea>`. A `contenteditable` element or any other target can still be filled, but its value is recorded as `[REDACTED]`.
 - `eval` sources are always recorded as `[REDACTED]`, so `eval` steps cannot be replayed from the record.
 - In the `default` mode every write request is allowed and recorded. Writes that cannot be attributed to a page are listed separately under "writes not attributed to a page".

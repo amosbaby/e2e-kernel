@@ -172,7 +172,7 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
   const params = validateParams('open', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'open', params) as OpenResult;
   print(ctx, result, formatOpen);
-  return ExitCode.OK;
+  return result.blocked === 'login' ? ExitCode.WAIT_LOGIN : ExitCode.OK;
 }
 
 async function step(ctx: Ctx, args: string[]): Promise<number> {
@@ -185,7 +185,7 @@ async function step(ctx: Ctx, args: string[]): Promise<number> {
   const ops = parseJson(text, '操作必须是一个 JSON 数组');
   const params = validateParams('step', { session, ops });
   const result = await send(ctx, resolveHome(ctx.io.env), 'step', params) as StepResult;
-  if (result.exit !== 0 && result.exit !== 10 && result.exit !== 11) throw malformed();
+  if (result.exit !== 0 && result.exit !== 10 && result.exit !== 11 && result.exit !== 20) throw malformed();
   print(ctx, result, formatStep);
   return result.exit;
 }

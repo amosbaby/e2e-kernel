@@ -89,6 +89,24 @@ function cappedSnapshot(raw: string): string {
   });
 }
 
+type LoginWall = { blocked: 'login' | null; next: string | null };
+
+// 主页面顶层文档里有没有可见的密码框。这只是给人的提示，不是安全判断：驱动查不出（抛 DriverError）就当没有，少提示一次。
+// 别的错误（内核自己的毛病）照常往上抛。next 里的地址先脱敏。
+async function loginWall(page: Page, startUrl: string): Promise<LoginWall> {
+  let found = false;
+  try {
+    found = await page.hasVisiblePasswordField();
+  } catch (e) {
+    if (!(e instanceof DriverError)) throw e;
+  }
+  if (!found) return { blocked: null, next: null };
+  return {
+    blocked: 'login',
+    next: `页面停在登录页（有可见的密码框）：请人运行 login ${safely(() => redactUrl(startUrl))} 登录后重试；若这是预期页面（如修改密码页）可忽略。会话仍开着，用完请 close`,
+  };
+}
+
 function hostOf(url: string): string {
   return new URL(url).hostname;
 }
@@ -166,7 +184,9 @@ export class SessionManager {
     try {
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() });
       const tallies = tally(results);
-      return { session: s.id, results, tallies, exit: exitFor(tallies) };
+      const wall = await loginWall(s.page, s.start.url);
+      // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。
+      return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall };
     } finally {
       // 执行期间会话可能已经被关停收尾，那就不再计时。
       if (s.state === 'stepping') {
@@ -355,12 +375,14 @@ export class SessionManager {
       const loc = await page.location();
       // 关停已经开始：不建成会话，由下面的 catch 清理并拒绝。
       if (this.stopping) throw stopping();
+      const wall = await loginWall(page, p.url);
+      if (this.stopping) throw stopping();
       s.url = safely(() => redactUrl(loc.url));
       s.state = 'idle';
       this.restartIdle(s);
       return {
         session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: o.mode, runDir: s.runDir,
-        snapshot: cappedSnapshot(snapshot),
+        snapshot: cappedSnapshot(snapshot), ...wall,
       };
     } catch (e) {
       // 先清理（关页、删空的报告目录、撤销登记），会话不建立；再把驱动的错误换成 action-failed，别的原样抛。
