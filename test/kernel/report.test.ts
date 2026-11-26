@@ -211,10 +211,21 @@ test('writeRun: if redaction of a field throws, that field becomes a fixed marke
   assert.ok(!html.includes(secret)); assert.ok(html.includes('<html'));
 });
 
-test('op parameters are shown redacted and escaped', () => {
-  const op = { op: 'fill', target: 'e2', value: `<b>v</b> ${jwt}` } as Op;
-  const html = renderReport(buildResult(input({ actions: [act('fill', 'ok', { op })] })));
-  assert.ok(!html.includes('eyJ')); assert.ok(!html.includes('<b>v</b>')); assert.ok(html.includes('参数'));
+test('report.html does not show op parameters; result.json keeps exactly what the recorder gave it', () => {
+  const plain = 'plain-value-' + 'x'.repeat(6);
+  const actions = [
+    act('fill', 'ok', { op: { op: 'fill', target: 'e2', value: REDACTED } as Op }),
+    act('fill', 'ok', { op: { op: 'fill', target: 'e3', value: plain } as Op }),
+    act('fill', 'ok', { op: { op: 'fill', target: 'e4', value: `<b>v</b> ${jwt}` } as Op }),
+  ];
+  const out = writeRun(join(tmp, 'r-ops'), buildResult(input({ actions })));
+  const html = readFileSync(out.reportPath, 'utf8');
+  assert.ok(!html.includes(plain)); assert.ok(!html.includes('<b>v</b>')); assert.ok(!html.includes('eyJ'));
+  assert.ok(!html.includes('参数')); assert.ok(!html.includes(REDACTED));
+  const saved = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.equal(saved.actions[0].op.value, REDACTED);
+  assert.equal(saved.actions[1].op.value, plain);
+  assert.ok(!JSON.stringify(saved).includes(jwt));
 });
 
 test('writeRun refuses to write through a symlink that leaves the run directory', () => {

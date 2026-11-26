@@ -66,16 +66,8 @@ function targetCell(a: ActionRecord): string {
   return stable === null || stable.selector === a.target.given ? given : `${given}<br>稳定选择器 <code>${own(stable.selector)}</code>`;
 }
 
-// 操作的参数（去掉操作名和目标）：agent 给的内容，脱敏后再显示。
-function paramsOf(op: ActionRecord['op']): string {
-  const { op: _name, target: _target, ...rest } = op as Record<string, unknown>;
-  return Object.keys(rest).length === 0 ? '' : `参数 <code>${page(safely(() => JSON.stringify(rest)))}</code>`;
-}
-
 function detailCell(a: ActionRecord): string {
   const parts: string[] = [];
-  const params = paramsOf(a.op);
-  if (params !== '') parts.push(params);
   if (a.op.op === 'assert') parts.push(`实测 <code>${scalar(a.actual)}</code>，期望 <code>${scalar(a.expected)}</code>`);
   if (a.error !== undefined) parts.push(`错误 ${page(a.error)}`);
   return parts.join('<br>');
