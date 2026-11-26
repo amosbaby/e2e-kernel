@@ -7,11 +7,13 @@ import type { Capabilities, Check, Decision, Driver, Instance, Page, PageLocatio
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
-import { parseRoleTarget } from './stable.ts';
+import { parseRoleTarget, stableCandidates } from './stable.ts';
+import type { ElementInfo } from './stable.ts';
 
 // Playwright 驱动（设计 5.10）：实例、页面登记、请求拦截、页面和实例的关闭事件。
 // 这是唯一 import playwright 的地方（src/drivers/playwright/ 以外不碰浏览器库）。
-// 目标翻译里只有最小的一份（locate），页面操作里只有当前需要的那几个；其余按「还没做」抛错，见各方法。
+// 页面上的操作、读数和 describe 也在这里；目标翻译见 locate。
+// 报错消息只取 Playwright 消息的第一行，里面可能带 URL 或选择器：内核要在写日志和报告之前脱敏。
 
 // 取值来自 docs/m0-findings.md：§3、§4 的实测里，跨进程 iframe 和原生表单提交的写请求 route() 都看得见也拦得住。
 const CAPABILITIES: Capabilities = {
@@ -45,10 +47,6 @@ function httpUrlOrNull(url: string): string | null {
   return /^https?:/i.test(url) ? url : null;
 }
 
-function notYet(what: string): never {
-  throw new DriverError('other', `${what} is not implemented yet`);
-}
-
 // 监听器里的异常不能带垮驱动。
 function emit<A extends unknown[]>(listeners: readonly ((...args: A) => void)[], ...args: A): void {
   for (const l of [...listeners]) {
@@ -64,6 +62,70 @@ function locate(page: PwPage, target: Target): Locator {
   const role = parseRoleTarget(target);
   if (role !== null) return page.getByRole(role.role as Parameters<PwPage['getByRole']>[0], { name: role.name, exact: true });
   return page.locator(target);
+}
+
+// 在页面里对一个元素取值（作为函数交给 locator.evaluate 序列化，所以必须自成一体：不引用这个文件里的任何东西）。
+// 得到的是 stableCandidates 要的 ElementInfo，外加元素是不是密码框。
+function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boolean } {
+  const norm = (v: string): string => v.replace(/\s+/g, ' ').trim();
+  const tag = el.localName;
+  const type = el instanceof HTMLInputElement ? el.type : '';
+  const textTypes = ['text', 'search', 'email', 'url', 'tel', 'password'];
+
+  let role: string | null = null;
+  const attrRole = (el.getAttribute('role') ?? '').trim().split(/\s+/)[0] ?? '';
+  if (attrRole !== '') role = attrRole;
+  else if (tag === 'button') role = 'button';
+  else if (tag === 'a' && el.hasAttribute('href')) role = 'link';
+  else if (tag === 'input') role = type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio' : textTypes.includes(type) ? 'textbox' : null;
+  else if (tag === 'textarea') role = 'textbox';
+  else if (tag === 'select') role = 'combobox';
+  else if (/^h[1-6]$/.test(tag)) role = 'heading';
+
+  // 名字：aria-label，再是关联 label 的文本，再是（只有按钮、链接、标题）自身文本，要单行且不超过 80 个字符。
+  let name: string | null = null;
+  const aria = norm(el.getAttribute('aria-label') ?? '');
+  if (aria !== '') {
+    name = aria;
+  } else {
+    const labels = 'labels' in el ? Array.from((el as HTMLInputElement).labels ?? []) : [];
+    const labelText = norm(labels.map((l) => l.textContent ?? '').join(' '));
+    if (labelText !== '') {
+      name = labelText;
+    } else if (role === 'button' || role === 'link' || role === 'heading') {
+      const own = ((el as HTMLElement).innerText ?? '').trim();
+      if (own !== '' && own.length <= 80 && !/[\r\n]/.test(own)) name = own;
+    }
+  }
+
+  // css 路径：从最近的带 id 的祖先（没有就从 body）起，用 标签:nth-of-type(n) 连下来。
+  let cssPath: string;
+  if (el === document.documentElement) {
+    cssPath = 'html';
+  } else if (el === document.body) {
+    cssPath = 'body';
+  } else {
+    const parts: string[] = [];
+    let anchor = '';
+    let cur: Element | null = el;
+    while (cur !== null && cur !== document.body) {
+      if (cur !== el && cur.id !== '') {
+        anchor = '#' + CSS.escape(cur.id);
+        break;
+      }
+      let n = 1;
+      for (let sib = cur.previousElementSibling; sib !== null; sib = sib.previousElementSibling) if (sib.localName === cur.localName) n++;
+      parts.unshift(`${cur.localName}:nth-of-type(${n})`);
+      cur = cur.parentElement;
+    }
+    if (anchor === '' && cur === document.body) anchor = 'body';
+    cssPath = (anchor === '' ? parts : [anchor, ...parts]).join(' > ');
+  }
+
+  return {
+    info: { testId: el.getAttribute('data-testid'), id: el.id === '' ? null : el.id, role, name, cssPath },
+    isPassword: el instanceof HTMLInputElement && el.type === 'password',
+  };
 }
 
 // 实例对页面开放的那一小块：页面登记、弹窗列表。
@@ -125,52 +187,97 @@ class PlaywrightPage implements Page {
     });
   }
 
-  async snapshot(_o: { depth?: number }): Promise<string> { return notYet('snapshot'); }
-  async text(_o: { target?: Target }): Promise<string> { return notYet('text'); }
-  async screenshot(_o: { path: string; fullPage: boolean }): Promise<void> { return notYet('screenshot'); }
-  async console(): Promise<{ level: string; text: string }[]> { return notYet('console'); }
+  // 目标翻译之后先数一数：一个都没有就是 not-found（不等它出现，要等用 wait）。
+  // 匹配多个时交给 Playwright 的严格模式：动作不会悄悄落在第一个上，那样的错归 other。
+  private async resolve(target: Target): Promise<Locator> {
+    const loc = locate(this.page, target);
+    if ((await loc.count()) === 0) throw new DriverError('not-found', 'element not found');
+    return loc;
+  }
+
+  snapshot(o: { depth?: number }): Promise<string> {
+    return this.run(() => this.page.ariaSnapshot(o.depth === undefined ? { mode: 'ai' } : { mode: 'ai', depth: o.depth }));
+  }
+
+  text(o: { target?: Target }): Promise<string> {
+    return this.run(async () => {
+      if (o.target === undefined) return await this.page.evaluate(() => document.body?.innerText ?? '');
+      return await (await this.resolve(o.target)).first().innerText();
+    });
+  }
+
+  screenshot(o: { path: string; fullPage: boolean }): Promise<void> {
+    return this.run(async () => {
+      await this.page.screenshot({ path: o.path, fullPage: o.fullPage, scale: 'css', type: 'jpeg', quality: 60 });
+    });
+  }
+
+  console(): Promise<{ level: string; text: string }[]> {
+    return this.run(async () => (await this.page.consoleMessages()).map((m) => ({ level: m.type(), text: m.text() })));
+  }
 
   click(target: Target): Promise<void> {
-    return this.run(() => locate(this.page, target).click());
+    return this.run(async () => { await (await this.resolve(target)).click(); });
   }
 
-  async hover(_target: Target): Promise<void> { return notYet('hover'); }
+  hover(target: Target): Promise<void> {
+    return this.run(async () => { await (await this.resolve(target)).hover(); });
+  }
 
   fill(target: Target, value: string): Promise<void> {
-    return this.run(() => locate(this.page, target).fill(value));
+    return this.run(async () => { await (await this.resolve(target)).fill(value); });
   }
 
-  async press(_key: string, _target?: Target): Promise<void> { return notYet('press'); }
-  async scroll(_o: { target?: Target; dx?: number; dy?: number }): Promise<void> { return notYet('scroll'); }
+  press(key: string, target?: Target): Promise<void> {
+    return this.run(async () => {
+      if (target === undefined) await this.page.keyboard.press(key);
+      else await (await this.resolve(target)).press(key);
+    });
+  }
+
+  // 有目标就滚到它可见；没有目标就在当前鼠标位置滚轮 dx、dy。
+  scroll(o: { target?: Target; dx?: number; dy?: number }): Promise<void> {
+    return this.run(async () => {
+      if (o.target !== undefined) await (await this.resolve(o.target)).scrollIntoViewIfNeeded();
+      else await this.page.mouse.wheel(o.dx ?? 0, o.dy ?? 0);
+    });
+  }
 
   goto(url: string): Promise<void> {
     return this.run(async () => { await this.page.goto(url); });
   }
 
-  async setViewport(_v: Viewport): Promise<void> { return notYet('setViewport'); }
+  setViewport(v: Viewport): Promise<void> {
+    return this.run(() => this.page.setViewportSize({ width: v.width, height: v.height }));
+  }
 
-  // 只做了 text 和 target+state 两种；urlContains 和 ms 还没做。
   waitFor(cond: WaitCond, timeoutMs: number): Promise<void> {
     return this.run(async () => {
       if ('text' in cond) {
         await this.page.waitForFunction((t: string) => (document.body?.innerText ?? '').includes(t), cond.text, { timeout: timeoutMs, polling: 100 });
       } else if ('target' in cond) {
         await locate(this.page, cond.target).first().waitFor({ state: cond.state, timeout: timeoutMs });
+      } else if ('urlContains' in cond) {
+        // 子串判断，不用通配也不用正则；commit 就够了（单页应用的 pushState 也算）。
+        await this.page.waitForURL((u) => u.href.includes(cond.urlContains), { timeout: timeoutMs, waitUntil: 'commit' });
       } else {
-        notYet('waitFor urlContains/ms');
+        await this.page.waitForTimeout(cond.ms);
       }
     });
   }
 
-  // 只做了 text 和 url；count、css、visible 还没做。
+  // read 不等待：text、css 目标不存在立刻 not-found；count 给 0；visible 给 false。
   read(q: { kind: AssertKind; target?: Target; property?: string }): Promise<string | number | boolean> {
     return this.run(async () => {
       if (q.kind === 'url') return this.page.url();
-      if (q.kind !== 'text') return notYet(`read ${q.kind}`);
-      if (q.target === undefined) throw new DriverError('other', 'read text needs a target');
+      if (q.target === undefined) throw new DriverError('other', `read ${q.kind} needs a target`);
       const loc = locate(this.page, q.target);
+      if (q.kind === 'count') return await loc.count();
+      if (q.kind === 'visible') return await loc.first().isVisible();
       if ((await loc.count()) === 0) throw new DriverError('not-found', 'element not found');
-      return (await loc.first().innerText()).trim();
+      if (q.kind === 'text') return (await loc.first().innerText()).trim();
+      if (q.property === undefined) throw new DriverError('other', 'read css needs a property');
+      return await loc.first().evaluate((el, prop) => getComputedStyle(el).getPropertyValue(prop), q.property);
     });
   }
 
@@ -178,7 +285,34 @@ class PlaywrightPage implements Page {
     return this.run(() => this.page.evaluate(js));
   }
 
-  async describe(_target: Target): Promise<{ stable: Stable | null; isPassword: boolean }> { return notYet('describe'); }
+  // 选择器写法的目标原样返回（via: 'given'）；引用要找出一个稳定的选择器（设计 5.8）：
+  // 在 iframe 里的引用（f 开头）先不解析；其余按 testid → id → role → css 逐个验证，
+  // 第一个「匹配数正好是 1，且就是这个元素」的就是结果，都不行就是 null。元素找不到抛 not-found。
+  describe(target: Target): Promise<{ stable: Stable | null; isPassword: boolean }> {
+    return this.run(async () => {
+      const loc = (await this.resolve(target)).first();
+      const { info, isPassword } = await loc.evaluate(collectElementInfo);
+      if (!isRef(target)) return { stable: { selector: target, via: 'given' as const }, isPassword };
+      if (target.startsWith('f')) return { stable: null, isPassword };
+      return { stable: await this.firstStable(loc, info), isPassword };
+    });
+  }
+
+  private async firstStable(loc: Locator, info: ElementInfo): Promise<Stable | null> {
+    const handle = await loc.elementHandle();
+    try {
+      for (const candidate of stableCandidates(info)) {
+        try {
+          const found = locate(this.page, candidate.selector);
+          if ((await found.count()) !== 1) continue;
+          if (await found.evaluate((el, same) => el === same, handle)) return candidate;
+        } catch { /* 这个候选写不成可用的选择器，试下一个 */ }
+      }
+      return null;
+    } finally {
+      await handle.dispose().catch(() => {});
+    }
+  }
 
   async close(): Promise<void> {
     if (this.closed) throw new DriverError('other', 'page is already closed');

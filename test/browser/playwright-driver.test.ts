@@ -1,7 +1,7 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -35,6 +35,46 @@ async function until(fn: () => boolean): Promise<void> {
     if (Date.now() > deadline) assert.fail('condition not met within 5 seconds');
     await sleep(50);
   }
+}
+
+// 快照里 button "<label>" 那一行的引用。
+async function refOf(p: Page, label: string): Promise<string> {
+  const snap = await p.snapshot({});
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const m = new RegExp(`button "${escaped}" \\[ref=([^\\]]+)\\]`).exec(snap);
+  assert.ok(m, `no button "${label}" in the snapshot:\n${snap}`);
+  return m[1]!;
+}
+
+// 快照里匹配某个正则的第一处引用（正则第 1 组是引用）。
+async function refMatching(p: Page, re: RegExp): Promise<string> {
+  const snap = await p.snapshot({});
+  const m = re.exec(snap);
+  assert.ok(m, `no match for ${re} in the snapshot:\n${snap}`);
+  return m[1]!;
+}
+
+// 轮询页面里的一个表达式，直到为真（最多 5 秒）。
+async function untilEval(p: Page, expr: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!(await p.evaluate(expr))) {
+    if (Date.now() > deadline) assert.fail(`page condition not met within 5 seconds: ${expr}`);
+    await sleep(50);
+  }
+}
+
+// JPEG 的宽高：读第一个 SOF 标记（0xFFC0..0xFFCF 里除了 C4、C8、CC）。
+function jpegSize(file: string): { width: number; height: number } {
+  const b = readFileSync(file);
+  let i = 2;
+  while (i + 9 < b.length) {
+    assert.equal(b[i], 0xff, 'not at a JPEG marker');
+    const marker = b[i + 1]!;
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc)
+      return { height: b.readUInt16BE(i + 5), width: b.readUInt16BE(i + 7) };
+    i += 2 + b.readUInt16BE(i + 2);
+  }
+  return assert.fail('no SOF marker in the JPEG');
 }
 
 before(async () => {
@@ -239,9 +279,211 @@ test('location reports the url, title, frames and popups', { timeout: 60_000 }, 
   assert.ok(framed.frames.some(f => f.url.startsWith(server.altOrigin)));
 });
 
-test('goto and waitFor failures map to DriverError kinds', { timeout: 60_000 }, async () => {
+test('snapshot has refs; click by ref changes the page', { timeout: 60_000 }, async () => {
+  await page.fill('role=textbox[name="New item"]', 'Gamma');
+  await page.click(await refOf(page, 'Add'));
+  await page.waitFor({ text: 'Added' }, 5000);
+  assert.equal(await page.read({ kind: 'count', target: '#list li' }), 3);
+});
+
+test('describe resolves refs to stable selectors', { timeout: 60_000 }, async () => {
+  assert.deepEqual((await page.describe(await refOf(page, 'Add'))).stable, { selector: '[data-testid="add"]', via: 'testid' });
+  assert.deepEqual((await page.describe(await refOf(page, 'Save'))).stable, { selector: '#save', via: 'id' });
+  assert.deepEqual((await page.describe(await refOf(page, 'Plain'))).stable, { selector: 'role=button[name="Plain"]', via: 'role' });
+  assert.deepEqual(await page.describe('#save'), { stable: { selector: '#save', via: 'given' }, isPassword: false });
+  await page.goto(server.origin + '/login.html');
+  assert.equal((await page.describe('#pw')).isPassword, true);
+});
+
+test('describe falls back to a css path, and skips candidates that are ambiguous or unsafe', { timeout: 60_000 }, async () => {
+  // 没有 testid、id、可用的角色：从最近带 id 的祖先连下来（这里是 #list）。
+  const item = await refMatching(page, /listitem \[ref=(e\d+)\]: Beta/);
+  assert.deepEqual((await page.describe(item)).stable, { selector: '#list > li:nth-of-type(2)', via: 'css' });
+  // 同一个 testid 出现两次：匹配数不是 1，跳过，落到角色。
+  const add = await refOf(page, 'Add');
+  await page.evaluate(`(() => { const d = document.createElement('div'); d.setAttribute('data-testid', 'add'); document.body.append(d); })()`);
+  assert.deepEqual((await page.describe(add)).stable, { selector: 'role=button[name="Add"]', via: 'role' });
+  // 两个同名按钮：角色也不唯一，落到 css（从 body 起）。
+  const plain = await refOf(page, 'Plain');
+  await page.evaluate(`(() => { const b = document.createElement('button'); b.textContent = 'Plain'; document.body.append(b); })()`);
+  assert.deepEqual((await page.describe(plain)).stable, { selector: 'body > button:nth-of-type(3)', via: 'css' });
+  // 值里有换行的 testid 和 id：不写进选择器，落到下一个候选。
+  const save = await refOf(page, 'Save');
+  await page.evaluate(`(() => {
+    document.getElementById('save').setAttribute('data-testid', 'a\\nb');
+    document.getElementById('save').id = 'sa\\nve';
+  })()`);
+  assert.deepEqual((await page.describe(save)).stable, { selector: 'role=button[name="Save"]', via: 'role' });
+});
+
+test('describe: missing elements, iframe refs and the password flag', { timeout: 60_000 }, async () => {
+  await assert.rejects(page.describe('#nope'), (e: DriverError) => e instanceof DriverError && e.kind === 'not-found');
+  await assert.rejects(page.describe('e999'), (e: DriverError) => e instanceof DriverError && e.kind === 'not-found');
+  await page.goto(server.origin + '/frames.html');
+  const framed = await refMatching(page, /\[ref=(f\d+e\d+)\]/);
+  assert.deepEqual(await page.describe(framed), { stable: null, isPassword: false });
+  await page.goto(server.origin + '/login.html');
+  assert.equal((await page.describe('input[name="user"]')).isPassword, false);
+});
+
+test('snapshot honours depth', { timeout: 60_000 }, async () => {
+  const full = await page.snapshot({});
+  assert.match(full, /heading "Items"/);
+  assert.match(full, /listitem \[ref=e\d+\]: Alpha/);
+  const shallow = await page.snapshot({ depth: 1 });
+  assert.match(shallow, /heading "Items"/);
+  assert.ok(!shallow.includes('Alpha'), shallow);
+});
+
+test('read: css, text, url, visible, missing', { timeout: 60_000 }, async () => {
+  assert.equal(await page.read({ kind: 'css', target: '#styled', property: 'color' }), 'rgb(0, 128, 0)');
+  assert.equal(await page.read({ kind: 'css', target: '#styled', property: 'font-size' }), '18px');
+  assert.equal(await page.read({ kind: 'text', target: 'h1' }), 'Items');
+  assert.equal(await page.read({ kind: 'url' }), server.origin + '/index.html');
+  assert.equal(await page.read({ kind: 'visible', target: '#styled' }), true);
+  assert.equal(await page.read({ kind: 'visible', target: '#nope' }), false);
+  await assert.rejects(page.read({ kind: 'text', target: '#nope' }), (e: DriverError) => e.kind === 'not-found');
+  assert.match(await page.text({}), /Items[\s\S]*Alpha[\s\S]*Beta/);
+});
+
+test('read: count, css and visible edge cases', { timeout: 60_000 }, async () => {
+  assert.equal(await page.read({ kind: 'count', target: '#list li' }), 2);
+  assert.equal(await page.read({ kind: 'count', target: '#nope' }), 0);
+  assert.equal(await page.read({ kind: 'count', target: 'role=button[name="Plain"]' }), 1);
+  assert.equal(await page.read({ kind: 'count', target: 'role=button[name="Nobody"]' }), 0);
+  await assert.rejects(page.read({ kind: 'css', target: '#nope', property: 'color' }), (e: DriverError) => e.kind === 'not-found');
+  await assert.rejects(page.read({ kind: 'css', target: '#styled' }), (e: DriverError) => e instanceof DriverError && e.kind === 'other');
+  await assert.rejects(page.read({ kind: 'count' }), (e: DriverError) => e instanceof DriverError && e.kind === 'other');
+  // 几个元素都匹配时 visible 看第一个，不抛严格模式的错。
+  assert.equal(await page.read({ kind: 'visible', target: '#list li' }), true);
+  await page.evaluate(`document.getElementById('styled').style.display = 'none'`);
+  assert.equal(await page.read({ kind: 'visible', target: '#styled' }), false);
+  assert.equal(await page.read({ kind: 'count', target: '#styled' }), 1);
+});
+
+test('text with a target reads that element; missing target is not-found', { timeout: 60_000 }, async () => {
+  assert.equal(await page.text({ target: '#styled' }), 'Styled');
+  assert.match(await page.text({ target: '#list' }), /Alpha\s+Beta/);
+  await assert.rejects(page.text({ target: '#nope' }), (e: DriverError) => e.kind === 'not-found');
+});
+
+test('console returns what the page logged', { timeout: 60_000 }, async () => {
+  await page.evaluate(`console.log('hello-console'); console.error('oops-console')`);
+  const msgs = await page.console();
+  assert.ok(msgs.some(m => m.level === 'log' && m.text === 'hello-console'), JSON.stringify(msgs));
+  assert.ok(msgs.some(m => m.level === 'error' && m.text === 'oops-console'), JSON.stringify(msgs));
+});
+
+test('navigation failures and timeouts map to DriverError', { timeout: 60_000 }, async () => {
+  await assert.rejects(page.goto('http://127.0.0.1:9/'), DriverError);             // 没人监听的端口
+  await assert.rejects(page.waitFor({ text: 'never appears' }, 300), (e: DriverError) => e.kind === 'timeout');
+});
+
+test('action errors: a missing target is not-found, messages are one line', { timeout: 60_000 }, async () => {
+  for (const act of [() => page.click('#nope'), () => page.hover('#nope'), () => page.fill('#nope', 'x'),
+    () => page.press('Enter', '#nope'), () => page.scroll({ target: '#nope' }), () => page.click('e999'),
+    () => page.click('role=button[name="Nobody"]')])
+    await assert.rejects(act(), (e: DriverError) => e instanceof DriverError && e.kind === 'not-found' && !e.message.includes('\n'));
+  // 两个元素匹配同一个选择器：不乱点第一个，当作别的错。
+  await assert.rejects(page.click('#list li'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
+  await assert.rejects(page.press('NoSuchKey'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
+  await assert.rejects(page.evaluate('throw new Error("page threw")'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
   await assert.rejects(page.goto('http://127.0.0.1:9/'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
-  await assert.rejects(page.waitFor({ text: 'never appears' }, 300), (e: DriverError) => e instanceof DriverError && e.kind === 'timeout');
+});
+
+test('screenshot is a JPEG', { timeout: 60_000 }, async () => {
+  const file = join(makeTmp('e2k-shot-'), 'shot.jpg');
+  await page.screenshot({ path: file, fullPage: false });
+  assert.deepEqual([...readFileSync(file).subarray(0, 2)], [0xff, 0xd8]);
+});
+
+test('screenshot is in CSS pixels and, without fullPage, no wider than the viewport', { timeout: 60_000 }, async () => {
+  const small = await inst.openPage({ viewport: { width: 640, height: 480 } });
+  try {
+    await small.goto(server.origin + '/index.html');
+    await small.evaluate(`document.body.style.minHeight = '3000px'`);
+    const file = join(makeTmp('e2k-shot-'), 'view.jpg');
+    await small.screenshot({ path: file, fullPage: false });
+    const view = jpegSize(file);
+    assert.ok(view.width <= 640, `width ${view.width}`);
+    assert.ok(view.height <= 480, `height ${view.height}`);
+    const full = join(makeTmp('e2k-shot-'), 'full.jpg');
+    await small.screenshot({ path: full, fullPage: true });
+    const all = jpegSize(full);
+    assert.ok(all.width <= 640, `width ${all.width}`);
+    assert.ok(all.height > 480, `height ${all.height}`);
+  } finally {
+    await small.close().catch(() => {});
+  }
+});
+
+test('press works with a target and without one', { timeout: 60_000 }, async () => {
+  const value = (): Promise<unknown> => page.evaluate(`document.getElementById('new-item').value`);
+  await page.click('#new-item');
+  await page.press('A');                      // 没有目标：发给当前焦点
+  assert.equal(await value(), 'A');
+  await page.press('Backspace', '#new-item'); // 有目标：先聚焦再按
+  assert.equal(await value(), '');
+  await page.press('B', 'role=textbox[name="New item"]');
+  assert.equal(await value(), 'B');
+});
+
+test('hover moves the pointer onto the target', { timeout: 60_000 }, async () => {
+  await page.evaluate(`(() => { const s = document.createElement('style'); s.textContent = '#styled:hover { color: rgb(255, 0, 0) !important }'; document.head.append(s); })()`);
+  assert.equal(await page.read({ kind: 'css', target: '#styled', property: 'color' }), 'rgb(0, 128, 0)');
+  await page.hover('#styled');
+  assert.equal(await page.read({ kind: 'css', target: '#styled', property: 'color' }), 'rgb(255, 0, 0)');
+});
+
+test('scroll by target and by dx/dy', { timeout: 60_000 }, async () => {
+  await page.evaluate(`(() => {
+    document.body.style.minHeight = '4000px'; document.body.style.minWidth = '4000px';
+    const d = document.createElement('div'); d.id = 'bottom'; d.style.marginTop = '3000px'; d.textContent = 'bottom'; document.body.append(d);
+  })()`);
+  assert.equal(await page.evaluate('window.scrollY'), 0);
+  await page.scroll({ target: '#bottom' });
+  await untilEval(page, 'window.scrollY > 1000');
+  await page.evaluate('window.scrollTo(0, 0)');
+  await page.scroll({ dy: 300 });
+  await untilEval(page, 'window.scrollY === 300');
+  await page.scroll({ dx: 200 });
+  await untilEval(page, 'window.scrollX === 200');
+  await page.scroll({ dy: -100 });
+  await untilEval(page, 'window.scrollY === 200');
+});
+
+test('setViewport resizes the page, and openPage applies a requested viewport', { timeout: 60_000 }, async () => {
+  await page.setViewport({ width: 640, height: 480 });
+  assert.deepEqual(await page.evaluate('[window.innerWidth, window.innerHeight]'), [640, 480]);
+  const sized = await inst.openPage({ viewport: { width: 800, height: 600 } });
+  try {
+    await sized.goto(server.origin + '/index.html');
+    assert.deepEqual(await sized.evaluate('[window.innerWidth, window.innerHeight]'), [800, 600]);
+  } finally {
+    await sized.close().catch(() => {});
+  }
+});
+
+test('waitFor urlContains and ms', { timeout: 60_000 }, async () => {
+  await page.waitFor({ urlContains: 'index.html' }, 1000);          // 已经满足：马上返回
+  await page.evaluate(`setTimeout(() => history.pushState({}, '', '/index.html?later=yes'), 200)`);
+  await page.waitFor({ urlContains: 'later=yes' }, 5000);
+  assert.equal(await page.read({ kind: 'url' }), server.origin + '/index.html?later=yes');
+  await assert.rejects(page.waitFor({ urlContains: 'never-in-the-url' }, 300), (e: DriverError) => e instanceof DriverError && e.kind === 'timeout');
+  // 子串，不是通配也不是正则：星号和点只代表它们自己。
+  await assert.rejects(page.waitFor({ urlContains: 'index*html' }, 300), (e: DriverError) => e.kind === 'timeout');
+  await assert.rejects(page.waitFor({ urlContains: 'index.+html' }, 300), (e: DriverError) => e.kind === 'timeout');
+  const t0 = Date.now();
+  await page.waitFor({ ms: 300 }, 5000);
+  assert.ok(Date.now() - t0 >= 280, `waited only ${Date.now() - t0} ms`);
+});
+
+test('waitFor target states', { timeout: 60_000 }, async () => {
+  await page.waitFor({ target: '#nope', state: 'hidden' }, 1000);       // 不存在也算隐藏
+  await assert.rejects(page.waitFor({ target: '#nope', state: 'visible' }, 300), (e: DriverError) => e.kind === 'timeout');
+  await page.evaluate(`setTimeout(() => { document.getElementById('styled').style.display = 'none'; }, 200)`);
+  await page.waitFor({ target: '#styled', state: 'hidden' }, 5000);
+  assert.equal(await page.read({ kind: 'visible', target: '#styled' }), false);
 });
 
 test('no service worker gets registered', { timeout: 60_000 }, async () => {

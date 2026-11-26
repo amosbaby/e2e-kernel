@@ -53,3 +53,15 @@ test('parseRoleTarget round-trips awkward names and rejects near-misses', () => 
     'role=[name="a"]', 'role=button[name=a]', 'role=button[name="a"][x]', 'button[name="a"]'])
     assert.equal(parseRoleTarget(t), null, t);
 });
+
+test('testid and id values with control characters are skipped, so no unparseable selector is written', () => {
+  for (const bad of ['a\nb', 'a\rb', 'a\tb', 'a\fb', 'a\x00b', 'a\x7fb', '\n']) {
+    const c = stableCandidates({ testId: bad, id: bad, role: 'button', name: 'Add', cssPath: 'p' });
+    assert.deepEqual(c.map(x => x.via), ['role', 'css'], JSON.stringify(bad));
+  }
+  // 只跳过有问题的那个候选，另一个照常出。
+  const c = stableCandidates({ testId: 'ok', id: 'a\nb', role: null, name: null, cssPath: 'p' });
+  assert.deepEqual(c.map(x => x.selector), ['[data-testid="ok"]', 'p']);
+  // 普通的非 ASCII 字符不受影响。
+  assert.deepEqual(stableCandidates({ testId: '文字', id: null, role: null, name: null, cssPath: 'p' })[0]?.selector, '[data-testid="文字"]');
+});

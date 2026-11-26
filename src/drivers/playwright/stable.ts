@@ -11,8 +11,15 @@ const CSS_IDENT = /^-?[A-Za-z_][A-Za-z0-9_-]*$/;
 const ROLE_WORD = /^[A-Za-z][A-Za-z0-9_-]*$/;
 const ROLE_TARGET = /^role=([A-Za-z][A-Za-z0-9_-]*)\[name="((?:[^"\\]|\\[\s\S])*)"\]$/;
 
+// 控制字符（含换行）写进带引号的选择器会让它解析不了：这样的 testid 和 id 不出候选，落到下一个。
+const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+
 function has(v: string | null): v is string {
   return v !== null && v !== '';
+}
+
+function usable(v: string | null): v is string {
+  return has(v) && !CONTROL_CHARS.test(v);
 }
 
 function quote(v: string): string {
@@ -22,8 +29,8 @@ function quote(v: string): string {
 // 按 testid → id → role → css 的顺序出候选；css 总是最后一个。
 export function stableCandidates(info: ElementInfo): Stable[] {
   const out: Stable[] = [];
-  if (has(info.testId)) out.push({ selector: `[data-testid="${quote(info.testId)}"]`, via: 'testid' });
-  if (has(info.id)) out.push({ selector: CSS_IDENT.test(info.id) ? `#${info.id}` : `[id="${quote(info.id)}"]`, via: 'id' });
+  if (usable(info.testId)) out.push({ selector: `[data-testid="${quote(info.testId)}"]`, via: 'testid' });
+  if (usable(info.id)) out.push({ selector: CSS_IDENT.test(info.id) ? `#${info.id}` : `[id="${quote(info.id)}"]`, via: 'id' });
   if (has(info.role) && has(info.name) && ROLE_WORD.test(info.role))
     out.push({ selector: `role=${info.role}[name="${quote(info.name)}"]`, via: 'role' });
   out.push({ selector: info.cssPath, via: 'css' });
