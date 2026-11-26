@@ -380,6 +380,28 @@ test('describe: password-like detection and element kind, failing closed', { tim
   assert.deepEqual(await info('#t-role'), [false, 'other']);
 });
 
+// fill 落到 label（或 label 里的文字）上时，Playwright 改填这个 label 的 control；describe 判断的必须是那个元素。
+test('describe: a label, or text inside it, is judged by the field it controls', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/login.html');
+  await page.evaluate(`(() => {
+    const add = (html) => document.body.insertAdjacentHTML('beforeend', html);
+    add('<label id="t-wrap"><span id="t-wrap-text">Code</span> <input type="text" autocomplete="one-time-code"></label>');
+    add('<label for="t-name" id="t-name-label"><b id="t-name-text">Name</b></label><input id="t-name" type="text">');
+    add('<label id="t-bare"><span id="t-bare-text">Nothing</span></label>');
+  })()`);
+  const info = async (sel: string) => { const d = await page.describe(sel); return [d.isPassword, d.kind]; };
+  assert.deepEqual(await info('#lab'), [true, 'other']);
+  assert.deepEqual(await info('#sp'), [true, 'other']);
+  assert.deepEqual(await info('text=Password'), [true, 'other']);
+  assert.deepEqual(await info('#t-wrap'), [true, 'text-input']);
+  assert.deepEqual(await info('#t-wrap-text'), [true, 'text-input']);
+  assert.deepEqual(await info('#t-name-label'), [false, 'text-input']);
+  assert.deepEqual(await info('#t-name-text'), [false, 'text-input']);
+  assert.deepEqual(await info('#t-bare-text'), [false, 'other']);
+  // describe 里看到的 stable 仍是调用方给的目标本身
+  assert.deepEqual((await page.describe('#sp')).stable, { selector: '#sp', via: 'given' });
+});
+
 test('snapshot honours depth', { timeout: 60_000 }, async () => {
   const full = await page.snapshot({});
   assert.match(full, /heading "Items"/);

@@ -121,10 +121,16 @@ test('page tokens never reach the output; a failed action stops the batch', { ti
 });
 
 test('the kernel refuses to type into a password field', { timeout: 180_000 }, async () => {
-  const r = await e2k('step', sid, JSON.stringify([{ op: 'goto', url: origin + '/login.html' }, { op: 'fill', target: '#pw', value: 'not-a-real-password' }]));
-  assert.equal(r.code, 11);
-  assert.match(r.out, /password-field/);
-  assert.ok(!r.out.includes('not-a-real-password') && !r.err.includes('not-a-real-password'));
+  const runs = [await e2k('step', sid, JSON.stringify([{ op: 'goto', url: origin + '/login.html' }, { op: 'fill', target: '#pw', value: 'not-a-real-password' }]))];
+  // 目标是 label、label 里的文字或文字选择器时，Playwright 会改填 label 的 control，也就是同一个密码框
+  for (const target of ['#lab', '#sp', 'text=Password']) runs.push(await e2k('step', sid, JSON.stringify([{ op: 'fill', target, value: 'not-a-real-password' }])));
+  for (const r of runs) {
+    assert.equal(r.code, 11);
+    assert.match(r.out, /password-field/);
+    assert.ok(!r.out.includes('not-a-real-password') && !r.err.includes('not-a-real-password'));
+  }
+  const typed = await e2k('step', sid, JSON.stringify([{ op: 'eval', js: 'document.querySelector("#pw").value.length' }]), '--json');
+  assert.equal(JSON.parse(typed.out).results[0].output, '0', 'nothing may have been typed into the password field');
 });
 
 test('close writes a report with evidence, writes, a replayable record, and no secrets', { timeout: 180_000 }, async () => {
@@ -137,7 +143,9 @@ test('close writes a report with evidence, writes, a replayable record, and no s
   const post = result.writes.allowed.find((w: any) => w.method === 'POST' && w.url.endsWith('/api/items'));
   // 填值：只有确认不是密码框的才留值，被拒绝的密码框那条记成 [REDACTED]
   assert.equal(result.actions[0].op.value, 'Gamma');
-  assert.equal(result.actions.at(-1).op.value, '[REDACTED]');
+  const refused = result.actions.filter((a: any) => a.op.op === 'fill').slice(1);
+  assert.deepEqual(refused.map((a: any) => a.op.target), ['#pw', '#lab', '#sp', 'text=Password']);
+  for (const a of refused) assert.equal(a.op.value, '[REDACTED]');
   assert.ok(post.body.includes('[REDACTED]'), 'the POST body had a password key, so it must show the marker');
   assert.equal(post.status, 200);
   assert.equal(post.decision, 'allowed');

@@ -85,7 +85,7 @@ function locate(page: PwPage, target: Target): Locator {
 }
 
 // 在页面里对一个元素取值（作为函数交给 locator.evaluate 序列化，所以必须自成一体：不引用这个文件里的任何东西）。
-// 得到的是 stableCandidates 要的 ElementInfo，外加元素是不是密码框。
+// 得到的是 stableCandidates 要的 ElementInfo（取自目标本身），外加 fill 实际会填的那个元素是不是密码框、是哪一类。
 function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boolean; kind: 'text-input' | 'textarea' | 'other' } {
   const norm = (v: string): string => v.replace(/\s+/g, ' ').trim();
   const tag = el.localName;
@@ -142,14 +142,30 @@ function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boole
     cssPath = (anchor === '' ? parts : [anchor, ...parts]).join(' > ');
   }
 
+  // fill 实际会填的元素：照 Playwright 的 follow-label 重定向算。目标不是 input、textarea、select 或 contenteditable 时，
+  // 先换成最近的按钮类祖先；还不是可交互的控件，就换成所在 <label> 的 control。所以 label、label 里的文字、
+  // text=… 选中的文字，实际填的都是那个 label 关联的输入框。isPassword 和 kind 都按这个元素判断。
+  let filled: Element = el;
+  if (!el.matches('input, textarea, select') && (el as HTMLElement).isContentEditable !== true) {
+    filled = el.closest('button, [role=button], [role=checkbox], [role=radio]') ?? el;
+  }
+  if (!filled.matches('a, input, textarea, button, select, option, optgroup, [role=link], [role=button], [role=checkbox], [role=radio]')
+      && (filled as HTMLElement).isContentEditable !== true) {
+    const control = filled.closest('label')?.control;
+    if (control) filled = control;
+  }
+  // 往保守处判：type=password，或 autocomplete 里有密码类的词（「显示密码」之后的输入框常是 type=text 加 current-password）。
+  const looksPassword = (e: Element | null | undefined): boolean => e !== null && e !== undefined && (
+    (e instanceof HTMLInputElement && e.type === 'password')
+    || (e.getAttribute('autocomplete') ?? '').toLowerCase().split(/\s+/).some((t) => t === 'current-password' || t === 'new-password' || t === 'one-time-code'));
+
   return {
     info: { testId: el.getAttribute('data-testid'), id: el.id === '' ? null : el.id, role, name, cssPath },
-    // 往保守处判：type=password，或 autocomplete 里有密码类的词（「显示密码」之后的输入框常是 type=text 加 current-password）。
-    isPassword: (el instanceof HTMLInputElement && el.type === 'password')
-      || (el.getAttribute('autocomplete') ?? '').toLowerCase().split(/\s+/).some((t) => t === 'current-password' || t === 'new-password' || t === 'one-time-code'),
+    // 目标本身、实际会填的元素、目标所在 label 的 control，任何一个像密码框都算密码框。
+    isPassword: looksPassword(el) || looksPassword(filled) || looksPassword(el.closest('label')?.control),
     // 只有这两类认得出的输入框是 text-input / textarea；contenteditable、role=textbox 等一律 other。
-    kind: el instanceof HTMLTextAreaElement ? 'textarea'
-      : el instanceof HTMLInputElement && ['text', 'email', 'search', 'tel', 'url', 'number'].includes(el.type) ? 'text-input'
+    kind: filled instanceof HTMLTextAreaElement ? 'textarea'
+      : filled instanceof HTMLInputElement && ['text', 'email', 'search', 'tel', 'url', 'number'].includes(filled.type) ? 'text-input'
         : 'other',
   };
 }

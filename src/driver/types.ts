@@ -54,7 +54,8 @@ export type Decision =
 
 export interface Stable { selector: string; via: 'given' | 'testid' | 'id' | 'role' | 'css' }
 
-// describe 对目标元素的判断。isPassword：type=password，或 autocomplete 含 current-password / new-password / one-time-code。
+// describe 对目标的判断，判断的是 fill 实际会填的元素（目标是 label 或 label 里的文字时，是这个 label 关联的输入框）。
+// isPassword：type=password，或 autocomplete 含 current-password / new-password / one-time-code。
 // kind：text-input = type 为 text、email、search、tel、url、number 的 <input>；textarea = <textarea>；其余（contenteditable、
 // role=textbox、别的标签和 type）都是 other。内核只在 isPassword 为 false 且 kind 不是 other 时才把 fill 的值留进记录。
 export type ElementKind = 'text-input' | 'textarea' | 'other';
