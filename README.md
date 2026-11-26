@@ -135,6 +135,7 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 - Screenshots are not redacted automatically; use `mask` to cover known sensitive elements. `mask` covers each element's bounding box only (content overflowing it stays visible), and matches are re-resolved when the image is taken, so an element that is replaced or moved between the check and the capture is not masked, without an error.
 - Password-page detection can time out and then drops the body (fail closed): the probe is limited to 300 ms, so a page whose thread is busy (a synchronous XHR, a long script) is treated as undetermined. The probe runs when the request reaches the handler, so a single-page app that swaps the form out right after submitting may not be recognised (the key-name redaction is the fallback). A password field in a sibling iframe, when the request comes from the top document, is not seen, and neither is one inside a closed shadow root (open shadow roots are searched). If a navigation of the frame (or of the top frame) has already started, or the frame address changes while the probe runs, the result is undetermined. Two kinds of page swap can still be misjudged: one that makes no network request (for example a jump to `about:blank`), and a DOM replacement that keeps the document (`document.write`, emptying the body). The cost of failing closed: native form posts, and writes from busy pages, lose their bodies even on pages without a password field.
 - `open --touch` emulates a touch screen on the session's main page only (per-page CDP `Emulation.setTouchEmulationEnabled`): `(pointer: coarse)` and `(hover: none)` match, `maxTouchPoints` is 5 and touch events exist. It is verified at `open` time and `open` fails (11, no session) if the emulation does not take. It stays on across `viewport`, every screenshot and cross-site navigation (see docs/m0-findings.md section 9.8). Not covered (measured, they do not inherit it): popups and new tabs opened by the page, and cross-site iframes (a same-site iframe does follow the page), `click` still sends mouse events (there is no `tap`), the user agent is unchanged and `isMobile` is not emulated. `start.touch` in `result.json` and the report's environment section say whether it was on.
+- A write made from inside a SharedWorker does not pass through the request handler (Playwright's `context.route` does not see it), so it is neither judged nor recorded. Dedicated Workers are covered. Measured in docs/m0-findings (section 9.9); the fix is to remove `SharedWorker` from every page, planned for M2.
 - The single-instance lock has a millisecond-scale race.
 - A redirect's follow-up hops do not pass through the request handler (Playwright calls a route handler only for the first URL of a redirect chain), so a write that is redirected, for example by a 307, is judged and recorded only at its first hop. Recorded by a test, not fixed; see docs/m0-findings.md.
 
@@ -145,8 +146,9 @@ No domain rules or read-only mode, no per-site profiles, no approval flow (there
 ## Development
 
 ```sh
-npm run check         # typecheck, unit and kernel tests, public-repo scan
+npm run check         # fast, no browser: typecheck, unit and kernel tests, public-repo scan
+npm run check:all     # check, then the headed-Chromium tests (test:browser, test:e2e); run before a PR
 npm run test:browser  # driver tests in a real headed Chromium
 npm run test:e2e      # build, then end-to-end acceptance on local fixtures
-npm run m0            # route-coverage probe; results are described in docs/m0-findings.md
+npm run m0            # route-coverage and worker probes; results are described in docs/m0-findings.md
 ```

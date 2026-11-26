@@ -18,8 +18,9 @@
     "test:e2e": "npm run build && node --test \"test/browser/e2e.test.ts\"",
     "check": "npm run typecheck && npm test && npm run check:public",
     "prepare": "npm run build",
+    "check:all": "npm run check && npm run test:browser && npm run test:e2e",
     "check:public": "node scripts/publicity-check.ts",
-    "m0": "node scripts/m0/route-coverage.ts"
+    "m0": "node scripts/m0/route-coverage.ts && node scripts/m0/worker-probe.ts"
   },
   "dependencies": {
     "playwright": "1.65.1"

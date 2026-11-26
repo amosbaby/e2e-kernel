@@ -179,6 +179,42 @@ Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调�
 - 失败关闭：驱动发完命令后在空白页上实测 `matchMedia('(pointer: coarse)').matches`，不是 true 就关掉这一页（并 detach 会话）、报 `touch emulation is not available`，`open` 以 11 退出，不建会话；`newCDPSession` 抛错同样。两条失败路径都有桩住 `context.newCDPSession` 的测试。
 - 不覆盖（已实测：不继承）：touch 页用 `window.open` 开出的弹窗，`pointer: coarse` 为 false、`maxTouchPoints` 为 0；touch 页里的跨站 iframe 同样为 false、0；同站 iframe 为 true、5（跟着主页走）。另外 `click` 仍发鼠标事件、UA 不变、`isMobile` 不模拟。
 
+## 9.9 Web Worker 与 SharedWorker 发出的写
+
+问题：持久 context 上的 `context.route('**/*')` 能不能看到、拦住 Dedicated Worker 和 SharedWorker 里 `fetch` 发出的写。
+
+方法：`scripts/m0/worker-probe.ts`（`npm run m0` 会接着 route-coverage 跑它）。有头持久化 context，`serviceWorkers: 'block'`；路由里遇到 `/api/sink` 就记下来再 `abort`，本地服务记哪些请求真的到了。页面自己 `fetch` POST 当对照，再各起一个 Dedicated Worker 和 SharedWorker，在里面 `fetch` POST。Playwright 1.65.1，同样的结果跑了 3 次。
+
+| 场景 | route 看到 | 服务端收到 |
+| --- | --- | --- |
+| 页面自己 `fetch` POST（对照） | 看到（`frame()` 可用，`resourceType=fetch`） | 没收到（被拦） |
+| Dedicated Worker 里 `fetch` POST | 看到（`frame()` 可用） | 没收到（被拦） |
+| **SharedWorker 里 `fetch` POST** | **看不到** | **收到了** |
+| SharedWorker 的脚本 `/sw.js` 本身 | 看到，`resourceType=script`，和普通脚本分不出来 | — |
+
+- 路由阶段 `allHeaders()` 里拿不到 `sec-fetch-dest`，所以没法据此单独拦下 SharedWorker 的脚本。
+- 能堵的办法（已实测）：`addInitScript(() => { delete globalThis.SharedWorker })`。页面里 `new SharedWorker()` 抛错，服务端一条也没收到，路由也看不到 `/sw.js`。
+- 探针按上面的结论断言，结果不一致时退出码为 1：Playwright 或 Chromium 升级后行为变了，就要重做本节。
+
+结论：默认模式下 SharedWorker 的写不经路由，也不进记录，这是 M1 已有的缺口（README Known gaps 里有同一条）。Dedicated Worker 已覆盖，归属也能拿到。**M2a 起驱动在所有页面删掉 `SharedWorker`**（页面脚本之前注入的 init script），让只读上下文里没有这条旁路。`Capabilities` 里相应记 `sharedWorkers: 'not-covered'`，报告据此说明。
+
+## 9.10 原生对话框
+
+问题：内核将来要用原生对话框做批准，从 Node 子进程能不能弹出来，`giving up after` 的超时能不能回传。
+
+方法：`scripts/m0/dialog-probe.ts`，只手动跑，不接进 `npm run m0`。它用 `child_process.execFile('osascript', …)` 执行 `display dialog … buttons {"拒绝","允许"} default button "拒绝" giving up after 8`，打印返回串和耗时。本机 macOS，Node v24.22.1，2026-11-27。
+
+| 起法 | 结果 |
+| --- | --- |
+| agent 的 Bash 工具直接起 Node | 弹出；8 s 后超时关闭，`out = "button returned:, gave up:true"`，约 8.4 s，没有错误 |
+| agent 在终端面板（PTY，用户的登录 shell）里起 Node | 一样：`gave up:true`，约 8.4 s，没有错误 |
+| 人在自己的终端里起 | 没单独测。它和 PTY 是同一个用户的 GUI 会话，预期一样 |
+| 不能访问 WindowServer 的沙箱 | 没测。预期会失败，所以 `doctor` 要检查这一项，失败时拒绝开需要批准的模式 |
+
+结论：从 Node 子进程调 `osascript` 弹原生对话框可行，超时也能正确回传。
+
+还没测：人点了「允许」或「拒绝」之后的返回值（需要人来点）；`choose from list` 多选清单；弹框是否抢焦点（大概率会抢，对批准框本来就是想要的）。
+
 ## 10. 复测
 
-运行 `npm run m0`。Playwright 升级后必须重跑并更新本文件。
+运行 `npm run m0`（route-coverage 之后接 worker-probe）。Playwright 升级后必须重跑并更新本文件。`node scripts/m0/dialog-probe.ts` 要人在场，不在 `npm run m0` 里，需要时手动跑。
