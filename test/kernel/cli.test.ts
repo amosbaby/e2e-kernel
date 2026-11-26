@@ -106,7 +106,7 @@ async function until(cond: () => boolean, ms = 5000): Promise<void> {
   }
 }
 
-test('kernel not running: exit 22 and the exact command a human should run', async () => {
+test('kernel not running: exit 22 and the command that starts the kernel', async () => {
   const t = io({ env: emptyEnv });
   assert.equal(await main(['open', 'http://localhost:5173/'], t), 22);
   assert.match(t.errText(), /node bin\/e2k\.js start/);
@@ -263,13 +263,17 @@ test('this build has no approve, rule, run or save-case command', async () => {
   for (const c of ['approve', 'rule', 'run', 'save-case']) assert.equal(await main([c], io()), 2, c);
 });
 
-test('start and login refuse to run without a terminal', async () => {
-  let built = 0;
-  const s = io({ isTTY: false, env: freshEnv, makeDriver: async () => { built++; throw new Error('no driver without a terminal'); } });
-  assert.equal(await main(['start'], s), 22); assert.ok(!existsSync(fresh.socket)); assert.match(s.errText(), /终端/);
-  assert.equal(built, 0);
+test('start without a terminal runs until the stop signal', async () => {
+  const t = io({ isTTY: false, env: freshEnv }); const done = main(['start'], t);
+  await until(() => existsSync(fresh.socket)); t.fireStopSignal();
+  assert.equal(await done, 0); assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
+});
+
+test('login without a terminal is refused (22)', async () => {
   const before = fake.calls.length;
-  assert.equal(await main(['login', 'http://localhost:5173/login.html'], io({ isTTY: false })), 22);
+  const t = io({ isTTY: false });
+  assert.equal(await main(['login', 'http://localhost:5173/login.html'], t), 22);
+  assert.match(t.errText(), /终端/);
   assert.equal(fake.calls.length, before);
 });
 
@@ -324,9 +328,53 @@ function runReal(argv: string[], o: { env: NodeJS.ProcessEnv; stdin: string }): 
   return new Promise((resolve) => { child.on('close', (code) => { clearTimeout(timer); resolve({ code, out, err }); }); });
 }
 
-test('realIo: start refuses when standard input is a pipe', async () => {
-  const r = await runReal(['start'], { env: freshEnv, stdin: '' });
-  assert.equal(r.code, 22); assert.match(r.err, /start 需要人在终端里运行/); assert.ok(!existsSync(fresh.socket));
+// 起一个真实内核子进程，读到「内核已启动」后销毁父端的 stdout 读流（之后子进程再写就是 EPIPE），再发信号。
+async function stopRealKernelAfterStdoutClosed(signal: NodeJS.Signals): Promise<{ code: number | null; err: string }> {
+  const script = `import { main, realIo } from './src/cli/main.ts';\nprocess.exitCode = await main(['start'], realIo());\n`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env: freshEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+  const timer = setTimeout(() => { child.kill('SIGKILL'); }, 20_000);   // 挂住就算失败
+  let err = '';
+  child.stderr.setEncoding('utf8').on('data', (s: string) => { err += s; });
+  const closed = new Promise<number | null>((resolve) => { child.on('close', (code) => { clearTimeout(timer); resolve(code); }); });
+  child.stdin.on('error', () => { /* 子进程先退出：EPIPE */ });
+  child.stdin.end('');
+  let seen = '';
+  const started = new Promise<void>((resolve) => {
+    child.stdout.setEncoding('utf8').on('data', (s: string) => { seen += s; if (seen.includes('内核已启动')) resolve(); });
+  });
+  try {
+    await until(() => existsSync(fresh.socket));
+    await started;
+  } catch (e) { child.kill('SIGKILL'); throw e; }
+  child.stdout.destroy();
+  child.kill(signal);
+  return { code: await closed, err };
+}
+
+test('realIo: start with piped stdin runs until SIGTERM', async () => {
+  const script = `import { main, realIo } from './src/cli/main.ts';\nprocess.exitCode = await main(['start'], realIo());\n`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env: freshEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+  const timer = setTimeout(() => { child.kill('SIGKILL'); }, 20_000);   // 挂住就算失败
+  const closed = new Promise<number | null>((resolve) => { child.on('close', (code) => { clearTimeout(timer); resolve(code); }); });
+  child.stdin.on('error', () => { /* 子进程先退出：EPIPE */ });
+  child.stdin.end('');
+  try {
+    await until(() => existsSync(fresh.socket));
+  } catch (e) { child.kill('SIGKILL'); throw e; }
+  child.kill('SIGTERM');
+  assert.equal(await closed, 0); assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
+});
+
+test('realIo: SIGTERM after the stdout reader is gone still stops cleanly (no EPIPE crash)', async () => {
+  const r = await stopRealKernelAfterStdoutClosed('SIGTERM');
+  assert.equal(r.code, 0); assert.doesNotMatch(r.err, /EPIPE|Unhandled/);
+  assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
+});
+
+test('realIo: SIGHUP takes the same clean-up path', async () => {
+  const r = await stopRealKernelAfterStdoutClosed('SIGHUP');
+  assert.equal(r.code, 0); assert.doesNotMatch(r.err, /EPIPE|Unhandled/);
+  assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
 });
 
 test('realIo: an oversized --stdin is refused before it is parsed', async () => {

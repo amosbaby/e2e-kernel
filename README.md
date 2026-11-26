@@ -20,7 +20,7 @@ Commands below are written as `node bin/e2k.js <command>` and run from the repos
 
 ## Usage
 
-1. Start the kernel. A person must do this in a terminal; without a TTY it exits 22 and there is no override. It stays in the foreground, Ctrl-C stops it.
+1. Start the kernel (a person or an agent; it runs in the foreground, run it in the background if needed; Ctrl-C, SIGTERM or SIGHUP stops it and cleans up). The CLI never starts it for you. If you put it in the background with `&` from an interactive terminal, closing the terminal sends SIGHUP and output to the closed terminal is dropped; the kernel still cleans up on SIGHUP, but `nohup` with the output redirected to a file keeps it running after the terminal closes.
 
 ```sh
 node bin/e2k.js start
@@ -53,7 +53,7 @@ The kernel only flags one contradiction: a `pass` verdict while the record holds
 
 Other commands:
 
-- `node bin/e2k.js login https://example.com/login` opens the dedicated profile so a person can sign in; must be run by a person in a terminal. The cookie stays in the profile for later sessions.
+- `node bin/e2k.js login https://example.com/login` opens the dedicated profile so a person can sign in; must be run in a terminal, where a person presses Enter after signing in. The cookie stays in the profile for later sessions.
 - `node bin/e2k.js status` shows version, driver, browser and sessions. `node bin/e2k.js doctor` checks Node, platform, state directory permissions, socket path length, Chromium (fix: `npx playwright install chromium`), whether the kernel is running, and the kernel version. It exits 22 if any check fails, including "kernel not running"; most failing checks print a fix.
 - `--json` (on commands that support it) prints exactly one line on stdout: the result, or `{ "error": ... }`.
 
@@ -93,7 +93,7 @@ Supported `css` assertion forms:
 | 11 | an action failed (a batch with both a mismatch and a failed action reports 11); a refused password fill is also 11 (but 20 when the page is a login wall) |
 | 20 | after `open` or `step`, the top page shows a visible password-like field; a person should run `login`. Takes precedence over 10 and 11 |
 | 21 | waiting for an approval (reserved, not used in M1) |
-| 22 | needs a person: no kernel running, or a command that must be run by a person in a terminal |
+| 22 | no kernel running, `login` without a terminal, a state-directory problem a person must fix (see `next`), or `doctor` found a failing check |
 
 ## Where things live
 
@@ -118,6 +118,7 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 - The socket is open to any process of the same local user, including `login.begin`.
 - `press` typing key by key, and assigning an input's value inside `eval`, can get around the refusal to fill password fields.
 - Any process of the same user can read and write the state directory.
+- The terminal check on `login` only waits for Enter; it does not prove a person is there.
 
 ### Known M1 gaps
 

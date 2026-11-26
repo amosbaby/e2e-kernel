@@ -111,7 +111,7 @@ agent 面    CLI（主）      薄 MCP 壳      使用说明（一份短文档�
 
 - 内核是唯一持有浏览器、profile、会话、批准记录的进程。
 - CLI 和 MCP 壳都是薄客户端，只做参数校验和转发。
-- **内核由人启动**（`e2k start`，或设成登录时自启），不由 agent 的调用拉起。理由：agent 的沙箱里可能起不了浏览器、弹不出对话框、写不了状态目录。CLI 发现内核没在跑，就返回「要人处理」并给出启动命令。
+- **内核由人或 agent 运行 `e2k start` 启动**（或设成登录时自启），CLI 不自动拉起；TTY 检查证明不了是人，不当作安全边界。理由：agent 的沙箱里可能起不了浏览器、弹不出对话框、写不了状态目录。CLI 发现内核没在跑，就返回「要人处理」（22）并给出启动命令。
 
 ### 5.2 域名规则
 
@@ -239,7 +239,7 @@ agent 面    CLI（主）      薄 MCP 壳      使用说明（一份短文档�
 - **CLI**（暂名 `e2k`）：`start`、`open`、`step`、`close`、`run`、`save-case`、`login`、`status`、`doctor`、`rule`（查看和修改域名规则、域名组）。默认输出给 agent 读的紧凑文本，`--json` 出结构化结果。退出码区分：通过、不符、动作执行失败、等登录、等批准、要人处理、用法或内部错误。退出码只反映代码判的 `assert` 和执行情况（加上下一条的登录墙）；agent 写的语义结论（含「存在 / 不存在 / 无法判断」）在输出和 `result.json` 里，不映射成退出码。
 - **退出码 20 已启用（内置启发式）**：`open` 和 `step` 结束时，会话主页面的顶层文档里有可见的密码类字段（`type=password`，或 `autocomplete` 含 `current-password` / `one-time-code`，不含 `new-password`；不进 iframe，穿透 open shadow DOM）就返回 20，并在 `blocked` / `next` 里提示人运行 `login`。20 优先于 10 和 11。它只是提示：会话不暂停、不关闭，也不写进 `result.json`；查不出就不报。域名组里的登录主机识别、跳转到登录主机时的暂停和 `result.json` 的 `blocked`，仍是 M2 的事。
 - CLI 里改规则的子命令只是提交一份待批准的改动，批准前不生效。
-- **MCP 壳**：一个 stdio MCP 服务，暴露 `open`、`step`、`close`、`run`、`save-case`、`status`、`doctor` 和只读的规则查询。`login`、`start`、改规则不经 MCP，由人在终端里做。
+- **MCP 壳**：一个 stdio MCP 服务，暴露 `open`、`step`、`close`、`run`、`save-case`、`status`、`doctor` 和只读的规则查询。`login`、改规则不经 MCP，由人在终端里做。
 - **使用说明**：一份短文档，讲三个动作、退出码、遇到阻断怎么办。不为某个 agent 写专用 hook。
 - **防绕过**：不做拦命令的 hook。依靠两点：profile 被内核进程占着，别的进程打不开同一个 user data 目录；批准不走 agent 的通道。
 

@@ -24,7 +24,7 @@ export interface Io {
   selfCmd: string;                        // 这个 CLI 实际该怎么调用，用在提示里
   stdin: { isTTY: boolean; readLine(): Promise<string>; readAll(maxBytes: number): Promise<string> };   // 超过 maxBytes 抛 E2kError('usage')
   makeDriver(): Promise<Driver>;
-  onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT 和 SIGTERM
+  onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP
 }
 
 type Options = Record<string, { type: 'string' | 'boolean' }>;
@@ -45,7 +45,7 @@ function helpText(selfCmd: string): string {
   return [
     `用法：${selfCmd} <命令>`,
     '',
-    '  start                                  前台运行内核（只能由人在终端里运行）',
+    '  start                                  前台运行内核（Ctrl-C 或 SIGTERM 停止）',
     '  status [--json]                        版本、驱动、浏览器和会话',
     '  doctor [--json]                        自检',
     '  open <url> [--viewport <宽>x<高>] [--name <名字>] [--json]',
@@ -53,7 +53,7 @@ function helpText(selfCmd: string): string {
     '  step <会话> --stdin [--json]           从标准输入读 JSON 数组',
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
     '               [--findings <JSON>] [--not-done <JSON>] [--json]',
-    '  login <url>                            在专用 profile 里登录（只能由人在终端里运行）',
+    '  login <url>                            在专用 profile 里登录（要在终端里由人按回车确认）',
     '  --version',
     '  help',
   ].join('\n');
@@ -103,14 +103,14 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-// 发给内核。内核没在跑时补上人该运行的命令；内核回的错误原样往上抛（code、message、next 都不改）。
+// 发给内核。内核没在跑时补上启动命令；内核回的错误原样往上抛（code、message、next 都不改）。
 async function send(ctx: Ctx, home: Home, method: Method, params: unknown): Promise<unknown> {
   let r;
   try {
     r = await call(home, method, params);
   } catch (e) {
     if (e instanceof E2kError && e.code === 'needs-human' && e.next === undefined) {
-      throw new E2kError(e.code, e.message, `请人在终端里运行：${ctx.io.selfCmd} start`);
+      throw new E2kError(e.code, e.message, `运行 ${ctx.io.selfCmd} start（前台运行，可以放到后台）`);
     }
     throw e;
   }
@@ -129,7 +129,6 @@ function needsTerminal(ctx: Ctx, command: string): void {
 // ---- 命令 ----
 
 async function start(ctx: Ctx, args: string[]): Promise<number> {
-  needsTerminal(ctx, 'start');
   positionals(ctx, parse(ctx, args, {}), 0, '无');
   const home = resolveHome(ctx.io.env);
   let wake = (): void => {};
@@ -137,7 +136,7 @@ async function start(ctx: Ctx, args: string[]): Promise<number> {
   ctx.io.onStopSignal(() => { wake(); });
   const kernel = await startKernel({ home, driver: await ctx.io.makeDriver() });
   ctx.io.out(`内核已启动，状态目录 ${home.root}`);
-  ctx.io.out('按 Ctrl-C 停止');
+  ctx.io.out('按 Ctrl-C 或发送 SIGTERM 停止');
   await stopSignal;
   ctx.io.out('正在停止内核……');
   await kernel.stop();
@@ -307,8 +306,16 @@ async function readAll(maxBytes: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+let streamErrorsIgnored = false;
+
 export function realIo(): Io {
   const env = process.env;
+  // 读端关掉后再写会 EPIPE；不挂监听就是未处理的 'error' 事件，进程崩溃，清理做不完。输出丢了无所谓，只挂一次。
+  if (!streamErrorsIgnored) {
+    streamErrorsIgnored = true;
+    process.stdout.on('error', () => {});
+    process.stderr.on('error', () => {});
+  }
   return {
     out: (s) => { process.stdout.write(`${s}\n`); },
     err: (s) => { process.stderr.write(`${s}\n`); },
@@ -321,6 +328,7 @@ export function realIo(): Io {
     onStopSignal: (cb) => {
       process.on('SIGINT', cb);
       process.on('SIGTERM', cb);
+      process.on('SIGHUP', cb);
     },
   };
 }
