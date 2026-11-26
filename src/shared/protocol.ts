@@ -47,7 +47,7 @@ export interface Verdict { value: VerdictValue; because?: string }
 export interface Finding { claim: string; basis: string; verdict?: VerdictValue }
 // 「序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代」。序号是整个会话从 1 起的序号（OpResult.seq）。
 export interface Supersede { failed: number; by: number }
-export interface OpenParams { url: string; viewport?: Viewport; name?: string }
+export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean }
 export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean }
 export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[]; superseded?: Supersede[] }
 export type Outcome = 'ok' | 'match' | 'mismatch' | 'failed' | 'not-run';
@@ -169,10 +169,11 @@ export function validateParams(method: Method, p: unknown): unknown {
       plainObject(p, 'params', []);
       return {};
     case 'open': {
-      const o = plainObject(p, 'params', ['url', 'viewport', 'name']);
+      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch']);
       const out: OpenParams = { url: httpUrl(o.url, 'params.url') };
       if (o.viewport !== undefined) out.viewport = viewport(o.viewport, 'params.viewport');
       if (o.name !== undefined) out.name = str(o.name, 'params.name', { min: 1, max: 40, pattern: SESSION_NAME });
+      if (o.touch !== undefined) out.touch = bool(o.touch, 'params.touch');
       return out;
     }
     case 'step': {

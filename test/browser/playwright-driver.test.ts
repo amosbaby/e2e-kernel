@@ -1279,3 +1279,123 @@ test('idle retries when a navigation destroys the page context, and a page close
   await page.close();
   await outcome;
 });
+
+// ---- openPage({ touch: true }): 会话页按页模拟触屏，`(pointer: coarse)` 成立 ----
+
+const COARSE = `matchMedia('(pointer: coarse)').matches`;
+
+test('touch: a touch page matches (pointer: coarse) after goto, and a plain page in the same context does not', { timeout: 60_000 }, async () => {
+  const touch = await inst.openPage({ touch: true });
+  const plain = await inst.openPage({});
+  try {
+    await touch.goto(server.origin + '/index.html');
+    await plain.goto(server.origin + '/index.html');
+    assert.equal(await touch.evaluate(COARSE), true);
+    assert.equal(await touch.evaluate(`matchMedia('(any-pointer: coarse)').matches`), true);
+    assert.equal(await plain.evaluate(COARSE), false);
+    assert.equal(await page.evaluate(COARSE), false);           // beforeEach 开的那页
+    assert.equal(await touch.evaluate(COARSE), true);            // 另开的页没有把它冲掉
+  } finally {
+    await touch.close().catch(() => {});
+    await plain.close().catch(() => {});
+  }
+});
+
+test('touch: still coarse after setViewport, after every kind of screenshot, and after a cross-site goto', { timeout: 60_000 }, async () => {
+  const touch = await inst.openPage({ touch: true, viewport: { width: 800, height: 600 } });
+  const dir = makeTmp('e2k-touch-');
+  try {
+    await touch.goto(server.origin + '/index.html');
+    assert.equal(await touch.evaluate(COARSE), true);
+    await touch.setViewport({ width: 600, height: 500 });
+    assert.equal(await touch.evaluate(COARSE), true);
+    await touch.screenshot({ path: join(dir, 'a.jpg'), fullPage: false });
+    assert.equal(await touch.evaluate(COARSE), true);
+    await touch.evaluate(`document.body.style.minHeight = '5000px'`);   // 超出视口：fullPage 截图会走 captureBeyondViewport
+    await touch.screenshot({ path: join(dir, 'b.jpg'), fullPage: true });
+    assert.equal(await touch.evaluate(COARSE), true);
+    await touch.screenshot({ path: join(dir, 'c.png'), fullPage: false, format: 'png', target: 'body' });
+    assert.equal(await touch.evaluate(COARSE), true);
+    await touch.goto(server.altOrigin + '/index.html');
+    assert.equal(await touch.evaluate(COARSE), true);
+    assert.equal(await touch.evaluate(`'ontouchstart' in window`), true);
+  } finally {
+    await touch.close().catch(() => {});
+  }
+});
+
+test('touch: closing the touch page leaves other pages alone, and a new touch page can be opened after it', { timeout: 60_000 }, async () => {
+  const touch = await inst.openPage({ touch: true });
+  await touch.goto(server.origin + '/index.html');
+  await touch.close();
+  await page.goto(server.origin + '/index.html');
+  assert.equal(await page.evaluate(COARSE), false);
+  const again = await inst.openPage({ touch: true });
+  try {
+    await again.goto(server.origin + '/index.html');
+    assert.equal(await again.evaluate(COARSE), true);
+  } finally {
+    await again.close().catch(() => {});
+  }
+});
+
+// ---- 触屏模拟的失败路径和会话生命周期（桩住 context.newCDPSession） ----
+
+interface Stubbable { context: { newCDPSession: (page: unknown) => Promise<unknown>; pages: () => unknown[] } }
+
+// 临时替换 newCDPSession，跑完还原。
+async function withCdpStub(stub: (real: Stubbable['context']['newCDPSession'], context: Stubbable['context']) => Stubbable['context']['newCDPSession'],
+  fn: (context: Stubbable['context']) => Promise<void>): Promise<void> {
+  const context = (inst as unknown as Stubbable).context;
+  const real = context.newCDPSession.bind(context);
+  context.newCDPSession = stub(real, context);
+  try {
+    await fn(context);
+  } finally {
+    context.newCDPSession = real;
+  }
+}
+
+test('touch: a CDP session that cannot be created fails the open with a DriverError and leaves no page', { timeout: 60_000 }, async () => {
+  await withCdpStub(() => async () => { throw new Error('no cdp here'); }, async (context) => {
+    const before = context.pages().length;
+    await assert.rejects(inst.openPage({ touch: true }), (e: DriverError) => e instanceof DriverError && e.kind === 'other');
+    await until(() => context.pages().length === before);
+  });
+});
+
+test('touch: a session whose commands succeed but whose pointer is not coarse fails the open, closes the page and detaches exactly once', { timeout: 60_000 }, async () => {
+  let detached = 0;
+  const sent: string[] = [];
+  const fake = { send: async (m: string) => { sent.push(m); }, detach: async () => { detached++; } };
+  await withCdpStub(() => async () => fake, async (context) => {
+    const before = context.pages().length;
+    await assert.rejects(inst.openPage({ touch: true }), (e: DriverError) => e instanceof DriverError && /touch emulation is not available/.test(e.message));
+    await until(() => context.pages().length === before);
+    assert.deepEqual(sent, ['Emulation.setTouchEmulationEnabled']);
+    assert.equal(detached, 1);
+  });
+});
+
+test('touch: closing a touch page detaches its CDP session exactly once, and a plain openPage creates none', { timeout: 60_000 }, async () => {
+  let created = 0;
+  let detached = 0;
+  await withCdpStub((real) => async (p) => {
+    created++;
+    const session = await real(p) as { detach: () => Promise<void> };
+    const detach = session.detach.bind(session);
+    session.detach = async () => { detached++; return detach(); };
+    return session;
+  }, async () => {
+    const plain = await inst.openPage({});
+    await plain.close();
+    assert.equal(created, 0);
+    const touch = await inst.openPage({ touch: true });
+    assert.equal(created, 1);
+    assert.equal(detached, 0);
+    await touch.close();
+    await until(() => detached >= 1);
+    await sleep(200);
+    assert.equal(detached, 1);
+  });
+});

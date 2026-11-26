@@ -232,6 +232,19 @@ test('a first navigation that fails leaves no session behind', { timeout: 180_00
   assert.deepEqual(JSON.parse((await e2k('status', '--json')).out).sessions, []);
 });
 
+test('open --touch gives only that session page a coarse pointer, and the report says so', { timeout: 180_000 }, async () => {
+  const touch = JSON.parse((await e2k('open', origin + '/index.html', '--touch', '--name', NAME, '--json')).out);
+  const plain = JSON.parse((await e2k('open', origin + '/index.html', '--name', NAME, '--json')).out);
+  const probe = JSON.stringify([{ op: 'eval', js: "matchMedia('(pointer: coarse)').matches" }]);
+  assert.match(JSON.parse((await e2k('step', touch.session, probe, '--json')).out).results[0].output, /true/);
+  assert.match(JSON.parse((await e2k('step', plain.session, probe, '--json')).out).results[0].output, /false/);
+  for (const [s, want] of [[touch, true], [plain, false]] as const) {
+    const close = JSON.parse((await e2k('close', s.session, '--verdict', 'undetermined', '--because', 'probe', '--json')).out);
+    assert.equal(JSON.parse(readFileSync(close.resultPath, 'utf8')).start.touch, want);
+    if (want) assert.ok(readFileSync(close.reportPath, 'utf8').includes('触屏模拟 是'));
+  }
+});
+
 test('permissions and shutdown', { timeout: 180_000 }, async () => {
   assert.equal(statSync(home.root).mode & 0o777, 0o700);
   assert.equal(statSync(home.socket).mode & 0o777, 0o600);

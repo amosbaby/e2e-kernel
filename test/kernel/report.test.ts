@@ -31,7 +31,7 @@ function driverWith(caps: Partial<Capabilities> = {}): RunInput['driver'] {
 }
 function input(o: Partial<RunInput> = {}): RunInput {
   return { kernelVersion: '0.1.0', session: 's-a41f00', name: 'session', startedAt: new Date('2026-11-26T15:30:00Z'),
-    endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, profile: 'default' },
+    endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'default' },
     driver: driverWith(), actions: [], writes: [], unattributedWrites: [], hosts: [{ host: 'localhost', mode: 'default' }], webSockets: 0,
     verdict: null, findings: [], notDone: [], superseded: [], ...o };
 }
@@ -170,11 +170,19 @@ test('coverage notes and next', () => {
 });
 
 test('html escapes everything that came from the page', () => {
-  const html = renderReport(buildResult(input({ start: { url: 'http://localhost/?q=<b>x</b>', viewport: null, profile: 'default' },
+  const html = renderReport(buildResult(input({ start: { url: 'http://localhost/?q=<b>x</b>', viewport: null, touch: true, profile: 'default' },
     actions: [act('click', 'failed', { error: '<script>window.pwned=1</script>', shot: 'shots/01.jpg"><img src=x onerror=1' })] })));
   assert.ok(!html.includes('<script')); assert.ok(!html.includes('<b>x</b>')); assert.ok(!html.includes('onerror=1"'));
   assert.ok(!html.includes('<img src=x'));
   assert.ok(html.includes('&lt;script&gt;')); assert.ok(html.includes('Content-Security-Policy'));
+});
+
+test('the environment section says whether touch emulation was on, and result.json carries start.touch', () => {
+  const on = renderReport(buildResult(input({ start: { url: 'http://localhost/', viewport: null, touch: true, profile: 'default' } })));
+  const off = renderReport(buildResult(input()));
+  assert.ok(on.includes('触屏模拟 是') && !on.includes('触屏模拟 否'));
+  assert.ok(off.includes('触屏模拟 否') && !off.includes('触屏模拟 是'));
+  assert.equal(buildResult(input({ start: { url: 'http://localhost/', viewport: null, touch: true, profile: 'default' } })).start.touch, true);
 });
 
 test('a valid screenshot path becomes an img, anything else does not', () => {
@@ -468,7 +476,7 @@ test('writeRun redacts page content, keeps kernel identifiers, writes 0600 files
   const longName = 'a'.repeat(40);
   const longSelector = '[data-testid="' + 'Ab1'.repeat(20) + '"]';
   const out = writeRun(runDir, buildResult(input({ name: longName, findings: [{ claim: 'c', basis: jwt }],
-    start: { url: 'http://localhost/?token=abc123', viewport: null, profile: 'default' },
+    start: { url: 'http://localhost/?token=abc123', viewport: null, touch: false, profile: 'default' },
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: longSelector, via: 'testid' } } })] })));
   const saved = JSON.parse(readFileSync(out.resultPath, 'utf8'));
   assert.equal(saved.name, longName); assert.equal(saved.actions[0].target.stable.selector, longSelector);

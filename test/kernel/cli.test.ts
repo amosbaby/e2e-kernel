@@ -129,6 +129,12 @@ test('open prints the session id and snapshot; --json prints one JSON object', a
   assert.equal(JSON.parse(j.outText()).mode, 'default');
 });
 
+test('open --touch goes through, and the help text lists it', async () => {
+  const t = io(); assert.equal(await main(['open', 'http://localhost:5173/', '--touch', '--json'], t), 0);
+  assert.equal(JSON.parse(t.outText()).mode, 'default');
+  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url> .*--touch/);
+});
+
 test('open exits 20 on a login wall and prints the full hint; a normal page exits 0', async () => {
   const t = io(); assert.equal(await main(['open', 'http://localhost:5173/wall'], t), 20);
   assert.match(t.outText(), /^等登录：页面停在登录页（有可见的密码框）：请人运行 login http:\/\/localhost:5173\/wall 登录后重试；若这是预期页面（如修改密码页）可忽略。会话仍开着，用完请 close$/m);

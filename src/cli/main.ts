@@ -48,7 +48,8 @@ function helpText(selfCmd: string): string {
     '  start                                  前台运行内核（Ctrl-C 或 SIGTERM 停止）',
     '  status [--json]                        版本、驱动、浏览器、会话和 profile（含最近一次 login）',
     '  doctor [--json]                        自检（含 profile 状态；只读）',
-    '  open <url> [--viewport <宽>x<高>] [--name <名字>] [--json]',
+    '  open <url> [--viewport <宽>x<高>] [--touch] [--name <名字>] [--json]',
+    '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
     '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
     '  step <会话> --stdin [--keep-going] [--json]        从标准输入读 JSON 数组',
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
@@ -162,13 +163,14 @@ async function doctor(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function open(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' } });
+  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' } });
   const [url] = positionals(ctx, p, 1, '<url>');
   const raw: Record<string, unknown> = { url };
   const viewport = optString(p, 'viewport');
   const name = optString(p, 'name');
   if (viewport !== undefined) raw.viewport = parseViewport(viewport);
   if (name !== undefined) raw.name = name;
+  if (p.values.touch === true) raw.touch = true;
   const params = validateParams('open', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'open', params) as OpenResult;
   print(ctx, result, formatOpen);

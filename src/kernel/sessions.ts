@@ -43,7 +43,7 @@ interface Session {
   readonly runDir: string;
   readonly startedAt: Date;
   readonly instance: Instance;               // 会话的页所在的实例
-  readonly start: { url: string; viewport: Viewport | null; profile: string };
+  readonly start: { url: string; viewport: Viewport | null; touch: boolean; profile: string };
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
   readonly recorder: Recorder;
@@ -372,11 +372,11 @@ export class SessionManager {
     let page: Page | undefined;
     let registered = false;
     try {
-      page = await instance.openPage(p.viewport === undefined ? {} : { viewport: p.viewport });
+      page = await instance.openPage({ ...(p.viewport === undefined ? {} : { viewport: p.viewport }), ...(p.touch === true ? { touch: true } : {}) });
       if (this.stopping) throw stopping();
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
-        start: { url: p.url, viewport: p.viewport ?? null, profile: DEFAULT_PROFILE },
+        start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: DEFAULT_PROFILE },
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(),
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };

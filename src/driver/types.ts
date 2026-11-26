@@ -92,7 +92,7 @@ export interface Instance {
   onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean }) => void): void;
   addInitScript(source: string): Promise<void>;                                      // 拦截：页面脚本之前的注入脚本
   onPageOpened(listener: (page: Page, openerId: string | null) => void): void;       // 弹窗和新标签页
-  openPage(o: { viewport?: Viewport }): Promise<Page>;                               // 页面：打开一个空白页，由内核再 goto
+  openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page>;              // 页面：打开一个空白页，由内核再 goto；touch 只对这一页模拟触屏（不能模拟就抛错，不留页）
 }
 
 export interface Page {

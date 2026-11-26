@@ -83,6 +83,25 @@ test('open creates a session, a private run dir and a first reading', async () =
   assert.equal((await sm.open({ url: 'http://localhost:5173/' })).name, 'session');
 });
 
+test('open --touch asks the driver for a touch page and records start.touch; without it the page is plain and start.touch is false', async () => {
+  const { sm, fake } = setup();
+  const plain = await sm.open({ url: 'http://localhost:5173/', name: 'plain' });
+  const touch = await sm.open({ url: 'http://localhost:5173/', name: 'touch', touch: true });
+  const opens = fake.calls.filter((c) => c.method === 'openPage').map((c) => c.args[0]);
+  assert.deepEqual(opens, [{}, { touch: true }]);
+  await sm.close({ session: plain.session });
+  await sm.close({ session: touch.session });
+  assert.equal(readResult(plain.runDir).start.touch, false);
+  assert.equal(readResult(touch.runDir).start.touch, true);
+});
+
+test('open --touch fails cleanly when the driver cannot emulate touch: no session, no page, no run dir', async () => {
+  const { sm, fake, home } = setup({ failOpenWith: new DriverError('other', 'touch emulation is not available') });
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/', name: 'nt', touch: true }), (e: E2kError) => e.code === 'action-failed');
+  assert.deepEqual(fake.openPages(), []); assert.deepEqual(sm.list(), []);
+  assert.ok(!existsSync(join(home.runsDir, 'nt')) || readdirSync(join(home.runsDir, 'nt')).length === 0);
+});
+
 test('the default profile is launched lazily and once, even for concurrent opens', async () => {
   const { sm, fake, home } = setup({ launchDelayMs: 50 });
   assert.equal(sm.instanceState(), 'stopped');

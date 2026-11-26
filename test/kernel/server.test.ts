@@ -249,6 +249,15 @@ test('step keepGoing travels over the socket: the batch goes on after a failure,
   assert.equal(bad.ok, false);
 });
 
+test('open touch travels over the socket, a non-boolean is refused, and touch is not a sensitive key', async () => {
+  const params = { url: 'http://localhost:5173/', touch: true };
+  const open = await call(home, 'open', params);
+  assert.ok(open.ok);
+  for (const key of [...keysOf(open), ...Object.keys(params)]) assert.ok(!isSensitiveKey(key), key);
+  const bad = await call(home, 'open', { url: 'http://localhost:5173/', touch: 'yes' });
+  assert.equal(bad.ok, false);
+});
+
 test('responses are redacted but kernel identifiers survive', async () => {
   const open = await call(home, 'open', { url: 'http://localhost:5173/leak?token=abc123', name: 'a'.repeat(40) });
   assert.ok(open.ok); const o = open.result as OpenResult;

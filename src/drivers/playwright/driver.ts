@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
-import type { BrowserContext, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
+import type { BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
 import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../driver/types.ts';
@@ -27,6 +27,7 @@ const CAPABILITIES: Capabilities = {
 };
 
 const MAX_BODY_BYTES = 64 * 1024;
+const TOUCH_POINTS = 5;   // 触屏模拟报给页面的 maxTouchPoints
 const MAX_MESSAGE_CHARS = 300;
 // 失败诊断（DriverError.hints）：驱动只做保护性的截断，不脱敏也不截短（内核先脱敏、再截到 300），
 // 免得一个长条目的截断点正好落在 token 中间。最多 6 条：第一条是总数或遮挡说明，其余是前 5 个候选。
@@ -373,6 +374,8 @@ class PlaywrightPage implements Page {
   closed = false;
   webSockets = 0;
   private notified = false;
+  // 触屏模拟的 CDP 会话：只属于这一页，页关时 detach（会话一 detach，模拟就失效，所以开着直到页关）。
+  private touchSession: CDPSession | undefined;
   private readonly closedListeners: (() => void)[] = [];
   private readonly host: Host;
   private readonly onGone: (p: PlaywrightPage) => void;
@@ -400,6 +403,9 @@ class PlaywrightPage implements Page {
   markClosed(): void {
     if (this.closed) return;
     this.closed = true;
+    const touch = this.touchSession;
+    this.touchSession = undefined;
+    if (touch !== undefined) touch.detach().catch(() => { /* 页关时 Playwright 多半已经断开会话 */ });
     this.onGone(this);
     setImmediate(() => this.flushClosed());
   }
@@ -410,6 +416,18 @@ class PlaywrightPage implements Page {
     this.notified = true;
     this.onNotified(this);
     emit((e) => this.host.reportError(e), this.closedListeners);
+  }
+
+  // 打开按页的触屏模拟（Chromium 的 CDP）：`(pointer: coarse)`、`maxTouchPoints`、触摸事件。
+  // 失败关闭：发了命令也要实测 `(pointer: coarse)` 真的成立，否则报错，由调用方关掉这一页。
+  async enableTouch(context: BrowserContext): Promise<void> {
+    this.touchSession = await context.newCDPSession(this.page);
+    await this.sendTouch();
+    if ((await this.page.evaluate(`matchMedia('(pointer: coarse)').matches`)) !== true) throw new DriverError('other', 'touch emulation is not available');
+  }
+
+  private async sendTouch(): Promise<void> {
+    await this.touchSession?.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: TOUCH_POINTS });
   }
 
   // diagnose 给了目标时，动作失败会尽力带上诊断（hints）：选择器匹配了好几个、或点击被别的元素挡住。
@@ -488,8 +506,8 @@ class PlaywrightPage implements Page {
     }, o.target);
   }
 
-  screenshot(o: { path: string; fullPage: boolean; format?: 'jpeg' | 'png'; target?: Target; mask?: Target[]; maskColor?: string }): Promise<void> {
-    return this.run(async () => {
+  async screenshot(o: { path: string; fullPage: boolean; format?: 'jpeg' | 'png'; target?: Target; mask?: Target[]; maskColor?: string }): Promise<void> {
+    await this.run(async () => {
       // 失败关闭：每个遮罩目标至少要匹配一个元素，否则不截图（Playwright 对匹配不到的遮罩是悄悄跳过，图上就有没盖住的内容）。
       for (const [i, t] of (o.mask ?? []).entries()) {
         if ((await locate(this.page, t).count()) === 0) throw new DriverError('not-found', `mask[${i}] matched no element`);
@@ -503,6 +521,9 @@ class PlaywrightPage implements Page {
       if (o.target !== undefined) await (await this.resolve(o.target, false)).screenshot(opts);
       else await this.page.screenshot({ ...opts, fullPage: o.fullPage });
     }, o.target);
+    // 实测截图不会重置触屏模拟；为防 Playwright 或 Chromium 版本变化（captureBeyondViewport），仍尽力重发一次。
+    // 尽力而为：图已经写好，重发失败不能让这次截图的结果变成失败。
+    await this.sendTouch().catch(() => {});
   }
 
   console(): Promise<{ level: string; text: string }[]> {
@@ -765,7 +786,7 @@ class PlaywrightInstance implements Instance, Host {
     this.pageOpenedListeners.push(listener);
   }
 
-  async openPage(o: { viewport?: Viewport }): Promise<Page> {
+  async openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page> {
     if (this.closed) throw new DriverError('other', 'browser is closed');
     this.opening++;
     let own: PlaywrightPage;
@@ -785,6 +806,14 @@ class PlaywrightInstance implements Instance, Host {
     if (o.viewport !== undefined) {
       try {
         await own.page.setViewportSize({ width: o.viewport.width, height: o.viewport.height });
+      } catch (e) {
+        await own.close().catch(() => {});
+        throw mapError(e);
+      }
+    }
+    if (o.touch === true) {
+      try {
+        await own.enableTouch(this.context);
       } catch (e) {
         await own.close().catch(() => {});
         throw mapError(e);

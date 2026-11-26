@@ -159,6 +159,26 @@ Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调�
 - 严格模式冲突的第一行是 `locator.click: Error: strict mode violation: locator('.dup') resolved to 2 elements:`，后面是 `1) <button …> aka getByRole(…)` 这样的候选预览。这是给人看的行文，驱动不解析它：只看消息第一行里有没有 `strict mode violation` 来判断类型（调用记录里可能带页面文字，不看），再自己用 `locator.count()` 和 `evaluateAll` 取前 5 个候选（标签、角色、名字、位置大小，不取元素的值）。
 - 两种诊断都是页面文字：遮挡元素的属性、候选的名字。驱动只做每条 4000 字符的保护性截断，不脱敏也不截短；内核先脱敏、再截到 300，否则一个跨在截断点上的 token 会留下认不出来的半截。
 
+## 9.8 按页的触屏模拟（`open --touch`）
+
+问题：持久 context 只有一个，Playwright 的 `hasTouch` 是 `newContext` 的选项，没法按页设。
+
+出处：
+- CDP `Emulation.setTouchEmulationEnabled`（chromedevtools.github.io/devtools-protocol/tot/Emulation）。
+- Playwright 文档里的 `browserContext.newCDPSession(page)`（只支持 Chromium）和 `hasTouch`（context 选项）。
+- `playwright-core/lib/coreBundle.js`（本机 1.65.1，`takeScreenshot`，第 39206 行起）：Playwright 只在 `!fitsViewport && hasTouch` 时，在 `Page.captureScreenshot` 之后重发 `Emulation.setTouchEmulationEnabled({ enabled: true })`，说明超出视口的截图（`captureBeyondViewport`）可能把触屏模拟重置。
+- 官方文档没有说 `setTouchEmulationEnabled` 会让 `(pointer: coarse)` 成立，所以先实测再实现。
+
+实测：脚本 `scripts/m0/touch-probe.ts`（有头 Chromium，每页都 `context.newCDPSession(page)`，输出逐行对应下面各条）；`test/browser/playwright-driver.test.ts` 里以 `touch:` 开头的几条测试固化了结论。
+
+- 方法一：`Emulation.setTouchEmulationEnabled({ enabled: true, maxTouchPoints: 5 })`。成立：`(pointer: coarse)`、`(any-pointer: coarse)`、`(hover: none)` 都为真，`navigator.maxTouchPoints` 为 5。空白页上发完就生效；goto 之后 `ontouchstart` 也在了。
+- 退路 A：只发 `Emulation.setEmulatedMedia({ features: [pointer、any-pointer = coarse，hover、any-hover = none] })`：不成立（`matchMedia` 全是 false，`maxTouchPoints` 为 0）。和方法一一起发时成立，但方法一单独就够，所以不用。
+- 按页隔离：同一个 context 里不带 touch 的页仍是 `false`。
+- 之后仍然成立：`setViewportSize` 之后、整页截图之后（测试用 5000 像素高的页面，确实超出视口）、元素截图之后、跨站 goto（`origin` 到 `altOrigin`）之后。也就是实测截图没有重置模拟；为防 Playwright 或 Chromium 版本变化，驱动在任何截图之后仍尽力重发一次，重发失败不影响这次截图的结果（图已写好）。
+- 生命周期：CDP 会话一 `detach`，模拟立刻失效（`pointer: coarse` 变回 false，下一次跨站导航后 `ontouchstart` 也没了）。所以会话要开到页关为止，页关时才 detach；驱动在页的关闭处理里 detach，测试用计数包装确认正好一次，不泄漏。
+- 失败关闭：驱动发完命令后在空白页上实测 `matchMedia('(pointer: coarse)').matches`，不是 true 就关掉这一页（并 detach 会话）、报 `touch emulation is not available`，`open` 以 11 退出，不建会话；`newCDPSession` 抛错同样。两条失败路径都有桩住 `context.newCDPSession` 的测试。
+- 不覆盖（已实测：不继承）：touch 页用 `window.open` 开出的弹窗，`pointer: coarse` 为 false、`maxTouchPoints` 为 0；touch 页里的跨站 iframe 同样为 false、0；同站 iframe 为 true、5（跟着主页走）。另外 `click` 仍发鼠标事件、UA 不变、`isMobile` 不模拟。
+
 ## 10. 复测
 
 运行 `npm run m0`。Playwright 升级后必须重跑并更新本文件。

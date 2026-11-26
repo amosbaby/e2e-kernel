@@ -15,7 +15,7 @@ export type ClosedBy = 'agent' | 'idle-timeout' | 'kernel-shutdown' | 'browser-g
 
 export interface RunInput {
   kernelVersion: string; session: string; name: string; startedAt: Date; endedAt: Date; closedBy: ClosedBy;
-  start: { url: string; viewport: Viewport | null; profile: string };
+  start: { url: string; viewport: Viewport | null; touch: boolean; profile: string };
   driver: { name: string; capabilities: Capabilities };
   actions: ActionRecord[]; writes: WriteRecord[]; unattributedWrites: WriteRecord[];
   hosts: { host: string; mode: Mode }[]; webSockets: number;

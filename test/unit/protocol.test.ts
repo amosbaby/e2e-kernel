@@ -30,7 +30,7 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
     'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm',
     'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing', 'graphql', 'summary',
-    'superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'label', 'format', 'mask', 'fullPage', 'idle'];
+    'superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'label', 'format', 'mask', 'fullPage', 'idle', 'touch'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
 
@@ -120,6 +120,12 @@ test('close rejects malformed superseded and finding verdicts with usage', () =>
   ];
   for (const b of bad) assert.throws(() => validateParams('close', { session: sess, ...(b as object) }), isUsage, JSON.stringify(b).slice(0, 80));
   assert.ok(validateParams('close', { session: sess, superseded: [{ failed: 1, by: Number.MAX_SAFE_INTEGER }] }));
+});
+
+test('open takes touch as a boolean and nothing else', () => {
+  assert.deepEqual(validateParams('open', { url: 'http://localhost/', touch: true }), { url: 'http://localhost/', touch: true });
+  assert.deepEqual(validateParams('open', { url: 'http://localhost/', touch: false }), { url: 'http://localhost/', touch: false });
+  for (const touch of ['yes', 1, null, {}, []]) assert.throws(() => validateParams('open', { url: 'http://localhost/', touch }), isUsage, String(touch));
 });
 
 test('validateParams rejects bad parameters with usage', () => {
