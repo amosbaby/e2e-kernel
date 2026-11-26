@@ -604,14 +604,14 @@ class PlaywrightInstance implements Instance, Host {
     };
   }
 
-  // 回调抛错、描述请求失败、给出不认识的决定，一律中止：失败时偏向拦住。
+  // 回调抛错、描述请求失败、给出不认识的决定、handler 还没装上，一律中止：失败时偏向拦住。
   private async handleRoute(route: Route): Promise<void> {
     const request = route.request();
     let decision: Decision = { action: 'abort' };
     try {
       const info = await this.describeRequest(request);
-      this.requestIds.set(request, info.id);
-      decision = this.handler === undefined ? { action: 'continue' } : await this.handler(info);
+      if (this.handler !== undefined) this.requestIds.set(request, info.id);
+      decision = this.handler === undefined ? { action: 'abort' } : await this.handler(info);
     } catch {
       decision = { action: 'abort' };
     }

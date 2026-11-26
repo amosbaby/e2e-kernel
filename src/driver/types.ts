@@ -9,6 +9,7 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../shared/ops.ts';
 // - 页面 id 和 RequestInfo.id 在驱动对象的整个生命期内唯一：不按实例、不按每次 launch 重置。
 // - 动作失败抛 DriverError；其余异常内核一律当内部错误。
 // - setRequestHandler 的回调抛错时，驱动中止这个请求（失败时偏向拦住），不放行。
+// - setRequestHandler 之前到来的请求，驱动一律中止（失败关闭），不放行也不记录。
 // - read 不等待：text、css 的目标不存在立刻抛 DriverError('not-found')；count 返回 0；visible 返回 false。
 // - describe 对选择器写法的目标返回 { selector: 原样, via: 'given' }；对引用返回解析出的稳定选择器，
 //   解析不出返回 null。元素找不到时抛 DriverError。

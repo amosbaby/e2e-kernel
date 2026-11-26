@@ -120,6 +120,7 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 
 - A write whose page cannot be identified (for example a form POST from a new tab's first navigation) is listed as unattributed; reads are not. Unattributed writes are listed in the report of every session that was open at the time, so concurrent sessions can show each other's.
 - The single-instance lock has a millisecond-scale race.
+- A redirect's follow-up hops do not pass through the request handler (Playwright calls a route handler only for the first URL of a redirect chain), so a write that is redirected, for example by a 307, is judged and recorded only at its first hop. Recorded by a test, not fixed; see docs/m0-findings.md.
 
 ## Not in this version
 

@@ -45,8 +45,10 @@ test('element failures, goto failures and read semantics', async () => {
   await assert.rejects(page.click('#not-in-spec'), (e: DriverError) => e.kind === 'not-found');
 });
 
-test('request handler: default continue, handler decision, abort when the handler throws', async () => {
+test('request handler: default abort, handler decision, abort when the handler throws', async () => {
   const { d, inst, page } = await setup({});
+  assert.deepEqual(await d.emitRequest({ pageId: page.id, method: 'POST', url: 'http://localhost/api' }), { action: 'abort' });
+  inst.setRequestHandler(() => ({ action: 'continue' }));
   assert.deepEqual(await d.emitRequest({ pageId: page.id, method: 'POST', url: 'http://localhost/api' }), { action: 'continue' });
   inst.setRequestHandler(() => ({ action: 'abort' }));
   assert.deepEqual(await d.emitRequest({ pageId: page.id, method: 'POST', url: 'http://localhost/api' }), { action: 'abort' });

@@ -106,6 +106,14 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     const url = new URL(raw, 'http://127.0.0.1');
     const method = req.method ?? 'GET';
 
+    // 只用来记录重定向的后续跳是否经过路由 handler：任何方法都 307 到写端点，浏览器会带着方法和请求体再来一次。
+    if (url.pathname === '/r307') {
+      await readBody(req);
+      res.writeHead(307, { location: '/api/sink', 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     if (WRITE_METHODS.includes(method) && url.pathname.startsWith('/api/')) {
       const contentType = req.headers['content-type'] ?? null;
       const body = await readBody(req);

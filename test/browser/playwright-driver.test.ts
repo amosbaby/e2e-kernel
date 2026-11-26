@@ -147,6 +147,39 @@ test('request handler sees writes with bodies and can block them', { timeout: 60
   assert.match(post.body!, /"name":"Delta"/); assert.equal(post.contentType, 'application/json');
 });
 
+test('requests that arrive before a handler is set are aborted, then pass once it is', { timeout: 60_000 }, async () => {
+  const fresh = await driver.launch({ name: 'fresh', userDataDir: makeTmp('e2k-pw-') });
+  try {
+    const freshSeen: RequestInfo[] = [];
+    const before = server.hits.length;
+    const other = await fresh.openPage({});
+    // 写请求也一样：no-cors 的 POST 到得了写端点才会进 hits，没装 handler 时它必须被中止。
+    await other.evaluate(`fetch('${server.origin}/api/items?pre=1', { method: 'POST', body: '{}', mode: 'no-cors' }).then(() => 'sent', () => 'blocked')`);
+    await assert.rejects(other.goto(server.origin + '/index.html'), DriverError);
+    // 等被中止的导航留下的错误页落定，免得它打断下一次 goto；轮询有上限。
+    const deadline = Date.now() + 5000;
+    while (!(await other.location()).url.startsWith('chrome-error:')) {
+      if (Date.now() > deadline) assert.fail('the aborted navigation never settled on the error page');
+      await sleep(50);
+    }
+    assert.equal(server.hits.length, before);
+    fresh.setRequestHandler(r => { freshSeen.push(r); return { action: 'continue' }; });
+    await other.goto(server.origin + '/index.html');
+    assert.ok(freshSeen.some(r => r.url.endsWith('/index.html')));
+  } finally {
+    await fresh.stop();
+  }
+});
+
+// 只记录现状：Playwright 的路由 handler 只对重定向链的第一个 URL 调用，后续跳不经 handler（见 docs/m0-findings.md）。
+test('a redirect target is not shown to the handler (known gap, recorded not fixed)', { timeout: 60_000 }, async () => {
+  const before = server.hits.length;
+  await page.evaluate(`fetch('/r307', { method: 'POST', body: '{}' })`); await settle();
+  assert.ok(seen.some(r => r.method === 'POST' && r.url.endsWith('/r307')));
+  assert.ok(!seen.some(r => r.url.endsWith('/api/sink')), 'the redirect target reached the handler');
+  assert.ok(server.hits.slice(before).some(h => h.path === '/api/sink'), 'the redirect target reached the server');
+});
+
 test('a throwing handler aborts the request', { timeout: 60_000 }, async () => {
   const before = server.hits.length;
   decide = () => { throw new Error('boom'); };

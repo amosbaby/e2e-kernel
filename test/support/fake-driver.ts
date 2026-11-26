@@ -311,7 +311,7 @@ export class FakeDriver implements Driver {
       id: `r${++this.requestSeq}`, openerPageId: page?.openerId ?? null, resourceType: 'fetch', isNavigation: false,
       topFrame: true, topUrl: page?.url ?? null, contentType: null, body: null, ...r,
     };
-    if (inst.requestHandler === undefined) return { action: 'continue' };
+    if (inst.requestHandler === undefined) return { action: 'abort' };
     try {
       return await inst.requestHandler(info);
     } catch {
