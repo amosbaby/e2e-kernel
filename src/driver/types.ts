@@ -11,7 +11,8 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../shared/ops.ts';
 // - setRequestHandler 的回调抛错时，驱动中止这个请求（失败时偏向拦住），不放行。
 // - Decision.continue 带 followRedirects: false 时，驱动只发首跳、不跟随重定向（Playwright 的路由 handler 只见重定向链的
 //   第一个 URL，后续跳绕过内核的判断）：首跳是 3xx 就先通知 onRequestDone { status: 首跳状态, failed: true, redirectRefused: true }
-//   （去重以先到为准，所以通知在前），再中止请求；不是 3xx 就把响应原样交给页面。
+//   （去重以先到为准，所以通知在前），再中止请求；不是 3xx 就把响应原样交给页面；发送出错一律中止，不算重定向。
+//   只有同源的请求这样发；跨源的（含判断不出同源的）照常放行，由浏览器自己发，浏览器才继续执行 CORS 和 SameSite。
 // - setRequestHandler 之前到来的请求，驱动一律中止（失败关闭），不放行也不记录。
 // - read 不等待：text、css 的目标不存在立刻抛 DriverError('not-found')；count 返回 0；visible 返回 false。
 // - describe 对选择器写法的目标返回 { selector: 原样, via: 'given' }；对引用返回解析出的稳定选择器，

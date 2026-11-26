@@ -124,6 +124,17 @@ export async function guardedHints(collect: () => Promise<string[]>, timeoutMs: 
   }
 }
 
+// 请求的目标和发出它的 frame 同源。判断不出（Worker 的请求没有 frame、frame 地址不是 http(s)、解析失败、源是 null）按跨源算。
+function isSameOrigin(request: PwRequest): boolean {
+  try {
+    const from = new URL(request.frame().url());
+    const to = new URL(request.url());
+    return from.origin !== 'null' && from.origin === to.origin;
+  } catch {
+    return false;
+  }
+}
+
 function httpUrlOrNull(url: string): string | null {
   return /^https?:/i.test(url) ? url : null;
 }
@@ -982,7 +993,10 @@ class PlaywrightInstance implements Instance, Host {
     try {
       switch (decision.action) {
         case 'continue':
-          if (decision.followRedirects === false) await this.sendWithoutRedirects(route);
+          // 只有同源的请求走 route.fetch：跨源的请求经它发会绕过浏览器的 CORS 和 SameSite（route.fetch 不看 SameSite 一律附上
+          // cookie，fulfill 还会替没有 ACAO 的响应补上 CORS 头），所以跨源的照常 continue，由浏览器自己发；
+          // 代价是它的 307 / 308 后续跳路由看不到（README Known gaps）。
+          if (decision.followRedirects === false && isSameOrigin(request)) await this.sendWithoutRedirects(route);
           else await route.continue();
           break;
         case 'fulfill':
@@ -995,26 +1009,29 @@ class PlaywrightInstance implements Instance, Host {
   }
 
   // 放行但不跟随重定向：由 Node 代发首跳（Playwright 的路由 handler 只见重定向链的第一个 URL，后续跳绕过内核的判断）。
-  // 首跳是 3xx、或 fetch 因重定向而抛错：先通知 redirectRefused（去重以先到为准，abort 之后的 requestfailed 会被忽略），再中止。
-  // 其他错误也中止（失败关闭）。不是 3xx：原样交给页面。
+  // 首跳是 3xx：先通知 redirectRefused（去重以先到为准，abort 之后的 requestfailed 会被忽略），再中止。
+  // fetch 抛错一律中止（失败关闭），不当成重定向：1.65.1 下 maxRedirects: 0 不抛错而是返回 3xx 响应，
+  // 错误消息里又带着完整 URL，按字样判断会把 redirect_uri= 之类误报。不是 3xx：原样交给页面。
   private async sendWithoutRedirects(route: Route): Promise<void> {
     const request = route.request();
     let response: APIResponse;
     try {
       response = await route.fetch({ maxRedirects: 0, timeout: NAVIGATION_TIMEOUT_MS });
-    } catch (e) {
-      if (/redirect/i.test(e instanceof Error ? e.message : String(e))) this.requestDone(request, null, true, true);
+    } catch {
       await route.abort();
       return;
     }
-    const status = response.status();
-    if (status >= 300 && status < 400) {
-      this.requestDone(request, status, true, true);
-      await response.dispose().catch(() => {});
-      await route.abort();
-      return;
+    try {
+      const status = response.status();
+      if (status >= 300 && status < 400) {
+        this.requestDone(request, status, true, true);
+        await route.abort();
+      } else {
+        await route.fulfill({ response });
+      }
+    } finally {
+      await response.dispose().catch(() => {});   // 不然响应体留在 context 里直到关闭
     }
-    await route.fulfill({ response });
   }
 
   // 每个请求只通知一次：先到的事件为准，之后的 requestfinished / requestfailed 一律忽略。

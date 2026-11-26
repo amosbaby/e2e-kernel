@@ -143,10 +143,13 @@ Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调�
 结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；README Known gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定）。
 
 M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里 `followRedirects: false` 的几条）：驱动对放行且带 `followRedirects: false` 的请求走 `route.fetch({ maxRedirects: 0 })`。
-- `maxRedirects: 0` **不抛错**，返回 3xx 响应本身（307 带 `location`）。驱动据此先通知 `redirectRefused`、再 `route.abort()`；服务端只收到首跳一次，目标地址一次也没收到，页面的 `fetch` 被拒。若 fetch 抛的错误消息含 `redirect`，按同样处理（实测没触发过）。
+- `maxRedirects: 0` **不抛错**，返回 3xx 响应本身（307 带 `location`）。驱动据此先通知 `redirectRefused`、再 `route.abort()`；服务端只收到首跳一次，目标地址一次也没收到，页面的 `fetch` 被拒。1.65.1 下 `maxRedirects: 0` 不会抛错（内部映射成 -1），所以驱动不按错误消息里的 `redirect` 字样判断：消息的 Call log 带完整 URL 和 referer，`redirect_uri=` 之类会被误报。`fetch` 抛任何错都只是中止请求，由随后的 `requestfailed` 通知一次（status 为 null，没有 `redirectRefused`）。
 - Cookie：`route.fetch` 带上浏览器的 cookie（先访问设 cookie 的页面，服务端在这个写请求里看到了它），响应的 `Set-Cookie` 经 `route.fulfill({ response })` 回到浏览器（页面 `document.cookie` 随后含新值）。
 - gzip：服务端回 `content-encoding: gzip`，`fulfill({ response })` 原样转发正文和头，页面读到的正文正确解码。
 - 非 3xx（例如 200）原样交给页面，状态和正文不变。
+
+- 跨源不能走这条路：`route.fetch` 按 URL 附上 context 里所有匹配的 cookie（不看 SameSite，也不看页面 `fetch` 的 credentials 模式），`fulfill({ response })` 在请求带 `Origin`、跨源且响应没有 `access-control-allow-origin` 时还会自动补 `access-control-allow-origin: <origin>` 和 `access-control-allow-credentials: true`。实测（页面在 `127.0.0.1`，目标在 `localhost`，目标主机上有 SameSite=Strict 的 cookie）：经 `route.fetch` 发出的请求带着这个 cookie，浏览器自己发的不带。所以驱动只对同源请求用 `route.fetch`，跨源的 `route.continue()`。
+- `route.fetch` 的响应要 `dispose()`，否则响应体留在 context 里直到关闭；驱动在 `fulfill` 或中止之后都会 dispose。
 
 结论：四条在 1.65.1 下都做得到，不需要降级。代价：这样发出的请求由 Node 代发，不信任系统额外安装的根证书（README Known gaps）。
 

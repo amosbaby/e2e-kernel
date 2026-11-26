@@ -122,6 +122,13 @@ export async function startFixtureServer(): Promise<FixtureServer> {
       return;
     }
 
+    // GET /set-strict：给当前主机设一个 SameSite=Strict 的 cookie（跨站请求浏览器不会带它，route.fetch 会）。
+    if (url.pathname === '/set-strict') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'set-cookie': 'strict_c=1; Path=/; SameSite=Strict' });
+      res.end('ok');
+      return;
+    }
+
     // /redir：302 到 index.html（重定向链：idle 计数在中间跳上不能漏减）。
     if (url.pathname === '/redir') {
       res.writeHead(302, { location: '/index.html', 'cache-control': 'no-store' });
@@ -159,6 +166,11 @@ export async function startFixtureServer(): Promise<FixtureServer> {
       const contentType = req.headers['content-type'] ?? null;
       const body = await readBody(req);
       hits.push({ method, path: url.pathname, query: Object.fromEntries(url.searchParams), body, contentType });
+      // /api/redirect-reset：读完请求就掐断连接（路径里带 redirect，用来确认错误消息里的字样不会被当成重定向）。
+      if (url.pathname === '/api/redirect-reset') {
+        req.socket.destroy();
+        return;
+      }
       // POST /api/cookie：记下请求头里的 cookie，并回一个 Set-Cookie。
       if (url.pathname === '/api/cookie') {
         cookieSeen.push(req.headers.cookie ?? null);

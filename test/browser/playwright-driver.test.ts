@@ -412,6 +412,32 @@ test('followRedirects: false still sends the browser cookies and hands Set-Cooki
   assert.match(String(await page.evaluate('document.cookie')), /\bk=v\b/);
 });
 
+test('followRedirects: false on a cross-origin write is continued natively, so SameSite still applies', { timeout: 60_000 }, async () => {
+  await page.goto(server.altOrigin + '/set-strict'); await settle();   // localhost 上的 Strict cookie
+  await page.goto(server.origin + '/index.html'); await settle();
+  const first = server.cookieSeen.length;
+  decide = r => noRedirect(r, '/api/cookie');
+  // 页面在 127.0.0.1，目标在 localhost：跨站。浏览器自己发的话不会带 Strict cookie；经 route.fetch 发就会带上。
+  await page.evaluate(`fetch('${server.altOrigin}/api/cookie', { method: 'POST', body: 'x', mode: 'no-cors', credentials: 'include' }).catch(() => {})`); await settle();
+  assert.equal(server.cookieSeen.length, first + 1, 'the cross-origin write reached the server');
+  assert.doesNotMatch(server.cookieSeen.at(-1) ?? '', /strict_c/, 'a SameSite=Strict cookie must not ride along on a cross-site request');
+});
+
+test('followRedirects: false does not call a failed fetch a refused redirect just because the message mentions redirect', { timeout: 60_000 }, async () => {
+  const done: Done[] = [];
+  inst.onRequestDone(e => { done.push(e); });
+  decide = r => noRedirect(r, '/api/redirect-reset');
+  const outcome = await page.evaluate(`fetch('/api/redirect-reset', { method: 'POST', body: 'x' }).then(() => 'sent', () => 'blocked')`);
+  await settle();
+  assert.equal(outcome, 'blocked');
+  const req = seen.find(r => r.method === 'POST' && r.url.endsWith('/api/redirect-reset'))!;
+  const mine = done.filter(e => e.id === req.id);
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0]!.failed, true);
+  assert.equal(mine[0]!.status, null);
+  assert.ok(!('redirectRefused' in mine[0]!), 'a failed fetch is not a refused redirect');
+});
+
 test('followRedirects: false decodes a gzip response body', { timeout: 60_000 }, async () => {
   decide = r => noRedirect(r, '/api/gzip');
   const out = await page.evaluate(`fetch('/api/gzip', { method: 'POST', body: 'x' }).then(r => r.text())`);
