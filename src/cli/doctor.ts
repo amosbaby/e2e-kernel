@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { Check, Driver } from '../driver/types.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
+import { redactText, safely } from '../shared/redact.ts';
 import { PROFILE_STATE_TEXT, lastLoginText } from './format.ts';
 import { DEFAULT_PROFILE, profileInfo } from '../kernel/profiles.ts';
 import { createRulesResolver } from '../kernel/rules.ts';
@@ -90,7 +91,8 @@ function profileCheck(home: Home): Check {
 function rulesCheck(home: Home, selfCmd: string): Check {
   const name = 'rules';
   const s = createRulesResolver(home.rulesFile).state();
-  if (s.error !== null) return { name, ok: false, detail: s.error, fix: `改好 $E2K_HOME/rules.json，或运行 ${selfCmd} rule list 看错误` };
+  const { error } = s;
+  if (error !== null) return { name, ok: false, detail: safely(() => redactText(error)), fix: `改好 $E2K_HOME/rules.json，或运行 ${selfCmd} rule list 看错误` };
   return { name, ok: true, detail: s.hash === null ? '没有规则' : `${s.count} 条规则` };
 }
 

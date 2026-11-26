@@ -104,6 +104,15 @@ function profileLine(p: ProfileInfo): string {
   return `profile ${inline(p.name)} ${PROFILE_STATE_TEXT[p.state]}，最近一次 login ${lastLoginText(p)}`;
 }
 
+// 旧内核的 status 没有 rules：跳过这两行，不抛。
+function rulesLines(rules: StatusResult['rules'] | undefined): string[] {
+  if (rules === undefined) return [];
+  return [
+    rules.hash === null ? `规则 ${rules.count} 条` : `规则 ${rules.count} 条 ${inline(rules.hash)}`,
+    ...(rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(rules.error)}`]),
+  ];
+}
+
 export function formatStatus(r: StatusResult): string {
   const c = r.driver.capabilities;
   const lines = [
@@ -115,8 +124,7 @@ export function formatStatus(r: StatusResult): string {
     `会话 ${r.sessions.length} 个`,
     ...r.sessions.map((s) => `  ${inline(s.session)} ${inline(s.name)} 闲置 ${s.idleSec} 秒 ${inline(s.url)}`),
     ...(r.profiles ?? []).map(profileLine),
-    r.rules.hash === null ? `规则 ${r.rules.count} 条` : `规则 ${r.rules.count} 条 ${inline(r.rules.hash)}`,
-    ...(r.rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(r.rules.error)}`]),
+    ...rulesLines(r.rules),
   ];
   return lines.join('\n');
 }

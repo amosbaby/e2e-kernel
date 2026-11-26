@@ -149,7 +149,7 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 
 ## Not in this version
 
-No domain rules or read-only mode, no per-site profiles, no approval flow (there is deliberately no `approve` command), no "deny" mode, no `save-case` / `run`, no MCP wrapper, no headless mode, no CI use, and no platform other than macOS. See the milestones in [docs/design.md](docs/design.md).
+Domain rules are read, validated and reported (`rule list`, `status`, `doctor`) but not enforced yet, so there is no read-only mode; no per-site profiles, no approval flow (there is deliberately no `approve` command), no "deny" mode, no `save-case` / `run`, no MCP wrapper, no headless mode, no CI use, and no platform other than macOS. See the milestones in [docs/design.md](docs/design.md).
 
 ## Development
 

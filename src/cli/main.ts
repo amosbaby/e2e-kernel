@@ -13,7 +13,7 @@ import { resolveHome } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
 import { ExitCode, MAX_OPS_BYTES, exitCodeFor, validateParams } from '../shared/protocol.ts';
 import type { CloseResult, Method, OpenResult, StepResult } from '../shared/protocol.ts';
-import { redactText } from '../shared/redact.ts';
+import { redactText, safely } from '../shared/redact.ts';
 import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { runDoctor } from './doctor.ts';
@@ -178,6 +178,11 @@ async function doctor(ctx: Ctx, args: string[]): Promise<number> {
   return checks.every((c) => c.ok) ? ExitCode.OK : ExitCode.NEEDS_HUMAN;
 }
 
+// 解析错误会带上文件里的未知键名，和主机写法一样先脱敏。
+function redactError(error: string | null): string | null {
+  return error === null ? null : safely(() => redactText(error));
+}
+
 // 规则文件由 CLI 自己读，不需要内核。文件有错：照样打印（--json 里在 error 字段），退出码 2。
 async function rule(ctx: Ctx, args: string[]): Promise<number> {
   const [sub, ...rest] = args;
@@ -190,7 +195,7 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
     path: home.rulesFile,
     rules: f.rules.map((x) => ({ match: redactText(x.match), mode: x.mode })),
     loginHosts: f.loginHosts.map((x) => redactText(x)),
-    hash: f.hash, error: f.error,
+    hash: f.hash, error: redactError(f.error),
   };
   print(ctx, result, formatRuleList);
   return f.error === null ? ExitCode.OK : ExitCode.USAGE;

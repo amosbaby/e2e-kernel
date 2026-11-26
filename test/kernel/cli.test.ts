@@ -5,10 +5,10 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeF
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
-import { formatClose } from '../../src/cli/format.ts';
+import { formatClose, formatStatus } from '../../src/cli/format.ts';
 import type { Io } from '../../src/cli/main.ts';
 import { startKernel } from '../../src/kernel/server.ts';
-import type { KernelHandle } from '../../src/kernel/server.ts';
+import type { KernelHandle, StatusResult } from '../../src/kernel/server.ts';
 import type { Driver } from '../../src/driver/types.ts';
 import { call } from '../../src/shared/client.ts';
 import { E2kError } from '../../src/shared/errors.ts';
@@ -489,11 +489,25 @@ test('rule: needs the list subcommand and takes no extra arguments; help lists i
   const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /rule list \[--json\]/);
 });
 
-test('rule list prints host names without control characters', async () => {
-  await withRules(JSON.stringify({ version: 1, rules: [{ match: 'a.example.com', mode: 'readonly' }] }), async (h) => {
-    const t = io({ env: h.env }); await main(['rule', 'list'], t);
-    assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(t.outText()));
+test('a token-shaped key in a bad rules file is redacted in rule list (text and --json) and in doctor', async () => {
+  const label = 'Ab1'.repeat(13);   // 39 个字符：未知键名会被 usage 报错带出来，且长得像 token
+  await withRules(JSON.stringify({ version: 1, rules: [], [label]: 1 }), async (h) => {
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 2);
+    assert.ok(!t.outText().includes(label)); assert.match(t.outText(), /unexpected key/);
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 2);
+    assert.ok(!j.outText().includes(label)); assert.match((JSON.parse(j.outText()) as { error: string }).error, /unexpected key/);
+    const d = io({ env: h.env }); await main(['doctor'], d);
+    assert.ok(!d.outText().includes(label)); assert.match(d.outText(), /unexpected key/);
+    const dj = await doctorChecks(h.env);
+    assert.ok(!JSON.stringify(dj.checks).includes(label));
   });
+});
+
+test('status from an older kernel (no rules field) still formats', () => {
+  const old = { version: '0.1.0', pid: 1, home: '/x', driver: { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'yes', nativeFormSubmit: 'yes', selectorDialect: 'playwright' } },
+    instance: 'stopped', sessions: [], profiles: [] } as unknown as StatusResult;
+  assert.doesNotThrow(() => formatStatus(old));
+  assert.ok(!formatStatus(old).includes('规则'));
 });
 
 test('status carries rules; the text format adds a line only when the file is broken', async () => {
