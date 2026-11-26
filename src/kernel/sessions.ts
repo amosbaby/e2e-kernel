@@ -490,6 +490,7 @@ export class SessionManager {
         start: s.start, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
         actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
         verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [],
+        modes: s.recorder.modes, rules: this.rulesInForce(), blocked: s.lastWall, forced: s.forced,
       });
       paths = writeRun(s.runDir, result);
     } catch (e) {
@@ -505,6 +506,12 @@ export class SessionManager {
       session: s.id, runDir: s.runDir, ...paths, tallies: result.tallies, consistency: result.consistency, conflicts: result.conflicts,
       exit: result.tallies.mismatch > 0 ? 10 : 0,
     };
+  }
+
+  // 收尾时生效的规则（规则文件有错时是最后一份好的）。
+  private rulesInForce(): { hash: string | null; count: number } {
+    const { hash, count } = this.deps.modes.state();
+    return { hash, count };
   }
 
   // 清理旧报告时不能删的目录：所有还在进行中的会话（含正在开的），以及刚收尾、要交给调用方的这一份。

@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Capabilities } from '../../src/driver/types.ts';
-import type { ActionRecord, WriteRecord } from '../../src/kernel/recorder.ts';
+import type { ActionRecord, ModeChange, WriteRecord } from '../../src/kernel/recorder.ts';
 import { renderReport } from '../../src/report/html.ts';
 import { buildResult } from '../../src/report/result.ts';
 import type { RunInput } from '../../src/report/result.ts';
@@ -33,7 +33,8 @@ function input(o: Partial<RunInput> = {}): RunInput {
   return { kernelVersion: '0.1.0', session: 's-a41f00', name: 'session', startedAt: new Date('2026-11-26T15:30:00Z'),
     endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'default' },
     driver: driverWith(), actions: [], writes: [], unattributedWrites: [], hosts: [{ host: 'localhost', mode: 'default' }], webSockets: 0,
-    verdict: null, findings: [], notDone: [], superseded: [], ...o };
+    verdict: null, findings: [], notDone: [], superseded: [],
+    modes: [], rules: { hash: null, count: 0 }, blocked: null, forced: false, ...o };
 }
 function textOf(html: string, id: string): string {
   const m = new RegExp(`<p id="${id}">([^<]*)</p>`).exec(html);
@@ -284,7 +285,9 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true }),
       write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' })],
-    unattributedWrites: [write('PUT', 'http://localhost/b', null)],
+    unattributedWrites: [{ ...write('PUT', 'http://localhost/b', null, { reason: 'unattributed', mode: 'readonly' }), decision: 'blocked' }],
+    modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef' }],
+    rules: { hash: 'sha256:0123456789abcdef', count: 2 }, blocked: 'login', forced: true,
   }));
   const bad: string[] = [];
   const walk = (v: unknown): void => {
@@ -301,8 +304,120 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     else if (typeof v === 'object' && v !== null) for (const [k, val] of Object.entries(v)) { keys.add(k); collect(val); }
   };
   collect(r);
-  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle']) assert.ok(keys.has(k), k);
+  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'readonly', 'blockedSummary', 'unattributed']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
+});
+
+const blockedWrite = (m: string, u: string, reason: NonNullable<WriteRecord['reason']>, extra: Partial<WriteRecord> = {}): WriteRecord =>
+  ({ ...write(m, u, null, { reason, mode: 'readonly', ...extra }), decision: 'blocked' });
+
+test('buildResult carries the read-only fields through as given', () => {
+  const modes: ModeChange[] = [
+    { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: null },
+    { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef' },
+  ];
+  const r = buildResult(input({ modes, rules: { hash: 'sha256:0123456789abcdef', count: 3 }, forced: true, blocked: 'login' }));
+  assert.deepEqual(r.modes, modes);
+  assert.deepEqual(r.rules, { hash: 'sha256:0123456789abcdef', count: 3 });
+  assert.equal(r.blocked, 'login');
+  assert.deepEqual(r.start, { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', readonly: true });
+  const plain = buildResult(input({}));
+  assert.deepEqual([plain.modes, plain.rules, plain.blocked, plain.start.readonly], [[], { hash: null, count: 0 }, null, false]);
+});
+
+test('blocked writes carry reason and mode in result.json', () => {
+  const r = buildResult(input({ writes: [blockedWrite('PUT', 'http://localhost/a', 'method'), write('POST', 'http://localhost/b', 200)] }));
+  assert.deepEqual(r.writes.blocked.map((w) => [w.reason, w.mode]), [['method', 'readonly']]);
+  assert.deepEqual(r.writes.allowed.map((w) => [w.reason, w.mode]), [[null, 'default']]);
+});
+
+test('blockedSummary groups blocked writes by host, method and reason, includes unattributed ones, and has no paths', () => {
+  const r = buildResult(input({
+    writes: [
+      blockedWrite('POST', 'http://b.example.com/api/a', 'graphql-mutation'), blockedWrite('post', 'http://b.example.com/api/z?x=1', 'graphql-mutation'),
+      blockedWrite('POST', 'http://b.example.com/api/c', 'method'), blockedWrite('DELETE', 'http://a.example.com/api/1', 'method'),
+      write('POST', 'http://a.example.com/ok', 200),
+    ],
+    unattributedWrites: [blockedWrite('POST', 'http://b.example.com/f', 'unattributed'), blockedWrite('POST', 'http://b.example.com/g', 'unattributed'),
+      write('POST', 'http://b.example.com/allowed-one', 200)],
+  }));
+  assert.deepEqual(r.writes.blockedSummary, [
+    { host: 'a.example.com', method: 'DELETE', reason: 'method', count: 1, unattributed: false },
+    { host: 'b.example.com', method: 'POST', reason: 'graphql-mutation', count: 2, unattributed: false },
+    { host: 'b.example.com', method: 'POST', reason: 'method', count: 1, unattributed: false },
+    { host: 'b.example.com', method: 'POST', reason: 'unattributed', count: 2, unattributed: true },
+  ]);
+  assert.ok(!JSON.stringify(r.writes.blockedSummary).includes('/api'));
+  assert.deepEqual(buildResult(input({})).writes.blockedSummary, []);
+});
+
+test('the same host, method and reason is split into an attributed and an unattributed row', () => {
+  const r = buildResult(input({
+    writes: [blockedWrite('POST', 'http://x.example.com/a', 'redirected-write')],
+    unattributedWrites: [blockedWrite('POST', 'http://x.example.com/b', 'redirected-write')],
+  }));
+  assert.deepEqual(r.writes.blockedSummary.map((e) => [e.unattributed, e.count]), [[false, 1], [true, 1]]);
+});
+
+test('the environment section says the session ended on a login page only when blocked is login', () => {
+  const env = (o: Partial<RunInput>): string => section(renderReport(buildResult(input(o))), 'env');
+  assert.ok(env({ blocked: 'login' }).includes('收尾时停在登录页'));
+  assert.ok(!env({ blocked: null }).includes('收尾时停在登录页'));
+});
+
+test('the mode section says default all along when there is nothing but the default mode', () => {
+  const only = (modes: ModeChange[]): string => section(renderReport(buildResult(input({ modes }))), 'modes');
+  assert.ok(only([]).includes('全程默认模式'));
+  assert.ok(only([{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: null }]).includes('全程默认模式'));
+});
+
+test('the mode section lists time, host, mode and reason, and the rules in force', () => {
+  const r = buildResult(input({
+    modes: [
+      { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: 'sha256:0123456789abcdef' },
+      { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef' },
+      { at: '2026-11-26T15:30:20.000Z', host: 'x.example.com', mode: 'readonly', reason: 'forced', rulesHash: null },
+    ],
+    rules: { hash: 'sha256:0123456789abcdef', count: 2 },
+  }));
+  const sec = section(renderReport(r), 'modes');
+  assert.ok(!sec.includes('全程默认模式'));
+  const rows = [...sec.matchAll(/<tr><td>([^<]*)<\/td><td>([^<]*)<\/td><td>([^<]*)<\/td><td>([^<]*)<\/td><\/tr>/g)].map((m) => m.slice(1, 5));
+  assert.deepEqual(rows, [
+    ['2026-11-26T15:30:01.000Z', 'localhost', 'default', '无规则命中'],
+    ['2026-11-26T15:30:09.000Z', 'app.example.com', 'readonly', '规则命中'],
+    ['2026-11-26T15:30:20.000Z', 'x.example.com', 'readonly', '--readonly 强制'],
+  ]);
+  assert.ok(sec.includes('规则 2 条') && sec.includes('sha256:0123456789abcdef'), sec);
+  assert.ok(section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('没有规则文件'));
+});
+
+test('the blocked-writes section shows the summary table, or says none', () => {
+  const r = buildResult(input({
+    writes: [blockedWrite('POST', 'http://api.example.com/a', 'graphql-mutation'), blockedWrite('POST', 'http://api.example.com/b', 'graphql-mutation')],
+    unattributedWrites: [blockedWrite('POST', 'http://api.example.com/f', 'unattributed')],
+  }));
+  const sec = section(renderReport(r), 'blocked-writes');
+  const rows = [...sec.matchAll(/<tr><td>([^<]*)<\/td><td>([^<]*)<\/td><td>([^<]*)<\/td><td>([^<]*)<\/td><td>([^<]*)<\/td><\/tr>/g)].map((m) => m.slice(1, 6));
+  assert.deepEqual(rows, [
+    ['api.example.com', 'POST', 'GraphQL mutation', '2', '否'],
+    ['api.example.com', 'POST', '未归属的写', '1', '是'],
+  ]);
+  assert.ok(!sec.includes('/api/'));
+  const none = section(renderReport(buildResult(input({ writes: [write('POST', 'http://api.example.com/a', 200)] }))), 'blocked-writes');
+  assert.ok(none.includes('没有') && !none.includes('<table'), none);
+});
+
+test('hosts in the mode and blocked-writes sections are redacted and escaped', () => {
+  const r = buildResult(input({
+    modes: [{ at: '2026-11-26T15:30:09.000Z', host: '<img src=x onerror=alert(1)>', mode: 'readonly', reason: 'rule', rulesHash: null }],
+    writes: [blockedWrite('POST', 'http://x.example.com/a', 'method', { host: '<script>alert(1)</script>.example.com' })],
+  }));
+  const html = renderReport(r);
+  const both = section(html, 'modes') + section(html, 'blocked-writes');
+  assert.ok(!both.includes('<img') && !both.includes('<script>'), both);
+  assert.ok(both.includes('&lt;img') && both.includes('&lt;script&gt;'), both);
 });
 
 // 序号固定的动作：[失败(1), 未执行(2), 完成(3), 完成(4)]

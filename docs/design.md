@@ -223,7 +223,8 @@ agent 面    CLI（主）      薄 MCP 壳      使用说明（一份短文档�
 - **`assert` 的结果统一叫「相符 / 不符」**，不叫通过、不通过：复核问题时，`assert` 不符可能正是问题存在的证据，和总结论并排时不能让人误读。
 - **总结论有两种口径**：验证改动用「通过 / 不通过」；复核问题用「存在 / 不存在 / 无法判断」。「无法判断」必须写原因（没复现条件、被写策略拦住走不下去、等登录等）。
 - **每次运行一个目录**：`report.html`、`result.json`、截图、被拦下的写、被放行的写、用到的批准、域名和当时的模式。
-- `result.json` 里有 `blocked`（等登录、等批准、身份不符、跳到了不允许或别的组的域名）和 `next`（下一步该谁做什么）。M1 里 `blocked` 恒为 `null`：撞到登录墙只在 `open` / `step` 的回应和退出码 20 里提示（见 5.9）。
+- `result.json` 里有 `blocked`（等登录、等批准、身份不符、跳到了不允许或别的组的域名）和 `next`（下一步该谁做什么）。`blocked` 现在只有 `'login'` 和 `null`：值是会话最后一次登录墙检查（`open` 和每次 `step` 之后各做一次）的结果，收尾时仍停在登录页才是 `'login'`，中途撞到又离开了不算；等批准、身份不符、跳到不允许的域名要到 M3。撞到登录墙的实时提示仍在 `open` / `step` 的回应和退出码 20 里（见 5.9）。
+- **只读相关的记录**（只加字段，`schema` 仍是 1）：`modes` 是模式变更时间线（`at`、已脱敏的 `host`、`mode`、`reason` 为 `rule` / `forced` / `no-rule`、`rulesHash`；和上一条模式相同就不记）；`rules` 是收尾时生效的规则 `{ hash, count }`（没有规则文件是 `{ hash: null, count: 0 }`）；`start.readonly` 是 `open --readonly`；`writes.blocked[*]` 带 `reason`（`method`、`graphql-mutation`、`persisted-query`、`redirected-write`、`unattributed`）和判定当时的有效 `mode`；`writes.blockedSummary` 把被拦的写按主机 × 方法 × 原因分组计数，未归属的被拦写也在里面（`unattributed: true`），不带路径和请求体。`report.html` 为此多两段：「模式」（时间线表，只有一条且为默认模式时写「全程默认模式」，另列规则条数和哈希）和「被拦下的写」（`blockedSummary` 的表，没有时写「没有」）；`blocked` 为 `'login'` 时「环境」一段写「收尾时停在登录页」。
 - **没做的要写出来**：计划了但没执行的检查、被跳过的步骤，在结论区单列，不能并进「通过」。
 - **失败分「已恢复 / 未解决」**：`close --superseded '[{"failed":n,"by":m}]'` 声明「序号 n 的失败由序号 m 取代」（序号即 `step` 输出里的 `序号`）。内核在收尾前对着记录校验：`failed` 只能是执行失败或未执行（`assert` 不符不可被取代），`by` 只能是之后完成或相符的操作，同一个 `failed` 不能出现两次；不合格是 usage 错误，会话保持打开、可重新 `close`。报告里两边的操作名和目标取自记录（已脱敏、转义），不取自 agent 的声明；报告分「已恢复的失败」（并排显示，取代者是只读操作或 `wait`、而被取代的是动作时标出；一个取代者取代多个失败时也标出）和「未解决的失败」，没被取代的未执行操作仍在「没做的」里。`tallies` 保持原始计数。
 - **按条判定**：`findings` 每条可带自己的 `verdict`，报告里显示在每条前面。结论是 `pass` 时，下面任一条成立算冲突：有不符、有未解决的失败、有未解决的未执行、`--not-done` 非空、有 finding 的判定是 `fail`；`result.json` 的 `conflicts` 逐条列出原因。

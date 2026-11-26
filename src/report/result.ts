@@ -1,5 +1,6 @@
 import type { Capabilities } from '../driver/types.ts';
-import type { ActionRecord, WriteRecord } from '../kernel/recorder.ts';
+import type { ActionRecord, ModeChange, WriteRecord } from '../kernel/recorder.ts';
+import type { BlockReason } from '../kernel/write-policy.ts';
 import { E2kError } from '../shared/errors.ts';
 import { READ_OPS } from '../shared/ops.ts';
 import type { Op, Viewport } from '../shared/ops.ts';
@@ -20,6 +21,10 @@ export interface RunInput {
   hosts: { host: string; mode: Mode }[]; webSockets: number;
   verdict: Verdict | null; findings: Finding[]; notDone: string[];
   superseded: Supersede[];   // agent 声明的；buildResult 对着 actions 校验，再补上两边的操作名和目标
+  modes: ModeChange[];       // 模式变更时间线
+  rules: { hash: string | null; count: number };   // 收尾时生效的那份规则
+  blocked: 'login' | null;   // 会话最后一次登录墙检查的结果
+  forced: boolean;           // open --readonly
 }
 
 // 一条已恢复的失败：序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代。op 和 target 来自记录，不来自 agent。
@@ -31,16 +36,20 @@ export interface SupersededEntry {
 // 写请求的汇总：已归属的写（放行加拦下）按主机 × 方法 × GraphQL 类型分组。host 是已脱敏的主机名，不带路径和请求体。
 export interface WriteSummaryRow { host: string; method: string; graphql: WriteRecord['graphql']; allowed: number; blocked: number }
 
+// 被拦下的写按主机 × 方法 × 原因分组（含未归属的，用 unattributed 区分）。host 是已脱敏的主机名，不带路径和请求体。
+export interface BlockedSummaryRow { host: string; method: string; reason: BlockReason; count: number; unattributed: boolean }
+
 export interface RunResult {
   schema: 1; kernelVersion: string; session: string; name: string; startedAt: string; endedAt: string; closedBy: ClosedBy;
-  start: RunInput['start']; driver: RunInput['driver']; hosts: RunInput['hosts'];
+  start: RunInput['start'] & { readonly: boolean }; driver: RunInput['driver']; hosts: RunInput['hosts'];
+  modes: ModeChange[]; rules: RunInput['rules'];
   verdict: Verdict | null; findings: Finding[]; notDone: string[]; superseded: SupersededEntry[];
   tallies: Tallies; consistency: 'ok' | 'conflict'; conflicts: ConflictReason[];
   actions: ActionRecord[];
-  writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[]; summary: WriteSummaryRow[] };
+  writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[]; summary: WriteSummaryRow[]; blockedSummary: BlockedSummaryRow[] };
   approvals: never[];                 // M2 才有内容
   coverage: { serviceWorkers: 'blocked'; webSockets: number; notes: string[] };
-  blocked: null;                      // M2 才有内容（等登录、等批准、身份不符、跳到不允许的域名）
+  blocked: 'login' | null;            // 会话最后一次登录墙检查的结果；等批准、身份不符、跳到不允许的域名要到 M3
   next: string | null;
 }
 
@@ -134,6 +143,26 @@ export function summarizeWrites(writes: readonly WriteRecord[]): WriteSummaryRow
   return [...rows.values()].sort((a, b) => by(a.host, b.host) || by(a.method, b.method) || by(a.graphql ?? '', b.graphql ?? ''));
 }
 
+// 被拦下的写：已归属的和未归属的各自分组，按 host、method、reason、unattributed（false 在前）排序，码点比较。
+// 被拦的写 reason 都有值；万一是 null 就不进汇总（放行的写 reason 是 null）。
+export function summarizeBlocked(writes: readonly WriteRecord[], unattributed: readonly WriteRecord[]): BlockedSummaryRow[] {
+  const rows = new Map<string, BlockedSummaryRow>();
+  const add = (list: readonly WriteRecord[], isUnattributed: boolean): void => {
+    for (const w of list) {
+      if (w.decision !== 'blocked' || w.reason === null) continue;
+      const method = w.method.toUpperCase();
+      const key = JSON.stringify([w.host, method, w.reason, isUnattributed]);
+      const row = rows.get(key);
+      if (row === undefined) rows.set(key, { host: w.host, method, reason: w.reason, count: 1, unattributed: isUnattributed });
+      else row.count++;
+    }
+  };
+  add(writes, false);
+  add(unattributed, true);
+  const by = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  return [...rows.values()].sort((a, b) => by(a.host, b.host) || by(a.method, b.method) || by(a.reason, b.reason) || Number(a.unattributed) - Number(b.unattributed));
+}
+
 export function buildResult(input: RunInput): RunResult {
   const tallies = tally(input.actions);
   const superseded = resolveSuperseded(input.actions, input.superseded);
@@ -146,9 +175,11 @@ export function buildResult(input: RunInput): RunResult {
     startedAt: input.startedAt.toISOString(),
     endedAt: input.endedAt.toISOString(),
     closedBy: input.closedBy,
-    start: { ...input.start },
+    start: { ...input.start, readonly: input.forced },
     driver: { name: input.driver.name, capabilities: { ...input.driver.capabilities } },
     hosts: input.hosts.map((h) => ({ ...h })),
+    modes: input.modes.map((m) => ({ ...m })),
+    rules: { ...input.rules },
     verdict: input.verdict === null ? null : { ...input.verdict },
     findings: input.findings.map((f) => ({ ...f })),
     notDone: [...input.notDone],
@@ -162,10 +193,11 @@ export function buildResult(input: RunInput): RunResult {
       blocked: input.writes.filter((w) => w.decision === 'blocked'),
       unattributed: [...input.unattributedWrites],
       summary: summarizeWrites(input.writes),
+      blockedSummary: summarizeBlocked(input.writes, input.unattributedWrites),
     },
     approvals: [],
     coverage: { serviceWorkers: 'blocked', webSockets: input.webSockets, notes: coverageNotes(input) },
-    blocked: null,
+    blocked: input.blocked,
     next: NEXT_BY_CLOSE[input.closedBy] ?? null,
   };
 }

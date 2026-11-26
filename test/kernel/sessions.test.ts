@@ -681,6 +681,18 @@ test('when the probe itself fails, no login wall is claimed (a hint only)', asyn
   assert.deepEqual([r.exit, r.blocked, r.next], [0, null, null]);
 });
 
+test('close writes blocked: login when the last wall check found one, and null when the session left the wall', async () => {
+  const { sm } = setup({ extraPages: WALL_PAGES });
+  const s = await sm.open({ url: 'http://localhost:5173/' });
+  await sm.step({ session: s.session, ops: [{ op: 'goto', url: WALL }] });
+  assert.equal(readResult((await sm.close({ session: s.session })).runDir).blocked, 'login');
+  const s2 = await sm.open({ url: WALL });
+  await sm.step({ session: s2.session, ops: [{ op: 'goto', url: 'http://localhost:5173/' }] });
+  assert.equal(readResult((await sm.close({ session: s2.session })).runDir).blocked, null);
+  const s3 = await sm.open({ url: WALL });                     // 只 open、没 step：open 时的检查结果也算
+  assert.equal(readResult((await sm.close({ session: s3.session })).runDir).blocked, 'login');
+});
+
 // ---- 只读模式（任务 12） ----
 
 const RO = 'http://example.com/';
@@ -737,6 +749,26 @@ test('open --readonly forces read-only on a host without rules, also after navig
   assert.equal(plain.mode, 'default'); assert.equal(inner(sm, plain.session).recorder.modes[0]!.reason, 'no-rule');
   const ruled = await sm.open({ url: RO });
   assert.equal(inner(sm, ruled.session).recorder.modes[0]!.reason, 'rule');
+});
+
+test('close writes the mode timeline, the rules in force, start.readonly and the blocked summary (unattributed included)', async () => {
+  const { sm, fake, st } = setupRo(['example.com']);
+  const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  await fake.emitRequest({ id: 'w1', pageId, method: 'POST', url: 'http://example.com/api/items', body: '{"a":1}', contentType: 'application/json' });
+  await fake.emitRequest({ id: 'u1', pageId: null, method: 'POST', url: 'http://localhost:5173/api' });
+  st.hash = 'sha256:0000000000000002';
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.modes.map((m) => [m.host, m.mode, m.reason, m.rulesHash]), [['example.com', 'readonly', 'rule', 'sha256:0000000000000001']]);
+  assert.deepEqual(res.rules, { hash: 'sha256:0000000000000002', count: 1 });   // 收尾时生效的那份
+  assert.equal(res.start.readonly, false);
+  assert.deepEqual(res.writes.blockedSummary, [
+    { host: 'example.com', method: 'POST', reason: 'method', count: 1, unattributed: false },
+    { host: 'localhost', method: 'POST', reason: 'unattributed', count: 1, unattributed: true },
+  ]);
+  const forced = await sm.open({ url: 'http://localhost:5173/', readonly: true });
+  const res2 = readResult((await sm.close({ session: forced.session })).runDir);
+  assert.equal(res2.start.readonly, true);
+  assert.deepEqual(res2.modes.map((m) => m.reason), ['forced']);
 });
 
 test('a popup of a read-only session is read-only even when its own top host is a default host', async () => {

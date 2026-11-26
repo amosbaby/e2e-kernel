@@ -3,7 +3,8 @@ import { escapeHtml } from '../shared/escape.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { Outcome, VerdictValue } from '../shared/protocol.ts';
 import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
-import type { ClosedBy, RunResult, SupersededEntry } from './result.ts';
+import type { BlockedSummaryRow, ClosedBy, RunResult, SupersededEntry } from './result.ts';
+import type { ModeChange } from '../kernel/recorder.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。
 // 页面内容的处理顺序固定：先脱敏、再截断、最后 escapeHtml。脱敏出错时给固定标记，绝不输出原值。
@@ -22,6 +23,14 @@ const OUTCOME_TEXT: Record<Outcome, string> = {
 const CLOSED_BY_TEXT: Record<ClosedBy, string> = {
   'agent': 'agent 关闭会话', 'idle-timeout': '闲置超时', 'kernel-shutdown': '内核关闭',
   'browser-gone': '浏览器被关闭', 'page-gone': '会话的页面被关闭',
+};
+
+const MODE_REASON_TEXT: Record<ModeChange['reason'], string> = {
+  'rule': '规则命中', 'forced': '--readonly 强制', 'no-rule': '无规则命中',
+};
+const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
+  'method': '非读方法', 'graphql-mutation': 'GraphQL mutation', 'persisted-query': '持久化查询',
+  'redirected-write': '重定向的写', 'unattributed': '未归属的写',
 };
 
 function clip(s: string, max: number): string {
@@ -121,6 +130,28 @@ function writesSection(r: RunResult): string {
   return `${out}</section>`;
 }
 
+// 模式变更时间线：只有一条且是默认模式（或一条也没有）时写「全程默认模式」。host 是页面内容，脱敏后转义。
+function modesSection(r: RunResult): string {
+  const modes = Array.isArray(r.modes) ? r.modes : [];
+  const rules = r.rules !== null && typeof r.rules === 'object' ? r.rules : { hash: null, count: 0 };
+  const rulesLine = rules.hash === null ? '<p>没有规则文件</p>' : `<p>收尾时生效的规则 ${own(rules.count)} 条，哈希 <code>${own(rules.hash)}</code></p>`;
+  let out = '<section id="modes"><h2>模式</h2>';
+  if (modes.length === 0 || (modes.length === 1 && modes[0]!.mode === 'default')) return `${out}<p>全程默认模式</p>${rulesLine}</section>`;
+  const rows = modes.map((m) => `<tr><td>${own(m.at)}</td><td>${page(m.host)}</td><td>${own(m.mode)}</td><td>${escapeHtml(MODE_REASON_TEXT[m.reason] ?? '未知')}</td></tr>`).join('');
+  out += `<table><thead><tr><th>时间</th><th>主机</th><th>模式</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table>`;
+  return `${out}${rulesLine}</section>`;
+}
+
+// 被拦下的写（含未归属的）：主机名、方法、原因、次数，不带路径和请求体。
+function blockedWritesSection(r: RunResult): string {
+  const rows = Array.isArray(r.writes.blockedSummary) ? r.writes.blockedSummary : [];
+  const head = '<section id="blocked-writes"><h2>被拦下的写</h2>';
+  if (rows.length === 0) return `${head}<p>没有</p></section>`;
+  const body = rows.map((e) => `<tr><td>${page(e.host)}</td><td>${page(e.method)}</td><td>${escapeHtml(BLOCK_REASON_TEXT[e.reason] ?? '未知')}</td>`
+    + `<td>${own(e.count)}</td><td>${e.unattributed ? '是' : '否'}</td></tr>`).join('');
+  return `${head}<table><thead><tr><th>主机</th><th>方法</th><th>原因</th><th>次数</th><th>未归属</th></tr></thead><tbody>${body}</tbody></table></section>`;
+}
+
 function verdictSection(r: RunResult): string {
   let out = '<section id="sec-verdict"><h2>结论</h2>';
   if (r.verdict === null) {
@@ -201,6 +232,7 @@ function envSection(r: RunResult): string {
     + `<h3>覆盖说明</h3>${listOrNone(notes)}`
     + `<p>起始地址 ${pageUrl(r.start.url)}，视口 ${vp}，触屏模拟 ${r.start.touch ? '是' : '否'}，profile ${own(r.start.profile)}</p>`
     + `<p>开始 ${own(r.startedAt)}，结束 ${own(r.endedAt)}，结束方式 ${CLOSED_BY_TEXT[r.closedBy] ?? '未知'}，内核版本 ${own(r.kernelVersion)}</p>`
+    + (r.blocked === 'login' ? '<p id="env-blocked">收尾时停在登录页</p>' : '')
     + (r.next === null ? '' : `<p>${own(r.next)}</p>`)
     + '</section>';
 }
@@ -215,6 +247,6 @@ export function renderReport(r: RunResult): string {
     + `<meta http-equiv="Content-Security-Policy" content="${CSP}">`
     + `<title>e2e 报告 ${own(r.name)}</title><style>${STYLE}</style></head><body>`
     + `<h1>e2e 报告：${own(r.name)}（${own(r.session)}）</h1>`
-    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + writesSection(r) + stepsSection(r) + envSection(r)
+    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
     + '</body></html>\n';
 }
