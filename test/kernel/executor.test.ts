@@ -196,6 +196,56 @@ test('fill runs after a describe that says it is not a password field', async ()
   assert.deepEqual(recorder.actions[0].target, { given: '#name', stable: { selector: '#name', via: 'given' } });
 });
 
+test('a fill that was not run never records its value (the password status is unknown)', async () => {
+  const r = await runOps(page, [{ op: 'click', target: '#gone' }, { op: 'fill', target: 'e9', value: 'hunter2-not-real' }], ctx);
+  assert.deepEqual(r.map(x => x.outcome), ['failed', 'not-run']);
+  assert.deepEqual(recorder.actions[1].op, { op: 'fill', target: 'e9', value: REDACTED });
+  assert.ok(!fake.calls.some(c => c.method === 'describe' && c.args[0] === 'e9'));
+  assert.ok(!JSON.stringify([r, recorder.actions]).includes('hunter2-not-real'));
+});
+
+test('a confirmed non-password fill keeps its value in the record', async () => {
+  const [r] = await runOps(page, [{ op: 'fill', target: '#name', value: 'Widget' }], ctx);
+  assert.equal(r.outcome, 'ok');
+  assert.deepEqual(recorder.actions[0].op, { op: 'fill', target: '#name', value: 'Widget' });
+});
+
+test('a fill that fails after a non-password describe does not record its value, nor echo it in the error', async () => {
+  const echoing = withPage(page, { fill: async (_t, v) => { throw new DriverError('other', `cannot type ${v}`); } });
+  const [r] = await runOps(echoing, [{ op: 'fill', target: '#name', value: 'hunter2-not-real' }], ctx);
+  assert.equal(r.outcome, 'failed');
+  assert.deepEqual(recorder.actions[0].op, { op: 'fill', target: '#name', value: REDACTED });
+  assert.ok(!JSON.stringify([r, recorder.actions]).includes('hunter2-not-real'));
+});
+
+test('fill waits for its target before describe, and does not fill when the wait fails', async () => {
+  const order: string[] = [];
+  const waits: unknown[] = [];
+  const late = withPage(page, {
+    waitFor: async (cond, ms) => { order.push('waitFor'); waits.push([cond, ms]); },
+    describe: async (t) => { order.push('describe'); return page.describe(t); },
+    fill: async (t, v) => { order.push('fill'); return page.fill(t, v); },
+  });
+  const [ok] = await runOps(late, [{ op: 'fill', target: '#name', value: 'Widget' }], ctx);
+  assert.equal(ok.outcome, 'ok');
+  assert.deepEqual(order, ['waitFor', 'describe', 'fill']);
+  assert.deepEqual(waits, [[{ target: '#name', state: 'visible' }, 10_000]]);
+
+  order.length = 0;
+  const never = withPage(page, {
+    waitFor: async () => { order.push('waitFor'); throw new DriverError('timeout', 'waiting for #name timed out'); },
+    describe: async (t) => { order.push('describe'); return page.describe(t); },
+    fill: async (t, v) => { order.push('fill'); return page.fill(t, v); },
+  });
+  const r = await runOps(never, [{ op: 'fill', target: '#name', value: 'hunter2-not-real' }, { op: 'click', target: 'e2' }], ctx);
+  assert.deepEqual(r.map(x => x.outcome), ['failed', 'not-run']);
+  assert.match(r[0].error!, /^timeout:/);
+  assert.deepEqual(order, ['waitFor']);
+  assert.deepEqual(recorder.actions[1].op, { op: 'fill', target: '#name', value: REDACTED });
+  assert.deepEqual(recorder.actions[2].op, { op: 'click', target: 'e2' });
+  assert.ok(!JSON.stringify([r, recorder.actions]).includes('hunter2-not-real'));
+});
+
 test('recorded ops are redacted: fill value, goto url and eval js', async () => {
   const ops: Op[] = [
     { op: 'fill', target: '#name', value: `Bearer ${jwt}` },

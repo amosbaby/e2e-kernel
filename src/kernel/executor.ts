@@ -26,7 +26,8 @@ const MAX_NETWORK = 50;
 
 type Output = NonNullable<OpResult['output']>;
 
-// 一条操作跑完的结果。hideValue：记录里 fill 的值整个换成 REDACTED。
+// 一条操作跑完的结果。valueCleared：只有 describe 确认目标不是密码框、且 fill 成功的那条才为真；
+// 其余的 fill（没跑、被拒、describe 或等待失败、超时）记录里的值一律换成 REDACTED。
 interface Done {
   outcome: Outcome;
   stable?: Stable | null;
@@ -35,7 +36,7 @@ interface Done {
   expected?: string | number | boolean;
   error?: string;
   shot?: string;
-  hideValue?: boolean;
+  valueCleared?: boolean;
 }
 
 function truncate(s: string, max: number): string {
@@ -110,25 +111,38 @@ async function tryDescribe(page: Page, target: Target): Promise<{ ok: boolean; s
   }
 }
 
-// fill：先 describe，确定不是密码框才填。describe 失败、说不清是不是密码框、是密码框，都不调 page.fill()。
+// fill 的错误文本里不留下要填的值（驱动的消息里万一带着它）。
+function fillErrorText(e: DriverError, value: string): string {
+  const text = driverErrorText(e);
+  return value === '' ? text : text.split(value).join(REDACTED);
+}
+
+// fill：先等目标出现（describe 不等待），再 describe，确定不是密码框才填。
+// 等不到、describe 失败、说不清是不是密码框、是密码框，都不调 page.fill()。
 async function runFill(page: Page, op: Extract<Op, { op: 'fill' }>): Promise<Done> {
+  try {
+    await page.waitFor({ target: op.target, state: 'visible' }, ACTION_TIMEOUT_MS);
+  } catch (e) {
+    rethrowUnlessDriverError(e);
+    return { outcome: 'failed', stable: null, error: fillErrorText(e, op.value) };
+  }
   let described: { stable: Stable | null; isPassword: boolean };
   try {
     described = await page.describe(op.target);
   } catch (e) {
     rethrowUnlessDriverError(e);
-    return { outcome: 'failed', stable: null, error: `${FILL_UNCHECKED}（${driverErrorText(e)}）`, hideValue: true };
+    return { outcome: 'failed', stable: null, error: `${FILL_UNCHECKED}（${fillErrorText(e, op.value)}）` };
   }
   const { stable, isPassword } = described;
-  if (isPassword === true) return { outcome: 'failed', stable, error: PASSWORD_REFUSAL, hideValue: true };
-  if (isPassword !== false) return { outcome: 'failed', stable, error: FILL_UNCHECKED, hideValue: true };
+  if (isPassword === true) return { outcome: 'failed', stable, error: PASSWORD_REFUSAL };
+  if (isPassword !== false) return { outcome: 'failed', stable, error: FILL_UNCHECKED };
   try {
     await page.fill(op.target, op.value);
   } catch (e) {
     rethrowUnlessDriverError(e);
-    return { outcome: 'failed', stable, error: driverErrorText(e) };
+    return { outcome: 'failed', stable, error: fillErrorText(e, op.value) };
   }
-  return { outcome: 'ok', stable };
+  return { outcome: 'ok', stable, valueCleared: true };
 }
 
 // assert：读不到元素（not-found）算不符、actual 为 null；别的 DriverError 往外抛，由调用方记成 failed。
@@ -209,10 +223,10 @@ function redactWait(c: WaitCond): WaitCond {
 }
 
 // 进记录的操作：调用方给的自由文本先脱敏；target 原样留着（重放要用）。
-function recordedOp(op: Op, hideValue: boolean): Op {
+function recordedOp(op: Op, valueCleared: boolean): Op {
   switch (op.op) {
     case 'fill':
-      return { ...op, value: hideValue ? REDACTED : safely(() => redactText(op.value)) };
+      return { ...op, value: valueCleared ? safely(() => redactText(op.value)) : REDACTED };
     case 'goto':
       return { ...op, url: safely(() => redactUrl(op.url)) };
     case 'eval':
@@ -244,7 +258,7 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpRes
     }
     const ms = done.outcome === 'not-run' ? 0 : Math.max(0, ctx.now().getTime() - started.getTime());
 
-    const record: ActionRecord = { seq, at: started.toISOString(), ms, op: recordedOp(op, done.hideValue === true), outcome: done.outcome };
+    const record: ActionRecord = { seq, at: started.toISOString(), ms, op: recordedOp(op, done.valueCleared === true), outcome: done.outcome };
     const target = targetOf(op);
     if (target !== undefined) record.target = { given: target, stable: done.stable ?? null };
     const result: OpResult = { index, op: op.op, outcome: done.outcome };
