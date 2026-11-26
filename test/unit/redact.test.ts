@@ -138,6 +138,31 @@ test('nested sensitive params inside another param value are replaced', () => {
   assert.equal(redactText(`/x?auth={${v}}`), '/x?auth=[REDACTED]');
 });
 
+// 敏感参数的值里有 `?` 时，`?` 不结束值：值一直到 `&`、`#`、空白、`"`、`<`、`>` 或结尾。
+test('a sensitive value runs past `?` to the next delimiter', () => {
+  const v = 'V' + 'q7'.repeat(3);
+  assert.equal(redactText(`/x?password=p?ss${v}`), '/x?password=[REDACTED]');
+  assert.equal(redactText(`?token=?${v}`), '?token=[REDACTED]');
+  assert.equal(redactText(`?token=a?pw=${v}&x=1`), '?token=[REDACTED]&x=1');
+  // 嵌套：不敏感的值里再出现的 `?名字=` 仍单独判断
+  assert.equal(redactText(`?next=/cb?token=${v}`), '?next=/cb?token=[REDACTED]');
+  assert.equal(redactText(`?q=a?b&token=${v}`), '?q=a?b&token=[REDACTED]');
+  assert.equal(redactText(`/x#id_token=a?${v}&state=1`), '/x#id_token=[REDACTED]&state=1');
+  // 空值也换掉（失败关闭）
+  assert.equal(redactText('?token='), '?token=[REDACTED]');
+  assert.equal(redactText('?token=&a=1'), '?token=[REDACTED]&a=1');
+  assert.equal(redactText('?token=?'), '?token=[REDACTED]');
+  // 相邻的标记和标点：结束符之外的字符都算进值里，宁可多换
+  assert.equal(redactText(`<a href="/x?token=${v}?y">go</a>`), '<a href="/x?token=[REDACTED]">go</a>');
+  assert.equal(redactText(`see /x?token=${v}?**!… next`), 'see /x?token=[REDACTED] next');
+  assert.equal(redactText(`(/x?token=${v}?) and '/y?pw=?${v}'`), "(/x?token=[REDACTED] and '/y?pw=[REDACTED]");
+  assert.equal(redactText(`<p>/x?pw=${v}?</p>`), '<p>/x?pw=[REDACTED]</p>');
+  assert.equal(redactText(`/x?token=a?b\t${v}`), `/x?token=[REDACTED]\t${v}`);
+  // 很长的值和很多 `?`：结果对（扫描是线性的）
+  assert.equal(redactText('?token=' + '?'.repeat(100_000)), '?token=[REDACTED]');
+  assert.equal(redactText('?a=?'.repeat(20_000) + 'token=' + v), '?a=?'.repeat(20_000) + 'token=[REDACTED]');
+});
+
 test('deeply nested json never throws and never leaks', () => {
   for (const depth of [2000, 5000]) {
     const body = '['.repeat(depth) + '{"password":"p9"}' + ']'.repeat(depth);

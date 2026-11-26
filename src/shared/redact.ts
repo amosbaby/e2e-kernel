@@ -28,8 +28,9 @@ const JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+
 const AUTH_SCHEME = /\b([Bb][Ee][Aa][Rr][Ee][Rr]|Basic)([ \t]+)[A-Za-z0-9._~+/-]+=*/g;
 const HEX = /(?<![A-Za-z0-9])[0-9A-Fa-f]{32,}(?![A-Za-z0-9])/g;
 const B64URL = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])/g;
-// 值里不收 `?`：`?next=/cb?token=…` 这种嵌套的回跳地址里，后面的 `?token=` 要单独匹配。
-const URL_PARAM = /([?&#])([^=&#?\s"'<>]+)=([^?&#\s"<>]+)/g;
+// URL 参数的 `名字=`。值在哪结束由 redactParamsInText 逐字符定，不交给正则。
+const URL_PARAM_NAME = /([?&#])([^=&#?\s"'<>]+)=/g;
+const PARAM_VALUE_END = /[&#\s"<>]/;
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 const COOKIE_LINE = /^([ \t]*(?:set-)?cookie:)[^\r\n]*/gim;
 const COOKIE_PAIR = /^[^\s=;]+=[^;]*$/;
@@ -55,12 +56,31 @@ function redactCookieLine(line: string): string {
   return `${lead}${quote}${redacted}${quote}${trail}`;
 }
 
+// 自由文本里的 URL 参数，线性扫描：名字敏感时，值从 `=` 后一直到第一个 `&`、`#`、空白、`"`、`<`、`>` 或结尾
+// （`?` 不结束值，空值也换掉），换成 [REDACTED] 后从值的结尾接着找；名字不敏感时从 `=` 后接着找，
+// 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
+function redactParamsInText(s: string): string {
+  const re = new RegExp(URL_PARAM_NAME.source, 'g');
+  let out = '';
+  let copied = 0;
+  for (let m = re.exec(s); m !== null; m = re.exec(s)) {
+    if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后
+    const start = m.index + m[0].length;
+    let end = start;
+    while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) end++;
+    out += s.slice(copied, start) + REDACTED;
+    copied = end;
+    re.lastIndex = end;
+  }
+  return out + s.slice(copied);
+}
+
 export function redactText(s: string): string {
   let out = s.replace(JWT, REDACTED);
   out = out.replace(AUTH_SCHEME, (_m, scheme: string, gap: string) => `${scheme}${gap}${REDACTED}`);
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
-  out = out.replace(URL_PARAM, (m, sep: string, name: string) => (isSensitiveKey(safeDecode(name)) ? `${sep}${name}=${REDACTED}` : m));
+  out = redactParamsInText(out);
   out = out.replace(USERINFO, `://${REDACTED}@`);
   out = out.replace(COOKIE_LINE, `$1 ${REDACTED}`);
   return out.split('\n').map(redactCookieLine).join('\n');
