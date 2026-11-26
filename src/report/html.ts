@@ -8,7 +8,7 @@ import type { ClosedBy, RunResult, SupersededEntry } from './result.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。
 // 页面内容的处理顺序固定：先脱敏、再截断、最后 escapeHtml。脱敏出错时给固定标记，绝不输出原值。
-// 内核自己的值（会话名、选择器、路径、操作名）不脱敏，只 escapeHtml。
+// 内核自己的值（会话名、路径、操作名）不脱敏，只 escapeHtml。选择器在 store.ts 的 sanitize 里已经脱敏过，这里只转义。
 
 const CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'";
 const SHOT_PATH = /^shots\/\d{2,}(-[a-z0-9][a-z0-9-]{0,39})?\.(jpg|png)$/;

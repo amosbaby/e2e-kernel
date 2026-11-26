@@ -23,12 +23,17 @@ const FALLBACK_REPORT = '<!doctype html>\n<html lang="zh-CN"><head><meta charset
   + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'"><title>e2e 报告</title></head>'
   + '<body><p>报告页无法生成：部分内容脱敏失败，已整体隐去。完整的结构化结果见 result.json。</p></body></html>\n';
 
+// 落盘比回应多脱敏一层：选择器（target、given、selector）也过脱敏规则。agent 可能把 token、邮箱写进选择器，
+// 内核生成的稳定选择器也带页面文字。重放要的原样选择器只在给 agent 的回应里有。
+const SELECTOR_KEYS: ReadonlySet<string> = new Set(['target', 'given', 'selector']);
+const DISK_SKIP_KEYS: readonly string[] = KERNEL_SKIP_KEYS.filter((k) => !SELECTOR_KEYS.has(k));
+
 // 失败关闭：任何一个顶层字段脱敏出错，这个字段整个换成固定标记，绝不退回去写原值。
 function sanitize(r: RunResult): RunResult {
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(r)) {
     try {
-      out[key] = (redactDeep({ [key]: (r as unknown as Record<string, unknown>)[key] }, { skipKeys: KERNEL_SKIP_KEYS }) as Record<string, unknown>)[key];
+      out[key] = (redactDeep({ [key]: (r as unknown as Record<string, unknown>)[key] }, { skipKeys: DISK_SKIP_KEYS }) as Record<string, unknown>)[key];
     } catch {
       out[key] = REDACTED;
     }

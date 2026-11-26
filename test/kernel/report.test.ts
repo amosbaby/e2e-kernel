@@ -465,6 +465,26 @@ test('superseded entries are sanitized in result.json and in the failures sectio
   assert.equal(j.superseded[0].failed, 1); assert.equal(j.superseded[0].by, 2); assert.deepEqual(j.conflicts, []);
 });
 
+test('selectors are redacted on disk (op target, given, stable selector, wait target), plain selectors stay as given', () => {
+  const email = 'someone' + '@' + 'example.com';
+  const plain = '[data-testid="submit"] >> nth=1';
+  const out = writeRun(join(tmp, 'r-sel'), buildResult(input({ actions: [
+    act('click', 'ok', { op: { op: 'click', target: `text=${jwt}` }, target: { given: `text=${jwt}`, stable: { selector: `[data-testid="${email}"]`, via: 'testid' } } }),
+    act('wait', 'ok', { op: { op: 'wait', for: { target: `#${email}`, state: 'visible' } } }),
+    act('click', 'failed', { op: { op: 'click', target: plain }, target: { given: plain, stable: { selector: plain, via: 'given' } } }),
+  ] })));
+  for (const f of [out.reportPath, out.resultPath]) {
+    const t = readFileSync(f, 'utf8');
+    assert.ok(!t.includes(jwt), f); assert.ok(!t.includes(email), f);
+  }
+  const j = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.equal(j.actions[0].target.given, `text=${REDACTED}`);
+  assert.equal(j.actions[0].op.target, `text=${REDACTED}`);
+  assert.equal(j.actions[2].op.target, plain);
+  assert.equal(j.actions[2].target.given, plain);
+  assert.equal(j.actions[2].target.stable.selector, plain);
+});
+
 test('runDirName is UTC and matches RUN_DIR_RE', () => {
   const name = runDirName(new Date('2026-11-26T15:30:05Z'), 's-a41f00');
   assert.equal(name, '20261126-153005-s-a41f00'); assert.match(name, RUN_DIR_RE);
@@ -479,7 +499,7 @@ test('writeRun redacts page content, keeps kernel identifiers, writes 0600 files
     start: { url: 'http://localhost/?token=abc123', viewport: null, touch: false, profile: 'default' },
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: longSelector, via: 'testid' } } })] })));
   const saved = JSON.parse(readFileSync(out.resultPath, 'utf8'));
-  assert.equal(saved.name, longName); assert.equal(saved.actions[0].target.stable.selector, longSelector);
+  assert.equal(saved.name, longName); assert.equal(saved.actions[0].target.stable.selector, `[data-testid="${REDACTED}"]`);
   assert.equal(saved.session, 's-a41f00');
   for (const f of [out.reportPath, out.resultPath]) {
     const text = readFileSync(f, 'utf8');
