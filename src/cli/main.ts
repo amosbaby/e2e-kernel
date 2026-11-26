@@ -49,8 +49,8 @@ function helpText(selfCmd: string): string {
     '  status [--json]                        版本、驱动、浏览器、会话和 profile（含最近一次 login）',
     '  doctor [--json]                        自检（含 profile 状态；只读）',
     '  open <url> [--viewport <宽>x<高>] [--name <名字>] [--json]',
-    '  step <会话> <JSON 数组> [--json]',
-    '  step <会话> --stdin [--json]           从标准输入读 JSON 数组',
+    '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
+    '  step <会话> --stdin [--keep-going] [--json]        从标准输入读 JSON 数组',
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
     '               [--findings <JSON>] [--not-done <JSON>] [--json]',
     '  login <url>                            在专用 profile 里登录（要在终端里由人按回车确认）',
@@ -175,14 +175,16 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function step(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { ...JSON_OPTION, stdin: { type: 'boolean' } });
+  const p = parse(ctx, args, { ...JSON_OPTION, stdin: { type: 'boolean' }, 'keep-going': { type: 'boolean' } });
   const fromStdin = p.values.stdin === true;
   const [session, inlineOps] = positionals(ctx, p, fromStdin ? 1 : 2, fromStdin ? '<会话>' : '<会话> <JSON 数组>');
   // 先查长度、不解析：超长的一律当用法错误，什么都不发。
   const text = inlineOps ?? await ctx.io.stdin.readAll(MAX_OPS_BYTES);
   if (Buffer.byteLength(text, 'utf8') > MAX_OPS_BYTES) throw usage(`操作的 JSON 最多 ${MAX_OPS_BYTES} 字节`);
   const ops = parseJson(text, '操作必须是一个 JSON 数组');
-  const params = validateParams('step', { session, ops });
+  const raw: Record<string, unknown> = { session, ops };
+  if (p.values['keep-going'] === true) raw.keepGoing = true;
+  const params = validateParams('step', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'step', params) as StepResult;
   if (result.exit !== 0 && result.exit !== 10 && result.exit !== 11 && result.exit !== 20) throw malformed();
   print(ctx, result, formatStep);

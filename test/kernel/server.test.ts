@@ -233,7 +233,20 @@ test('a failed action comes back with redacted hints, and the key is not sensiti
   assert.equal(r.outcome, 'failed'); assert.equal(r.hints?.length, 2); assert.equal(r.hints?.[0], '2 matches');
   assert.ok(r.hints?.[1]?.includes('>> nth=0')); assert.ok(!JSON.stringify(step).includes(jwt));
   const keys = keysOf(step);
-  assert.ok(keys.includes('hints')); for (const key of keys) assert.ok(!isSensitiveKey(key), key);
+  assert.ok(keys.includes('hints') && keys.includes('seq')); for (const key of keys) assert.ok(!isSensitiveKey(key), key);
+});
+
+test('step keepGoing travels over the socket: the batch goes on after a failure, and seq/keepGoing are not sensitive keys', async () => {
+  const open = await call(home, 'open', { url: 'http://localhost:5173/' });
+  assert.ok(open.ok); const session = (open.result as OpenResult).session;
+  const params = { session, ops: [{ op: 'click', target: '#gone' }, { op: 'snapshot' }], keepGoing: true };
+  const step = await call(home, 'step', params);
+  assert.ok(step.ok); const r = step.result as StepResult;
+  assert.deepEqual(r.results.map((x) => x.outcome), ['failed', 'ok']); assert.equal(r.exit, 11);
+  assert.equal(r.results[1]!.seq, r.results[0]!.seq + 1);
+  for (const key of [...keysOf(step), ...Object.keys(params)]) assert.ok(!isSensitiveKey(key), key);
+  const bad = await call(home, 'step', { ...params, keepGoing: 'yes' });
+  assert.equal(bad.ok, false);
 });
 
 test('responses are redacted but kernel identifiers survive', async () => {

@@ -29,7 +29,7 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
     'results', 'tallies', 'exit', 'index', 'op', 'outcome', 'output', 'actual', 'expected', 'consistency', 'sessions', 'idleSec', 'version', 'pid',
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
     'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm',
-    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints'];
+    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
 
@@ -87,6 +87,14 @@ test('validateParams for the remaining methods', () => {
   assert.deepEqual(validateParams('login.end', { loginId: 'l-a41f00' }), { loginId: 'l-a41f00' });
 });
 
+test('step takes an optional boolean keepGoing and nothing else new', () => {
+  assert.deepEqual(validateParams('step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], keepGoing: true }),
+    { session: 's-a41f00', ops: [{ op: 'snapshot' }], keepGoing: true });
+  assert.deepEqual(validateParams('step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], keepGoing: false }), { session: 's-a41f00', ops: [{ op: 'snapshot' }], keepGoing: false });
+  for (const bad of [{ keepGoing: 'yes' }, { keepGoing: 1 }, { keepGoing: null }, { keepGoing_: true }, { keep_going: true }])
+    assert.throws(() => validateParams('step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], ...bad }), isUsage, JSON.stringify(bad));
+});
+
 test('validateParams rejects bad parameters with usage', () => {
   const cases: [Method, unknown][] = [
     ['status', { x: 1 }], ['status', null], ['status', undefined],
@@ -94,7 +102,7 @@ test('validateParams rejects bad parameters with usage', () => {
     ['open', { url: 'http://localhost/', viewport: { width: 319, height: 800 } }],
     ['open', { url: 'http://localhost/', viewport: { width: 1280, height: 2161 } }],
     ['step', { session: 's-a41f00' }], ['step', { session: 's-A41F00', ops: [{ op: 'snapshot' }] }],
-    ['step', { session: 's-a41f00', ops: [{ op: 'approve' }] }], ['step', { session: 's-a41f00', ops: [], x: 1 }],
+    ['step', { session: 's-a41f00', ops: [{ op: 'approve' }] }], ['step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], x: 1 }],
     ['close', { session: 's-a41f00', verdict: { value: 'ok' } }],
     ['close', { session: 's-a41f00', verdict: { value: 'pass', because: 'x'.repeat(1001) } }],
     ['close', { session: 's-a41f00', verdict: { value: 'undetermined', because: '' } }],

@@ -15,6 +15,7 @@ import type { WritePolicy } from '../../src/kernel/write-policy.ts';
 import { RUN_DIR_RE, runDirName } from '../../src/report/store.ts';
 import type { RunResult } from '../../src/report/result.ts';
 import { E2kError } from '../../src/shared/errors.ts';
+import type { Op } from '../../src/shared/ops.ts';
 import type { Mode } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
@@ -291,6 +292,27 @@ test('page closed by the human: the session ends as page-gone and close-time err
   assert.equal(readResult(runDir).coverage.webSockets, 0);                               // 页面已经没了，location() 抛错被接住，按 0 记
   assert.ok(logs.length > 0);                                                            // 接住的异常进了日志
   await sm.open({ url: 'http://localhost:5173/' }); assert.equal(fake.launches, 1);      // 实例还在，直接复用
+});
+
+test('keepGoing: a page that closes in the middle of a step turns the rest into not-run, not a pile of failures', async () => {
+  const { sm, fake } = setup(); const { session, pageId } = await opened(sm, fake);
+  const ops: Op[] = [{ op: 'wait', for: { ms: 100 } }, { op: 'click', target: 'e2' }, { op: 'snapshot' }];
+  const step = sm.step({ session, ops, keepGoing: true });
+  await sleep(30);
+  fake.closePage(pageId);
+  const r = await step;
+  assert.deepEqual(r.results.map((x) => x.outcome), ['ok', 'not-run', 'not-run']);
+  assert.equal(r.tallies.failed, 0); assert.equal(r.tallies.notRun, 2);
+});
+
+test('keepGoing: the browser going away in the middle of a step also turns the rest into not-run', async () => {
+  const { sm, fake } = setup(); const { session } = await opened(sm, fake);
+  const ops: Op[] = [{ op: 'wait', for: { ms: 100 } }, { op: 'click', target: 'e2' }, { op: 'snapshot' }];
+  const step = sm.step({ session, ops, keepGoing: true });
+  await sleep(30);
+  fake.closeBrowser();
+  const r = await step;
+  assert.deepEqual(r.results.map((x) => x.outcome), ['ok', 'not-run', 'not-run']);
 });
 
 test('browser gone: every session ends as browser-gone exactly once and the next open relaunches', async () => {

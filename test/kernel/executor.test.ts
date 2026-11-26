@@ -123,6 +123,29 @@ test('runs ops in order and stops at the first execution failure', async () => {
   assert.deepEqual(recorder.actions.map(a => a.outcome), ['ok', 'failed', 'not-run']);
 });
 
+test('with keepGoing a failure does not stop the batch: later ops run and nothing is not-run', async () => {
+  const r = await runOps(page, [{ op: 'click', target: '#gone' }, { op: 'snapshot' }, { op: 'click', target: 'e2' }], ctx, { keepGoing: true });
+  assert.deepEqual(r.map(x => x.outcome), ['failed', 'ok', 'ok']);
+  assert.equal(tally(r).notRun, 0); assert.equal(exitFor(tally(r)), 11);
+  assert.equal(r[0].shot, 'shots/01.jpg'); assert.ok(existsSync(join(ctx.runDir, r[0].shot!)));   // 失败截图照留
+  assert.ok(fake.calls.some(c => c.method === 'click' && c.args[0] === 'e2'));
+  assert.deepEqual(recorder.actions.map(a => a.outcome), ['failed', 'ok', 'ok']);
+});
+
+test('keepGoing false or absent keeps the default: stop at the first failure, the rest not-run', async () => {
+  const ops: Op[] = [{ op: 'click', target: '#gone' }, { op: 'click', target: 'e2' }];
+  assert.deepEqual((await runOps(page, ops, ctx, { keepGoing: false })).map(x => x.outcome), ['failed', 'not-run']);
+  assert.deepEqual((await runOps(page, ops, ctx, {})).map(x => x.outcome), ['failed', 'not-run']);
+});
+
+test('results carry the session-wide seq, the same as the record, across batches; not-run ops take a number too', async () => {
+  const a = await runOps(page, [{ op: 'click', target: '#gone' }, { op: 'click', target: 'e2' }], ctx);
+  assert.deepEqual(a.map(x => x.seq), [1, 2]); assert.equal(a[1].outcome, 'not-run');
+  const b = await runOps(page, [{ op: 'snapshot' }, { op: 'click', target: 'e3' }], ctx);
+  assert.deepEqual(b.map(x => x.seq), [3, 4]);
+  assert.deepEqual(recorder.actions.map(x => x.seq), [...a, ...b].map(x => x.seq));
+});
+
 test('assert mismatch does not stop the batch', async () => {
   const r = await runOps(page, [{ op: 'assert', kind: 'text', target: '#status', cmp: 'eq', expected: 'Nope' }, { op: 'click', target: 'e2' }], ctx);
   assert.deepEqual(r.map(x => x.outcome), ['mismatch', 'ok']);

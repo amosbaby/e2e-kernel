@@ -49,6 +49,7 @@ interface Session {
   readonly recorder: Recorder;
   url: string;                               // 首屏读数里的地址（已脱敏），给 list()
   state: State;
+  gone: boolean;                             // 主页面已关或会话已在收尾：同步置位，step 的后续操作据此不再执行
   lastActive: number;
   timer: NodeJS.Timeout | undefined;
   finished: Promise<CloseResult> | undefined;
@@ -183,7 +184,8 @@ export class SessionManager {
     s.state = 'stepping';
     this.pauseIdle(s);
     try {
-      const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() });
+      const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
+        { keepGoing: p.keepGoing === true, aborted: () => s.gone });
       const tallies = tally(results);
       const wall = await loginWall(s.page, s.start.url);
       // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。
@@ -374,12 +376,12 @@ export class SessionManager {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, profile: DEFAULT_PROFILE },
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(),
-        url: '', state: 'opening', lastActive: 0, timer: undefined, finished: undefined,
+        url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
       // 先登记再导航：首屏的请求才归得到这个会话。
       this.sessions.set(s.id, s);
       registered = true;
-      page.onClosed(() => { void this.mainPageClosed(s); });
+      page.onClosed(() => { s.gone = true; void this.mainPageClosed(s); });
       s.recorder.addHost(o.host, o.mode);
       await page.goto(p.url);
       if (this.stopping) throw stopping();
@@ -421,6 +423,7 @@ export class SessionManager {
 
   private finish(s: Session, closedBy: ClosedBy, p?: CloseParams): Promise<CloseResult> {
     s.state = 'closing';
+    s.gone = true;
     this.pauseIdle(s);
     s.finished = this.wrapUp(s, closedBy, p);
     return s.finished;

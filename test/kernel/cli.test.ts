@@ -116,7 +116,7 @@ test('kernel not running: exit 22 and the command that starts the kernel', async
 
 test('--version and help', async () => {
   const v = io(); assert.equal(await main(['--version'], v), 0); assert.equal(v.outText(), '0.1.0');
-  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url>/);
+  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url>/); assert.match(h.outText(), /step .*--keep-going/);
   assert.ok(!/approve|save-case/.test(h.outText()));
   assert.equal(await main([], io()), 2);
 });
@@ -180,19 +180,34 @@ describe('with a session', () => {
     assert.equal(await main(['step', sid, '[{"op":"snapshot"},{"op":"click","target":"#gone"},{"op":"click","target":"e2"}]'], t), 11);
     const lines = t.outText().split('\n');
     assert.equal(lines[0], `${sid} 相符 0 / 不符 0 / 执行失败 1 / 未执行 1`);
-    assert.equal(lines[1], '#1 snapshot 完成');
+    assert.match(lines[1] as string, /^#1 序号\d+ snapshot 完成$/);
     assert.equal(lines[2], '  - button "Add" [ref=e2]');
-    assert.match(lines[3] as string, /^#2 click 执行失败 \S.* shots\/\d\d\.jpg$/);
-    assert.equal(lines[4], '#3 click 未执行');
+    assert.match(lines[3] as string, /^#2 序号\d+ click 执行失败 \S.* shots\/\d\d\.jpg$/);
+    assert.match(lines[4] as string, /^#3 序号\d+ click 未执行$/);
+    const seqs = lines.map((l) => /^#\d 序号(\d+) /.exec(l)?.[1]).filter((x) => x !== undefined).map(Number);
+    assert.deepEqual(seqs, [seqs[0], seqs[0]! + 1, seqs[0]! + 2]);
+  });
+
+  test('step --keep-going is passed to the kernel: later ops still run after a failure; without it they do not', async () => {
+    const ops = '[{"op":"click","target":"#gone"},{"op":"snapshot"},{"op":"click","target":"e2"}]';
+    const t = io(); assert.equal(await main(['step', sid, ops, '--keep-going'], t), 11);
+    assert.match(t.outText().split('\n')[0] as string, /执行失败 1 \/ 未执行 0$/);
+    assert.ok(!t.outText().includes('未执行 click'));
+    const j = io(); assert.equal(await main(['step', sid, ops, '--keep-going', '--json'], j), 11);
+    assert.deepEqual((JSON.parse(j.outText()).results as { outcome: string }[]).map((r) => r.outcome), ['failed', 'ok', 'ok']);
+    const d = io(); assert.equal(await main(['step', sid, ops, '--json'], d), 11);
+    assert.deepEqual((JSON.parse(d.outText()).results as { outcome: string }[]).map((r) => r.outcome), ['failed', 'not-run', 'not-run']);
+    assert.equal(await main(['step', sid, '--stdin', '--keep-going'], io({ stdinText: ops })), 11);
+    assert.equal(await main(['step', sid, ops, '--keep-going=1'], io()), 2);
   });
 
   test('step text output: hints of a failed op follow it, indented, one per line', async () => {
     const t = io();
     assert.equal(await main(['step', sid, '[{"op":"click","target":"#amb"},{"op":"click","target":"e2"}]'], t), 11);
     const lines = t.outText().split('\n');
-    assert.match(lines[1] as string, /^#1 click 执行失败 /);
+    assert.match(lines[1] as string, /^#1 序号\d+ click 执行失败 /);
     assert.equal(lines[2], '  2 matches'); assert.equal(lines[3], '  1) 可写 #amb >> nth=0 · button @(1,2 3x4) "Save\\x1b[2K"');
-    assert.equal(lines[4], '#2 click 未执行');
+    assert.match(lines[4] as string, /^#2 序号\d+ click 未执行$/);
     assert.ok(!t.outText().includes(ESC), 'a control character in a hint is shown, not sent to the terminal');
   });
 

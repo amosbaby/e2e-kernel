@@ -120,6 +120,17 @@ test('page tokens never reach the output; a failed action stops the batch', { ti
   assert.match(r.out, /shots\/\d+\.jpg/);
 });
 
+test('step --keep-going runs the rest after a failure, keeps the failure shot, and shows session-wide sequence numbers', { timeout: 180_000 }, async () => {
+  const s0 = (JSON.parse((await e2k('step', sid, JSON.stringify([{ op: 'snapshot' }]), '--json')).out) as { results: { seq: number }[] }).results[0]!.seq;
+  const r = await e2k('step', sid, JSON.stringify([{ op: 'click', target: '#nope' }, { op: 'snapshot' }]), '--keep-going', '--json');
+  assert.equal(r.code, 11);
+  const out = JSON.parse(r.out) as { tallies: { notRun: number }; results: { outcome: string; seq: number; shot?: string }[] };
+  assert.deepEqual(out.results.map((x) => x.outcome), ['failed', 'ok']); assert.equal(out.tallies.notRun, 0);
+  assert.match(out.results[0]!.shot ?? '', /shots\/\d+\.jpg/); assert.deepEqual(out.results.map((x) => x.seq), [s0 + 1, s0 + 2]);   // 序号跨批次连续
+  const text = await e2k('step', sid, JSON.stringify([{ op: 'snapshot' }]));
+  assert.match(text.out, new RegExp(`^#1 序号${s0 + 3} snapshot 完成$`, 'm'));
+});
+
 test('the kernel refuses to type into a password field', { timeout: 180_000 }, async () => {
   const runs = [await e2k('step', sid, JSON.stringify([{ op: 'goto', url: origin + '/login.html' }, { op: 'fill', target: '#pw', value: 'not-a-real-password' }]))];
   // 目标是 label、label 里的文字或文字选择器时，Playwright 会改填 label 的 control，也就是同一个密码框

@@ -57,7 +57,7 @@ function outputText(output: NonNullable<OpResult['output']>): string {
 }
 
 function opLine(r: OpResult): string {
-  let line = `#${r.index + 1} ${inline(r.op)} ${OUTCOME_TEXT[r.outcome]}`;
+  let line = `#${r.index + 1} 序号${r.seq} ${inline(r.op)} ${OUTCOME_TEXT[r.outcome]}`;
   if (r.outcome === 'mismatch') line += ` 实测=${inline(r.actual ?? null)} 期望=${inline(r.expected ?? '')}`;
   if (r.outcome === 'failed' && r.error !== undefined) line += ` ${firstLine(r.error)}`;
   if (r.shot !== undefined) line += ` ${inline(r.shot)}`;

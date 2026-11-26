@@ -2,7 +2,7 @@ import { E2kError } from './errors.ts';
 import type { ErrorCode } from './errors.ts';
 import { validateOps } from './ops.ts';
 import type { Op, Viewport } from './ops.ts';
-import { httpUrl, int, oneOf, plainObject, str } from './validate.ts';
+import { bool, httpUrl, int, oneOf, plainObject, str } from './validate.ts';
 
 // 内核和 CLI 之间的 socket 协议：一条连接一问一答，各一行 JSON，以 \n 结束。
 
@@ -46,12 +46,13 @@ export type VerdictValue = 'pass' | 'fail' | 'exists' | 'absent' | 'undetermined
 export interface Verdict { value: VerdictValue; because?: string }
 export interface Finding { claim: string; basis: string }
 export interface OpenParams { url: string; viewport?: Viewport; name?: string }
-export interface StepParams { session: string; ops: Op[] }
+export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean }
 export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[] }
 export type Outcome = 'ok' | 'match' | 'mismatch' | 'failed' | 'not-run';
 export interface RequestSummary { id: string; method: string; url: string; status: number | null; resourceType: string }
 export interface OpResult {
   index: number; op: Op['op']; outcome: Outcome;
+  seq: number;   // 整个会话从 1 起的序号，和记录、报告里的序号一致（未执行的也占号）
   output?: string | { level: string; text: string }[] | RequestSummary[];
   actual?: string | number | boolean | null; expected?: string | number | boolean; error?: string; shot?: string;
   hints?: string[];   // 失败时的诊断（匹配了哪几个、谁挡住了点击），已脱敏，每条不超过 300 字符，最多 6 条
@@ -150,8 +151,10 @@ export function validateParams(method: Method, p: unknown): unknown {
       return out;
     }
     case 'step': {
-      const o = plainObject(p, 'params', ['session', 'ops']);
-      return { session: session(o.session), ops: validateOps(o.ops) };
+      const o = plainObject(p, 'params', ['session', 'ops', 'keepGoing']);
+      const out: StepParams = { session: session(o.session), ops: validateOps(o.ops) };
+      if (o.keepGoing !== undefined) out.keepGoing = bool(o.keepGoing, 'params.keepGoing');
+      return out;
     }
     case 'close': {
       const o = plainObject(p, 'params', ['session', 'verdict', 'findings', 'notDone']);

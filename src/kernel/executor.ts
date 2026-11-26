@@ -308,10 +308,14 @@ async function recordHints(page: Page, hints: string[]): Promise<string[]> {
   return (await passwordLike(page)).found === false ? hints : [HINTS_NOT_RECORDED];
 }
 
-export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpResult[]> {
+// keepGoing：失败不拦住后面的操作（默认失败后停，其余记未执行）。
+// aborted：每个操作开始前问一次，页面或浏览器已经没了就停下，其余记未执行（不然 keepGoing 下会对着关掉的页面逐个记成执行失败）。
+export async function runOps(page: Page, ops: Op[], ctx: ExecCtx, opts?: { keepGoing?: boolean; aborted?: () => boolean }): Promise<OpResult[]> {
+  const keepGoing = opts?.keepGoing === true;
   const results: OpResult[] = [];
   let stopped = false;
   for (const [index, op] of ops.entries()) {
+    if (!stopped && opts?.aborted?.() === true) stopped = true;
     const seq = ctx.recorder.nextSeq();
     const started = ctx.now();
     let done: Done;
@@ -320,7 +324,7 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpRes
     } else {
       done = await runOne(page, op, seq, ctx);
       if (done.outcome === 'failed') {
-        stopped = true;
+        if (!keepGoing) stopped = true;
         done.shot ??= await failureShot(page, seq, ctx);
       }
     }
@@ -329,7 +333,7 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpRes
     const record: ActionRecord = { seq, at: started.toISOString(), ms, op: recordedOp(op, done.valueCleared === true), outcome: done.outcome };
     const target = targetOf(op);
     if (target !== undefined) record.target = { given: target, stable: done.stable ?? null };
-    const result: OpResult = { index, op: op.op, outcome: done.outcome };
+    const result: OpResult = { index, op: op.op, outcome: done.outcome, seq };
     if (done.output !== undefined) result.output = done.output;
     if (done.hints !== undefined) result.hints = done.hints;
     if (done.hints !== undefined) record.hints = await recordHints(page, done.hints);
