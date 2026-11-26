@@ -318,3 +318,16 @@ test('isMutationLikeUrl: a mutation, or an unreadable query parameter that menti
   assert.equal(isMutationLikeUrl(u('')), false);
   assert.equal(isMutationLikeUrl(u('?query=%0Bmutational%7Ba%7D')), false, 'a longer word is not the keyword');
 });
+
+test('url query parameters are found by decoded key in every separator style', () => {
+  const q = j({ query: 'query{a}' });
+  for (const tail of ['x=1;%71uery=query%7Ba%7D', 'x=1;%51uery=query%7Ba%7D', 'x=1;que%72y=query%7Ba%7D', 'x=1&%71uery=1', '%71uery', 'x=1;%zzuery=1', 'x=1;+query=1']) {
+    assert.equal(isStrictQuery('POST', q, JSON_CT, `http://localhost/graphql?${tail}`), tail === 'x=1;+query=1', tail);
+  }
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?x=1#;query=1'), true, 'a fragment is not a query');
+  for (const tail of ['x=1;%71uery=mutation%7Ba%7D', 'x=1;%51uery=mutation%7Ba%7D', 'x=1;que%72y=%0Bmutation%7Ba%7D', 'x=1;%zzuery=mutation%7Ba%7D']) {
+    assert.equal(isMutationLikeUrl(`http://localhost/graphql?${tail}`), true, tail);
+  }
+  assert.equal(isMutationLikeUrl('http://localhost/graphql?x=1;%71uery=query%7Ba%7D'), false);
+  assert.equal(isMutationLikeUrl('http://localhost/graphql?x=mutation#query=mutation'), false);
+});

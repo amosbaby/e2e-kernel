@@ -266,29 +266,46 @@ function documentsOf(body: string, isDoc: boolean): string[] | null {
   return docs;
 }
 
-const URL_QUERY_PARAM = /[?&;]query=/i;
-
 // 只读模式里唯一放行的写：方法 POST，Content-Type 的 MIME 是 application/json 或 application/graphql，
 // graphqlKind 判成 'query'（批量、subscription、unknown 都不行），并且每个操作的文档去掉注释后含 `{`
 // （挡住 `query builder` 这种当不了操作的文本），JSON 的键和重复键也要合规（见 documentsOf）。
-// url 可选：给了就连 URL 一起看，URL 里有 query 参数（`;` 分隔的写法也算）就不放行，失败关闭。
+// url 可选：给了就连 URL 一起看，URL 里有 query 参数（键按解码后比，`;` 分隔、百分号编码的写法都算，键解不开也算）就不放行，失败关闭。
 export function isStrictQuery(method: string, body: string | null, contentType: string | null, url = ''): boolean {
   if (method.toUpperCase() !== 'POST' || body === null) return false;
   const mime = (contentType ?? '').split(';')[0]!.trim().toLowerCase();
   if (mime !== 'application/json' && mime !== 'application/graphql') return false;
-  if (URL_QUERY_PARAM.test(url)) return false;
+  if (urlQueryParams(url).length > 0) return false;
   if (graphqlKind(body, contentType, url) !== 'query') return false;
   const docs = documentsOf(body, mime === 'application/graphql');
   return docs !== null && docs.every(hasSelectionSet);
 }
 
-function decodeParam(v: string): string {
-  const s = v.replace(/\+/g, ' ');
+// 按 URL 查询串的原文读 query 参数：取第一个 `?` 之后、`#` 之前的部分，按 `&` 和 `;` 切开
+// （有的服务端把 `;` 当分隔符，URLSearchParams 不当），键、值都先把 `+` 换成空格再百分号解码，键不分大小写地比 `query`。
+// 键解不开的也算（失败关闭）。返回每个命中的值（已解码，解不开时用原文）。
+function decodePart(v: string): string | null {
   try {
-    return decodeURIComponent(s);
+    return decodeURIComponent(v.replace(/\+/g, ' '));
   } catch {
-    return s;
+    return null;
   }
+}
+
+function urlQueryParams(url: string): string[] {
+  const hash = url.indexOf('#');
+  const base = hash < 0 ? url : url.slice(0, hash);
+  const q = base.indexOf('?');
+  if (q < 0) return [];
+  const values: string[] = [];
+  for (const item of base.slice(q + 1).split(/[&;]/)) {
+    const eq = item.indexOf('=');
+    const rawKey = eq < 0 ? item : item.slice(0, eq);
+    const rawValue = eq < 0 ? '' : item.slice(eq + 1);
+    const key = decodePart(rawKey);
+    if (key !== null && key.toLowerCase() !== 'query') continue;
+    values.push(decodePart(rawValue) ?? rawValue.replace(/\+/g, ' '));
+  }
+  return values;
 }
 
 // 一个 query 参数值看起来是不是 mutation：扫描器判成 mutation，或判不出（unknown）但出现了 mutation 这个词。
@@ -298,16 +315,7 @@ function looksLikeMutation(value: string): boolean {
   return kind === 'mutation' || (kind === 'unknown' && /\bmutation\b/i.test(value));
 }
 
-// GET/HEAD 的 URL 里有没有看起来像 mutation 的 query 参数。除了 URLSearchParams 读到的，
-// 还按 `?` `&` `;` 三种分隔符各读一遍（有的服务端把 `;` 当参数分隔符，URLSearchParams 不当）。多拦只会更严。
+// GET/HEAD 的 URL 里有没有看起来像 mutation 的 query 参数（读法见 urlQueryParams）。多拦只会更严。
 export function isMutationLikeUrl(url: string): boolean {
-  if (graphqlKind(null, null, url) === 'mutation') return true;
-  try {
-    for (const [k, v] of new URL(url).searchParams) if (k.toLowerCase() === 'query' && looksLikeMutation(v)) return true;
-  } catch {
-    // 读不了 URL：下面按原文再找一遍
-  }
-  const re = /[?&;]query=([^&;#]*)/gi;
-  for (let m = re.exec(url); m !== null; m = re.exec(url)) if (looksLikeMutation(decodeParam(m[1]!))) return true;
-  return false;
+  return graphqlKind(null, null, url) === 'mutation' || urlQueryParams(url).some(looksLikeMutation);
 }

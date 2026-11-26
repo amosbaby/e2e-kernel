@@ -147,3 +147,21 @@ test('an unattributed block answers with JSON even for a navigation', () => {
   const v = policy.decideUnattributed(req({ method: 'POST', isNavigation: true, topFrame: true }), { anyReadonly: true });
   assert.deepEqual(v, { decision: BLOCK_JSON, reason: 'unattributed' });
 });
+
+test('a percent-encoded query key behind a semicolon cannot hide a mutation, in GET and POST alike', () => {
+  for (const tail of ['x=1;%71uery=mutation%7Ba%7D', 'x=1;%51uery=mutation%7Ba%7D', 'x=1;que%72y=%0Bmutation%7Ba%7D', 'x=1;%zzuery=mutation%7Ba%7D']) {
+    const url = `http://localhost/graphql?${tail}`;
+    blocked(ro(req({ url })), 'graphql-mutation');
+    blocked(ro(post(j({ query: 'query{a}' }), JSON_CT, { url })), 'graphql-mutation');
+  }
+  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?x=1;%71uery=query%7Ba%7D' })), { decision: { action: 'continue' }, reason: null });
+  blocked(ro(post(j({ query: 'query{a}' }), JSON_CT, { url: 'http://localhost/graphql?x=1;%71uery=query%7Ba%7D' })), 'method');
+});
+
+test('any safe method that carries a body goes through the write checks', () => {
+  for (const method of ['GET', 'HEAD', 'OPTIONS']) {
+    blocked(ro(req({ method, url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'mutation{b}' }) })), 'graphql-mutation');
+    blocked(ro(req({ method, url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'query{a}' }) })), 'method');
+  }
+  assert.deepEqual(ro(req({ method: 'GET', body: null })), { decision: { action: 'continue' }, reason: null });
+});

@@ -28,8 +28,8 @@ function block(req: RequestInfo, reason: BlockReason): PolicyVerdict {
 }
 
 function decideReadonly(req: RequestInfo): PolicyVerdict {
-  // OPTIONS 带体不算读：和其他方法一样走下面的写检查（带体的 OPTIONS 永远过不了 isStrictQuery，最后落到 method）。
-  if (isSafeMethod(req.method) && !(req.method.toUpperCase() === 'OPTIONS' && req.body !== null)) {
+  // 带体的 GET/HEAD/OPTIONS 不算读（浏览器不会发，没有误伤）：和其他方法一样走下面的写检查，过不了 isStrictQuery，最后落到 method。
+  if (isSafeMethod(req.method) && req.body === null) {
     return isMutationLikeUrl(req.url) ? block(req, 'graphql-mutation') : PASS;
   }
   if (isPersistedOnly(req.body)) return block(req, 'persisted-query');
