@@ -134,6 +134,18 @@ restore-2-ok: true
 after-restore-2: Claude
 ```
 
+同一天再跑一次 `--lsappinfo`（用 `lsappinfo front` 和 `lsappinfo info -only bundleID` 读前台，用 `open -b <bundle id>` 还回去，不经 System Events、不需要「自动化」授权）。原样输出，`<应用 A>` 是起脚本的桌面应用的 bundle id：
+
+```text
+front-app-before: <应用 A>
+after-launch: com.google.chrome.for.testing
+restore-1-ok: true
+after-restore-1: <应用 A>
+after-new-page: com.google.chrome.for.testing
+restore-2-ok: true
+after-restore-2: <应用 A>
+```
+
 结论：启动和在运行中的实例里开新页都会抢焦点；事后按 bundle id 激活原前台应用能还回去。抢和还之间有一小段窗口（这里约 2 秒，实际可以更短），这段时间里用户的按键会落到浏览器上，所以只能缩短、不能消除。
 
 ## 8. 人关窗口后

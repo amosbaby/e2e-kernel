@@ -1,6 +1,8 @@
 // M2: after a headed launch takes the foreground, can we hand it back, and does opening another page in the
 // running instance take it again? Run by hand with `node scripts/m0/focus-restore-probe.ts` and do not touch
 // the keyboard or mouse for about 10 seconds. A headed Chromium window opens and closes by itself.
+// `--lsappinfo` reads the front app with `lsappinfo` and hands focus back with `open -b` (no Automation permission
+// needed) instead of System Events.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,13 +26,34 @@ function osa(lines: string[], args: string[] = []): string | null {
   }
 }
 
-const frontApp = (): string | null =>
-  osa(['tell application "System Events" to get name of first process whose frontmost is true']);
-const frontBundleId = (): string | null =>
-  osa(['tell application "System Events" to get bundle identifier of first process whose frontmost is true']);
+function run(cmd: string, args: string[]): string | null {
+  try {
+    return execFileSync(cmd, args, { encoding: 'utf8', timeout: OSASCRIPT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    return null;
+  }
+}
+
+const useLsappinfo = process.argv.includes('--lsappinfo');
+
+function lsFrontBundleId(): string | null {
+  const asn = run('lsappinfo', ['front']);
+  if (asn === null || !/^ASN:0x[0-9a-f]+-0x[0-9a-f]+:$/i.test(asn)) return null;
+  const info = run('lsappinfo', ['info', '-only', 'bundleID', asn]);
+  const m = info === null ? null : /bundleID="([A-Za-z0-9.-]{1,255})"/.exec(info);
+  return m === null ? null : m[1]!;
+}
+
+const frontApp = (): string | null => useLsappinfo
+  ? lsFrontBundleId()
+  : osa(['tell application "System Events" to get name of first process whose frontmost is true']);
+const frontBundleId = (): string | null => useLsappinfo
+  ? lsFrontBundleId()
+  : osa(['tell application "System Events" to get bundle identifier of first process whose frontmost is true']);
 // The bundle id travels as an argv item, never inside the script text.
-const activate = (bundleId: string): boolean =>
-  osa(['on run argv', 'tell application id (item 1 of argv) to activate', 'end run'], [bundleId]) !== null;
+const activate = (bundleId: string): boolean => useLsappinfo
+  ? run('open', ['-b', bundleId]) !== null
+  : osa(['on run argv', 'tell application id (item 1 of argv) to activate', 'end run'], [bundleId]) !== null;
 
 const before = frontApp();
 const beforeId = frontBundleId();
