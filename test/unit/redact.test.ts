@@ -126,3 +126,25 @@ test('redactDeep: __proto__ key and non-string leaves', () => {
   assert.equal(redactDeep({ API_KEY: 'k' }, { extraKeys: ['api_key'] }).API_KEY, '[REDACTED]');
   assert.equal(redactDeep({ myField: 'v' }, { extraKeys: ['MYFIELD'] }).myField, '[REDACTED]');   // extraKeys 不分大小写
 });
+
+// 评审修复回归：嵌套在别的参数值里的敏感参数、深层嵌套 JSON。
+test('nested sensitive params inside another param value are replaced', () => {
+  const v = 'V' + 'q7'.repeat(3);
+  for (const out of [redactText(`see /login?next=/cb?token=${v}`), redactUrl(`http://localhost/login?next=/cb?access_token=${v}`),
+    redactUrl(`http://localhost/#state=ok?id_token=${v}`), redactText(`/login?returnTo=http://localhost/cb?auth=${v}`)])
+    assert.ok(!out.includes(v), out);
+  assert.equal(redactText(`see /login?next=/cb?token=${v}`), 'see /login?next=/cb?token=[REDACTED]');
+  assert.equal(redactText(`/x?token=ab(${v})&a=1`), '/x?token=[REDACTED]&a=1');
+  assert.equal(redactText(`/x?auth={${v}}`), '/x?auth=[REDACTED]');
+});
+
+test('deeply nested json never throws and never leaks', () => {
+  for (const depth of [2000, 5000]) {
+    const body = '['.repeat(depth) + '{"password":"p9"}' + ']'.repeat(depth);
+    const out = redactBody(body, 'application/json')!;
+    assert.ok(!out.includes('p9'));
+    assert.doesNotThrow(() => redactDeep(JSON.parse(body)));
+  }
+  const deepObj = '{"a":'.repeat(3000) + '"' + 'f0'.repeat(4) + '"' + '}'.repeat(3000);
+  assert.ok(!redactBody(deepObj, null)!.includes('f0f0f0f0'));
+});

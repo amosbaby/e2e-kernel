@@ -28,7 +28,8 @@ const JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+
 const AUTH_SCHEME = /\b([Bb][Ee][Aa][Rr][Ee][Rr]|Basic)([ \t]+)[A-Za-z0-9._~+/-]+=*/g;
 const HEX = /(?<![A-Za-z0-9])[0-9A-Fa-f]{32,}(?![A-Za-z0-9])/g;
 const B64URL = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])/g;
-const URL_PARAM = /([?&#])([^=&#?\s"'<>]+)=([^&#\s"'<>()[\]{}`]+)/g;
+// 值里不收 `?`：`?next=/cb?token=…` 这种嵌套的回跳地址里，后面的 `?token=` 要单独匹配。
+const URL_PARAM = /([?&#])([^=&#?\s"'<>]+)=([^?&#\s"<>]+)/g;
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 const COOKIE_LINE = /^([ \t]*(?:set-)?cookie:)[^\r\n]*/gim;
 const COOKIE_PAIR = /^[^\s=;]+=[^;]*$/;
@@ -145,11 +146,20 @@ export function redactBody(body: string | null, contentType: string | null, max 
     const trimmed = body.trimStart();
     const json = isJsonType || (!isFormType && (trimmed.startsWith('{') || trimmed.startsWith('[')))
       ? parseJsonContainer(body) : { ok: false as const };
-    if (json.ok) out = JSON.stringify(redactDeep(json.value));
+    if (json.ok) out = jsonRedacted(json.value);
     else if (isFormType || (!isJsonType && looksLikeForm(body))) out = redactText(redactParams(body));
     else out = redactText(body);
   }
   return out.length > max ? `${out.slice(0, max)}…[truncated ${out.length}]` : out;
+}
+
+// 失败关闭：出任何异常都给固定标记，绝不退回去输出原文。
+function jsonRedacted(value: unknown): string {
+  try {
+    return JSON.stringify(redactDeep(value));
+  } catch {
+    return REDACTED;
+  }
 }
 
 function setOwn(o: Record<string, unknown>, k: string, v: unknown): void {
@@ -157,22 +167,26 @@ function setOwn(o: Record<string, unknown>, k: string, v: unknown): void {
   Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
 }
 
-function walk(v: unknown, extra: ReadonlySet<string>, skip: ReadonlySet<string>): unknown {
+// 嵌套超过这么多层的对象或数组整个换成 REDACTED：页面可以给出很深的 JSON，不能让递归爆栈。
+const MAX_DEPTH = 64;
+
+function walk(v: unknown, extra: ReadonlySet<string>, skip: ReadonlySet<string>, depth: number): unknown {
   if (typeof v === 'string') return redactText(v);
-  if (Array.isArray(v)) return v.map((x: unknown) => walk(x, extra, skip));
   if (typeof v !== 'object' || v === null) return v;
+  if (depth >= MAX_DEPTH) return REDACTED;
+  if (Array.isArray(v)) return v.map((x: unknown) => walk(x, extra, skip, depth + 1));
   const out: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(v)) {
     if (isSensitiveKey(k) || extra.has(k.toLowerCase())) setOwn(out, k, REDACTED);
     else if (skip.has(k) && typeof val === 'string') setOwn(out, k, val);
-    else setOwn(out, k, walk(val, extra, skip));
+    else setOwn(out, k, walk(val, extra, skip, depth + 1));
   }
   return out;
 }
 
-// 递归处理 JSON 形态的对象和数组，返回新值，不改入参。敏感键优先于 skipKeys；extraKeys 不分大小写，skipKeys 精确匹配。
+// 递归处理 JSON 形态的对象和数组，返回新值，不改入参。嵌套超过 MAX_DEPTH 层的子树整个换成 REDACTED。敏感键优先于 skipKeys；extraKeys 不分大小写，skipKeys 精确匹配。
 export function redactDeep<T>(v: T, o?: { extraKeys?: readonly string[]; skipKeys?: readonly string[] }): T {
   const extra = new Set((o?.extraKeys ?? []).map((k) => k.toLowerCase()));
   const skip = new Set(o?.skipKeys ?? []);
-  return walk(v, extra, skip) as T;
+  return walk(v, extra, skip, 0) as T;
 }
