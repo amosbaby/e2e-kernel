@@ -47,13 +47,31 @@ function httpUrlOrNull(url: string): string | null {
   return /^https?:/i.test(url) ? url : null;
 }
 
-// 监听器里的异常不能带垮驱动。
-function emit<A extends unknown[]>(listeners: readonly ((...args: A) => void)[], ...args: A): void {
+// 监听器之间互相隔离：一个抛错不会让后面的监听器漏掉，也不会带垮 Playwright 的事件分发。
+// 但异常不吞：交给 report（见 DriverOptions.onListenerError）。
+function emit<A extends unknown[]>(report: (e: unknown) => void, listeners: readonly ((...args: A) => void)[], ...args: A): void {
   for (const l of [...listeners]) {
     try {
       l(...args);
-    } catch { /* a listener's failure must not break the driver */ }
+    } catch (e) {
+      try {
+        report(e);
+      } catch (e2) {
+        rethrowAsync(e2);   // 连处理函数也抛错：不能让它打断其余监听器
+      }
+    }
   }
+}
+
+// 监听器抛错时的默认处理：异步重抛，成为进程的 uncaughtException，不会在驱动里无声消失。
+function rethrowAsync(e: unknown): void {
+  queueMicrotask(() => { throw e; });
+}
+
+export interface DriverOptions {
+  // 监听器（onClosed、onPageOpened、onRequestDone）抛出的异常交给它；不给就异步重抛（rethrowAsync）。
+  // 每个抛错的监听器调用一次，其余监听器照常运行。
+  onListenerError?: (e: unknown) => void;
 }
 
 // 统一写法 → Playwright 的 Locator：引用 → getByRef；role=…[name="…"] → getByRole（我们自己解析）；其余 → locator。
@@ -131,6 +149,7 @@ function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boole
 // 实例对页面开放的那一小块：页面登记、弹窗列表。
 interface Host {
   popupsOf(pageId: string): string[];
+  reportError(e: unknown): void;
 }
 
 class PlaywrightPage implements Page {
@@ -141,15 +160,18 @@ class PlaywrightPage implements Page {
   ready: Promise<void> = Promise.resolve();
   closed = false;
   webSockets = 0;
+  private notified = false;
   private readonly closedListeners: (() => void)[] = [];
   private readonly host: Host;
   private readonly onGone: (p: PlaywrightPage) => void;
+  private readonly onNotified: (p: PlaywrightPage) => void;
 
-  constructor(host: Host, id: string, page: PwPage, onGone: (p: PlaywrightPage) => void) {
+  constructor(host: Host, id: string, page: PwPage, onGone: (p: PlaywrightPage) => void, onNotified: (p: PlaywrightPage) => void) {
     this.host = host;
     this.id = id;
     this.page = page;
     this.onGone = onGone;
+    this.onNotified = onNotified;
     page.on('close', () => this.markClosed());
     page.on('websocket', () => { this.webSockets++; });
   }
@@ -158,12 +180,24 @@ class PlaywrightPage implements Page {
     this.closedListeners.push(listener);
   }
 
-  // 任何一种关闭（人关的、页面自己关的、浏览器没了、调用方 close()）都走这里，只触发一次。
+  // 任何一种关闭（人关的、页面自己关的、浏览器没了、调用方 close()）都走这里。
+  // 状态马上置为已关，但 onClosed 的触发推迟一个宏任务：浏览器没了的时候 Playwright 先发页面的 close、
+  // 紧接着（同一个宏任务里）发 context 的 close，推迟之后才分得清「只关了一页」和「浏览器没了」。
+  // 后一种情形由实例的 handleClosed 先把实例置为已关，再同步冲刷各页的通知（flushClosed），所以页面监听器里
+  // health() 已经是 ok: false，和 fake 驱动一致（Ruling 6.3）。每页的通知只触发一次。
   markClosed(): void {
     if (this.closed) return;
     this.closed = true;
     this.onGone(this);
-    emit(this.closedListeners);
+    setImmediate(() => this.flushClosed());
+  }
+
+  // 触发这页的 onClosed 监听器（只一次）；之后不再等推迟的那次。
+  flushClosed(): void {
+    if (this.notified) return;
+    this.notified = true;
+    this.onNotified(this);
+    emit((e) => this.host.reportError(e), this.closedListeners);
   }
 
   private async run<T>(fn: () => Promise<T>): Promise<T> {
@@ -322,6 +356,7 @@ class PlaywrightPage implements Page {
       throw mapError(e);
     }
     this.markClosed();
+    this.flushClosed();   // 调用方自己关的：在 close() 返回之前通知，和 fake 一致
   }
 }
 
@@ -331,7 +366,9 @@ class PlaywrightInstance implements Instance, Host {
   private readonly anchors: ReadonlySet<PwPage>;        // 启动时自带的空白页：窗口的锚，不算任何会话的页面
   private readonly byPage = new WeakMap<PwPage, PlaywrightPage>();
   private readonly open = new Set<PlaywrightPage>();
+  private readonly closing = new Set<PlaywrightPage>();   // 已关、onClosed 还没触发的页
   private readonly requestIds = new WeakMap<PwRequest, string>();
+  private readonly reportListenerError: (e: unknown) => void;
   private readonly closedListeners: (() => void)[] = [];
   private readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean }) => void)[] = [];
   private readonly pageOpenedListeners: ((page: Page, openerId: string | null) => void)[] = [];
@@ -343,9 +380,10 @@ class PlaywrightInstance implements Instance, Host {
   private opening = 0;
   private readonly deferred = new Set<PwPage>();
 
-  constructor(context: BrowserContext, counters: Counters) {
+  constructor(context: BrowserContext, counters: Counters, reportListenerError: (e: unknown) => void) {
     this.context = context;
     this.counters = counters;
+    this.reportListenerError = reportListenerError;
     this.anchors = new Set(context.pages());
   }
 
@@ -436,16 +474,22 @@ class PlaywrightInstance implements Instance, Host {
     return own;
   }
 
+  reportError(e: unknown): void {
+    this.reportListenerError(e);
+  }
+
   popupsOf(pageId: string): string[] {
     return [...this.open].filter(w => w.openerId === pageId).map(w => w.page.url());
   }
 
-  // 浏览器没了（被关、崩了、自己 stop）：先让每个还开着的页触发 onClosed，再触发实例的，各一次。
+  // 浏览器没了（被关、崩了、自己 stop）：先把实例置为已关，再让每个页触发 onClosed（包括 Playwright 已经先关掉、
+  // 通知还在等的页），最后触发实例的，各一次。页面监听器里 health() 已经是 ok: false。
   private handleClosed(): void {
     if (this.closed) return;
     this.closed = true;
     for (const w of [...this.open]) w.markClosed();
-    emit(this.closedListeners);
+    for (const w of [...this.closing]) w.flushClosed();
+    emit(this.reportListenerError, this.closedListeners);
   }
 
   // 页面第一次出现时登记：同步分配 id 和登记，开启者随后异步查。返回 null 表示是启动时的锚页，不登记。
@@ -453,7 +497,7 @@ class PlaywrightInstance implements Instance, Host {
     if (this.anchors.has(p)) return null;
     const existing = this.byPage.get(p);
     if (existing !== undefined) return existing;
-    const w = new PlaywrightPage(this, `p${++this.counters.page}`, p, (gone) => { this.open.delete(gone); });
+    const w = new PlaywrightPage(this, `p${++this.counters.page}`, p, (gone) => { this.open.delete(gone); this.closing.add(gone); }, (done) => { this.closing.delete(done); });
     this.byPage.set(p, w);
     this.open.add(w);
     if (p.isClosed()) {
@@ -473,7 +517,7 @@ class PlaywrightInstance implements Instance, Host {
       w.openerId = null;   // 页已经没了或查不到，当作没有开启者
     }
     if (w.closed || this.closed) return;
-    emit(this.pageOpenedListeners, w, w.openerId);
+    emit(this.reportListenerError, this.pageOpenedListeners, w, w.openerId);
   }
 
   // 请求 → RequestInfo。归属判断不出来（request.frame() 抛错）时 pageId、openerPageId、topUrl 都是 null。
@@ -549,7 +593,7 @@ class PlaywrightInstance implements Instance, Host {
         status = (await request.response())?.status() ?? null;
       } catch { /* 页面没了，拿不到响应 */ }
     }
-    emit(this.requestDoneListeners, { id, status, failed });
+    emit(this.reportListenerError, this.requestDoneListeners, { id, status, failed });
   }
 }
 
@@ -557,6 +601,11 @@ class PlaywrightDriver implements Driver {
   readonly name = 'playwright';
   readonly capabilities: Capabilities = { ...CAPABILITIES };
   private readonly counters: Counters = { page: 0, request: 0 };
+  private readonly reportListenerError: (e: unknown) => void;
+
+  constructor(opts: DriverOptions) {
+    this.reportListenerError = opts.onListenerError ?? rethrowAsync;
+  }
 
   async selfCheck(): Promise<Check[]> {
     let path = '';
@@ -580,7 +629,7 @@ class PlaywrightDriver implements Driver {
     }
     context.setDefaultTimeout(ACTION_TIMEOUT_MS);
     context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-    const instance = new PlaywrightInstance(context, this.counters);
+    const instance = new PlaywrightInstance(context, this.counters, this.reportListenerError);
     try {
       await instance.attach();
     } catch (e) {
@@ -591,6 +640,6 @@ class PlaywrightDriver implements Driver {
   }
 }
 
-export function createPlaywrightDriver(): Driver {
-  return new PlaywrightDriver();
+export function createPlaywrightDriver(opts: DriverOptions = {}): Driver {
+  return new PlaywrightDriver(opts);
 }

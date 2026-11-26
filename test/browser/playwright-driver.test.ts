@@ -533,3 +533,83 @@ test('killing the browser process fires Instance.onClosed', { timeout: 60_000 },
   await until(() => closed === 1);
   assert.equal((await victim.health()).ok, false);
 });
+
+test('browser death with session pages open: page listeners already see health().ok === false, then the instance listener fires', { timeout: 60_000 }, async () => {
+  const dir = makeTmp('e2k-kill2-');
+  const errors: unknown[] = [];
+  const victim = await createPlaywrightDriver({ onListenerError: (e) => errors.push(e) }).launch({ name: 'x', userDataDir: dir });
+  const order: string[] = [];
+  const pageHealth: Promise<{ ok: boolean }>[] = [];
+  let pageFired = 0;
+  for (const label of ['a', 'b']) {
+    const p = await victim.openPage({});
+    p.onClosed(() => { pageFired++; order.push('page-' + label); pageHealth.push(victim.health()); });
+  }
+  let instFired = 0;
+  let instHealth: Promise<{ ok: boolean }> | undefined;
+  victim.onClosed(() => { instFired++; order.push('instance'); instHealth = victim.health(); });
+  try { execFileSync('pkill', ['-9', '-f', dir]); } catch { /* pkill 没匹配到时退出码非零，下面的断言会失败 */ }
+  await until(() => instFired === 1);
+  await settle();
+  assert.equal(pageFired, 2);
+  assert.equal(instFired, 1);
+  assert.deepEqual(order, ['page-a', 'page-b', 'instance']);
+  assert.deepEqual((await Promise.all(pageHealth)).map((h) => h.ok), [false, false]);
+  assert.equal((await instHealth)?.ok, false);
+  assert.equal((await victim.health()).ok, false);
+  assert.deepEqual(errors, []);
+});
+
+test('a tab closed from outside the driver API fires Page.onClosed once while the browser stays healthy', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/popup.html');
+  await page.click('#open-popup');
+  await until(() => opened.length === 1);
+  const [popup] = opened[0]!;
+  let closed = 0;
+  const healthAtFire: Promise<{ ok: boolean }>[] = [];
+  popup.onClosed(() => { closed++; healthAtFire.push(inst.health()); });
+  let instClosed = 0; inst.onClosed(() => instClosed++);
+  await popup.click('#close-self');
+  await until(() => closed === 1);
+  await settle();
+  assert.equal(closed, 1);
+  assert.equal(instClosed, 0);
+  assert.deepEqual((await Promise.all(healthAtFire)).map((h) => h.ok), [true]);
+  assert.equal((await inst.health()).ok, true);
+  await assert.rejects(popup.location(), (e: DriverError) => e instanceof DriverError && e.kind === 'other');
+});
+
+test('a throwing listener does not stop the others, and its error reaches onListenerError', { timeout: 60_000 }, async () => {
+  const errors: unknown[] = [];
+  const own = await createPlaywrightDriver({ onListenerError: (e) => errors.push(e) }).launch({ name: 'thrower', userDataDir: makeTmp('e2k-throw-') });
+  const p = await own.openPage({});
+  const fired: string[] = [];
+  p.onClosed(() => { fired.push('page-1'); throw new Error('page listener bug'); });
+  p.onClosed(() => { fired.push('page-2'); });
+  own.onClosed(() => { fired.push('instance-1'); throw new Error('instance listener bug'); });
+  own.onClosed(() => { fired.push('instance-2'); });
+  await own.stop(); await settle();
+  assert.deepEqual(fired, ['page-1', 'page-2', 'instance-1', 'instance-2']);
+  assert.deepEqual(errors.map((e) => (e as Error).message), ['page listener bug', 'instance listener bug']);
+});
+
+test('without a hook, a listener error is rethrown asynchronously (uncaughtException) and the other listeners still run', { timeout: 60_000 }, async () => {
+  const own = await createPlaywrightDriver().launch({ name: 'rethrow', userDataDir: makeTmp('e2k-rethrow-') });
+  const fired: string[] = [];
+  own.onClosed(() => { fired.push('first'); throw new Error('kernel handler bug'); });
+  own.onClosed(() => { fired.push('second'); });
+  // node:test 自己会接 uncaughtException 并判当前测试失败；这里临时换成我们的捕获，结束后还原。
+  const saved = process.listeners('uncaughtException');
+  const caught: unknown[] = [];
+  process.removeAllListeners('uncaughtException');
+  process.on('uncaughtException', (e) => { caught.push(e); });
+  try {
+    await own.stop(); await settle();
+  } finally {
+    process.removeAllListeners('uncaughtException');
+    for (const l of saved) process.on('uncaughtException', l);
+  }
+  assert.deepEqual(fired, ['first', 'second']);
+  assert.equal(caught.length, 1);
+  assert.equal((caught[0] as Error).message, 'kernel handler bug');
+});
