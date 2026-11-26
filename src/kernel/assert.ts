@@ -11,7 +11,7 @@ type Value = string | number | boolean;
 
 // 整串锚定：值前后多出任何字符（标点、括号、第二个值）都不匹配，返回 null。
 const HEX_COLOR = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
-const RGB_COLOR = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*(\d*\.?\d+)\s*)?\)$/i;
+const RGB_COLOR = /^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*(\d+(?:\.\d+)?|\.\d+)\s*)?\)$/i;
 const LENGTH = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:px)?$/i;
 
 export function normalizeColor(s: string): string | null {

@@ -90,6 +90,18 @@ test('normalizeColor fails closed on adjacent punctuation, nested delimiters and
   for (const s of bad) assert.equal(normalizeColor(s), null, JSON.stringify(s));
 });
 
+// alpha 的数字写法没有重叠的分支：一长串数字后面接着不合法的结尾，也只扫一遍就判为 null。只看结果，不计时。
+test('normalizeColor rejects a long digit run in alpha', () => {
+  const digits = '1'.repeat(100_000);
+  assert.equal(normalizeColor(`rgba(0,0,0,${digits}x)`), null);
+  assert.equal(normalizeColor(`rgba(0,0,0,${digits}.${digits}x)`), null);
+  assert.equal(normalizeColor(`rgba(0,0,0,.${digits}`), null);
+  assert.equal(normalizeColor(`rgba(0,0,0,${digits})`), null);   // 大于 1
+  assert.equal(normalizeColor(`rgba(0,0,0,0.${digits})`), `rgba(0,0,0,${Number('0.' + digits)})`);
+  assert.equal(normalizeColor('rgba(0,0,0,.5)'), 'rgba(0,0,0,0.5)');
+  assert.equal(normalizeColor('rgba(0,0,0,1.)'), null);
+});
+
 test('css lengths compare as numbers', () => {
   assert.equal(compare('css', 'eq', '18px', 18, 'font-size').match, true);
   assert.equal(compare('css', 'lt', '12px', '16px', 'margin-top').match, true);
