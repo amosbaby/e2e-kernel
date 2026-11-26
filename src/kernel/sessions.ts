@@ -48,7 +48,10 @@ interface Session {
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
   readonly recorder: Recorder;
   readonly forced: boolean;                  // open --readonly：不管规则，整场会话只读
-  topHost: string;                           // 主页面当前的顶层主机（URL.hostname）：模式跟着页面走，导航和重定向落地时更新
+  topHost: string;                           // 主页面已确认的顶层主机（URL.hostname）：模式跟着页面走，只在有「已提交」的证据时更新
+  // 已放行、但还没有证据说明提交了的顶层导航目标（下载、204、没人看见的重定向都可能让导航根本没提交）：
+  // 和 topHost 一起参与有效模式的计算，直到页面自己的请求或页面地址证明落在哪里。
+  readonly pendingHosts: Set<string>;
   lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
   url: string;                               // 首屏读数里的地址（已脱敏），给 list()
   state: State;
@@ -392,7 +395,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: DEFAULT_PROFILE },
-        page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, lastWall: null,
+        page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
       // 先登记再导航：首屏的请求才归得到这个会话。
@@ -416,7 +419,7 @@ export class SessionManager {
       s.state = 'idle';
       this.restartIdle(s);
       return {
-        session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: o.mode, runDir: s.runDir,
+        session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: this.sessionMode(s, []), runDir: s.runDir,
         snapshot: cappedSnapshot(snapshot), ...wall,
       };
     } catch (e) {
@@ -594,7 +597,9 @@ export class SessionManager {
     if (login !== undefined) return { action: 'continue' };       // 登录过程不套写策略，也不记录
     if (s !== undefined) return this.decideForSession(s, req);
     // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）：有任一只读会话活着就按「只读」拦写。
-    const anyReadonly = [...this.sessions.values()].some((x) => this.sessionMode(x, []) === 'readonly');
+    // 请求所在页自己的顶层主机只读也算（模式跟着页面走），不用等有只读会话。
+    const anyReadonly = [...this.sessions.values()].some((x) => this.sessionMode(x, []) === 'readonly')
+      || this.deps.modes.resolve(hostOf(req.topUrl ?? req.url)) === 'readonly';
     const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly });
     if (isWrite(req.method) || verdict.reason !== null) {
       const targetMode = this.deps.modes.resolve(hostOf(req.url));
@@ -619,15 +624,18 @@ export class SessionManager {
     const verdict: PolicyVerdict = this.deps.policy.decide(req, { mode });
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
-    // 判定之后才挪主机：导航被拦就留在原主机；重定向落地（主页面的其他请求带着新的顶层地址）也在这里跟上。
-    if (mainNav ? verdict.decision.action === 'continue' : isMain && req.topUrl !== null) this.moveTopHost(s, topHost);
+    // 判定之后才动主机。放行的顶层导航只记成待定（不确定它会不会提交）；主页面的其他请求带着的顶层地址是「已提交」的证据，
+    // 主机据此确定下来（重定向落地也在这里跟上）。被拦的导航什么都不改。
+    if (mainNav) {
+      if (verdict.decision.action === 'continue') s.pendingHosts.add(topHost);
+    } else if (isMain && req.topUrl !== null) this.converge(s, topHost);
     return verdict.decision;
   }
 
   // 会话的有效模式：被 --readonly 强制，或 [主页面顶层主机, ...extraHosts] 里任一只读 → readonly；任一 denied → denied；否则 default。
   private sessionMode(s: Session, extraHosts: string[]): Mode {
     if (s.forced) return 'readonly';
-    const modes = [s.topHost, ...extraHosts].map((h) => this.deps.modes.resolve(h));
+    const modes = [s.topHost, ...s.pendingHosts, ...extraHosts].map((h) => this.deps.modes.resolve(h));
     if (modes.includes('readonly')) return 'readonly';
     if (modes.includes('denied')) return 'denied';
     return 'default';
@@ -642,17 +650,18 @@ export class SessionManager {
     });
   }
 
-  private moveTopHost(s: Session, host: string): void {
-    if (host === s.topHost) return;
+  // 有「已提交」的证据：主机定为 host，待定的丢掉；模式变了才进时间线（Recorder 去重）。
+  private converge(s: Session, host: string): void {
+    s.pendingHosts.clear();
     s.topHost = host;
     this.recordMode(s);
   }
 
-  // 用主页面的实际地址校正顶层主机；不是 http(s) 地址（about:blank、浏览器的错误页）就不动，沿用上一个主机。
+  // 用主页面的实际地址确定顶层主机（页面地址是已提交的证据）；不是 http(s) 地址（about:blank、浏览器的错误页）就什么都不动，沿用上一个主机和待定的主机。
   private followTopHost(s: Session, url: string): void {
     try {
       const u = new URL(url);
-      if (u.protocol === 'http:' || u.protocol === 'https:') this.moveTopHost(s, u.hostname);
+      if (u.protocol === 'http:' || u.protocol === 'https:') this.converge(s, u.hostname);
     } catch {
       // 地址解析不了：沿用上一个主机。
     }

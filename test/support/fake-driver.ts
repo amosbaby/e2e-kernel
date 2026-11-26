@@ -14,6 +14,7 @@ export interface FakeElement { text?: string; visible?: boolean; css?: Record<st
   hints?: string[]; waitFails?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
   console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other';
+  redirectTo?: string;   // goto 这个地址时页面落到另一个地址（用那个地址的规格），模拟重定向
   passwordField?: boolean; passwordFieldFailWith?: 'timeout' | 'other';
   idleHints?: string[] }   // idleHints 给了：{ idle } 的等待会超时，带这些 hints
 
@@ -149,7 +150,8 @@ class FakePage implements Page {
     this.enter('goto', [url]);
     const spec = this.host.specFor(url);
     if (spec.gotoFailWith !== undefined) throw new DriverError(spec.gotoFailWith, `navigation failed: ${spec.gotoFailWith}`);
-    this.load(url, spec);
+    if (spec.redirectTo === undefined) this.load(url, spec);
+    else this.load(spec.redirectTo, this.host.specFor(spec.redirectTo));
   }
 
   async setViewport(v: Viewport): Promise<void> {

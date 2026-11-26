@@ -705,7 +705,7 @@ function setupRo(readonlyHosts: string[] = ['example.com'], overrides: Partial<S
 }
 
 // 会话内部状态，只给测试看：主页面的顶层主机和记录里的模式时间线。
-function inner(sm: SessionManager, id: string): { topHost: string; recorder: { modes: { mode: string; reason: string; rulesHash: string | null; host: string }[] } } {
+function inner(sm: SessionManager, id: string): { topHost: string; pendingHosts: Set<string>; recorder: { modes: { mode: string; reason: string; rulesHash: string | null; host: string }[] } } {
   return (sm as unknown as { sessions: Map<string, never> }).sessions.get(id) as never;
 }
 
@@ -726,8 +726,8 @@ test('open --readonly forces read-only on a host without rules, also after navig
   assert.equal(r.mode, 'readonly');
   assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api' })).action, 'fulfill');
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' }), { action: 'continue' });
-  assert.equal(inner(sm, r.session).topHost, 'example.org');
   assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'fulfill');
+  assert.equal(inner(sm, r.session).topHost, 'example.org');
   const modes = inner(sm, r.session).recorder.modes;
   assert.equal(modes.length, 1); assert.equal(modes[0]!.reason, 'forced'); assert.equal(modes[0]!.mode, 'readonly');
   assert.equal(modes[0]!.rulesHash, 'sha256:0000000000000001');
@@ -771,8 +771,8 @@ test('a read-only page writing to a default host is blocked', async () => {
 test('a redirect that lands the main page on a read-only host moves the session to read-only, for unattributed requests too', async () => {
   const { sm, fake } = setupRo(); const { session, pageId } = await opened(sm, fake);
   assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' })).action, 'continue');
-  assert.equal(inner(sm, session).topHost, 'example.org');
   assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'continue');
+  assert.equal(inner(sm, session).topHost, 'example.org');
   assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api' })).action, 'continue');
   // 子资源请求带着新的顶层地址（重定向落到了只读主机）：判定之后主机跟过去，时间线多一条。
   assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.com/app.js', topUrl: RO })).action, 'continue');
@@ -856,4 +856,55 @@ test('rules changed to default: the next main-page top-level navigation picks th
   assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'continue');
   assert.deepEqual(inner(sm, r.session).recorder.modes.map((m) => [m.mode, m.host, m.rulesHash]),
     [['readonly', 'example.com', 'sha256:0000000000000001'], ['default', 'example.org', 'sha256:0000000000000002']]);
+});
+
+test('an allowed navigation that never commits does not move the session off its read-only host: a later cross-host form POST is still blocked', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  const nav = { pageId, method: 'GET', url: 'http://example.org/file.zip', isNavigation: true, topFrame: true, topUrl: 'http://example.org/file.zip' };
+  assert.equal((await fake.emitRequest(nav)).action, 'continue');          // 下载或 204：页面其实还在只读主机上
+  assert.deepEqual([inner(sm, r.session).topHost, [...inner(sm, r.session).pendingHosts]], ['example.com', ['example.org']]);
+  const form = await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/submit', isNavigation: true, topFrame: true, topUrl: 'http://localhost:5173/submit' });
+  assert.equal(form.action, 'fulfill');
+  assert.equal(inner(sm, r.session).recorder.modes.length, 1);
+});
+
+test('commit evidence from a main-page request converges the session onto the committed host and clears the pending ones', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' });
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/app.js', topUrl: 'http://example.org/' })).action, 'continue');
+  const s = inner(sm, r.session);
+  assert.deepEqual([s.topHost, s.pendingHosts.size], ['example.org', 0]);
+  assert.deepEqual(s.recorder.modes.map((m) => [m.mode, m.host]), [['readonly', 'example.com'], ['default', 'example.org']]);
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://example.org/' })).action, 'continue');
+});
+
+test('reading the page address after a step converges the session; a non-http(s) address changes nothing', async () => {
+  const { sm, fake } = setupRo(['example.com']); const r = await sm.open({ url: 'http://localhost:5173/' }); const pageId = fake.openPages().at(-1)!;
+  await fake.emitRequest({ pageId, method: 'GET', url: RO, isNavigation: true, topFrame: true, topUrl: RO });
+  assert.deepEqual([inner(sm, r.session).topHost, [...inner(sm, r.session).pendingHosts]], ['localhost', ['example.com']]);
+  await sm.step({ session: r.session, ops: [{ op: 'goto', url: RO }] });   // 假驱动的页面地址变成只读主机
+  assert.deepEqual([inner(sm, r.session).topHost, inner(sm, r.session).pendingHosts.size], ['example.com', 0]);
+  await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' });
+  await sm.step({ session: r.session, ops: [{ op: 'goto', url: 'about:blank' }] });
+  assert.deepEqual([inner(sm, r.session).topHost, [...inner(sm, r.session).pendingHosts]], ['example.com', ['example.org']]);
+  assert.equal(inner(sm, r.session).recorder.modes.length, 2);
+});
+
+test('open reports the effective mode after the first screen: a start URL that lands on a read-only host is read-only', async () => {
+  const { sm } = setupRo(['example.com']);
+  const plain = await sm.open({ url: 'http://localhost:5173/' });
+  assert.equal(plain.mode, 'default');
+  const rules = mutableRules(['example.com']);
+  const { sm: sm2 } = setup({ modes: rules.resolver, policy, extraPages: { 'http://localhost:5173/landing': { redirectTo: RO } } });
+  const landed = await sm2.open({ url: 'http://localhost:5173/landing' });
+  assert.equal(landed.mode, 'readonly');
+  assert.equal(inner(sm2, landed.session).topHost, 'example.com');
+});
+
+test('an unattributed page on a read-only host is read-only even with no read-only session alive', async () => {
+  const { sm, fake } = setupRo(); await opened(sm, fake);
+  assert.equal((await fake.emitRequest({ id: 'u7', pageId: null, method: 'POST', url: 'http://localhost:5173/api', topUrl: RO })).action, 'fulfill');
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://example.com/api', topUrl: null })).action, 'fulfill');
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'GET', url: 'http://localhost:5173/', topUrl: RO })).action, 'continue');
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://example.com/api', topUrl: 'http://example.org/' })).action, 'continue');   // 页面在默认主机上
 });
