@@ -83,6 +83,10 @@ test('hosts: example family, loopback and doc hosts pass; others hit, lock file 
   assert.deepEqual(scanText('a.md', badUrl, []), [{ file: 'a.md', line: 1, rule: 'host', ref: 'shop.invalid' }]);
   assert.deepEqual(scanText('a.md', `see (${badUrl}).`, []).map((h) => h.ref), ['shop.invalid']);
   assert.deepEqual(scanText('a.md', 'http://${host}/x https://', []), []);
+  const badHost = ['shop', 'invalid'].join('.');
+  for (const s of [`**https://${badHost}**`, `https://${badHost}!`, `https://${badHost}…`, `https://${badHost}` + '${x}']) {
+    assert.deepEqual(scanText('a.md', s, []).map((h) => h.ref), ['shop.invalid'], s);
+  }
   const registry = 'https://' + ['registry', 'npmjs', 'org'].join('.') + '/x';
   assert.equal(scanText('a.md', registry, [])[0].rule, 'host');
   assert.deepEqual(scanText('package-lock.json', registry, [], { extraHosts: ['registry.npmjs.org'] }), []);

@@ -60,8 +60,10 @@ function hostOf(authority: string): string | null {
   const rest = at >= 0 ? authority.slice(at + 1) : authority;
   const bracketed = /^\[[0-9a-fA-F:.]+\]/.exec(rest);
   if (bracketed) return bracketed[0].toLowerCase();
-  const host = (rest.split(':')[0] ?? '').replace(/[.,;)\]}>]+$/, '').toLowerCase();
-  return /^[\p{L}\p{N}._-]+$/u.test(host) ? host : null;
+  // Longest leading run of host characters; anything after it (markup, punctuation, ${…}) ends the host.
+  const run = /^[\p{L}\p{N}.-]*/u.exec(rest.split(':')[0] ?? '')?.[0] ?? '';
+  const host = run.replace(/\.+$/, '').toLowerCase();
+  return host === '' ? null : host;
 }
 
 function hostAllowed(host: string, extraHosts: readonly string[]): boolean {
