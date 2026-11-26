@@ -14,6 +14,7 @@ import type { WritePolicy } from '../../src/kernel/write-policy.ts';
 import { RUN_DIR_RE, runDirName } from '../../src/report/store.ts';
 import type { RunResult } from '../../src/report/result.ts';
 import { E2kError } from '../../src/shared/errors.ts';
+import type { Mode } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
@@ -158,6 +159,19 @@ test('fails closed when the resolver returns a non-default mode', async () => {
   const { sm, fake } = setup({ modes: { resolve: () => 'readonly' } });
   await assert.rejects(sm.open({ url: 'http://localhost:5173/' }), (e: E2kError) => e.code === 'internal');
   assert.deepEqual(fake.openPages(), []);
+});
+
+test('a session request that touches a non-default host is aborted without asking the policy (fail closed)', async () => {
+  const asked: string[] = [];
+  const spy: WritePolicy = { decide: (r) => { asked.push(r.url); return { action: 'continue' }; }, decideUnattributed: () => ({ action: 'continue' }) };
+  const modes = { resolve: (host: string): Mode => (host === 'example.com' ? 'readonly' : 'default') };
+  const { sm, fake } = setup({ policy: spy, modes }); const { session, runDir, pageId } = await opened(sm, fake);
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' }), { action: 'abort' });
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://example.com/' }), { action: 'abort' });
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api' }), { action: 'continue' });
+  assert.deepEqual(asked, ['http://localhost:5173/api']);
+  await sm.close({ session });
+  assert.deepEqual(readResult(runDir).writes.blocked.map((w) => w.url), ['http://example.com/api', 'http://localhost:5173/api']);
 });
 
 test('shutdown closes every session as kernel-shutdown and stops the instance', async () => {

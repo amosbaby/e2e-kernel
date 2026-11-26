@@ -537,9 +537,11 @@ export class SessionManager {
     if (s !== undefined) {
       // R14：topUrl 可能是 null，退回请求自己的地址。
       const topHost = hostOf(req.topUrl ?? req.url);
-      const decision = this.deps.policy.decide(req, { mode: this.deps.modes.resolve(topHost), topHost });
+      const mode = this.deps.modes.resolve(topHost);
       const host = hostOf(req.url);
       const targetMode = this.deps.modes.resolve(host);
+      // 这个版本只实现了「默认」模式（open 时也这样把关）：顶层页面或请求目标有一边不是默认模式，就中止，不交给策略。
+      const decision: Decision = mode !== 'default' || targetMode !== 'default' ? { action: 'abort' } : this.deps.policy.decide(req, { mode, topHost });
       s.recorder.addRequest(req, decision, targetMode, this.deps.now());
       if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
       return decision;
