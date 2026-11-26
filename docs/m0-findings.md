@@ -120,6 +120,22 @@ changed: true
 
 结论：有头启动会抢一次焦点，与设计「窗口不抢焦点」冲突；M1 接受这一点（内核不主动把窗口提到前台），规避办法和『实例运行中再开页是否也抢焦点』留到 M2。
 
+### 7.1 把焦点还回去（M2，2026-11-27）
+
+`scripts/m0/focus-restore-probe.ts`：启动前记下前台应用的 bundle id，启动后用 `osascript` 的 `tell application id … to activate` 还回去（bundle id 走 argv，不拼进脚本）；再在同一个实例里开一个新页，看是否又抢；再还一次。用户在场、没碰键盘鼠标时由 agent 起的一次，原样输出（`Claude` 是起脚本的桌面应用）：
+
+```text
+front-app-before: Claude
+after-launch: Google Chrome for Testing
+restore-1-ok: true
+after-restore-1: Claude
+after-new-page: Google Chrome for Testing
+restore-2-ok: true
+after-restore-2: Claude
+```
+
+结论：启动和在运行中的实例里开新页都会抢焦点；事后按 bundle id 激活原前台应用能还回去。抢和还之间有一小段窗口（这里约 2 秒，实际可以更短），这段时间里用户的按键会落到浏览器上，所以只能缩短、不能消除。
+
 ## 8. 人关窗口后
 
 用户自己跑的 `node scripts/m0/window-close.ts`，原样输出：
@@ -224,8 +240,18 @@ M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里
 
 结论：从 Node 子进程调 `osascript` 弹原生对话框可行，超时也能正确回传。
 
-还没测：人点了「允许」或「拒绝」之后的返回值（需要人来点）；`choose from list` 多选清单；弹框是否抢焦点（大概率会抢，对批准框本来就是想要的）。
+人点按钮（2026-11-27，同一种 `execFile('osascript', …)` 起法，超时放宽到 60 s，用户在场点）：
+
+| 人的操作 | `stdout` | 退出码 |
+| --- | --- | --- |
+| 点「允许」 | `button returned:允许, gave up:false` | 0 |
+| 点「拒绝」 | `button returned:拒绝, gave up:false` | 0 |
+| 不点，等超时 | `button returned:, gave up:true` | 0 |
+
+三种情况退出码都是 0，只能靠解析 `stdout` 区分；8 秒对人太短（第一次就没来得及点）。按钮名不叫 Cancel，所以没有 `-128` 那条错误路径。
+
+还没测：`choose from list` 多选清单；弹框是否抢焦点（对批准框本来就是想要的）。
 
 ## 10. 复测
 
-运行 `npm run m0`（route-coverage 之后接 worker-probe）。Playwright 升级后必须重跑并更新本文件。`node scripts/m0/dialog-probe.ts` 要人在场，不在 `npm run m0` 里，需要时手动跑。
+运行 `npm run m0`（route-coverage 之后接 worker-probe）。Playwright 升级后必须重跑并更新本文件。`node scripts/m0/dialog-probe.ts` 和 `node scripts/m0/focus-restore-probe.ts` 要人在场，不在 `npm run m0` 里，需要时手动跑。
