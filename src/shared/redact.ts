@@ -28,15 +28,39 @@ const JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+
 const AUTH_SCHEME = /\b([Bb][Ee][Aa][Rr][Ee][Rr]|Basic)([ \t]+)[A-Za-z0-9._~+/-]+=*/g;
 const HEX = /(?<![A-Za-z0-9])[0-9A-Fa-f]{32,}(?![A-Za-z0-9])/g;
 const B64URL = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])/g;
-// URL 参数的 `名字=`。值在哪结束由 redactParamsInText 逐字符定，不交给正则。
-const URL_PARAM_NAME = /([?&#])([^=&#?\s"'<>]+)=/g;
+// 邮箱，`%40` 编码的也认。本地部分有长度上限，域名标签的字符类不含 `.`，所以是线性的。
+const EMAIL = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}(?:@|%40)(?:[A-Za-z0-9-]{1,63}\.){1,8}[A-Za-z]{2,24}(?![A-Za-z0-9-])/g;
+// 整个值像 token：标准 base64 或 base64url 字符，32 位以上，另需大小写字母和数字都有。只用在整个值上。
+const TOKEN_VALUE = /^[A-Za-z0-9+/_-]{32,}={0,2}$/;
+// URL 参数、`名字=值` 的 `名字=`。名字前可以是开头、`?&#`、空白或常见的括号和分隔符；名字的字符类不含这些分隔符，
+// 否则 `;a;a;a…` 这样的输入会让每个起点都扫到结尾。值在哪结束由 redactParamsInText 逐字符定，不交给正则。
+const URL_PARAM_NAME = /(^|[?&#\s;,({\[])([^=&#?\s"'<>;,({\[]+)=/g;
 const PARAM_VALUE_END = /[&#\s"<>]/;
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
-const COOKIE_LINE = /^([ \t]*(?:set-)?cookie:)[^\r\n]*/gim;
+// 自由文本里 JSON 形态的 `"名字" : "`，以及套了一层转义的 `\"名字\" : \"`。值的结尾由 redactJsonPairsInText 逐字符找。
+const JSON_PAIR_NAME = /"([^"\\\r\n]{1,100})"\s*:\s*"/g;
+const JSON_PAIR_NAME_ESC = /\\"([^"\\\r\n]{1,100})\\"\s*:\s*\\"/g;
+// 行首的 `头名: 值`。头名是敏感键（cookie、authorization、x-api-key……）就换值。
+const HEADER_LINE = /^([ \t]*)([A-Za-z0-9_-]{1,64}):[ \t]*([^\r\n]*)$/gm;
 const COOKIE_PAIR = /^[^\s=;]+=[^;]*$/;
 
 function isMixedCase(s: string): boolean {
   return /[A-Z]/.test(s) && /[a-z]/.test(s) && /[0-9]/.test(s);
+}
+
+// 整个值是 token 形态。以 `/` 开头或含 `//` 的是路径或网址，不算。
+function tokenShaped(v: string): boolean {
+  return v.length >= 32 && !v.startsWith('/') && !v.includes('//') && TOKEN_VALUE.test(v) && isMixedCase(v);
+}
+
+// 表单和 URL 参数的值：原值和（不把 `+` 当空格的）解码值各判一次；解码失败只判原值。
+function tokenValue(raw: string): boolean {
+  if (tokenShaped(raw)) return true;
+  try {
+    return tokenShaped(decodeURIComponent(raw));
+  } catch {
+    return false;
+  }
 }
 
 // 整行是两组以上用 `; ` 分开的 `名字=值`（document.cookie 的样子）时，值换掉、名字保留。
@@ -64,8 +88,24 @@ function redactParamsInText(s: string): string {
   let out = '';
   let copied = 0;
   for (let m = re.exec(s); m !== null; m = re.exec(s)) {
-    if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后
-    const start = m.index + m[0].length;
+    if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值
+    let start = m.index + m[0].length;
+    const quote = s[start];
+    if (quote === '"' || quote === "'") {
+      // 值以引号开头：只换两个引号之间的内容（引号里的反斜杠跳过下一个字符），再从结束引号之后接着找。
+      // 找不到结束引号就从值开头换到串尾（失败关闭）。
+      start++;
+      let close = -1;
+      for (let i = start; i < s.length; i++) {
+        if (s[i] === '\\') i++;
+        else if (s[i] === quote) { close = i; break; }
+      }
+      out += s.slice(copied, start) + REDACTED;
+      if (close < 0) return out;
+      copied = close;
+      re.lastIndex = close + 1;
+      continue;
+    }
     let end = start;
     while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) end++;
     out += s.slice(copied, start) + REDACTED;
@@ -75,23 +115,70 @@ function redactParamsInText(s: string): string {
   return out + s.slice(copied);
 }
 
+// 自由文本里 JSON 形态的 `"名字":"值"`，名字是敏感键的，值换掉。逐字符找值的结尾，不交给正则回溯。
+// 找不到结尾（引号没闭合）时，从值开头一直换到串尾，不再往后找（失败关闭）。
+// 套了一层转义的形态（`\"名字\":\"值\"`）里，结束引号前恰好一个反斜杠；值里自带的引号是三个，不算结尾。
+function redactJsonPairsInText(s: string, nameRe: RegExp, escaped: boolean): string {
+  const re = new RegExp(nameRe.source, 'g');
+  let out = '';
+  let copied = 0;
+  for (let m = re.exec(s); m !== null; m = re.exec(s)) {
+    if (!isSensitiveKey(m[1]!)) continue;
+    const start = m.index + m[0].length;
+    let close = -1;                                   // 值的结尾（不含）；-1 表示没找到
+    for (let i = start; i < s.length; i++) {
+      const c = s[i];
+      if (!escaped) {
+        if (c === '\\') i++;
+        else if (c === '"') { close = i; break; }
+      } else if (c === '"') {
+        let run = 0;
+        while (i - 1 - run >= start && s[i - 1 - run] === '\\') run++;
+        if (run === 1) { close = i - 1; break; }
+      }
+    }
+    out += s.slice(copied, start) + REDACTED;
+    if (close < 0) return out;
+    copied = close;
+    re.lastIndex = close + (escaped ? 2 : 1);
+  }
+  return out + s.slice(copied);
+}
+
+// 行首 `头名: 值`：头名是敏感键就整个值换掉（空值、非 ASCII、纯符号都换）。`Bearer`、`Basic` 方案名留下。
+function redactHeaderLines(s: string): string {
+  return s.replace(HEADER_LINE, (m, lead: string, name: string, value: string) => {
+    if (!isSensitiveKey(name)) return m;
+    const scheme = /^(?:bearer|basic)[ \t]+/i.exec(value)?.[0] ?? '';
+    return `${lead}${name}: ${scheme}${REDACTED}`;
+  });
+}
+
 export function redactText(s: string): string {
   let out = s.replace(JWT, REDACTED);
   out = out.replace(AUTH_SCHEME, (_m, scheme: string, gap: string) => `${scheme}${gap}${REDACTED}`);
+  out = out.replace(USERINFO, `://${REDACTED}@`);     // 先于邮箱：`://用户名:密码@主机` 要整段换掉
+  out = out.replace(EMAIL, REDACTED);
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
   out = redactParamsInText(out);
-  out = out.replace(USERINFO, `://${REDACTED}@`);
-  out = out.replace(COOKIE_LINE, `$1 ${REDACTED}`);
+  out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
+  out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);
+  out = redactHeaderLines(out);
   return out.split('\n').map(redactCookieLine).join('\n');
 }
 
-// `a=1&b=2` 形式：名字是敏感键的，值换掉；其余原样。
+// `a=1&b=2` 形式：名字是敏感键的，值换掉；名字不敏感时，值先解码再判（接住 URL 编码的 JSON 里的邮箱），
+// 解码后过 redactText 有变化、或整个值是 token 形态，就整个值换掉。名字照旧保留，解码后的内容不会写回去。
 function redactParams(s: string): string {
   return s.split('&').map((part) => {
     const eq = part.indexOf('=');
     if (eq <= 0 || eq === part.length - 1) return part;
-    return isSensitiveKey(safeDecode(part.slice(0, eq))) ? `${part.slice(0, eq)}=${REDACTED}` : part;
+    const name = part.slice(0, eq);
+    const value = part.slice(eq + 1);
+    if (isSensitiveKey(safeDecode(name))) return `${name}=${REDACTED}`;
+    const decoded = safeDecode(value);
+    return redactText(decoded) !== decoded || tokenValue(value) ? `${name}=${REDACTED}` : part;
   }).join('&');
 }
 
@@ -191,7 +278,7 @@ function setOwn(o: Record<string, unknown>, k: string, v: unknown): void {
 const MAX_DEPTH = 64;
 
 function walk(v: unknown, extra: ReadonlySet<string>, skip: ReadonlySet<string>, depth: number): unknown {
-  if (typeof v === 'string') return redactText(v);
+  if (typeof v === 'string') return tokenShaped(v) ? REDACTED : redactText(v);
   if (typeof v !== 'object' || v === null) return v;
   if (depth >= MAX_DEPTH) return REDACTED;
   if (Array.isArray(v)) return v.map((x: unknown) => walk(x, extra, skip, depth + 1));

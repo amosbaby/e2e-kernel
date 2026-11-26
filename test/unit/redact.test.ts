@@ -80,7 +80,7 @@ test('kernel-shaped values survive redactText', () => {
 });
 
 test('redactText: more token and url shapes', () => {
-  assert.equal(redactText('x-csrf: ' + 'f0'.repeat(16) + '.'), 'x-csrf: [REDACTED].');
+  assert.equal(redactText('x-csrf: ' + 'f0'.repeat(16) + '.'), 'x-csrf: [REDACTED]');
   assert.equal(redactText(`a <b>${mixed42}</b>`), 'a <b>[REDACTED]</b>');
   assert.equal(redactText('/cb?acc%65ss_token=v1'), '/cb?acc%65ss_token=[REDACTED]');
   assert.equal(redactText('Set-Cookie: sid=v2; Path=/\nnext line'), 'Set-Cookie: [REDACTED]\nnext line');
@@ -91,10 +91,20 @@ test('redactText: more token and url shapes', () => {
 test('redactText stays fast on adversarial input', () => {
   const inputs = ['eyJ'.repeat(20000), 'a'.repeat(60000) + '!', '?'.repeat(30000) + '=', '&a'.repeat(30000),
     '://'.repeat(20000), '://a:' + 'b:'.repeat(30000), 'Bearer '.repeat(10000), ('A1b-'.repeat(10) + '.').repeat(5000),
-    'x=1; '.repeat(20000), ' '.repeat(60000) + 'x', 'a' + '\t'.repeat(60000) + 'b'];
+    'x=1; '.repeat(20000), ' '.repeat(60000) + 'x', 'a' + '\t'.repeat(60000) + 'b',
+    'a@' + 'a.'.repeat(50000), 'a%40'.repeat(30000), '@'.repeat(60000), 'a.'.repeat(50000) + '@',
+    '"' + 'a'.repeat(1e5), '"token":"' + '\\'.repeat(1e5), '"token":"' + 'a'.repeat(1e5), '"token":"'.repeat(30000),
+    '"a" '.repeat(30000), '"a"' + ' '.repeat(1e5), '\\"token\\":\\"'.repeat(30000), '\\"token\\":\\"' + 'a'.repeat(1e5),
+    '\\"token\\":\\"' + '\\"'.repeat(60000), '\\"token\\":\\"' + '\\\\\\"'.repeat(30000), 'a:'.repeat(30000), '-'.repeat(1e5) + ':', ('a-'.repeat(20) + ':\n').repeat(30000),
+    ' password="'.repeat(30000), 'password="' + 'a'.repeat(1e5), " password='".repeat(30000), 'password="' + '\\'.repeat(1e5),
+    ';a'.repeat(30000), ',a'.repeat(30000), '(a'.repeat(30000), '{a'.repeat(30000), '[a'.repeat(30000), '=a'.repeat(30000)];
   const start = performance.now();
   for (const s of inputs) redactText(s);
   redactBody('Content-Disposition: x; '.repeat(20000), 'multipart/form-data; boundary=b');
+  redactBody('a=' + 'Ab1+'.repeat(30000), 'application/x-www-form-urlencoded');
+  redactBody('a=Ab1%2B&'.repeat(30000), 'application/x-www-form-urlencoded');
+  redactBody('a=%40&'.repeat(30000), 'application/x-www-form-urlencoded');
+  redactBody(JSON.stringify({ x: 'A1b+'.repeat(30000), y: 'a@' + 'a.'.repeat(30000) }), 'application/json');
   assert.ok(performance.now() - start < 2000);
 });
 
@@ -172,4 +182,101 @@ test('deeply nested json never throws and never leaks', () => {
   }
   const deepObj = '{"a":'.repeat(3000) + '"' + 'f0'.repeat(4) + '"' + '}'.repeat(3000);
   assert.ok(!redactBody(deepObj, null)!.includes('f0f0f0f0'));
+});
+
+// 新规则的测试值都在运行时拼，不写成字面量。
+const b64Std = 'Ab1+Cd2/'.repeat(5) + 'Ef3+';                              // 44 位，标准 base64 字符，含 + 和 /
+const b64Enc = encodeURIComponent(b64Std);
+
+test('e-mail addresses, plain and percent-encoded', () => {
+  assert.equal(redactText('contact ann.lee+x@example.com now'), 'contact [REDACTED] now');
+  assert.equal(redactText('a%40b.example.com'), '[REDACTED]');
+  assert.equal(redactText('to=u%40example.com&x=1'), 'to=[REDACTED]&x=1');
+  assert.equal(redactText('mail ann@example.com.'), 'mail [REDACTED].');
+  for (const s of ['@types/node', 'lodash@4.17.21', 'version 1.65.1', 'author: Ann', 'user@host', 'a @ b.example.com'])
+    assert.equal(redactText(s), s);
+  assert.equal(redactText('http://usr7:pw9@example.com/a'), 'http://[REDACTED]@example.com/a');   // 用户名也不留
+});
+
+test('free-text secrets: name=value, json pairs, header lines', () => {
+  assert.equal(redactText('password=hunter-x 和后文'), 'password=[REDACTED] 和后文');
+  assert.equal(redactText('login failed (password=hunter-x) ok'), 'login failed (password=[REDACTED] ok');   // 值到空白才结束，多换掉一个 `)`
+  assert.equal(redactText('note a=1; pwd=hunter-x b=2'), 'note a=1; pwd=[REDACTED] b=2');
+  assert.equal(redactText('{"token":"v1","ok":1}'), '{"token":"[REDACTED]","ok":1}');
+  assert.equal(redactText('\'"token" : "v\\"q"\' x'), '\'"token" : "[REDACTED]"\' x');
+  assert.equal(redactText('{"a":"1","api_key":"k\\\\","b":"2"}'), '{"a":"1","api_key":"[REDACTED]","b":"2"}');
+  assert.equal(redactText('{"author":"Ann","note":"x"}'), '{"author":"Ann","note":"x"}');
+  assert.equal(redactText('X-Api-Key: v1'), 'X-Api-Key: [REDACTED]');
+  assert.equal(redactText('  x-api-key:v1\nnext: ok'), '  x-api-key: [REDACTED]\nnext: ok');
+  assert.equal(redactText('Authorization: Basic v1'), 'Authorization: Basic [REDACTED]');
+  assert.equal(redactText('Authorization: Digest username="a", response="b"'), 'Authorization: [REDACTED]');
+  assert.equal(redactText('Cookie: a=1; b=2'), 'Cookie: [REDACTED]');
+  for (const s of ['author: Ann', 'Content-Type: application/json', 'note: a=1; b=2', 'Authors: Ann'])
+    assert.equal(redactText(s), s);
+});
+
+test('json pairs fail closed when the closing quote is missing', () => {
+  const out = redactText('{"token":"abc');
+  assert.ok(!out.includes('abc'));
+  assert.equal(out, '{"token":"[REDACTED]');
+  assert.ok(!redactText('before {"token":"abc"x, "next":"y').includes('abc'));
+  assert.equal(redactText('{"token":"v","b":"keep"}'), '{"token":"[REDACTED]","b":"keep"}');   // 找到了就从结束引号之后继续
+});
+
+test('json pairs in the doubly encoded shape', () => {
+  const out = redactText('{\\"token\\":\\"v\\",\\"b\\":\\"keep\\"}');
+  assert.ok(!out.includes('v\\"'));
+  assert.equal(out, '{\\"token\\":\\"[REDACTED]\\",\\"b\\":\\"keep\\"}');
+  assert.equal(redactText('{\\"token\\":\\"a\\\\\\"b\\",\\"c\\":1}'), '{\\"token\\":\\"[REDACTED]\\",\\"c\\":1}');
+});
+
+test('redactBody: form values are decoded before judging and never written back', () => {
+  const out = redactBody(`ids=%5B%22u%40example.com%22%5D&state=${b64Enc}&n=1`, 'application/x-www-form-urlencoded');
+  assert.equal(out, 'ids=[REDACTED]&state=[REDACTED]&n=1');
+  assert.ok(!out!.includes('example.com'));
+  assert.equal(redactBody('ids=u%40example.com', null), 'ids=[REDACTED]');
+  assert.equal(redactBody('q=a+b&r=hello%20world', 'application/x-www-form-urlencoded'), 'q=a+b&r=hello%20world');
+});
+
+test('redactBody: whole-value tokens in unencoded, + containing and JSON shapes', () => {
+  assert.equal(redactBody(`state=${b64Std}`, 'application/x-www-form-urlencoded'), 'state=[REDACTED]');
+  assert.equal(redactBody(`state=${b64Std}=`, null), 'state=[REDACTED]');
+  assert.equal(redactBody(JSON.stringify({ x: b64Std, k: 'v' }), 'application/json'), '{"x":"[REDACTED]","k":"v"}');
+  assert.equal(redactUrl(`http://localhost/x?s=${b64Enc}&a=1`), 'http://localhost/x?s=[REDACTED]&a=1');
+  assert.equal(redactDeep({ x: b64Std }).x, REDACTED);
+});
+
+test('whole-value token rule leaves paths and ordinary values alone', () => {
+  const path = '/api/v2/Accounts/Settings/Profile2Overview';
+  assert.equal(redactDeep({ p: path }).p, path);
+  assert.equal(redactBody(`next=${path}`, 'application/x-www-form-urlencoded'), `next=${path}`);
+  assert.equal(redactBody(`next=${encodeURIComponent(path)}`, 'application/x-www-form-urlencoded'), `next=${encodeURIComponent(path)}`);
+  assert.equal(redactDeep({ p: '//cdn/Accounts/Settings/Profile2Overview/x' }).p, '//cdn/Accounts/Settings/Profile2Overview/x');
+  assert.equal(redactDeep({ p: 'x/' + path }).p, 'x/' + path);                     // 含 // 的不算
+  assert.equal(redactDeep({ p: 'Short1Value' }).p, 'Short1Value');
+  assert.equal(redactDeep({ p: 'g'.repeat(40) }).p, 'g'.repeat(40));              // 没有大写和数字
+  assert.equal(redactUrl(`http://localhost${path}?next=${path}`), `http://localhost${path}?next=${path}`);
+});
+
+test('quoted parameter values: only the content between the quotes is replaced', () => {
+  assert.equal(redactText('password="a b" ok'), 'password="[REDACTED]" ok');
+  assert.equal(redactText('password="hunter2X" ok'), 'password="[REDACTED]" ok');
+  assert.equal(redactText("data-token='v1' ok"), "data-token='[REDACTED]' ok");
+  assert.equal(redactText('/cb?token="v1"&a=1'), '/cb?token="[REDACTED]"&a=1');
+  assert.equal(redactText('password="a\\"b c" ok'), 'password="[REDACTED]" ok');
+  assert.equal(redactText('password="a b" pwd="c d"'), 'password="[REDACTED]" pwd="[REDACTED]"');
+  assert.ok(!redactText('password="abc').includes('abc'));          // 没有结束引号：换到串尾
+  assert.ok(!redactText("password='abc d").includes('abc'));
+  assert.equal(redactText('note="a b" ok'), 'note="a b" ok');       // 名字不敏感
+});
+
+test('sensitive header lines: non-ascii, symbol-only, line separators, underscores', () => {
+  assert.equal(redactText('Password: \u043f\u0430\u0440\u043e\u043b\u044c'), 'Password: [REDACTED]');
+  assert.equal(redactText('X-Api-Key: !@#$%^&*()'), 'X-Api-Key: [REDACTED]');
+  assert.equal(redactText('Cookie:'), 'Cookie: [REDACTED]');
+  assert.equal(redactText('X-Api-Key: v1\u2028tail'), 'X-Api-Key: [REDACTED]');
+  assert.equal(redactText('X-Api-Key: v1\u2029tail'), 'X-Api-Key: [REDACTED]');
+  assert.equal(redactText('api_key: v1'), 'api_key: [REDACTED]');
+  assert.equal(redactText('client_secret: v1\nok: 1'), 'client_secret: [REDACTED]\nok: 1');
+  assert.equal(redactText('Authorization: Bearer [REDACTED]'), 'Authorization: Bearer [REDACTED]');
 });
