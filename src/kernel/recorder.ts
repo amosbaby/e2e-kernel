@@ -3,7 +3,7 @@ import type { Op, Target } from '../shared/ops.ts';
 import type { Mode, Outcome, RequestSummary } from '../shared/protocol.ts';
 import { graphqlKind } from './graphql.ts';
 import type { GraphqlKind } from './graphql.ts';
-import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts';
+import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
 
 // 会话的记录（设计 5.7、5.8）：动作、写、请求摘要、到过的域名。进记录之前先脱敏。
 
@@ -27,15 +27,6 @@ const WRITE_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DEL
 // 不分大小写：fetch 不会把 patch 规范成大写，宁可多记一条写。
 export function isWrite(method: string): boolean {
   return WRITE_METHODS.has(method.toUpperCase());
-}
-
-// 失败关闭：脱敏函数抛错时给固定标记，绝不退回去用原值。
-export function safely(redact: () => string): string {
-  try {
-    return redact();
-  } catch {
-    return REDACTED;
-  }
 }
 
 function hostOf(url: string): string {

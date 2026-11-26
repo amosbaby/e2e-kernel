@@ -12,6 +12,7 @@ import { resolveHome } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
 import { ExitCode, MAX_OPS_BYTES, exitCodeFor, validateParams } from '../shared/protocol.ts';
 import type { CloseResult, Method, OpenResult, StepResult } from '../shared/protocol.ts';
+import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { runDoctor } from './doctor.ts';
 import { formatChecks, formatClose, formatError, formatOpen, formatStatus, formatStep } from './format.ts';
@@ -103,10 +104,6 @@ function parseViewport(v: string): Viewport {
   const m = /^([0-9]{1,5})x([0-9]{1,5})$/.exec(v);
   if (m === null) throw usage('--viewport 要写成 <宽>x<高>，比如 1280x800');
   return { width: Number(m[1]), height: Number(m[2]) };
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 // 发给内核。内核没在跑时补上启动命令；内核回的错误原样往上抛（code、message、next 都不改）。

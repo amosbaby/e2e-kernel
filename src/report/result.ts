@@ -1,12 +1,11 @@
 import type { Capabilities } from '../driver/types.ts';
-import { tally } from '../kernel/executor.ts';
 import type { ActionRecord, WriteRecord } from '../kernel/recorder.ts';
-import { safely } from '../kernel/recorder.ts';
 import { E2kError } from '../shared/errors.ts';
 import { READ_OPS } from '../shared/ops.ts';
 import type { Op, Viewport } from '../shared/ops.ts';
+import { tally } from '../shared/protocol.ts';
 import type { ConflictReason, Finding, Mode, Supersede, Tallies, Verdict } from '../shared/protocol.ts';
-import { redactText } from '../shared/redact.ts';
+import { redactText, safely } from '../shared/redact.ts';
 
 // 一场会话的结果（设计 5.3「留痕」）。字段名不得是脱敏意义上的敏感键（名字里不能带 auth、token 一类的片段）：
 // 否则 writeRun 的脱敏会把整个值换掉。

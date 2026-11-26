@@ -1,9 +1,8 @@
 import type { ActionRecord, WriteRecord } from '../kernel/recorder.ts';
-import { safely } from '../kernel/recorder.ts';
 import { escapeHtml } from '../shared/escape.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { Outcome, VerdictValue } from '../shared/protocol.ts';
-import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts';
+import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
 import type { ClosedBy, RunResult, SupersededEntry } from './result.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。

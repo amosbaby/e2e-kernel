@@ -9,6 +9,10 @@ function usage(message: string): E2kError {
   return new E2kError('usage', message);
 }
 
+export function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 export function str(v: unknown, name: string, o: { min?: number; max: number; pattern?: RegExp }): string {
   const min = o.min ?? 0;
   if (typeof v !== 'string') throw usage(`${name} must be a string`);

@@ -1,4 +1,5 @@
-export type ErrorCode = 'usage' | 'not-found' | 'busy' | 'action-failed' | 'internal' | 'needs-human' | 'wait-login' | 'wait-approval';
+export const ERROR_CODES = ['usage', 'not-found', 'busy', 'action-failed', 'internal', 'needs-human', 'wait-login', 'wait-approval'] as const;
+export type ErrorCode = (typeof ERROR_CODES)[number];
 
 // 内核和 CLI 共用的错误：code 决定退出码，next 是给调用方的下一步建议（可选）。
 export class E2kError extends Error {

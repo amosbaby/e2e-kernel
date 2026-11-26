@@ -3,6 +3,20 @@
 
 export const REDACTED = '[REDACTED]';
 
+// 超长就截断，后缀带原长度。截断一律放在脱敏之后：反过来会把 token 切成认不出来的半截。
+export function truncate(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…[truncated ${s.length}]` : s;
+}
+
+// 失败关闭：脱敏函数抛错时给固定标记，绝不退回去用原值。
+export function safely(redact: () => string): string {
+  try {
+    return redact();
+  } catch {
+    return REDACTED;
+  }
+}
+
 const SENSITIVE_PARTS = ['password', 'passwd', 'pwd', 'secret', 'token', 'auth', 'cookie', 'apikey', 'api_key', 'api-key',
   'credential', 'signature', 'csrf', 'xsrf', 'sessionid', 'session_id', 'session-id'];
 const SENSITIVE_EXACT = new Set(['pw', 'pass', 'otp', 'sid', 'sig']);
@@ -257,7 +271,7 @@ export function redactBody(body: string | null, contentType: string | null, max 
     else if (isFormType || (!isJsonType && looksLikeForm(body))) out = redactText(redactParams(body));
     else out = redactText(body);
   }
-  return out.length > max ? `${out.slice(0, max)}…[truncated ${out.length}]` : out;
+  return truncate(out, max);
 }
 
 // 失败关闭：出任何异常都给固定标记，绝不退回去输出原文。

@@ -4,9 +4,8 @@ import type { Described, Page, PasswordProbe, Stable } from '../driver/types.ts'
 import type { Op, Target, WaitCond } from '../shared/ops.ts';
 import type { OpResult, Outcome, Tallies } from '../shared/protocol.ts';
 import { ensurePrivateDir, resolveInside } from '../shared/paths.ts';
-import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts';
+import { REDACTED, redactBody, redactText, redactUrl, safely, truncate } from '../shared/redact.ts';
 import { compare } from './assert.ts';
-import { safely } from './recorder.ts';
 import type { ActionRecord, Recorder } from './recorder.ts';
 
 // 执行一批操作（设计 5.6、5.8）：按顺序跑，动作执行失败就停，后面的标 not-run；assert 不符不停。
@@ -17,7 +16,7 @@ export interface ExecCtx { recorder: Recorder; runDir: string; now(): Date }
 const PASSWORD_REFUSAL = 'password-field: 内核不输入密码，请由人登录后再继续';
 const FILL_UNCHECKED = 'fill-unchecked: 判断不出目标是不是密码框，内核不填写';
 
-const MAX_SNAPSHOT = 20_000;
+export const MAX_SNAPSHOT = 20_000;
 const DEFAULT_TEXT = 4_000;
 const MAX_TEXT = 20_000;
 const MAX_EVAL = 4_000;
@@ -48,12 +47,8 @@ interface Done {
   jsHash?: string;
 }
 
-function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max)}…[truncated ${s.length}]` : s;
-}
-
 // 先脱敏再截断：反过来会把 token 切成认不出来的半截。
-function redactCap(raw: string, max: number): string {
+export function redactCap(raw: string, max: number): string {
   return safely(() => truncate(redactText(raw), max));
 }
 
@@ -361,15 +356,6 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx, opts?: { keepG
     results.push(result);
   }
   return results;
-}
-
-export function tally(items: readonly { outcome: Outcome }[]): Tallies {
-  const t: Tallies = { ok: 0, match: 0, mismatch: 0, failed: 0, notRun: 0 };
-  for (const { outcome } of items) {
-    if (outcome === 'not-run') t.notRun++;
-    else t[outcome]++;
-  }
-  return t;
 }
 
 // 一批里既有不符又有执行失败时报 11。

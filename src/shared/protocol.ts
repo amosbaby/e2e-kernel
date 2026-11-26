@@ -60,6 +60,15 @@ export interface OpResult {
   hints?: string[];   // 失败时的诊断（匹配了哪几个、谁挡住了点击），已脱敏，每条不超过 300 字符，最多 6 条
 }
 export interface Tallies { ok: number; match: number; mismatch: number; failed: number; notRun: number }
+
+export function tally(items: readonly { outcome: Outcome }[]): Tallies {
+  const t: Tallies = { ok: 0, match: 0, mismatch: 0, failed: 0, notRun: 0 };
+  for (const { outcome } of items) {
+    if (outcome === 'not-run') t.notRun++;
+    else t[outcome]++;
+  }
+  return t;
+}
 export interface SessionInfo { session: string; name: string; url: string; idleSec: number }
 export interface OpenResult {
   session: string; name: string; url: string; title: string; mode: Mode; runDir: string; snapshot: string; blocked: 'login' | null; next: string | null;

@@ -10,13 +10,14 @@ import { E2kError } from '../shared/errors.ts';
 import type { Viewport } from '../shared/ops.ts';
 import { ensurePrivateDir, resolveInside } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
+import { tally } from '../shared/protocol.ts';
 import type { CloseParams, CloseResult, Mode, OpenParams, OpenResult, SessionInfo, StepParams, StepResult }
   from '../shared/protocol.ts';
-import { redactText, redactUrl } from '../shared/redact.ts';
-import { exitFor, runOps, tally } from './executor.ts';
+import { redactText, redactUrl, safely } from '../shared/redact.ts';
+import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
 import type { ModeResolver } from './mode.ts';
 import { DEFAULT_PROFILE, recordLogin } from './profiles.ts';
-import { Recorder, isWrite, safely, toWriteRecord } from './recorder.ts';
+import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import type { WritePolicy } from './write-policy.ts';
 
@@ -29,7 +30,6 @@ export interface SessionDeps {
 }
 
 const DEFAULT_NAME = 'session';
-const MAX_SNAPSHOT = 20_000;
 const MAX_UNATTRIBUTED = 200;
 
 // opening：页面已登记、首屏还没读完，对外当作不存在；closing：收尾中，再来的 step、close 都是 busy。
@@ -83,12 +83,8 @@ function errorText(e: unknown): string {
   return firstLine(e);
 }
 
-// 先脱敏再截断：反过来会把 token 切成认不出来的半截。
 function cappedSnapshot(raw: string): string {
-  return safely(() => {
-    const s = redactText(raw);
-    return s.length > MAX_SNAPSHOT ? `${s.slice(0, MAX_SNAPSHOT)}…[truncated ${s.length}]` : s;
-  });
+  return redactCap(raw, MAX_SNAPSHOT);
 }
 
 type LoginWall = { blocked: 'login' | null; next: string | null };

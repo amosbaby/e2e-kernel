@@ -1,18 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { relative } from 'node:path';
-import { E2kError } from './errors.ts';
+import { ERROR_CODES, E2kError } from './errors.ts';
 import type { ErrorCode } from './errors.ts';
 import { assertSocketPathFits, resolveInside } from './paths.ts';
 import type { Home } from './paths.ts';
 import { PROTOCOL_VERSION } from './protocol.ts';
 import type { Method, Response } from './protocol.ts';
+import { isObject } from './validate.ts';
 
 // CLI 这一侧：连内核的 socket，发一行请求、收一行回应（设计 5.1）。
 // 不设超时：一批操作可以跑几十分钟，一直等到内核回话。
-
-const ERROR_CODES: readonly ErrorCode[] =
-  ['usage', 'not-found', 'busy', 'action-failed', 'internal', 'needs-human', 'wait-login', 'wait-approval'];
 
 function notRunning(): E2kError {
   return new E2kError('needs-human', '内核没在跑');
@@ -24,10 +22,6 @@ function interrupted(): E2kError {
 
 function malformed(): E2kError {
   return new E2kError('internal', '内核的回应格式不对');
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 // 回应的 id 必须是这次请求的；内核解析不出请求时回 "-"，那只能是一个错误回应。

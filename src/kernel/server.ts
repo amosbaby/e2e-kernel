@@ -10,12 +10,11 @@ import { assertSocketPathFits, ensurePrivateDir, resolveInside } from '../shared
 import type { Home } from '../shared/paths.ts';
 import { KERNEL_SKIP_KEYS, MAX_LINE_BYTES, PROTOCOL_VERSION, parseRequest, validateParams } from '../shared/protocol.ts';
 import type { Request, Response, SessionInfo } from '../shared/protocol.ts';
-import { redactDeep, redactText } from '../shared/redact.ts';
+import { redactDeep, redactText, safely } from '../shared/redact.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { defaultOnlyResolver } from './mode.ts';
 import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
 import type { ProfileInfo } from './profiles.ts';
-import { safely } from './recorder.ts';
 import { SessionManager } from './sessions.ts';
 import { allowAllPolicy } from './write-policy.ts';
 
