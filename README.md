@@ -1,5 +1,135 @@
 # e2e-kernel
-A local resident kernel plus an `e2k` CLI that lets AI agents do e2e verification in a browser through a driver protocol.
-Status: M1 in development.
-Design: [docs/design.md](docs/design.md)
-License: MIT
+
+A local resident kernel plus an `e2k` CLI that lets an AI agent do e2e verification in a real browser. The kernel owns a headed Chromium (driven through Playwright behind a small driver protocol), keeps sessions alive across CLI calls, records what the agent did and what the page did, and writes a report for a person to read.
+It does not call a model, does not type passwords and does not solve CAPTCHAs: a person logs in, the agent verifies.
+Status: M1 (kernel, CLI, Playwright driver, `default` mode, `open` / `step` / `close`, `login`, reports). Design: [docs/design.md](docs/design.md). License: MIT.
+
+## Requirements and setup
+
+- macOS (the only platform verified), a login session with a graphical display (the browser is always headed).
+- Node >= 24.12.
+- Install and build:
+
+```sh
+npm install
+npx playwright install chromium
+npm run build
+```
+
+Commands below are written as `node bin/e2k.js <command>` and run from the repository root. After `npm link` you can type `e2k <command>` instead; whether to link is your call. `bin/e2k.js` imports `dist/`, so run `npm run build` after changing the source.
+
+## Usage
+
+1. Start the kernel. A person must do this in a terminal; without a TTY it exits 22 and there is no override. It stays in the foreground, Ctrl-C stops it.
+
+```sh
+node bin/e2k.js start
+```
+
+2. Open a page. This returns a session id and a first snapshot. `--name` groups reports (default `session`), `--viewport 1280x720` is optional, `--json` prints one JSON line.
+
+```sh
+node bin/e2k.js open http://localhost:3000/ --name smoke
+```
+
+3. Run a batch of operations (a JSON array, at most 50 operations, at most 1,000,000 bytes). For large batches, or operations that contain quotes, use `--stdin`.
+
+```sh
+node bin/e2k.js step s-1a2b3c '[{"op":"click","target":"e7"},{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Saved"}]'
+echo '[{"op":"snapshot"}]' | node bin/e2k.js step s-1a2b3c --stdin
+```
+
+`target` is either a ref from the latest snapshot (such as `e7`) or a selector string. A failed action stops the batch; a failed `assert` is recorded and the batch goes on. In the text output `#n` is the 1-based position of the operation in the batch.
+
+4. Close the session. This writes the report. `--verdict` is one of `pass`, `fail`, `exists`, `absent`, `undetermined`; `--because` gives the reason; `--findings` and `--not-done` take a JSON array.
+
+```sh
+node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by one"
+```
+
+The kernel compares the verdict with the recorded assertions and says whether they are consistent; a conflict is called out in the report.
+
+Other commands:
+
+- `node bin/e2k.js login https://example.com/login` opens the dedicated profile so a person can sign in; must be run by a person in a terminal. The cookie stays in the profile for later sessions.
+- `node bin/e2k.js status` shows version, driver, browser and sessions. `node bin/e2k.js doctor` checks Node, platform, Chromium (fix: `npx playwright install chromium`), and kernel version; each failing check prints its fix.
+- `--json` (on commands that support it) prints exactly one line on stdout: the result, or `{ "error": ... }`.
+
+## Operations
+
+| op | fields | what it does |
+|---|---|---|
+| `snapshot` | `depth?` (1-50) | accessibility snapshot with refs (cut at 20000 characters) |
+| `text` | `target?`, `max?` (1-20000, default 4000) | visible text of the page or an element |
+| `screenshot` | `fullPage?` | JPEG of the viewport (quality 60) saved under the report's `shots/` |
+| `console` | | last 50 console messages (300 characters each) |
+| `network` | | summary of the last 50 requests |
+| `click`, `hover` | `target` | pointer actions |
+| `fill` | `target`, `value` | type into an input (refuses password fields) |
+| `press` | `key`, `target?` | press a key |
+| `scroll` | `target?`, `dx?`, `dy?` | scroll an element into view, or the page window by dx/dy |
+| `goto` | `url` | navigate (http/https only) |
+| `viewport` | `width`, `height` | resize (320-3840 by 240-2160) |
+| `wait` | `for`, `timeoutMs?` | wait for `{text}`, `{target,state}` (visible/hidden), `{urlContains}` or `{ms}`; default 10 s, max 60 s |
+| `assert` | `kind`, `target?`, `property?`, `cmp`, `expected` | check `text`, `count`, `css`, `url` or `visible`; result is a match or a mismatch, never "pass/fail" |
+| `eval` | `js` | run a JavaScript expression in the page (result cut at 4000 characters) |
+
+Supported assertion forms:
+
+- Colours in `css` assertions: `#rgb`, `#rrggbb`, `rgb()` and `rgba()`.
+- Lengths: a plain number or `<number>px`.
+- Anything else (named colours, `#rrggbbaa`, other units) does not match.
+- `scroll` with `dx` / `dy` scrolls the page window, not an inner scroller.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | ok / consistent pass |
+| 1 | internal error |
+| 2 | usage error, unknown session, or the kernel is busy (including a kernel that is shutting down) |
+| 10 | at least one assertion mismatched |
+| 11 | an action failed (a batch with both a mismatch and a failed action reports 11); a refused password fill is also 11 |
+| 20 | waiting for a login |
+| 21 | waiting for an approval (reserved, not used in M1) |
+| 22 | needs a person: no kernel running, or a command that must be run by a person in a terminal |
+
+## Where things live
+
+State directory: `~/.e2e-kernel/` (override with an absolute `E2K_HOME`). It holds `kernel.sock`, `kernel.pid`, `kernel.log`, `profiles/default/` (the browser profile with login cookies) and `runs/`.
+Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` with `report.html` (no scripts; screenshots are linked from `shots/NN.jpg` and render when the file is opened from disk), `result.json` (a replayable record) and `shots/`. The newest 20 reports per session name are kept. A session idle for 15 minutes is closed (time spent inside a `step` does not count).
+
+## Safety
+
+- The kernel never types a password. `fill` into a password field is refused (exit 11, "a person must log in"). If the kernel cannot tell whether a field is a password field, it does not fill. Log in with `login`.
+- Fill values are kept in records only for fields the kernel confirmed are not password fields; every other fill value is recorded as `[REDACTED]`.
+- In the `default` mode every write request is allowed and recorded. Writes that cannot be attributed to a page are listed separately under "writes not attributed to a page".
+- Command output, `result.json` and `report.html` are redacted (token-shaped strings, credentials in URLs, request bodies) and everything from the page is HTML-escaped in the report.
+- Known boundary: `target`, `given` and `selector` are passed through verbatim, unredacted, so that a record can be replayed. Selectors written by an agent, and stable selectors the kernel derives (`data-testid`, `id`, accessible names), can carry page text.
+- Focus: on macOS, launching the headed browser takes window focus. This is a known M1 limitation and will be addressed in M2.
+
+### Threat model
+
+The kernel guards against an agent that drifts, misclicks or takes shortcuts. It does not defend against a deliberately hostile agent or process (see section 5.4 of [docs/design.md](docs/design.md)). Known limits:
+
+- The socket is open to any process of the same local user, including `login.begin`.
+- `press` typing key by key, and assigning an input's value inside `eval`, can get around the refusal to fill password fields.
+- Any process of the same user can read and write the state directory.
+
+### Known M1 gaps
+
+- A new tab's first navigation request cannot be attributed to a page and is reported as unattributed.
+- The single-instance lock has a millisecond-scale race.
+
+## Not in this version
+
+No domain rules or read-only mode, no per-site profiles, no approval flow (there is deliberately no `approve` command), no "deny" mode, no `save-case` / `run`, no MCP wrapper, no headless mode, no CI use, and no platform other than macOS. See the milestones in [docs/design.md](docs/design.md).
+
+## Development
+
+```sh
+npm run check         # typecheck, unit and kernel tests, public-repo scan
+npm run test:browser  # driver tests in a real headed Chromium
+npm run test:e2e      # build, then end-to-end acceptance on local fixtures
+npm run m0            # route-coverage probe; results are described in docs/m0-findings.md
+```
