@@ -69,10 +69,16 @@ interface Login {
   readonly host: string;                     // 起始地址的主机（URL.hostname），人按回车结束时记进登录记录
   readonly mode: Mode;                       // resolve(起始主机)：起点只读，登录里的写就都按只读
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
+  readonly places: Map<string, LoginPlace>;  // 每个登录页现在在哪个主机上（照会话的 topHost / pendingHosts 那套）
   blocked: number;                           // 登录期间被拦下的写（含放行后发现重定向被拒的）
   // 放行时带 followRedirects: false 的请求 id → 日志行，onRequestDone 发现重定向被拒时用它补记一条拦截。
   readonly requestIds: Map<string, string>;
 }
+
+// 登录页所在的主机：committed 是已提交的证据，pending 是放行了、但还不确定会不会提交的顶层导航目标。
+interface LoginPlace { committed: string; readonly pending: Set<string> }
+
+const KNOWN_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 
 function busy(): E2kError {
   return new E2kError('busy', '会话正忙', '稍后重试');
@@ -269,7 +275,7 @@ export class SessionManager {
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, host, mode, pages: new Map([[page.id, page]]), blocked: 0, requestIds: new Map() };
+      login = { id, instance, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, requestIds: new Map() };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -619,23 +625,52 @@ export class SessionManager {
     return verdict.decision;
   }
 
-  // 登录页（和它弹出的窗口）的请求：不进任何记录。请求目标主机或所在页的顶层主机是 loginHost 的免拦；
-  // 其余按只读规则：登录起点主机只读，或请求所在页的顶层主机只读，都算只读。
+  // 登录页（和它弹出的窗口）的请求：不进任何记录。免拦两种：请求目标主机是 loginHost；或是顶层导航（SAML POST 绑定、
+  // OIDC form_post 回调），而发起它的页停在（或待定在）loginHost 上。真驱动给顶层导航的 topUrl 是导航目标，所以「发起页在哪」
+  // 得自己跟：place 记着已提交的主机和待定的主机。loginHost 页上的 fetch/XHR 去别的主机不免拦，照只读规则判。
+  // 其余请求的有效模式：登录起点、页面已提交和待定的主机、请求自己的顶层主机，任一只读就按只读。
   private decideForLogin(login: Login, req: RequestInfo): Decision {
     const { modes } = this.deps;
     const topHost = hostOf(req.topUrl ?? req.url);
-    if (modes.isLoginHost(hostOf(req.url)) || modes.isLoginHost(topHost)) return { action: 'continue' };
-    const modeList = [login.mode, modes.resolve(topHost)];
-    const mode: Mode = modeList.includes('readonly') ? 'readonly' : modeList.includes('denied') ? 'denied' : 'default';
-    const verdict = this.deps.policy.decide(req, { mode });
-    const line = `登录 ${login.id}：拦下 ${req.method} ${safely(() => redactText(hostOf(req.url)))}`;
-    if (verdict.reason !== null) {
-      login.blocked++;
-      this.logLine(line);
-    } else if (verdict.decision.action === 'continue' && verdict.decision.followRedirects === false) {
-      login.requestIds.set(req.id, line);
+    const place = this.loginPlace(login, req.pageId, req.openerPageId);
+    const isNav = req.isNavigation && req.topFrame;
+    const exempt = modes.isLoginHost(hostOf(req.url))
+      || (isNav && [place.committed, ...place.pending].some((h) => modes.isLoginHost(h)));
+    let decision: Decision;
+    if (exempt) decision = { action: 'continue' };
+    else {
+      const all = [login.mode, ...[place.committed, ...place.pending, topHost].map((h) => modes.resolve(h))];
+      const mode: Mode = all.includes('readonly') ? 'readonly' : all.includes('denied') ? 'denied' : 'default';
+      const verdict = this.deps.policy.decide(req, { mode });
+      decision = verdict.decision;
+      const method = KNOWN_METHODS.has(req.method.toUpperCase()) ? req.method.toUpperCase() : 'OTHER';
+      const line = `登录 ${login.id}：拦下 ${method} ${safely(() => redactText(hostOf(req.url)))}`;
+      if (verdict.reason !== null) {
+        login.blocked++;
+        this.logLine(line);
+      } else if (decision.action === 'continue' && decision.followRedirects === false) {
+        login.requestIds.set(req.id, line);
+      }
     }
-    return verdict.decision;
+    // 判定之后才动主机：放行的顶层导航记成待定；非导航请求带着的顶层地址是「已提交」的证据，主机据此确定下来。
+    if (isNav) {
+      if (decision.action === 'continue') place.pending.add(topHost);
+    } else if (req.topUrl !== null) {
+      place.pending.clear();
+      place.committed = topHost;
+    }
+    return decision;
+  }
+
+  // 登录页的位置表：没有就建。弹窗在拿到自己的证据之前，按开启者已提交的主机算；开启者也不认识就退回登录起点。
+  private loginPlace(login: Login, pageId: string | null, openerId: string | null): LoginPlace {
+    const key = pageId ?? '';
+    let place = login.places.get(key);
+    if (place === undefined) {
+      place = { committed: (openerId === null ? undefined : login.places.get(openerId)?.committed) ?? login.host, pending: new Set() };
+      login.places.set(key, place);
+    }
+    return place;
   }
 
   // 会话页（主页面、弹窗）的请求。模式跟着页面走（设计 5.2）：有效模式 = 会话主页面的顶层主机和请求所在页的顶层主机取并，
@@ -751,6 +786,7 @@ export class SessionManager {
       page.onClosed(() => { owner.pages.delete(page.id); });
     } else if (login !== undefined) {
       login.pages.set(page.id, page);
+      this.loginPlace(login, page.id, openerId);
     }
   }
 

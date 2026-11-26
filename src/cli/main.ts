@@ -277,7 +277,7 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   // 老内核不返回 writesBlocked：当作 0。
   const blocked = isObject(ended) && typeof ended.writesBlocked === 'number' ? ended.writesBlocked : 0;
   if (blocked > 0) {
-    ctx.io.out(`登录过程中有 ${blocked} 条写被只读规则拦下：登录用的主机（含 SAML/OIDC 回调所在页的主机）可能没列进 rules.json 的 loginHosts`);
+    ctx.io.out(`登录过程中有 ${blocked} 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules.json 的 loginHosts`);
   }
   return ExitCode.OK;
 }

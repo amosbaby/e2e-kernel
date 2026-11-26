@@ -912,51 +912,90 @@ test('an unattributed page on a read-only host is read-only even with no read-on
 });
 
 // ---- 登录窗口过写策略（loginHosts 之外） ----
+// 请求形状照真驱动：顶层导航 isNavigation + topFrame，topUrl 是导航目标；其余请求的 topUrl 是所在页的地址。
 
 const LOGIN_START = 'http://app.example.com/login';
 const SSO_URL = 'http://sso.example.com/';
 const APP_URL = 'http://app.example.com/';
 
-async function loginSetup(readonlyHosts: string[] = ['*.example.com'], overrides: Partial<SessionDeps> = {}) {
+async function loginSetup(readonlyHosts: string[] = ['*.example.com'], start: string = LOGIN_START, overrides: Partial<SessionDeps> = {}) {
   const ctx = setupRo(readonlyHosts, overrides, ['sso.example.com']);
-  const { loginId } = await ctx.sm.loginBegin({ url: LOGIN_START });
+  const { loginId } = await ctx.sm.loginBegin({ url: start });
   return { ...ctx, loginId, loginPageId: ctx.fake.openPages().at(-1)! };
 }
 
-test('login: a write to a login host, or from a page on a login host, goes through; other writes follow the read-only rules', async () => {
+type LoginCtx = Awaited<ReturnType<typeof loginSetup>>;
+
+// 顶层导航（GET 或表单 POST）：topUrl 就是导航目标。
+function nav(c: LoginCtx, pageId: string, method: string, url: string) {
+  return c.fake.emitRequest({ id: `n${++navSeq}`, pageId, method, url, topUrl: url, isNavigation: true, topFrame: true,
+    ...(method === 'POST' ? { contentType: 'application/x-www-form-urlencoded', body: 'SAMLResponse=x' } : {}) });
+}
+let navSeq = 0;
+
+// 页面提交的证据：这个页自己发的子资源请求，topUrl 是页面地址。
+async function commit(c: LoginCtx, pageId: string, topUrl: string): Promise<void> {
+  assert.equal((await c.fake.emitRequest({ id: `e${++navSeq}`, pageId, method: 'GET', url: `${topUrl}app.js`, topUrl })).action, 'continue');
+}
+
+test('login: a form POST navigation from a login-host page (SAML/OIDC callback) goes through; a fetch from it to another host is judged by the rules', async () => {
+  const c = await loginSetup(); const { sm, fake, loginId, loginPageId } = c;
+  assert.deepEqual(await nav(c, loginPageId, 'GET', SSO_URL), { action: 'continue' });            // 去身份提供方：目标是 loginHost
+  await commit(c, loginPageId, SSO_URL);
+  const fetchPost = await fake.emitRequest({ id: 'b0', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api', topUrl: SSO_URL, contentType: 'application/json', body: '{}' });
+  assert.equal(fetchPost.action, 'fulfill');                                                        // 登录主机页上的脚本写别的主机：不免拦
+  assert.deepEqual(await nav(c, loginPageId, 'POST', 'http://app.example.com/acs'), { action: 'continue' });   // 回调：发起页在 loginHost，免拦且不加 followRedirects
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});
+
+test('login: a write to a login host goes through; other writes from a page on a read-only host are blocked, popups included; reads pass', async () => {
   const { sm, fake, loginId, loginPageId } = await loginSetup();
-  // 1. 顶层是 sso 的登录页向 sso 发 POST：放行（不加 followRedirects）
-  assert.deepEqual(await fake.emitRequest({ id: 'a1', pageId: loginPageId, method: 'POST', url: 'http://sso.example.com/auth', topUrl: SSO_URL }), { action: 'continue' });
-  // 2. 顶层是 sso 的页向 app 的回调 POST 导航：放行（页面的顶层主机是 loginHost）
-  assert.deepEqual(await fake.emitRequest({ id: 'a2', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/acs', topUrl: SSO_URL, isNavigation: true }), { action: 'continue' });
-  // 登录页向 loginHost 发 POST，哪怕页面本身在只读主机上：目标主机是 loginHost，放行
   assert.deepEqual(await fake.emitRequest({ id: 'a3', pageId: loginPageId, method: 'POST', url: 'http://sso.example.com/auth', topUrl: APP_URL }), { action: 'continue' });
-  // 3. 顶层是 app 的页向 app POST：拦
   const blocked = await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api/secret-path', topUrl: APP_URL, body: 'note=body-text', contentType: 'application/x-www-form-urlencoded' });
   assert.equal(blocked.action, 'fulfill'); assert.equal((blocked as { status: number }).status, 403);
-  // 登录页弹出的窗口按同样的规则
   assert.equal((await fake.emitRequest({ id: 'b2', pageId: 'p-popup', openerPageId: loginPageId, method: 'DELETE', url: 'http://app.example.com/x', topUrl: APP_URL })).action, 'fulfill');
-  // 读照旧放行
   assert.equal((await fake.emitRequest({ id: 'r1', pageId: loginPageId, method: 'GET', url: 'http://app.example.com/', topUrl: APP_URL })).action, 'continue');
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 2 });
 });
 
-test('login: a blocked write is logged as one line without the path or the body', async () => {
-  const { sm, fake, logs, loginId, loginPageId } = await loginSetup();
-  await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api/secret-path?x=1', topUrl: APP_URL, body: 'note=body-text', contentType: 'application/x-www-form-urlencoded' });
-  const lines = logs.filter((l) => l.includes(loginId));
-  assert.deepEqual(lines, [`登录 ${loginId}：拦下 POST app.example.com`]);
-  assert.ok(!logs.join('\n').includes('secret-path') && !logs.join('\n').includes('body-text'));
-  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+test('login: a popup opened by a login-host page can form-POST the callback; one opened by a read-only page cannot', async () => {
+  const c = await loginSetup(); const { sm, fake, loginId, loginPageId } = c;
+  await nav(c, loginPageId, 'GET', SSO_URL); await commit(c, loginPageId, SSO_URL);
+  const popup = fake.emitPopup(loginPageId, SSO_URL);
+  assert.deepEqual(await nav(c, popup.id, 'POST', 'http://app.example.com/acs'), { action: 'continue' });
+  // 另一条登录：弹窗的开启者停在只读的 app 上，表单 POST 被拦
+  const other = await sm.loginBegin({ url: LOGIN_START }); const otherPage = fake.openPages().at(-1)!;
+  const popup2 = fake.emitPopup(otherPage, APP_URL);
+  assert.equal((await nav(c, popup2.id, 'POST', 'http://app.example.com/acs')).action, 'fulfill');
+  await sm.loginEnd(other); await sm.loginEnd({ loginId });
 });
 
-test('login: a login that starts on a read-only host stays read-only for a page on a default host; login requests never enter any record', async () => {
-  const { sm, fake, loginId, loginPageId } = await loginSetup(['app.example.com']);
-  // 登录起点只读：页面顶层在默认主机上，写仍按只读拦
-  assert.equal((await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://localhost:5173/' })).action, 'fulfill');
-  // 起点只读，登录页顶层在 loginHost 上：放行
-  assert.equal((await fake.emitRequest({ id: 'a1', pageId: loginPageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: SSO_URL })).action, 'continue');
-  const s = await opened(sm, fake, 'other');
+test('login: starting on a default host, going to a read-only host and committing there, a form POST to a default host is blocked', async () => {
+  const D = 'http://localhost:5173/login'; const R = 'http://app.example.com/';
+  const c = await loginSetup(['app.example.com'], D); const { sm, fake, loginId, loginPageId } = c;
+  assert.equal((await nav(c, loginPageId, 'GET', R)).action, 'continue');
+  assert.equal((await nav(c, loginPageId, 'POST', 'http://example.org/post')).action, 'fulfill');   // 只是待定的 R，也算
+  await commit(c, loginPageId, R);                                                                  // 提交了 R
+  assert.equal((await nav(c, loginPageId, 'POST', 'http://example.org/post')).action, 'fulfill');
+  assert.equal((await fake.emitRequest({ id: 'b9', pageId: loginPageId, method: 'POST', url: 'http://example.org/api', topUrl: R })).action, 'fulfill');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 3 });
+});
+
+test('login: a blocked write is logged as one line without the path or the body, and an odd method is logged as OTHER', async () => {
+  const { sm, fake, logs, loginId, loginPageId } = await loginSetup();
+  await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api/secret-path?x=1', topUrl: APP_URL, body: 'note=body-text', contentType: 'application/x-www-form-urlencoded' });
+  await fake.emitRequest({ id: 'b2', pageId: loginPageId, method: 'tok-Zq7x91LkAb1', url: 'http://app.example.com/api', topUrl: APP_URL });
+  assert.deepEqual(logs.filter((l) => l.includes(loginId)), [`登录 ${loginId}：拦下 POST app.example.com`, `登录 ${loginId}：拦下 OTHER app.example.com`]);
+  assert.ok(!logs.join('\n').includes('secret-path') && !logs.join('\n').includes('body-text') && !logs.join('\n').includes('Zq7x91'));
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 2 });
+});
+
+test('login: login requests never enter any session record, even when a session is open while they are sent', async () => {
+  const { sm, fake } = setupRo(['app.example.com'], {}, ['sso.example.com']);
+  const s = await opened(sm, fake, 'other');                                                       // 先开会话，再发登录请求
+  const { loginId } = await sm.loginBegin({ url: LOGIN_START }); const loginPageId = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: APP_URL })).action, 'fulfill');
+  assert.equal((await fake.emitRequest({ id: 'a1', pageId: loginPageId, method: 'POST', url: 'http://sso.example.com/auth', topUrl: APP_URL })).action, 'continue');
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
   const w = readResult((await sm.close({ session: s.session })).runDir).writes;
   assert.deepEqual([w.allowed.length, w.blocked.length, w.unattributed.length], [0, 0, 0]);
@@ -984,7 +1023,7 @@ test('login: loginBegin refreshes the rules first', async () => {
 });
 
 test('login: a strict query let through without following redirects counts as blocked when the redirect is refused', async () => {
-  const { sm, fake, logs, loginId, loginPageId } = await loginSetup();
+  const { sm, fake, logs, loginId, loginPageId } = await loginSetup(['*.example.com']);
   assert.deepEqual(await fake.emitRequest({ id: 'q1', pageId: loginPageId, ...GRAPHQL_QUERY, url: 'http://app.example.com/graphql', topUrl: APP_URL }), { action: 'continue', followRedirects: false });
   assert.deepEqual(await fake.emitRequest({ id: 'q2', pageId: loginPageId, ...GRAPHQL_QUERY, url: 'http://app.example.com/graphql', topUrl: APP_URL }), { action: 'continue', followRedirects: false });
   fake.emitRequestDone('q1', 307, { redirectRefused: true });

@@ -422,7 +422,7 @@ async function loginWithBlockedWrites(posts: number): Promise<string> {
 
 test('login prints the loginHosts hint when read-only rules blocked writes during the login, and nothing when none were blocked', async () => {
   const hinted = await loginWithBlockedWrites(2);
-  assert.match(hinted, /登录过程中有 2 条写被只读规则拦下：登录用的主机（含 SAML\/OIDC 回调所在页的主机）可能没列进 rules\.json 的 loginHosts/);
+  assert.match(hinted, /登录过程中有 2 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules\.json 的 loginHosts/);
   assert.ok(!(await loginWithBlockedWrites(0)).includes('loginHosts'));
 });
 
