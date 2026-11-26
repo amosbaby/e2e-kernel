@@ -1,5 +1,5 @@
 import { ACTION_TIMEOUT_MS, DriverError } from '../driver/types.ts';
-import type { Page, Stable } from '../driver/types.ts';
+import type { Described, Page, Stable } from '../driver/types.ts';
 import type { Op, Target, WaitCond } from '../shared/ops.ts';
 import type { OpResult, Outcome, Tallies } from '../shared/protocol.ts';
 import { ensurePrivateDir, resolveInside } from '../shared/paths.ts';
@@ -26,8 +26,8 @@ const MAX_NETWORK = 50;
 
 type Output = NonNullable<OpResult['output']>;
 
-// 一条操作跑完的结果。valueCleared：只有 describe 确认目标不是密码框、且 fill 成功的那条才为真；
-// 其余的 fill（没跑、被拒、describe 或等待失败、超时）记录里的值一律换成 REDACTED。
+// 一条操作跑完的结果。valueCleared：只有 describe 确认目标不是密码框、是普通输入框或多行文本框、且 fill 成功的那条才为真；
+// 其余的 fill（没跑、被拒、describe 或等待失败、超时、目标是 contenteditable 等）记录里的值一律换成 REDACTED。
 interface Done {
   outcome: Outcome;
   stable?: Stable | null;
@@ -126,14 +126,14 @@ async function runFill(page: Page, op: Extract<Op, { op: 'fill' }>): Promise<Don
     rethrowUnlessDriverError(e);
     return { outcome: 'failed', stable: null, error: fillErrorText(e, op.value) };
   }
-  let described: { stable: Stable | null; isPassword: boolean };
+  let described: Described;
   try {
     described = await page.describe(op.target);
   } catch (e) {
     rethrowUnlessDriverError(e);
     return { outcome: 'failed', stable: null, error: `${FILL_UNCHECKED}（${fillErrorText(e, op.value)}）` };
   }
-  const { stable, isPassword } = described;
+  const { stable, isPassword, kind } = described;
   if (isPassword === true) return { outcome: 'failed', stable, error: PASSWORD_REFUSAL };
   if (isPassword !== false) return { outcome: 'failed', stable, error: FILL_UNCHECKED };
   try {
@@ -142,7 +142,8 @@ async function runFill(page: Page, op: Extract<Op, { op: 'fill' }>): Promise<Don
     rethrowUnlessDriverError(e);
     return { outcome: 'failed', stable, error: fillErrorText(e, op.value) };
   }
-  return { outcome: 'ok', stable, valueCleared: true };
+  // 值只在确认是普通输入框或多行文本框时才留进记录；contenteditable 等认不出的目标照填，但记成 [REDACTED]。
+  return { outcome: 'ok', stable, valueCleared: kind === 'text-input' || kind === 'textarea' };
 }
 
 // assert：读不到元素（not-found）算不符、actual 为 null；别的 DriverError 往外抛，由调用方记成 failed。
@@ -230,7 +231,7 @@ function recordedOp(op: Op, valueCleared: boolean): Op {
     case 'goto':
       return { ...op, url: safely(() => redactUrl(op.url)) };
     case 'eval':
-      return { ...op, js: safely(() => redactText(op.js)) };
+      return { ...op, js: REDACTED };   // eval 的源码可能带着明文值，不进记录；记录里的 eval 不能重放
     case 'wait':
       return { ...op, for: redactWait(op.for) };
     case 'assert':

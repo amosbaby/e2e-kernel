@@ -315,7 +315,7 @@ test('describe resolves refs to stable selectors', { timeout: 60_000 }, async ()
   assert.deepEqual((await page.describe(await refOf(page, 'Add'))).stable, { selector: '[data-testid="add"]', via: 'testid' });
   assert.deepEqual((await page.describe(await refOf(page, 'Save'))).stable, { selector: '#save', via: 'id' });
   assert.deepEqual((await page.describe(await refOf(page, 'Plain'))).stable, { selector: 'role=button[name="Plain"]', via: 'role' });
-  assert.deepEqual(await page.describe('#save'), { stable: { selector: '#save', via: 'given' }, isPassword: false });
+  assert.deepEqual(await page.describe('#save'), { stable: { selector: '#save', via: 'given' }, isPassword: false, kind: 'other' });
   await page.goto(server.origin + '/login.html');
   assert.equal((await page.describe('#pw')).isPassword, true);
 });
@@ -346,9 +346,38 @@ test('describe: missing elements, iframe refs and the password flag', { timeout:
   await assert.rejects(page.describe('e999'), (e: DriverError) => e instanceof DriverError && e.kind === 'not-found');
   await page.goto(server.origin + '/frames.html');
   const framed = await refMatching(page, /\[ref=(f\d+e\d+)\]/);
-  assert.deepEqual(await page.describe(framed), { stable: null, isPassword: false });
+  assert.deepEqual(await page.describe(framed), { stable: null, isPassword: false, kind: 'other' });
   await page.goto(server.origin + '/login.html');
   assert.equal((await page.describe('input[name="user"]')).isPassword, false);
+});
+
+test('describe: password-like detection and element kind, failing closed', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/login.html');
+  await page.evaluate(`(() => {
+    const add = (html) => document.body.insertAdjacentHTML('beforeend', html);
+    add('<input id="t-plain" type="text">');
+    add('<input id="t-current" type="text" autocomplete="current-password">');
+    add('<input id="t-new" type="text" autocomplete="NEW-PASSWORD">');
+    add('<input id="t-otp" type="text" autocomplete="username one-time-code">');
+    add('<input id="t-user" type="text" autocomplete="username">');
+    add('<input id="t-num" type="number">');
+    add('<input id="t-check" type="checkbox">');
+    add('<textarea id="t-area"></textarea>');
+    add('<div id="t-edit" contenteditable="true"></div>');
+    add('<div id="t-role" role="textbox" tabindex="0"></div>');
+  })()`);
+  const info = async (sel: string) => { const d = await page.describe(sel); return [d.isPassword, d.kind]; };
+  assert.deepEqual(await info('#pw'), [true, 'other']);
+  assert.deepEqual(await info('#t-plain'), [false, 'text-input']);
+  assert.deepEqual(await info('#t-current'), [true, 'text-input']);
+  assert.deepEqual(await info('#t-new'), [true, 'text-input']);
+  assert.deepEqual(await info('#t-otp'), [true, 'text-input']);
+  assert.deepEqual(await info('#t-user'), [false, 'text-input']);
+  assert.deepEqual(await info('#t-num'), [false, 'text-input']);
+  assert.deepEqual(await info('#t-check'), [false, 'other']);
+  assert.deepEqual(await info('#t-area'), [false, 'textarea']);
+  assert.deepEqual(await info('#t-edit'), [false, 'other']);
+  assert.deepEqual(await info('#t-role'), [false, 'other']);
 });
 
 test('snapshot honours depth', { timeout: 60_000 }, async () => {

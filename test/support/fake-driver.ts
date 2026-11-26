@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DriverError } from '../../src/driver/types.ts';
-import type { Capabilities, Check, Decision, Driver, Instance, Page, PageLocation, RequestInfo, Stable }
+import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, RequestInfo, Stable }
   from '../../src/driver/types.ts';
 import { isRef } from '../../src/shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/ops.ts';
@@ -10,7 +10,7 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/op
 // 页面内容来自构造时给的规格（按 URL 查）；openPage 和页面上的方法都记进 calls。
 
 export interface FakeElement { text?: string; visible?: boolean; css?: Record<string, string>; count?: number;
-  password?: boolean; stable?: Stable | null; failWith?: 'not-found' | 'timeout'; describeFails?: number }
+  password?: boolean; kind?: Described['kind']; stable?: Stable | null; failWith?: 'not-found' | 'timeout'; describeFails?: number }
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
   console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other' }
 
@@ -177,8 +177,8 @@ class FakePage implements Page {
     return this.spec.evalResult;
   }
 
-  // 规格里写了 stable 就原样返回（含 null）；没写时选择器给 given，引用给 null。
-  async describe(target: Target): Promise<{ stable: Stable | null; isPassword: boolean }> {
+  // 规格里写了 stable 就原样返回（含 null）；没写时选择器给 given，引用给 null。kind 规格没写就是 'other'（往保守处判）。
+  async describe(target: Target): Promise<Described> {
     this.enter('describe', [target]);
     const el = this.element(target);
     if ((el.describeFails ?? 0) > 0) {
@@ -186,7 +186,7 @@ class FakePage implements Page {
       throw new DriverError('other', 'describe failed');
     }
     const stable = 'stable' in el ? (el.stable ?? null) : isRef(target) ? null : { selector: target, via: 'given' as const };
-    return { stable, isPassword: el.password === true };
+    return { stable, isPassword: el.password === true, kind: el.kind ?? 'other' };
   }
 
   // 调用方主动关的页也触发 onClosed（和真实浏览器一致）；已关的页再 close 会在 enter 里抛错，不会再触发。

@@ -54,6 +54,12 @@ export type Decision =
 
 export interface Stable { selector: string; via: 'given' | 'testid' | 'id' | 'role' | 'css' }
 
+// describe 对目标元素的判断。isPassword：type=password，或 autocomplete 含 current-password / new-password / one-time-code。
+// kind：text-input = type 为 text、email、search、tel、url、number 的 <input>；textarea = <textarea>；其余（contenteditable、
+// role=textbox、别的标签和 type）都是 other。内核只在 isPassword 为 false 且 kind 不是 other 时才把 fill 的值留进记录。
+export type ElementKind = 'text-input' | 'textarea' | 'other';
+export interface Described { stable: Stable | null; isPassword: boolean; kind: ElementKind }
+
 export interface PageLocation { url: string; title: string; frames: { url: string; name: string }[]; popups: string[]; webSockets: number }
 
 export interface Driver {
@@ -95,6 +101,6 @@ export interface Page {
   waitFor(cond: WaitCond, timeoutMs: number): Promise<void>;
   read(q: { kind: AssertKind; target?: Target; property?: string }): Promise<string | number | boolean>;
   evaluate(js: string): Promise<unknown>;                                            // 页面内执行脚本
-  describe(target: Target): Promise<{ stable: Stable | null; isPassword: boolean }>;
+  describe(target: Target): Promise<Described>;
   close(): Promise<void>;                                                            // 收尾
 }

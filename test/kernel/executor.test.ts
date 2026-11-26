@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DriverError } from '../../src/driver/types.ts';
-import type { Page, RequestInfo } from '../../src/driver/types.ts';
+import type { Described, Page, RequestInfo } from '../../src/driver/types.ts';
 import { exitFor, runOps, tally } from '../../src/kernel/executor.ts';
 import type { ExecCtx } from '../../src/kernel/executor.ts';
 import { Recorder, isWrite, toWriteRecord } from '../../src/kernel/recorder.ts';
@@ -32,7 +32,10 @@ function pageSpec(): FakePageSpec {
       e9: { password: true },
       '#flaky': { describeFails: 1 },
       '#long': { text: 'word '.repeat(2000) },
-      '#name': {},
+      '#name': { kind: 'text-input' },
+      '#area': { kind: 'textarea' },
+      '#editable': {},
+      '#pwtext': { password: true, kind: 'text-input' },
       '#tok': { text: `token is ${jwt}` },
     },
     console: [
@@ -182,7 +185,7 @@ test('a password refusal stops the batch and leaves the value out of the result 
 });
 
 test('fill is not attempted when describe cannot say whether the target is a password field', async () => {
-  const unsure = withPage(page, { describe: async () => ({ stable: null, isPassword: undefined as unknown as boolean }) });
+  const unsure = withPage(page, { describe: async () => ({ stable: null, isPassword: undefined as unknown as boolean, kind: 'text-input' as const }) });
   const [r] = await runOps(unsure, [{ op: 'fill', target: '#name', value: 'hunter2-not-real' }], ctx);
   assert.equal(r.outcome, 'failed');
   assert.ok(!fake.calls.some(c => c.method === 'fill'));
@@ -208,6 +211,32 @@ test('a confirmed non-password fill keeps its value in the record', async () => 
   const [r] = await runOps(page, [{ op: 'fill', target: '#name', value: 'Widget' }], ctx);
   assert.equal(r.outcome, 'ok');
   assert.deepEqual(recorder.actions[0].op, { op: 'fill', target: '#name', value: 'Widget' });
+});
+
+test('a textarea fill keeps its value; a contenteditable (kind other) fill runs but records [REDACTED]', async () => {
+  const r = await runOps(page, [
+    { op: 'fill', target: '#area', value: 'Widget' }, { op: 'fill', target: '#editable', value: 'hunter2-not-real' },
+  ], ctx);
+  assert.deepEqual(r.map(x => x.outcome), ['ok', 'ok']);
+  assert.deepEqual(fake.calls.filter(c => c.method === 'fill').map(c => c.args), [['#area', 'Widget'], ['#editable', 'hunter2-not-real']]);
+  assert.deepEqual(recorder.actions[0].op, { op: 'fill', target: '#area', value: 'Widget' });
+  assert.deepEqual(recorder.actions[1].op, { op: 'fill', target: '#editable', value: REDACTED });
+  assert.ok(!JSON.stringify([r, recorder.actions]).includes('hunter2-not-real'));
+});
+
+test('a describe without a kind is treated as other: the fill runs and the value is not recorded', async () => {
+  const noKind = withPage(page, { describe: async () => ({ stable: null, isPassword: false } as unknown as Described) });
+  const [r] = await runOps(noKind, [{ op: 'fill', target: '#name', value: 'hunter2-not-real' }], ctx);
+  assert.equal(r.outcome, 'ok');
+  assert.deepEqual(recorder.actions[0].op, { op: 'fill', target: '#name', value: REDACTED });
+});
+
+test('a text-like input flagged as a password (autocomplete) is refused and its value never recorded', async () => {
+  const [r] = await runOps(page, [{ op: 'fill', target: '#pwtext', value: 'hunter2-not-real' }], ctx);
+  assert.equal(r.outcome, 'failed'); assert.match(r.error!, /^password-field/);
+  assert.ok(!fake.calls.some(c => c.method === 'fill'));
+  assert.deepEqual(recorder.actions[0].op, { op: 'fill', target: '#pwtext', value: REDACTED });
+  assert.ok(!JSON.stringify([r, recorder.actions]).includes('hunter2-not-real'));
 });
 
 test('a fill that fails after a non-password describe does not record its value, nor echo it in the error', async () => {
@@ -256,6 +285,7 @@ test('recorded ops are redacted: fill value, goto url and eval js', async () => 
   assert.deepEqual(r.map(x => x.outcome), ['ok', 'ok', 'ok']);
   const recorded = JSON.stringify(recorder.actions);
   for (const gone of [jwt, 'abc123']) assert.ok(!recorded.includes(gone));
+  assert.deepEqual(recorder.actions[1].op, { op: 'eval', js: REDACTED });   // eval 源码不进记录，哪怕脱敏过
   assert.equal(fake.calls.find(c => c.method === 'fill')!.args[1], `Bearer ${jwt}`);
 });
 

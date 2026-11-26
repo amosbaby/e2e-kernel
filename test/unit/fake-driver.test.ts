@@ -39,7 +39,7 @@ test('element failures, goto failures and read semantics', async () => {
   assert.equal(await page.read({ kind: 'count', target: '#nope' }), 0);
   assert.equal(await page.read({ kind: 'visible', target: '#nope' }), false);
   await assert.rejects(page.describe('#flaky'), DriverError);
-  assert.deepEqual(await page.describe('#flaky'), { stable: null, isPassword: false });
+  assert.deepEqual(await page.describe('#flaky'), { stable: null, isPassword: false, kind: 'other' });
   const other = await inst.openPage({});
   await assert.rejects(other.goto('http://localhost/down'), (e: DriverError) => e.kind === 'timeout');
   await assert.rejects(page.click('#not-in-spec'), (e: DriverError) => e.kind === 'not-found');
@@ -150,12 +150,13 @@ test('waitFor sleeps for ms conditions and succeeds immediately otherwise', asyn
 test('describe: explicit stable wins, otherwise selector is given and ref is unresolved', async () => {
   const testid = { selector: '[data-testid="save"]', via: 'testid' as const };
   const { page } = await setup({ elements: {
-    e3: { stable: testid }, e4: {}, '#pw': { password: true }, '#nulled': { stable: null },
+    e3: { stable: testid }, e4: {}, '#pw': { password: true }, '#nulled': { stable: null }, '#t': { kind: 'text-input' },
   } });
-  assert.deepEqual(await page.describe('e3'), { stable: testid, isPassword: false });
-  assert.deepEqual(await page.describe('e4'), { stable: null, isPassword: false });
-  assert.deepEqual(await page.describe('#pw'), { stable: { selector: '#pw', via: 'given' }, isPassword: true });
-  assert.deepEqual(await page.describe('#nulled'), { stable: null, isPassword: false });
+  assert.deepEqual(await page.describe('e3'), { stable: testid, isPassword: false, kind: 'other' });
+  assert.deepEqual(await page.describe('e4'), { stable: null, isPassword: false, kind: 'other' });   // 规格没写 kind：往保守处判
+  assert.deepEqual(await page.describe('#pw'), { stable: { selector: '#pw', via: 'given' }, isPassword: true, kind: 'other' });
+  assert.deepEqual(await page.describe('#nulled'), { stable: null, isPassword: false, kind: 'other' });
+  assert.deepEqual(await page.describe('#t'), { stable: { selector: '#t', via: 'given' }, isPassword: false, kind: 'text-input' });
   await assert.rejects(page.describe('e99'), (e: DriverError) => e.kind === 'not-found');
 });
 

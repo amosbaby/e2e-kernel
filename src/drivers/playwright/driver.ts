@@ -3,7 +3,7 @@ import { isAbsolute } from 'node:path';
 import { chromium } from 'playwright';
 import type { BrowserContext, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
-import type { Capabilities, Check, Decision, Driver, Instance, Page, PageLocation, RequestInfo, Stable }
+import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, RequestInfo, Stable }
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
@@ -86,7 +86,7 @@ function locate(page: PwPage, target: Target): Locator {
 
 // 在页面里对一个元素取值（作为函数交给 locator.evaluate 序列化，所以必须自成一体：不引用这个文件里的任何东西）。
 // 得到的是 stableCandidates 要的 ElementInfo，外加元素是不是密码框。
-function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boolean } {
+function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boolean; kind: 'text-input' | 'textarea' | 'other' } {
   const norm = (v: string): string => v.replace(/\s+/g, ' ').trim();
   const tag = el.localName;
   const type = el instanceof HTMLInputElement ? el.type : '';
@@ -144,7 +144,13 @@ function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boole
 
   return {
     info: { testId: el.getAttribute('data-testid'), id: el.id === '' ? null : el.id, role, name, cssPath },
-    isPassword: el instanceof HTMLInputElement && el.type === 'password',
+    // 往保守处判：type=password，或 autocomplete 里有密码类的词（「显示密码」之后的输入框常是 type=text 加 current-password）。
+    isPassword: (el instanceof HTMLInputElement && el.type === 'password')
+      || (el.getAttribute('autocomplete') ?? '').toLowerCase().split(/\s+/).some((t) => t === 'current-password' || t === 'new-password' || t === 'one-time-code'),
+    // 只有这两类认得出的输入框是 text-input / textarea；contenteditable、role=textbox 等一律 other。
+    kind: el instanceof HTMLTextAreaElement ? 'textarea'
+      : el instanceof HTMLInputElement && ['text', 'email', 'search', 'tel', 'url', 'number'].includes(el.type) ? 'text-input'
+        : 'other',
   };
 }
 
@@ -338,13 +344,13 @@ class PlaywrightPage implements Page {
   // 选择器写法的目标原样返回（via: 'given'）；引用要找出一个稳定的选择器（设计 5.8）：
   // 在 iframe 里的引用（f 开头）先不解析；其余按 testid → id → role → css 逐个验证，
   // 第一个「匹配数正好是 1，且就是这个元素」的就是结果，都不行就是 null。元素找不到抛 not-found。
-  describe(target: Target): Promise<{ stable: Stable | null; isPassword: boolean }> {
+  describe(target: Target): Promise<Described> {
     return this.run(async () => {
       const loc = (await this.resolve(target, false)).first();
-      const { info, isPassword } = await loc.evaluate(collectElementInfo);
-      if (!isRef(target)) return { stable: { selector: target, via: 'given' as const }, isPassword };
-      if (target.startsWith('f')) return { stable: null, isPassword };
-      return { stable: await this.firstStable(loc, info), isPassword };
+      const { info, isPassword, kind } = await loc.evaluate(collectElementInfo);
+      if (!isRef(target)) return { stable: { selector: target, via: 'given' as const }, isPassword, kind };
+      if (target.startsWith('f')) return { stable: null, isPassword, kind };
+      return { stable: await this.firstStable(loc, info), isPassword, kind };
     });
   }
 
