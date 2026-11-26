@@ -17,7 +17,8 @@
     "test:browser": "node --test --test-concurrency=1 \"test/browser/playwright-driver.test.ts\"",
     "test:e2e": "npm run build && node --test \"test/browser/e2e.test.ts\"",
     "check": "npm run typecheck && npm test && npm run check:public",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "check:public": "node scripts/publicity-check.ts"
   },
   "dependencies": {
     "playwright": "1.65.1"
