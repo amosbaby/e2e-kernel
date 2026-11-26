@@ -2,7 +2,7 @@
 
 A local resident kernel plus an `e2k` CLI that lets an AI agent do e2e verification in a real browser. The kernel owns a headed Chromium (driven through Playwright behind a small driver protocol), keeps sessions alive across CLI calls, records what the agent did and what the page did, and writes a report for a person to read.
 It does not call a model, does not type passwords and does not solve CAPTCHAs: a person logs in, the agent verifies.
-Status: M1 (kernel, CLI, Playwright driver, `default` mode, `open` / `step` / `close`, `login`, reports), plus fixes from a first real-world retest, and, in M2a, domain rules enforced as a read-only mode. Design: [docs/design.md](docs/design.md). License: MIT.
+Status: M2a. It has M1 (kernel, CLI, Playwright driver, `default` mode, `open` / `step` / `close`, `login`, reports) plus fixes from a first real-world retest, and, new in M2a, domain rules (`rules.json`) enforced as a read-only mode, `open --readonly`, `rule list`, and blocked writes in the report. M2b (per-group profiles, approvals for declared writes, identity probe) is not built yet. Design: [docs/design.md](docs/design.md). License: MIT.
 If you are an AI agent, read [docs/agent-guide.md](docs/agent-guide.md) first: a short guide to the commands, the field rules and the exit codes.
 The CLI messages, the text output, `report.html` and the documents under `docs/` are in Chinese; field names, op names, `--json` output and exit codes are language-neutral.
 

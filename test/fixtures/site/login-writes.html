@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Login Writes</title>
+</head>
+<body>
+<script>
+  // 登录页加载后自动发两条写：一条发到另一个主机名（ALT_ORIGIN），一条发回本主机。
+  // 用 text/plain、no-cors：跨源也不触发预检（fixture 对 OPTIONS 回 404）。
+  const send = (url) => fetch(url, { method: 'POST', mode: 'no-cors', headers: { 'content-type': 'text/plain' }, body: 'x' }).catch(() => {});
+  send('{{ALT_ORIGIN}}/api/login');
+  send('/api/x');
+</script>
+</body>
+</html>

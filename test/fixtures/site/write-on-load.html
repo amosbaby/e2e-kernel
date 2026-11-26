@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Write On Load</title>
+</head>
+<body>
+<p id="host"></p>
+<script>
+  // 加载就发一条写，请求体带着当前主机名，服务端据此分辨是哪个主机上的页面发的。
+  document.getElementById('host').textContent = location.hostname;
+  fetch('/api/auto', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: location.hostname }).catch(() => {});
+</script>
+</body>
+</html>

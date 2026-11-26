@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Read-only Probe</title>
+</head>
+<body>
+<button id="fire">Fire</button>
+<p id="out"></p>
+<form method="post" action="/api/form">
+  <input name="title" value="hello">
+  <button id="submit-form">Submit</button>
+</form>
+<script>
+  // 每一种写的出路各发一次（路径各不相同，服务端按路径数）；结果写进 #out，全部发完后追加 all-sent。
+  const out = document.getElementById('out');
+  const note = (s) => { out.textContent += s + ' '; };
+  const gql = (body) => fetch('/api/graphql', { method: 'POST', headers: { 'content-type': 'application/json' }, body }).then((r) => r.status, () => 'err');
+  document.getElementById('fire').addEventListener('click', async () => {
+    note('get:' + await fetch('/index.html').then((r) => r.status, () => 'err'));
+    note('fetch:' + await fetch('/api/fetch', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'x' }).then((r) => r.status, () => 'err'));
+    note('xhr:' + await new Promise((resolve) => {
+      const x = new XMLHttpRequest();
+      x.open('POST', '/api/xhr');
+      x.onloadend = () => resolve(x.status);
+      x.send('x');
+    }));
+    note('beacon:' + navigator.sendBeacon('/api/beacon', 'x'));
+    note('query:' + await gql('{"query":"query Q { items { id } }"}'));
+    note('mutation:' + await gql('{"query":"mutation M { addItem { id } }"}'));
+    note('worker:' + await new Promise((resolve) => {
+      const w = new Worker('/post-worker.js');
+      w.onmessage = (e) => resolve(e.data);
+      w.onerror = () => resolve('err');
+    }));
+    note('all-sent');
+  });
+</script>
+</body>
+</html>

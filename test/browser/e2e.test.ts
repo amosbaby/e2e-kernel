@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createPlaywrightDriver } from '../../src/drivers/playwright/driver.ts';
 import { startKernel } from '../../src/kernel/server.ts';
@@ -242,6 +242,190 @@ test('open --touch gives only that session page a coarse pointer, and the report
     const close = JSON.parse((await e2k('close', s.session, '--verdict', 'undetermined', '--because', 'probe', '--json')).out);
     assert.equal(JSON.parse(readFileSync(close.resultPath, 'utf8')).start.touch, want);
     if (want) assert.ok(readFileSync(close.reportPath, 'utf8').includes('触屏模拟 是'));
+  }
+});
+
+// ---- 只读模式（M2a）：真浏览器、真内核、真 CLI ----
+
+// 写好 rules.json 再跑 fn，无论成败都删掉，不影响后面按顺序跑的测试。
+async function withRules(rules: unknown, fn: () => Promise<void>): Promise<void> {
+  writeFileSync(home.rulesFile, typeof rules === 'string' ? rules : JSON.stringify(rules));
+  try {
+    await fn();
+  } finally {
+    rmSync(home.rulesFile, { force: true });
+  }
+}
+
+const readonlyRules = (host: string, loginHosts: string[] = []): unknown => ({ version: 1, rules: [{ match: host, mode: 'readonly' }], loginHosts });
+
+async function until(what: string, cond: () => boolean, ms = 10_000): Promise<void> {
+  for (let t = 0; !cond(); t += 50) {
+    assert.ok(t < ms, `timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+const settle = (ms = 500): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function stepJson(session: string, ops: unknown[]): Promise<{ exit: number; writesBlocked: number; notices: string[]; results: { outcome: string; output?: string }[] }> {
+  const r = await e2kIn(JSON.stringify(ops), 'step', session, '--stdin', '--json');
+  return JSON.parse(r.out);
+}
+
+async function closeResult(session: string): Promise<any> {
+  const close = JSON.parse((await e2k('close', session, '--verdict', 'undetermined', '--because', 'e2e probe', '--json')).out);
+  return JSON.parse(readFileSync(close.resultPath, 'utf8'));
+}
+
+test('read-only host: every write path is blocked, a strict query passes, and each block is on record', { timeout: 180_000 }, async () => {
+  await withRules(readonlyRules('127.0.0.1'), async () => {
+    const from = server.hits.length;
+    const open = JSON.parse((await e2k('open', origin + '/ro.html', '--json')).out);
+    try {
+      assert.equal(open.mode, 'readonly');
+      const fired = await stepJson(open.session, [{ op: 'click', target: '#fire' }, { op: 'wait', for: { text: 'all-sent' } },
+        ...['get:200', 'fetch:403', 'xhr:403', 'beacon:true', 'query:200', 'mutation:403', 'worker:403']
+          .map((expected) => ({ op: 'assert', kind: 'text', target: '#out', cmp: 'contains', expected }))]);
+      assert.equal(fired.exit, 0, 'GET passes, the strict query reaches the server, every other write gets a 403 (the beacon is only queued)');
+      assert.equal(fired.writesBlocked, 5);
+      // 原生表单提交：导航回一张写着原因的 403 页面
+      const form = await stepJson(open.session, [{ op: 'click', target: '#submit-form' }, { op: 'wait', for: { text: 'blocked by e2k read-only mode' } }]);
+      assert.equal(form.exit, 0);
+      assert.equal(form.writesBlocked, 1);
+      await settle();
+      const reached = server.hits.slice(from);
+      assert.deepEqual(reached.map((h) => h.path), ['/api/graphql'], 'only the strict query reached the server: no fetch, XHR, beacon, worker, form or mutation');
+      assert.match(reached[0]!.body, /query Q/);
+    } finally {
+      const result = await closeResult(open.session);
+      assert.equal(result.start.readonly, false);
+      assert.equal(result.modes[0].mode, 'readonly');
+      assert.equal(result.modes[0].reason, 'rule');
+      assert.equal(result.rules.count, 1);
+      const blocked: any[] = result.writes.blocked;
+      const reasonOf = (suffix: string): string | undefined => blocked.find((w) => w.url.endsWith(suffix) && (suffix !== '/api/graphql' || w.graphql === 'mutation'))?.reason;
+      for (const suffix of ['/api/fetch', '/api/xhr', '/api/beacon', '/api/worker', '/api/form']) assert.equal(reasonOf(suffix), 'method', suffix);
+      assert.equal(reasonOf('/api/graphql'), 'graphql-mutation');
+      assert.equal(blocked.length, 6, 'the Worker write is on record too');
+      for (const w of blocked) { assert.equal(w.decision, 'blocked'); assert.equal(w.mode, 'readonly'); }
+      assert.deepEqual(result.writes.allowed.map((w: any) => [w.url.slice(-12), w.graphql]), [['/api/graphql', 'query']]);
+      assert.deepEqual(result.writes.blockedSummary.map((r: any) => [r.method, r.reason, r.count]).sort(), [['POST', 'graphql-mutation', 1], ['POST', 'method', 5]]);
+    }
+  });
+});
+
+test('read-only host: a strict query that answers with a redirect is refused at the first hop', { timeout: 180_000 }, async () => {
+  await withRules(readonlyRules('127.0.0.1'), async () => {
+    const from = server.hits.length;
+    const open = JSON.parse((await e2k('open', origin + '/index.html', '--json')).out);
+    try {
+      assert.equal(open.mode, 'readonly');
+      const js = "fetch('/r307', { method: 'POST', body: '{\"query\":\"query{a}\"}', headers: { 'content-type': 'application/json' } }).then((r) => r.status, () => 'refused')";
+      await stepJson(open.session, [{ op: 'eval', js }]);
+      await settle();
+      const mine = server.hits.slice(from);
+      assert.equal(mine.filter((h) => h.path === '/r307').length, 1, 'the first hop was sent (it is a strict query)');
+      assert.equal(mine.filter((h) => h.path === '/api/sink').length, 0, 'the redirect target never got the write');
+    } finally {
+      const result = await closeResult(open.session);
+      const entry = result.writes.blocked.find((w: any) => w.url.endsWith('/r307'));
+      assert.ok(entry !== undefined, 'the refused redirect is recorded as a blocked write');
+      assert.equal(entry.reason, 'redirected-write');
+    }
+  });
+});
+
+test('open --readonly forces read-only on a host with no rule and keeps it after a goto to another host name', { timeout: 180_000 }, async () => {
+  const from = server.hits.length;
+  const open = JSON.parse((await e2k('open', origin + '/write-on-load.html', '--readonly', '--json')).out);
+  try {
+    assert.equal(open.mode, 'readonly');
+    await stepJson(open.session, [{ op: 'goto', url: server.altOrigin + '/write-on-load.html' }, { op: 'assert', kind: 'text', target: '#host', cmp: 'eq', expected: 'localhost' }]);
+    await settle();
+    assert.deepEqual(server.hits.slice(from).filter((h) => h.path === '/api/auto'), [], 'neither host name saw the write');
+  } finally {
+    const result = await closeResult(open.session);
+    assert.equal(result.start.readonly, true);
+    assert.equal(result.modes[0].reason, 'forced');
+    assert.equal(result.modes[0].mode, 'readonly');
+    const auto: any[] = result.writes.blocked.filter((w: any) => w.url.endsWith('/api/auto'));
+    assert.deepEqual(auto.map((w) => new URL(w.url).hostname).sort(), ['127.0.0.1', 'localhost']);
+  }
+  // 对照：没有 --readonly 也没有规则时，同一页的写照常到达
+  const plain = JSON.parse((await e2k('open', origin + '/write-on-load.html', '--json')).out);
+  try {
+    assert.equal(plain.mode, 'default');
+    await until('the default-mode write', () => server.hits.slice(from).some((h) => h.path === '/api/auto'));
+  } finally {
+    await e2k('close', plain.session);
+  }
+});
+
+test('a broken rules.json makes open fail with a usage error and rule list print the exact error', { timeout: 180_000 }, async () => {
+  const broken = '{"version":1,"rules":[{"match":"*.example.com","mode":"nope"}]}';
+  await withRules(broken, async () => {
+    const open = await e2k('open', origin + '/index.html');
+    assert.equal(open.code, 2);
+    assert.ok(open.err.includes('规则文件有错'), open.err);
+    assert.deepEqual(JSON.parse((await e2k('status', '--json')).out).sessions, [], 'no session was opened');
+    const list = await e2k('rule', 'list');
+    assert.equal(list.code, 2);
+    assert.ok(list.out.includes('mode'), `rule list names the bad field: ${list.out}${list.err}`);
+    const json = JSON.parse((await e2k('rule', 'list', '--json')).out);
+    assert.equal(typeof json.error, 'string');
+    assert.deepEqual(json.rules, []);
+  });
+  await withRules('{not json', async () => {
+    const list = await e2k('rule', 'list');
+    assert.equal(list.code, 2);
+    assert.match(list.out + list.err, /JSON|json/);
+  });
+});
+
+test('login window: a write to a loginHost passes, a write back to the read-only host is blocked and counted', { timeout: 180_000 }, async () => {
+  await withRules(readonlyRules('127.0.0.1', ['localhost']), async () => {
+    const from = server.hits.length;
+    const begin = await call(home, 'login.begin', { url: origin + '/login-writes.html' });
+    assert.ok(begin.ok);
+    const loginId = (begin as { result: { loginId: string } }).result.loginId;
+    try {
+      await until('the write to the login host', () => server.hits.slice(from).some((h) => h.path === '/api/login'));
+      await settle();
+    } finally {
+      const end = await call(home, 'login.end', { loginId });
+      assert.ok(end.ok);
+      assert.equal((end as { result: { writesBlocked: number } }).result.writesBlocked, 1);
+    }
+    const reached = server.hits.slice(from).map((h) => h.path);
+    assert.deepEqual(reached, ['/api/login'], '/api/x went to the read-only host and never arrived');
+  });
+});
+
+test('a popup opened with noopener by a read-only session page is still read-only', { timeout: 180_000 }, async () => {
+  const from = server.hits.length;
+  const sinkHits = (): number => server.hits.slice(from).filter((h) => h.path === '/api/sink' && h.query.case === 'popup-fetch').length;
+  // 对照：默认模式的会话里，同一个弹窗的写照常到达，说明下面的「没到」不是因为弹窗没发或没等够
+  const plain = JSON.parse((await e2k('open', origin + '/popup-noopener.html', '--json')).out);
+  try {
+    await stepJson(plain.session, [{ op: 'click', target: '#open' }]);
+    await until('the popup write in default mode', () => sinkHits() === 1);
+  } finally {
+    await e2k('close', plain.session);
+  }
+  const open = JSON.parse((await e2k('open', origin + '/popup-noopener.html', '--readonly', '--json')).out);
+  try {
+    await stepJson(open.session, [{ op: 'click', target: '#open' }]);
+    await settle(2500);
+    assert.equal(sinkHits(), 1, 'the read-only popup write never arrived (the default-mode control accounts for the one hit)');
+  } finally {
+    const result = await closeResult(open.session);
+    // 实测：noopener 的弹窗 Playwright 仍然归得到会话，写记在 blocked（不是 unattributed），原因 method
+    const popup = result.writes.blocked.find((w: any) => w.url.includes('/api/sink'));
+    assert.ok(popup !== undefined, JSON.stringify(result.writes));
+    assert.equal(popup.reason, 'method');
+    assert.equal(popup.mode, 'readonly');
+    assert.deepEqual(result.writes.unattributed, []);
   }
 });
 
