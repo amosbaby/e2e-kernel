@@ -65,6 +65,11 @@ function busy(): E2kError {
   return new E2kError('busy', '会话正忙', '稍后重试');
 }
 
+// 关停开始以后，所有入口一律拒绝。
+function stopping(): E2kError {
+  return new E2kError('busy', '内核正在关停', '等内核重新启动后再试');
+}
+
 // 错误只留第一行并脱敏：驱动的消息里可能带着 URL 或选择器。
 function firstLine(e: unknown): string {
   return safely(() => redactText(String(e instanceof Error ? e.message : e).split('\n', 1)[0] ?? ''));
@@ -112,17 +117,27 @@ export class SessionManager {
   private readonly unattributed: WriteRecord[] = [];
   private instance: Instance | undefined;
   private acquiring: Promise<Instance> | undefined;
+  // 关停是终态：一旦开始，不再接受任何调用，也不再启动浏览器。
+  private stopping = false;
+  private stopped: Promise<void> | undefined;
+  // 还没有结果的 open 和 loginBegin：关停要等它们落定后才停实例。
+  private readonly inflight = new Set<Promise<unknown>>();
 
   constructor(deps: SessionDeps) {
     this.deps = deps;
   }
 
-  async open(p: OpenParams): Promise<OpenResult> {
+  open(p: OpenParams): Promise<OpenResult> {
+    return this.track(() => this.openSession(p));
+  }
+
+  private async openSession(p: OpenParams): Promise<OpenResult> {
     const host = new URL(p.url).hostname;
     const mode = this.deps.modes.resolve(host);
     // M1 没有域名规则，到不了这里；到了就宁可拒绝，不开任何页面。
     if (mode !== 'default') throw new E2kError('internal', '这个版本只支持「默认」模式');
     const instance = await this.acquireInstance();
+    if (this.stopping) throw stopping();
 
     const name = p.name ?? DEFAULT_NAME;
     const startedAt = this.deps.now();
@@ -142,6 +157,7 @@ export class SessionManager {
   }
 
   async step(p: StepParams): Promise<StepResult> {
+    if (this.stopping) throw stopping();
     // 检查和置位之间没有 await：同一会话的两次 step 不会交错。
     const s = this.live(p.session);
     if (s.state !== 'idle') throw busy();
@@ -162,6 +178,7 @@ export class SessionManager {
 
   // step 在跑或已在收尾时都是 busy：不在操作进行到一半时关页、出报告。
   async close(p: CloseParams, closedBy: ClosedBy = 'agent'): Promise<CloseResult> {
+    if (this.stopping) throw stopping();
     const s = this.live(p.session);
     if (s.state !== 'idle') throw busy();
     return this.finish(s, closedBy, p);
@@ -180,20 +197,28 @@ export class SessionManager {
   }
 
   // 在 default profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录过程不套写策略，也不检查模式。
-  async loginBegin(p: { url: string }): Promise<{ loginId: string }> {
+  loginBegin(p: { url: string }): Promise<{ loginId: string }> {
+    return this.track(() => this.beginLogin(p));
+  }
+
+  private async beginLogin(p: { url: string }): Promise<{ loginId: string }> {
     const instance = await this.acquireInstance();
+    if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;
     while (this.logins.has(id)) id = `l-${randomHex()}`;
     let login: Login | undefined;
     try {
       const page = await instance.openPage({});
-      // 先登记再导航：登录页的首个请求就按登录页放行。
+      // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
       login = { id, instance, pages: new Map([[page.id, page]]) };
       this.logins.set(id, login);
+      if (this.stopping) throw stopping();
       await page.goto(p.url);
+      if (this.stopping) throw stopping();
       return { loginId: id };
     } catch (e) {
       if (login !== undefined) await this.endLogin(login);
+      if (this.stopping) throw stopping();
       if (e instanceof DriverError) throw new E2kError('action-failed', firstLine(e));
       throw e;
     }
@@ -201,6 +226,7 @@ export class SessionManager {
 
   // 关掉登录页和它弹出的窗口；登录态留在 user data 目录里。
   async loginEnd(p: { loginId: string }): Promise<Record<string, never>> {
+    if (this.stopping) throw stopping();
     const login = this.logins.get(p.loginId);
     if (login === undefined) throw new E2kError('not-found', '没有这个登录');
     await this.endLogin(login);
@@ -211,11 +237,18 @@ export class SessionManager {
     return this.instance === undefined ? 'stopped' : 'running';
   }
 
-  // 所有会话出报告（kernel-shutdown），再停实例。正在执行 step 的会话也收尾：内核要退出了。
-  async shutdown(): Promise<void> {
+  // 关停是终态，可以重复调用（返回同一个结果）。先等还在进行的 open、loginBegin 落定：它们看到关停后清理并拒绝，
+  // 不会建成会话。再让所有会话出报告（kernel-shutdown，正在执行 step 的也收尾），关登录页，最后停实例。
+  shutdown(): Promise<void> {
+    this.stopping = true;
+    this.stopped ??= this.drainAndStop();
+    return this.stopped;
+  }
+
+  private async drainAndStop(): Promise<void> {
+    await Promise.allSettled([...this.inflight]);
     const pending: Promise<unknown>[] = [];
     for (const s of [...this.sessions.values()]) {
-      if (s.state === 'opening') continue;           // 实例停掉后它的首屏会失败，由 open 自己清理
       if (s.state === 'closing') {
         if (s.finished !== undefined) pending.push(s.finished.catch(() => undefined));
         continue;
@@ -229,6 +262,15 @@ export class SessionManager {
     // 先摘掉再停：stop() 触发的 onClosed 是自己引起的，不算浏览器没了。
     this.instance = undefined;
     if (inst !== undefined) await this.stopQuietly(inst);
+  }
+
+  // 记下还没有结果的调用，关停时等它们落定。
+  private track<T>(run: () => Promise<T>): Promise<T> {
+    if (this.stopping) return Promise.reject(stopping());
+    const pr = run();
+    this.inflight.add(pr);
+    pr.then(() => { this.inflight.delete(pr); }, () => { this.inflight.delete(pr); });
+    return pr;
   }
 
   // ---- 实例 ----
@@ -246,6 +288,7 @@ export class SessionManager {
       this.instance = undefined;
       await this.stopQuietly(current);
     }
+    if (this.stopping) throw stopping();
     const profileDir = resolveInside(this.deps.home.profilesDir, PROFILE);
     ensurePrivateDir(this.deps.home.profilesDir);
     ensurePrivateDir(profileDir);
@@ -293,6 +336,7 @@ export class SessionManager {
     let registered = false;
     try {
       page = await instance.openPage(p.viewport === undefined ? {} : { viewport: p.viewport });
+      if (this.stopping) throw stopping();
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, profile: PROFILE },
@@ -305,8 +349,12 @@ export class SessionManager {
       page.onClosed(() => { void this.mainPageClosed(s); });
       s.recorder.addHost(o.host, o.mode);
       await page.goto(p.url);
+      if (this.stopping) throw stopping();
       const snapshot = await page.snapshot({});
+      if (this.stopping) throw stopping();
       const loc = await page.location();
+      // 关停已经开始：不建成会话，由下面的 catch 清理并拒绝。
+      if (this.stopping) throw stopping();
       s.url = safely(() => redactUrl(loc.url));
       s.state = 'idle';
       this.restartIdle(s);
@@ -323,6 +371,7 @@ export class SessionManager {
         this.logFailure(o.id, '删空的报告目录', err);
       }
       if (registered) this.sessions.delete(o.id);
+      if (this.stopping) throw stopping();
       if (e instanceof DriverError) throw new E2kError('action-failed', firstLine(e));
       throw e;
     }

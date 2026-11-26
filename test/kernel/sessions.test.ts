@@ -387,3 +387,71 @@ test('browser gone, with the instance event arriving late: the page listener see
   }
   await sm.open({ url: 'http://localhost:5173/' }); assert.equal(fake.launches, 2);
 });
+
+test('shutdown drains an open that is still launching the browser: it is rejected, cleaned up and never registered', async () => {
+  const { sm, fake, home } = setup({ launchDelayMs: 50 });
+  const pending = sm.open({ url: 'http://localhost:5173/', name: 'late' });
+  const login = sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  await sm.shutdown();
+  await assert.rejects(pending, (e: E2kError) => e.code === 'busy' && e.message === '内核正在关停');
+  await assert.rejects(login, (e: E2kError) => e.code === 'busy');
+  assert.deepEqual(sm.list(), []); assert.deepEqual(fake.openPages(), []); assert.equal(sm.instanceState(), 'stopped');
+  assert.ok(!existsSync(join(home.runsDir, 'late')) || readdirSync(join(home.runsDir, 'late')).length === 0);
+});
+
+test('shutdown drains an open that is past the launch: the established session gets a report, the in-flight one is rejected', async () => {
+  const { sm, fake, home } = setup();
+  const { runDir } = await opened(sm, fake, 'early');
+  const pending = sm.open({ url: 'http://localhost:5173/', name: 'late' });   // 实例已在，停在开页面、导航之间
+  const login = sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  const done = sm.shutdown();
+  await assert.rejects(pending, (e: E2kError) => e.code === 'busy');
+  await assert.rejects(login, (e: E2kError) => e.code === 'busy');
+  await done;
+  assert.equal(readResult(runDir).closedBy, 'kernel-shutdown');
+  assert.deepEqual(sm.list(), []); assert.deepEqual(fake.openPages(), []); assert.equal(sm.instanceState(), 'stopped');
+  assert.ok(!existsSync(join(home.runsDir, 'late')) || readdirSync(join(home.runsDir, 'late')).length === 0);
+  assert.equal(fake.launches, 1);
+});
+
+test('after shutdown every entry point rejects and the browser is not launched again; shutdown stays idempotent', async () => {
+  const { sm, fake } = setup(); const { session } = await opened(sm, fake);
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  await sm.shutdown();
+  const isStopping = (e: E2kError) => e.code === 'busy' && e.message === '内核正在关停';
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/' }), isStopping);
+  await assert.rejects(sm.step({ session, ops: [{ op: 'snapshot' }] }), isStopping);
+  await assert.rejects(sm.close({ session }), isStopping);
+  await assert.rejects(sm.loginBegin({ url: 'http://localhost:5173/login.html' }), isStopping);
+  await assert.rejects(sm.loginEnd({ loginId }), isStopping);
+  assert.equal(fake.launches, 1); assert.equal(sm.instanceState(), 'stopped'); assert.deepEqual(sm.list(), []);
+  await sm.shutdown();
+  assert.equal(fake.launches, 1);
+});
+
+test('shutdown stops the browser only after an in-flight open has settled', async () => {
+  const { sm, fake, logs } = setup();
+  // 导航慢 50 毫秒：关停开始时 open 还停在 goto 上。
+  const launch = fake.launch.bind(fake);
+  fake.launch = async (profile) => {
+    const inst = await launch(profile);
+    const openPage = inst.openPage.bind(inst);
+    inst.openPage = async (o) => {
+      const page = await openPage(o);
+      const goto = page.goto.bind(page);
+      page.goto = async (url) => { await sleep(50); return goto(url); };
+      return page;
+    };
+    return inst;
+  };
+  await sm.open({ url: 'http://localhost:5173/' });            // 先把实例启动起来
+  let settled = false;
+  const pending = sm.open({ url: 'http://localhost:5173/', name: 'late' });
+  pending.then(() => { settled = true; }, () => { settled = true; });
+  await sleep(10);
+  await sm.shutdown();
+  assert.equal(settled, true);
+  await assert.rejects(pending, (e: E2kError) => e.code === 'busy');
+  assert.ok(!logs.some((l) => l.includes('关页面')));                // 页面是在实例停掉之前、好好关掉的
+  assert.deepEqual(fake.openPages(), []);
+});
