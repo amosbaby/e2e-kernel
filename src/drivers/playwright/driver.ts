@@ -1040,7 +1040,10 @@ class PlaywrightDriver implements Driver {
     if (profile.userDataDir === '' || !isAbsolute(profile.userDataDir)) throw new DriverError('other', 'userDataDir must be an absolute path');
     let context: BrowserContext;
     try {
-      context = await chromium.launchPersistentContext(profile.userDataDir, { headless: false, serviceWorkers: 'block' });
+      // 信号归内核自己：关停时由内核停实例；Playwright 自带的处理器会和它抢跑，第二次 SIGINT 还会直接 exit(130)。
+      context = await chromium.launchPersistentContext(profile.userDataDir, {
+        headless: false, serviceWorkers: 'block', handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
+      });
     } catch (e) {
       throw mapError(e);
     }

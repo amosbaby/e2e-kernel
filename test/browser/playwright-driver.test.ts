@@ -134,6 +134,24 @@ test('launch refuses a relative or empty user data dir', { timeout: 60_000 }, as
     await assert.rejects(driver.launch({ name: 'x', userDataDir }), (e: DriverError) => e instanceof DriverError && e.kind === 'other');
 });
 
+// 信号归内核和 CLI：Playwright 默认会在 launch 时挂自己的 SIGINT/SIGTERM/SIGHUP 处理器，第二次 SIGINT 会直接 exit(130)，
+// 抢在内核自己的收尾前面。不发真信号：在一个干净的子进程里 launch，看进程上有没有多出监听器
+// （处理器每个进程只装一次，本文件里别的测试已经 launch 过，所以不能在本进程里数）。
+test('launch does not add Playwright signal handlers to the process', { timeout: 60_000 }, () => {
+  const script = `import { createPlaywrightDriver } from './src/drivers/playwright/driver.ts';
+const count = () => ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => process.listenerCount(s));
+const before = count();
+const inst = await createPlaywrightDriver().launch({ name: 'signals', userDataDir: ${JSON.stringify(makeTmp('e2k-pw-'))} });
+const after = count();
+await inst.stop();
+console.log(JSON.stringify({ before, after }));
+process.exit(0);
+`;
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 45_000 });
+  const { before, after } = JSON.parse(out.trim().split('\n').pop() ?? '{}') as { before: number[]; after: number[] };
+  assert.deepEqual(after, before);
+});
+
 test('the launched browser is headed', { timeout: 60_000 }, async () => {
   const ua = await page.evaluate('navigator.userAgent');
   assert.equal(typeof ua, 'string');
