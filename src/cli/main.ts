@@ -58,6 +58,8 @@ function helpText(selfCmd: string): string {
     '  login <url>                            在专用 profile 里登录（要在终端里由人按回车确认）',
     '  --version',
     '  help',
+    '',
+    '退出码：0 正常；10 有断言不符；11 有动作失败；20 撞到登录墙（open / step，请人运行 login）；2 用法错误、会话不存在或正忙；22 要人处理（内核没在跑、login 没有终端、状态目录有问题）',
   ].join('\n');
 }
 

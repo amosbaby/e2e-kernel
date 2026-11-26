@@ -68,7 +68,7 @@ function exists(path: string): boolean {
   }
 }
 
-// profile 的状态和最近一次 login。只查不建；「没 login 过」不算失败（R7）：fresh home 上这一项是 ok。
+// profile 的状态和最近一次 login。只查不建；「没 login 过」不算失败：fresh home 上这一项是 ok。
 // ok 只在 profiles 目录或 profile 目录已存在、却不满足状态目录的权限规则时为 false。
 function profileCheck(home: Home): Check {
   const name = `profile-${DEFAULT_PROFILE}`;

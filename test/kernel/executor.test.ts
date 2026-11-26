@@ -625,7 +625,7 @@ test('isWrite, toWriteRecord and hosts', () => {
   assert.deepEqual(recorder.hosts, [{ host: 'localhost', mode: 'default' }, { host: '127.0.0.1', mode: 'readonly' }]);
 });
 
-// ---- P8：失败时的诊断（hints） ----
+// ---- 失败时的诊断（hints） ----
 
 async function hintsPage(url: string): Promise<Page> {
   const p = await inst.openPage({});

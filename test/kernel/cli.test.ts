@@ -119,6 +119,7 @@ test('--version and help', async () => {
   const v = io(); assert.equal(await main(['--version'], v), 0); assert.equal(v.outText(), '0.1.0');
   const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url>/); assert.match(h.outText(), /step .*--keep-going/);
   assert.ok(!/approve|save-case/.test(h.outText()));
+  assert.match(h.outText(), /退出码：.*10 .*11 .*20 .*22/);   // 退出码一行要列到 20 和 22
   assert.equal(await main([], io()), 2);
 });
 

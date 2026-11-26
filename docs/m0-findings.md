@@ -140,7 +140,7 @@ context-close: not-fired
 
 Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调用（`playwright-core/types/types.d.ts` 里 `route` 的说明）。实测（`test/browser/playwright-driver.test.ts`「a redirect target is not shown to the handler」）：页面 `fetch` POST 一个返回 307 的地址，307 的目标是写端点；驱动的 `seen` 里只有第一跳，fixture 服务收到了后续跳的写请求。
 
-结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；README Known gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定），不在 M7 内。
+结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；README Known gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定）。
 
 ## 9.6 写请求时探测密码框
 
