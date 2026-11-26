@@ -47,7 +47,7 @@ export interface Verdict { value: VerdictValue; because?: string }
 export interface Finding { claim: string; basis: string; verdict?: VerdictValue }
 // 「序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代」。序号是整个会话从 1 起的序号（OpResult.seq）。
 export interface Supersede { failed: number; by: number }
-export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean }
+export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean; readonly?: boolean }
 export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean }
 export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[]; superseded?: Supersede[] }
 export type Outcome = 'ok' | 'match' | 'mismatch' | 'failed' | 'not-run';
@@ -75,6 +75,8 @@ export interface OpenResult {
 }
 export interface StepResult {
   session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 | 20; blocked: 'login' | null; next: string | null;
+  // 只读模式的提示：writesBlocked 是本批执行期间本会话被拦下的写请求数；notices 是给人和 agent 看的整句提示，退出码不受影响。
+  writesBlocked: number; notices: string[];
 }
 // 结论为 pass 时和记录矛盾的原因（每种至多出现一次，顺序固定）。
 export type ConflictReason = 'mismatch' | 'unresolved-failed' | 'unresolved-not-run' | 'not-done' | 'finding-fail';
@@ -178,11 +180,12 @@ export function validateParams(method: Method, p: unknown): unknown {
       plainObject(p, 'params', []);
       return {};
     case 'open': {
-      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch']);
+      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch', 'readonly']);
       const out: OpenParams = { url: httpUrl(o.url, 'params.url') };
       if (o.viewport !== undefined) out.viewport = viewport(o.viewport, 'params.viewport');
       if (o.name !== undefined) out.name = str(o.name, 'params.name', { min: 1, max: 40, pattern: SESSION_NAME });
       if (o.touch !== undefined) out.touch = bool(o.touch, 'params.touch');
+      if (o.readonly !== undefined) out.readonly = bool(o.readonly, 'params.readonly');
       return out;
     }
     case 'step': {

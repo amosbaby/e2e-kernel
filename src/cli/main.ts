@@ -55,7 +55,8 @@ function helpText(selfCmd: string): string {
     '  status [--json]                        版本、驱动、浏览器、会话、profile（含最近一次 login）和域名规则',
     '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
     '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则（只读，不需要内核；规则文件只由人维护）',
-    '  open <url> [--viewport <宽>x<高>] [--touch] [--name <名字>] [--json]',
+    '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--json]',
+    '                                          --readonly 强制这个会话只读（不管域名规则）：只放行读和严格的 GraphQL query，其余写请求一律拦下；驱动不能拦网络时 open 失败',
     '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
     '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
     '  step <会话> --stdin [--keep-going] [--json]        从标准输入读 JSON 数组',
@@ -202,7 +203,7 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function open(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' } });
+  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' }, readonly: { type: 'boolean' } });
   const [url] = positionals(ctx, p, 1, '<url>');
   const raw: Record<string, unknown> = { url };
   const viewport = optString(p, 'viewport');
@@ -210,6 +211,7 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
   if (viewport !== undefined) raw.viewport = parseViewport(viewport);
   if (name !== undefined) raw.name = name;
   if (p.values.touch === true) raw.touch = true;
+  if (p.values.readonly === true) raw.readonly = true;
   const params = validateParams('open', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'open', params) as OpenResult;
   print(ctx, result, formatOpen);

@@ -47,6 +47,9 @@ interface Session {
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
   readonly recorder: Recorder;
+  readonly forced: boolean;                  // open --readonly：不管规则，整场会话只读
+  topHost: string;                           // 主页面当前的顶层主机（URL.hostname）：模式跟着页面走，导航和重定向落地时更新
+  lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
   url: string;                               // 首屏读数里的地址（已脱敏），给 list()
   state: State;
   gone: boolean;                             // 主页面已关或会话已在收尾：同步置位，step 的后续操作据此不再执行
@@ -149,9 +152,17 @@ export class SessionManager {
 
   private async openSession(p: OpenParams): Promise<OpenResult> {
     const host = new URL(p.url).hostname;
-    const mode = this.deps.modes.resolve(host);
-    // M1 没有域名规则，到不了这里；到了就宁可拒绝，不开任何页面。
-    if (mode !== 'default') throw new E2kError('internal', '这个版本只支持「默认」模式');
+    // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
+    this.deps.modes.refresh();
+    if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
+    const forced = p.readonly === true;
+    const mode: Mode = forced ? 'readonly' : this.deps.modes.resolve(host);
+    // 「denied」是 M3 的事，规则文件现在不收；到了这里也宁可拒绝，不开任何页面。
+    if (mode === 'denied') throw new E2kError('internal', '这个版本还不支持「denied」模式');
+    // 只读靠拦网络请求落实：驱动拦不了就不能开，不开页（失败关闭）。
+    if (mode === 'readonly' && !this.deps.driver.capabilities.networkInterception) {
+      throw new E2kError('internal', '这个驱动不能拦网络请求，不能以只读方式打开');
+    }
     const instance = await this.acquireInstance();
     if (this.stopping) throw stopping();
 
@@ -166,7 +177,7 @@ export class SessionManager {
       ensurePrivateDir(nameDir);
       const runDir = resolveInside(nameDir, dirName);
       ensurePrivateDir(runDir);
-      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode });
+      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced });
     } finally {
       this.reserved.delete(id);
     }
@@ -180,12 +191,20 @@ export class SessionManager {
     s.state = 'stepping';
     this.pauseIdle(s);
     try {
+      const blockedBefore = s.recorder.blockedEvents();
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
         { keepGoing: p.keepGoing === true, aborted: () => s.gone });
+      // 口径：本批执行期间被拦下的本会话请求。执行结束之后才到的「重定向被拒」算进下一批；未归属的请求不算（它们不属于任何会话的记录）。
+      const writesBlocked = s.recorder.blockedEvents() - blockedBefore;
       const tallies = tally(results);
+      await this.syncTopHost(s);
       const wall = await loginWall(s.page, s.start.url);
-      // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。
-      return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall };
+      s.lastWall = wall.blocked;
+      const notices: string[] = [];
+      if (writesBlocked > 0) notices.push(`本批被拦 ${writesBlocked} 条写（只读模式），详见报告`);
+      if (this.deps.modes.state().error !== null) notices.push('规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝');
+      // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。退出码不受 notices 影响。
+      return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
     } finally {
       // 执行期间会话可能已经被关停收尾，那就不再计时。
       if (s.state === 'stepping') {
@@ -364,7 +383,7 @@ export class SessionManager {
   }
 
   private async openPage(instance: Instance, p: OpenParams, o: { id: string; name: string; nameDir: string; dirName: string;
-    runDir: string; startedAt: Date; host: string; mode: Mode }): Promise<OpenResult> {
+    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean }): Promise<OpenResult> {
     let page: Page | undefined;
     let registered = false;
     try {
@@ -373,7 +392,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: DEFAULT_PROFILE },
-        page, pages: new Map([[page.id, page]]), recorder: new Recorder(),
+        page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
       // 先登记再导航：首屏的请求才归得到这个会话。
@@ -381,6 +400,7 @@ export class SessionManager {
       registered = true;
       page.onClosed(() => { s.gone = true; void this.mainPageClosed(s); });
       s.recorder.addHost(o.host, o.mode);
+      this.recordMode(s);
       await page.goto(p.url);
       if (this.stopping) throw stopping();
       const snapshot = await page.snapshot({});
@@ -388,8 +408,10 @@ export class SessionManager {
       const loc = await page.location();
       // 关停已经开始：不建成会话，由下面的 catch 清理并拒绝。
       if (this.stopping) throw stopping();
+      this.followTopHost(s, loc.url);
       const wall = await loginWall(page, p.url);
       if (this.stopping) throw stopping();
+      s.lastWall = wall.blocked;
       s.url = safely(() => redactUrl(loc.url));
       s.state = 'idle';
       this.restartIdle(s);
@@ -570,26 +592,79 @@ export class SessionManager {
       }
     }
     if (login !== undefined) return { action: 'continue' };       // 登录过程不套写策略，也不记录
-    if (s !== undefined) {
-      // topUrl 可能是 null（判断不出顶层页面），这时退回请求自己的地址。
-      const topHost = hostOf(req.topUrl ?? req.url);
-      const mode = this.deps.modes.resolve(topHost);
-      const host = hostOf(req.url);
-      const targetMode = this.deps.modes.resolve(host);
-      // 这个版本只实现了「默认」模式（open 时也这样把关）：顶层页面或请求目标有一边不是默认模式，就中止，不交给策略。
-      const verdict: PolicyVerdict = mode !== 'default' || targetMode !== 'default' ? { decision: { action: 'abort' }, reason: 'method' } : this.deps.policy.decide(req, { mode });
-      s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
-      if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
-      return verdict.decision;
-    }
-    // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）。
-    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly: false });   // Task 12 接上真值
+    if (s !== undefined) return this.decideForSession(s, req);
+    // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）：有任一只读会话活着就按「只读」拦写。
+    const anyReadonly = [...this.sessions.values()].some((x) => this.sessionMode(x, []) === 'readonly');
+    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly });
     if (isWrite(req.method) || verdict.reason !== null) {
       const targetMode = this.deps.modes.resolve(hostOf(req.url));
-      this.unattributed.push(toWriteRecord(req, verdict, { mode: targetMode, targetMode }, this.deps.now()));
+      this.unattributed.push(toWriteRecord(req, verdict, { mode: anyReadonly ? 'readonly' : 'default', targetMode }, this.deps.now()));
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
     }
     return verdict.decision;
+  }
+
+  // 会话页（主页面、弹窗）的请求。模式跟着页面走（设计 5.2）：有效模式 = 会话主页面的顶层主机和请求所在页的顶层主机取并，
+  // 任何一边只读就按只读；默认模式的页面发往只读主机的写照旧放行，只记录（targetMode）。
+  private decideForSession(s: Session, req: RequestInfo): Decision {
+    // topUrl 可能是 null（判断不出顶层页面），这时退回请求自己的地址。
+    const topHost = hostOf(req.topUrl ?? req.url);
+    const isMain = req.pageId === s.page.id;
+    const mainNav = isMain && req.isNavigation && req.topFrame;
+    // 主页面的顶层导航：规则可能刚被人改过，先刷新。导航前的主机（s.topHost）和目标一起算，所以只读页跨主机的表单 POST 也拦得住。
+    if (mainNav) this.deps.modes.refresh();
+    const mode = this.sessionMode(s, [topHost]);
+    const host = hostOf(req.url);
+    const targetMode = this.deps.modes.resolve(host);
+    const verdict: PolicyVerdict = this.deps.policy.decide(req, { mode });
+    s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
+    if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
+    // 判定之后才挪主机：导航被拦就留在原主机；重定向落地（主页面的其他请求带着新的顶层地址）也在这里跟上。
+    if (mainNav ? verdict.decision.action === 'continue' : isMain && req.topUrl !== null) this.moveTopHost(s, topHost);
+    return verdict.decision;
+  }
+
+  // 会话的有效模式：被 --readonly 强制，或 [主页面顶层主机, ...extraHosts] 里任一只读 → readonly；任一 denied → denied；否则 default。
+  private sessionMode(s: Session, extraHosts: string[]): Mode {
+    if (s.forced) return 'readonly';
+    const modes = [s.topHost, ...extraHosts].map((h) => this.deps.modes.resolve(h));
+    if (modes.includes('readonly')) return 'readonly';
+    if (modes.includes('denied')) return 'denied';
+    return 'default';
+  }
+
+  // 记一条模式变更（和上一条同模式的由 Recorder 去重）：reason 看这个主机有没有命中规则。
+  private recordMode(s: Session): void {
+    const { modes } = this.deps;
+    s.recorder.noteMode({
+      at: this.deps.now().toISOString(), host: s.topHost, mode: this.sessionMode(s, []),
+      reason: s.forced ? 'forced' : modes.ruleFor(s.topHost) === null ? 'no-rule' : 'rule', rulesHash: modes.state().hash,
+    });
+  }
+
+  private moveTopHost(s: Session, host: string): void {
+    if (host === s.topHost) return;
+    s.topHost = host;
+    this.recordMode(s);
+  }
+
+  // 用主页面的实际地址校正顶层主机；不是 http(s) 地址（about:blank、浏览器的错误页）就不动，沿用上一个主机。
+  private followTopHost(s: Session, url: string): void {
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'http:' || u.protocol === 'https:') this.moveTopHost(s, u.hostname);
+    } catch {
+      // 地址解析不了：沿用上一个主机。
+    }
+  }
+
+  private async syncTopHost(s: Session): Promise<void> {
+    try {
+      this.followTopHost(s, (await s.page.location()).url);
+    } catch (e) {
+      // 页面已经没了或驱动查不出：不更新，沿用上一个主机。
+      if (!(e instanceof DriverError)) throw e;
+    }
   }
 
   private onRequestDone(e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }): void {
@@ -601,6 +676,11 @@ export class SessionManager {
       if (w !== undefined && w.id === e.id) {
         w.status = e.status;
         w.failed = e.failed;
+        // 驱动在首跳 3xx 时中止了重定向：那条写其实没有跟过去，改记成被拦的 redirected-write（和会话里的记录一致）。
+        if (e.redirectRefused === true && w.decision !== 'blocked') {
+          w.decision = 'blocked';
+          w.reason = 'redirected-write';
+        }
         return;
       }
     }

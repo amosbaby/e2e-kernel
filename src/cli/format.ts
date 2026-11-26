@@ -77,7 +77,9 @@ export function formatOpen(r: OpenResult): string {
 }
 
 export function formatStep(r: StepResult): string {
-  return [`${inline(r.session)} ${tallyText(r.tallies)}`, ...waitLine(r), ...r.results.map(opLine)].join('\n');
+  // 老内核的回应没有 notices：当作没有提示。
+  const notices = Array.isArray(r.notices) ? r.notices : [];
+  return [`${inline(r.session)} ${tallyText(r.tallies)}`, ...waitLine(r), ...notices.map((n) => `提示：${inline(n)}`), ...r.results.map(opLine)].join('\n');
 }
 
 export function formatClose(r: CloseResult): string {

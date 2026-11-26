@@ -30,7 +30,7 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
     'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm',
     'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing', 'graphql', 'summary',
-    'superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'label', 'format', 'mask', 'fullPage', 'idle', 'touch'];
+    'superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'label', 'format', 'mask', 'fullPage', 'idle', 'touch', 'readonly', 'writesBlocked', 'notices'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
 
@@ -126,6 +126,12 @@ test('open takes touch as a boolean and nothing else', () => {
   assert.deepEqual(validateParams('open', { url: 'http://localhost/', touch: true }), { url: 'http://localhost/', touch: true });
   assert.deepEqual(validateParams('open', { url: 'http://localhost/', touch: false }), { url: 'http://localhost/', touch: false });
   for (const touch of ['yes', 1, null, {}, []]) assert.throws(() => validateParams('open', { url: 'http://localhost/', touch }), isUsage, String(touch));
+});
+
+test('open takes readonly as a boolean and nothing else', () => {
+  assert.deepEqual(validateParams('open', { url: 'http://localhost/', readonly: true }), { url: 'http://localhost/', readonly: true });
+  assert.deepEqual(validateParams('open', { url: 'http://localhost/', readonly: false }), { url: 'http://localhost/', readonly: false });
+  for (const readonly of ['yes', 1, null, {}, []]) assert.throws(() => validateParams('open', { url: 'http://localhost/', readonly }), isUsage, String(readonly));
 });
 
 test('validateParams rejects bad parameters with usage', () => {

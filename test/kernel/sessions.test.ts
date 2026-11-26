@@ -7,10 +7,11 @@ import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DriverError } from '../../src/driver/types.ts';
 import { defaultOnlyResolver } from '../../src/kernel/mode.ts';
+import type { ModeResolver } from '../../src/kernel/mode.ts';
 import { DEFAULT_PROFILE, profileInfo } from '../../src/kernel/profiles.ts';
 import { SessionManager } from '../../src/kernel/sessions.ts';
 import type { SessionDeps } from '../../src/kernel/sessions.ts';
-import { allowAllPolicy } from '../../src/kernel/write-policy.ts';
+import { allowAllPolicy, policy } from '../../src/kernel/write-policy.ts';
 import type { PolicyVerdict, WritePolicy } from '../../src/kernel/write-policy.ts';
 import { RUN_DIR_RE, runDirName } from '../../src/report/store.ts';
 import type { RunResult } from '../../src/report/result.ts';
@@ -226,23 +227,23 @@ test('idle sessions are closed with a report, but not while a step is running', 
   assert.equal(readResult(runDir).closedBy, 'idle-timeout'); assert.equal(sm.list().length, 0);
 });
 
-test('fails closed when the resolver returns a non-default mode', async () => {
+test('a rule that makes the start host read-only: open succeeds in read-only mode and the policy sees it', async () => {
   const { sm, fake } = setup({ modes: { ...defaultOnlyResolver, resolve: () => 'readonly' } });
-  await assert.rejects(sm.open({ url: 'http://localhost:5173/' }), (e: E2kError) => e.code === 'internal');
-  assert.deepEqual(fake.openPages(), []);
+  const r = await sm.open({ url: 'http://localhost:5173/' });
+  assert.equal(r.mode, 'readonly'); assert.deepEqual(fake.openPages().length, 1);
 });
 
-test('a session request that touches a non-default host is aborted without asking the policy (fail closed)', async () => {
-  const asked: string[] = [];
-  const spy: WritePolicy = { decide: (r) => { asked.push(r.url); return CONTINUE; }, decideUnattributed: () => CONTINUE };
+test('the policy is asked with the effective mode: a read-only page turns a default-host write into a block, a default page lets a write to a read-only host through', async () => {
+  const asked: { url: string; mode: Mode }[] = [];
+  const spy: WritePolicy = { decide: (r, ctx) => { asked.push({ url: r.url, mode: ctx.mode }); return CONTINUE; }, decideUnattributed: () => CONTINUE };
   const modes = { ...defaultOnlyResolver, resolve: (host: string): Mode => (host === 'example.com' ? 'readonly' : 'default') };
   const { sm, fake } = setup({ policy: spy, modes }); const { session, runDir, pageId } = await opened(sm, fake);
-  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' }), { action: 'abort' });
-  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://example.com/' }), { action: 'abort' });
-  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api' }), { action: 'continue' });
-  assert.deepEqual(asked, ['http://localhost:5173/api']);
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' }), { action: 'continue' });
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://example.com/' }), { action: 'continue' });
+  assert.deepEqual(asked, [{ url: 'http://example.com/api', mode: 'default' }, { url: 'http://localhost:5173/api', mode: 'readonly' }]);
   await sm.close({ session });
-  assert.deepEqual(readResult(runDir).writes.blocked.map((w) => w.url), ['http://example.com/api', 'http://localhost:5173/api']);
+  assert.deepEqual(readResult(runDir).writes.allowed.map((w) => [w.url, w.mode, w.targetMode]),
+    [['http://example.com/api', 'default', 'readonly'], ['http://localhost:5173/api', 'readonly', 'default']]);
 });
 
 test('shutdown closes every session as kernel-shutdown and stops the instance', async () => {
@@ -442,9 +443,10 @@ test('session requests: the mode check uses the top URL and falls back to the re
 });
 
 test('a request whose mode cannot be decided is aborted (fail closed)', async () => {
-  let calls = 0;
-  const { sm, fake, logs } = setup({ modes: { ...defaultOnlyResolver, resolve: () => { if (++calls > 1) throw new Error('rule error'); return 'default'; } } });
+  let armed = false;
+  const { sm, fake, logs } = setup({ modes: { ...defaultOnlyResolver, resolve: () => { if (armed) throw new Error('rule error'); return 'default'; } } });
   const { pageId } = await opened(sm, fake);
+  armed = true;
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'GET', url: 'http://localhost:5173/x' }), { action: 'abort' });
   assert.ok(logs.some((l) => l.includes('rule error')));
 });
@@ -677,4 +679,181 @@ test('when the probe itself fails, no login wall is claimed (a hint only)', asyn
   assert.deepEqual([o.blocked, o.next], [null, null]);
   const r = await sm.step({ session: o.session, ops: [{ op: 'snapshot' }] });
   assert.deepEqual([r.exit, r.blocked, r.next], [0, null, null]);
+});
+
+// ---- 只读模式（任务 12） ----
+
+const RO = 'http://example.com/';
+const GRAPHQL_QUERY = { method: 'POST', url: 'http://example.com/graphql', contentType: 'application/json', body: '{"query":"{ viewer { id } }"}' };
+
+// 可以在测试里改的规则解析器：ro 里的主机只读；pending 在下一次 refresh 时生效（模拟人改了规则文件）。
+function mutableRules(readonlyHosts: string[]) {
+  const st = { ro: new Set(readonlyHosts), hash: 'sha256:0000000000000001' as string | null, error: null as string | null, pending: null as (() => void) | null, refreshes: 0 };
+  const resolver: ModeResolver = {
+    resolve: (h) => (st.ro.has(h) ? 'readonly' : 'default'),
+    ruleFor: (h) => (st.ro.has(h) ? 'readonly' : null),
+    isLoginHost: () => false,
+    refresh: () => { st.refreshes++; const p = st.pending; st.pending = null; p?.(); },
+    state: () => ({ count: st.ro.size, hash: st.hash, error: st.error }),
+  };
+  return { st, resolver };
+}
+
+function setupRo(readonlyHosts: string[] = ['example.com'], overrides: Partial<SessionDeps> = {}) {
+  const rules = mutableRules(readonlyHosts);
+  return { ...setup({ modes: rules.resolver, policy, ...overrides }), ...rules };
+}
+
+// 会话内部状态，只给测试看：主页面的顶层主机和记录里的模式时间线。
+function inner(sm: SessionManager, id: string): { topHost: string; recorder: { modes: { mode: string; reason: string; rulesHash: string | null; host: string }[] } } {
+  return (sm as unknown as { sessions: Map<string, never> }).sessions.get(id) as never;
+}
+
+test('read-only by rule: writes from the session page get a 403, a strict GraphQL query goes through without following redirects', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  assert.equal(r.mode, 'readonly');
+  const post = await fake.emitRequest({ id: 'w1', pageId, method: 'POST', url: 'http://example.com/api/items', body: '{"a":1}', contentType: 'application/json' });
+  assert.equal(post.action, 'fulfill'); assert.equal((post as { status: number }).status, 403);
+  assert.deepEqual(await fake.emitRequest({ id: 'q1', pageId, ...GRAPHQL_QUERY }), { action: 'continue', followRedirects: false });
+  assert.deepEqual(fake.noRedirectIds, ['q1']);
+  await sm.close({ session: r.session });
+  const blocked = readResult(r.runDir).writes.blocked;
+  assert.deepEqual(blocked.map((w) => [w.id, w.decision, w.reason, w.mode]), [['w1', 'blocked', 'method', 'readonly']]);
+});
+
+test('open --readonly forces read-only on a host without rules, also after navigating to another default host', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: 'http://localhost:5173/', readonly: true }); const pageId = fake.openPages().at(-1)!;
+  assert.equal(r.mode, 'readonly');
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api' })).action, 'fulfill');
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' }), { action: 'continue' });
+  assert.equal(inner(sm, r.session).topHost, 'example.org');
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'fulfill');
+  const modes = inner(sm, r.session).recorder.modes;
+  assert.equal(modes.length, 1); assert.equal(modes[0]!.reason, 'forced'); assert.equal(modes[0]!.mode, 'readonly');
+  assert.equal(modes[0]!.rulesHash, 'sha256:0000000000000001');
+  const plain = await sm.open({ url: 'http://localhost:5173/' });
+  assert.equal(plain.mode, 'default'); assert.equal(inner(sm, plain.session).recorder.modes[0]!.reason, 'no-rule');
+  const ruled = await sm.open({ url: RO });
+  assert.equal(inner(sm, ruled.session).recorder.modes[0]!.reason, 'rule');
+});
+
+test('a popup of a read-only session is read-only even when its own top host is a default host', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  const popup = fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  const post = await fake.emitRequest({ pageId: popup.id, method: 'POST', url: 'http://localhost:5173/api' });
+  assert.equal(post.action, 'fulfill');
+  assert.equal(readResult((await sm.close({ session: r.session })).runDir).writes.blocked[0]!.mode, 'readonly');
+});
+
+test('a cross-host native form POST from a read-only page is blocked, and the session stays on the old host', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  const post = await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/submit', isNavigation: true, topFrame: true, topUrl: 'http://localhost:5173/submit',
+    body: 'a=1', contentType: 'application/x-www-form-urlencoded' });
+  assert.equal(post.action, 'fulfill'); assert.match((post as { contentType: string }).contentType, /html/);
+  assert.equal(inner(sm, r.session).topHost, 'example.com');
+});
+
+test('a default page may write to a read-only host: allowed, only recorded as targetMode read-only', async () => {
+  const { sm, fake } = setupRo(); const { session, runDir, pageId } = await opened(sm, fake);
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' }), { action: 'continue' });
+  await sm.close({ session });
+  const w = readResult(runDir).writes.allowed[0]!;
+  assert.deepEqual([w.mode, w.targetMode, w.decision, w.reason], ['default', 'readonly', 'allowed', null]);
+});
+
+test('a read-only page writing to a default host is blocked', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api' })).action, 'fulfill');
+  const w = readResult((await sm.close({ session: r.session })).runDir).writes.blocked[0]!;
+  assert.deepEqual([w.mode, w.targetMode], ['readonly', 'default']);
+});
+
+test('a redirect that lands the main page on a read-only host moves the session to read-only, for unattributed requests too', async () => {
+  const { sm, fake } = setupRo(); const { session, pageId } = await opened(sm, fake);
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' })).action, 'continue');
+  assert.equal(inner(sm, session).topHost, 'example.org');
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'continue');
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api' })).action, 'continue');
+  // 子资源请求带着新的顶层地址（重定向落到了只读主机）：判定之后主机跟过去，时间线多一条。
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.com/app.js', topUrl: RO })).action, 'continue');
+  assert.equal(inner(sm, session).topHost, 'example.com');
+  assert.deepEqual(inner(sm, session).recorder.modes.map((m) => m.mode), ['default', 'readonly']);
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api' })).action, 'fulfill');
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: RO })).action, 'fulfill');
+});
+
+test('a step reports the writes blocked while it ran (and only those), and the exit code is unchanged', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  const step = sm.step({ session: r.session, ops: [{ op: 'wait', for: { ms: 150 } }] });
+  await sleep(40);
+  await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/a' });
+  await fake.emitRequest({ pageId, method: 'DELETE', url: 'http://example.com/b' });
+  await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.com/c' });
+  const res = await step;
+  assert.equal(res.writesBlocked, 2); assert.equal(res.exit, 0);
+  assert.deepEqual(res.notices, ['本批被拦 2 条写（只读模式），详见报告']);
+  const next = await sm.step({ session: r.session, ops: [{ op: 'snapshot' }] });
+  assert.deepEqual([next.writesBlocked, next.notices], [0, []]);
+  // 一条已放行的严格查询事后被发现重定向被拒：落进下一批。
+  await fake.emitRequest({ id: 'q9', pageId, ...GRAPHQL_QUERY });
+  const during = sm.step({ session: r.session, ops: [{ op: 'wait', for: { ms: 100 } }] });
+  await sleep(30); fake.emitRequestDone('q9', 307, { redirectRefused: true });
+  assert.equal((await during).writesBlocked, 1);
+});
+
+test('a rules file with an error: open is refused (usage) and no page opens; an open session keeps going and its step carries a notice', async () => {
+  const { sm, fake, st } = setupRo();
+  const r = await sm.open({ url: 'http://localhost:5173/' });
+  st.error = 'rules.json: bad json';
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/' }), (e: E2kError) => e.code === 'usage' && e.message.includes('规则文件有错') && e.next === 'e2k rule list 看错误');
+  assert.equal(fake.openPages().length, 1);
+  const step = await sm.step({ session: r.session, ops: [{ op: 'snapshot' }] });
+  assert.equal(step.exit, 0); assert.deepEqual(step.notices, ['规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝']);
+});
+
+test('unattributed writes are blocked while a read-only session is alive, and let through after it ended', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO });
+  const blocked = await fake.emitRequest({ id: 'u1', pageId: null, method: 'POST', url: 'http://localhost:5173/api' });
+  assert.equal(blocked.action, 'fulfill');
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'GET', url: 'http://localhost:5173/' })).action, 'continue');
+  const closed = await sm.close({ session: r.session });
+  const u = readResult(closed.runDir).writes.unattributed[0]!;
+  assert.deepEqual([u.id, u.decision, u.reason, u.mode], ['u1', 'blocked', 'unattributed', 'readonly']);
+  assert.deepEqual(await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api' }), { action: 'continue' });
+});
+
+test('a refused redirect turns the allowed write into a blocked redirected-write, for session and unattributed requests', async () => {
+  const noRedirect: WritePolicy = { decide: policy.decide, decideUnattributed: () => ({ decision: { action: 'continue', followRedirects: false }, reason: null }) };
+  const { sm, fake } = setupRo(['example.com'], { policy: noRedirect });
+  const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  await fake.emitRequest({ id: 'q1', pageId, ...GRAPHQL_QUERY });
+  await fake.emitRequest({ id: 'u1', pageId: null, method: 'POST', url: 'http://localhost:5173/api' });
+  fake.emitRequestDone('q1', 307, { redirectRefused: true });
+  fake.emitRequestDone('u1', 302, { redirectRefused: true });
+  const result = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(result.writes.blocked.map((w) => [w.id, w.decision, w.reason, w.status, w.failed]), [['q1', 'blocked', 'redirected-write', 307, true]]);
+  assert.deepEqual(result.writes.unattributed.map((w) => [w.id, w.decision, w.reason, w.status, w.failed]), [['u1', 'blocked', 'redirected-write', 302, true]]);
+});
+
+test('a driver that cannot intercept requests refuses to open read-only (by rule or by --readonly), and opens nothing', async () => {
+  const fake = new FakeDriver({ capabilities: { networkInterception: false }, pages: { 'http://localhost:5173/': HOME_PAGE } });
+  const rules = mutableRules(['example.com']); const tmp = makeTmpHome();
+  const sm = new SessionManager({ driver: fake, home: tmp.home, modes: rules.resolver, policy, idleMs: 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: () => {} });
+  cleanups.push(async () => { await sm.shutdown(); tmp.cleanup(); });
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'internal' && e.message.includes('不能拦网络请求'));
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/', readonly: true }), (e: E2kError) => e.code === 'internal');
+  assert.deepEqual(fake.openPages(), []); assert.equal(fake.launches, 0);
+  assert.equal((await sm.open({ url: 'http://localhost:5173/' })).mode, 'default');
+});
+
+test('rules changed to default: the next main-page top-level navigation picks them up, writes are let through and the timeline gets an entry with the new hash', async () => {
+  const { sm, fake, st } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' })).action, 'fulfill');
+  st.pending = () => { st.ro.clear(); st.hash = 'sha256:0000000000000002'; };
+  const before = st.refreshes;
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://example.org/', isNavigation: true, topFrame: true, topUrl: 'http://example.org/' })).action, 'continue');
+  assert.equal(st.refreshes, before + 1);
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'continue');
+  assert.deepEqual(inner(sm, r.session).recorder.modes.map((m) => [m.mode, m.host, m.rulesHash]),
+    [['readonly', 'example.com', 'sha256:0000000000000001'], ['default', 'example.org', 'sha256:0000000000000002']]);
 });

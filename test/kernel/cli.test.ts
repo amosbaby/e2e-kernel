@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeF
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
-import { formatClose, formatStatus } from '../../src/cli/format.ts';
+import { formatClose, formatStatus, formatStep } from '../../src/cli/format.ts';
 import type { Io } from '../../src/cli/main.ts';
 import { startKernel } from '../../src/kernel/server.ts';
 import type { KernelHandle, StatusResult } from '../../src/kernel/server.ts';
@@ -138,6 +138,36 @@ test('open --touch goes through, and the help text lists it', async () => {
   const t = io(); assert.equal(await main(['open', 'http://localhost:5173/', '--touch', '--json'], t), 0);
   assert.equal(JSON.parse(t.outText()).mode, 'default');
   const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url> .*--touch/);
+});
+
+test('open --readonly is passed to the kernel (mode read-only), shown in the text output, and listed in help', async () => {
+  const j = io(); assert.equal(await main(['open', 'http://localhost:5173/', '--readonly', '--json'], j), 0);
+  const r = JSON.parse(j.outText()) as OpenResult; assert.equal(r.mode, 'readonly');
+  const t = io(); assert.equal(await main(['open', 'http://localhost:5173/', '--readonly'], t), 0);
+  assert.match(t.outText(), /模式 readonly/);
+  assert.equal(await main(['open', 'http://localhost:5173/', '--readonly=1'], io()), 2);
+  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url> .*--readonly/);
+  await call(kernelTmp.home, 'close', { session: r.session });
+});
+
+test('step text output prints each notice on its own line; a reply without notices (older kernel) prints none', () => {
+  const base = { session: 's-aaaaaa', results: [], tallies: { ok: 0, match: 0, mismatch: 0, failed: 0, notRun: 0 }, exit: 0 as const, blocked: null, next: null };
+  const out = formatStep({ ...base, writesBlocked: 2, notices: ['本批被拦 2 条写（只读模式），详见报告', '规则文件有错：甲\n乙'] });
+  assert.deepEqual(out.split('\n').slice(1), ['提示：本批被拦 2 条写（只读模式），详见报告', '提示：规则文件有错：甲\\n乙']);
+  assert.ok(!formatStep(base as never).includes('提示'));
+});
+
+test('open on a broken rules file is refused with exit 2 and a pointer to rule list; fixing the file lets it through', async () => {
+  await withRules(GOOD_RULES, async (h) => {
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }) });
+    try {
+      writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');
+      const t = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], t), 2);
+      assert.match(t.errText(), /规则文件有错/); assert.match(t.errText(), /rule list/);
+      writeFileSync(h.home.rulesFile, GOOD_RULES);
+      assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 0);
+    } finally { await kk.stop(); }
+  });
 });
 
 test('open exits 20 on a login wall and prints the full hint; a normal page exits 0', async () => {
