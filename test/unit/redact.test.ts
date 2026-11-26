@@ -284,7 +284,7 @@ test('sensitive header lines: non-ascii, symbol-only, line separators, underscor
 test('redactSelector: an unquoted attribute value ends at its closing bracket, so the rest of the selector survives', () => {
   assert.equal(redactSelector('[data-auth=primary][type=button]'), `[data-auth=${REDACTED}][type=button]`);
   assert.equal(redactSelector('div[data-token-state=ready] > span'), `div[data-token-state=${REDACTED}] > span`);
-  assert.equal(redactSelector('[data-auth="primary"][type=button]'), `[data-auth="${REDACTED}"][type=button]`);
+  assert.equal(redactSelector('[data-auth="primary"][type=button]'), `[data-auth=${REDACTED}][type=button]`);
   assert.equal(redactSelector('input[type=password]'), 'input[type=password]');
   assert.equal(redactSelector(`text=${jwt}`), `text=${REDACTED}`);
   // 值里成对的方括号算值的一部分：已脱敏的结果再过一遍不变，`[REDACTED]` 后面藏的东西也一起换掉。
@@ -299,8 +299,40 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
   assert.equal(redactSelector('[token=a\\'), `[token=${REDACTED}`);
   for (const esc of [' ', '"', '#', '&', '<', '>']) assert.equal(redactSelector(`[data-token=ab\\${esc}cd][x=1]`), `[data-token=${REDACTED}][x=1]`, esc);
   assert.equal(redactSelector(redactSelector('[data-token=ab\\]cd][x=1]')), `[data-token=${REDACTED}][x=1]`);
-  // 找不到配对的 `]`：照旧换到值的正常结尾（失败关闭）。
+  // 找不到配对的 `]`：换到串尾（失败关闭）。
   assert.equal(redactSelector('[token=a[b'), `[token=${REDACTED}`);
+  // `=` 两边有空白、CSS 运算符、引号混在值里、值里有空白：都换到配对的 `]`。
+  const cases: Array<[string, string]> = [
+    ['[data-token = secret][x=1]', `[data-token = ${REDACTED}][x=1]`],
+    ['[ data-token=secret ][x=1]', `[ data-token=${REDACTED}][x=1]`],
+    ['[data-token^=abc][x=1]', `[data-token^=${REDACTED}][x=1]`],
+    ['[data-token *= "abc"][x=1]', `[data-token *= ${REDACTED}][x=1]`],
+    ['[data-token|=abc i][x=1]', `[data-token|=${REDACTED}][x=1]`],
+    ['[token="ab"cd][x=1]', `[token=${REDACTED}][x=1]`],
+    ['[token="a]b"][x=1]', `[token=${REDACTED}][x=1]`],
+    ["[token='a]b'][x=1]", `[token=${REDACTED}][x=1]`],
+    ['[token=ab cd][x=1]', `[token=${REDACTED}][x=1]`],
+  ];
+  for (const [sel, want] of cases) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // 精确匹配的敏感名加运算符（名字不能把运算符吞进去）。
+  assert.equal(redactSelector('[pw^=secret][x=1]'), `[pw^=${REDACTED}][x=1]`);
+  assert.equal(redactSelector('[sid |= abc][x=1]'), `[sid |= ${REDACTED}][x=1]`);
+  // 不紧跟 `[` 的 `名字=`：换到串尾，不在 `]` 处停下（失败关闭）。
+  for (const sel of ['#x token=ab]cd', 'a[href="/cb?token=abc]def"]', 'div;token=ab]cd ef', 'text=x&token=ab]cd', 'token=ab]cd']) {
+    const out = redactSelector(sel);
+    assert.ok(out.endsWith(REDACTED) && !out.includes('cd') && !out.includes('def'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out);
+  }
+  assert.equal(redactSelector('#x token=abc >> div[x=1]'), `#x token=${REDACTED}`);
+  // 引号没闭合：换到串尾（失败关闭）。
+  assert.equal(redactSelector('[token=ab"cd][x=1]'), `[token=${REDACTED}`);
+  assert.equal(redactSelector('[data-token = "abc][x=1]'), `[data-token = ${REDACTED}`);
+  // 名字不敏感的照旧。
+  assert.equal(redactSelector('[type = "password"][x=1]'), '[type = "password"][x=1]');
+  assert.equal(redactSelector('role=button[name = "Submit order"]'), 'role=button[name = "Submit order"]');
   // 自由文本不受影响：`]` 不结束值。
   assert.equal(redactText('[data-auth=primary][type=button]'), `[data-auth=${REDACTED}`);
 });
@@ -317,7 +349,9 @@ test('redactDeep selectorKeys: strings under those keys (also nested, also in ar
 
 test('redactSelector stays fast on adversarial input', () => {
   const inputs = ['[token=' + '['.repeat(1e5), '[token=['.repeat(30000), '[token=]'.repeat(30000), '[a=['.repeat(30000),
-    '[token=' + '[]'.repeat(50000), '[token=' + ']'.repeat(1e5), '[token=a'.repeat(30000) + ']', '[token=' + '\\'.repeat(1e5), '[token=\\'.repeat(30000)];
+    '[token=' + '[]'.repeat(50000), '[token=' + ']'.repeat(1e5), '[token=a'.repeat(30000) + ']', '[token=' + '\\'.repeat(1e5), '[token=\\'.repeat(30000),
+    '[' + 'a'.repeat(1e5), '[a '.repeat(30000), '[ '.repeat(30000), '[a^'.repeat(30000), '[token = "'.repeat(30000),
+    '[token="' + '\\'.repeat(1e5), '[token = ['.repeat(30000), '[token="' + ']'.repeat(1e5), "[a='".repeat(30000)];
   const start = performance.now();
   for (const s of inputs) redactSelector(s);
   assert.ok(performance.now() - start < 2000);

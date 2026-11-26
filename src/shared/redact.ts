@@ -36,6 +36,9 @@ const TOKEN_VALUE = /^[A-Za-z0-9+/_-]{32,}={0,2}$/;
 // 否则 `;a;a;a…` 这样的输入会让每个起点都扫到结尾。值在哪结束由 redactParamsInText 逐字符定，不交给正则。
 const URL_PARAM_NAME = /(^|[?&#\s;,({\[])([^=&#?\s"'<>;,({\[]+)=/g;
 const PARAM_VALUE_END = /[&#\s"<>]/;
+// 选择器里的 `[名字 运算符 值]`：`[`、名字、`=` 之间可以有空白，运算符是 `=` 或 `~ | ^ $ *` 加 `=`。
+// 名字的字符类不含空白、`=`、方括号和引号，和前后的 `\s*` 不相交，也不跨过下一个 `[`，所以不回溯。值在哪结束由 selectorValueEnd 定。
+const SELECTOR_ATTR = /\[\s*([^\s=\[\]"']+?)\s*[~|^$*]?=\s*/g;
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 // 自由文本里 JSON 形态的 `"名字" : "`，以及套了一层转义的 `\"名字\" : \"`。值的结尾由 redactJsonPairsInText 逐字符找。
 const JSON_PAIR_NAME = /"([^"\\\r\n]{1,100})"\s*:\s*"/g;
@@ -83,9 +86,7 @@ function redactCookieLine(line: string): string {
 // 自由文本里的 URL 参数，线性扫描：名字敏感时，值从 `=` 后一直到第一个 `&`、`#`、空白、`"`、`<`、`>` 或结尾
 // （`?` 不结束值，空值也换掉），换成 [REDACTED] 后从值的结尾接着找；名字不敏感时从 `=` 后接着找，
 // 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
-// selector 为真时（只用于选择器），`[名字=值]` 里不带引号的值另外在配对的 `]` 处结束：值里成对的方括号算值的一部分，
-// 所以已换成 [REDACTED] 的值再过一遍不变，`[REDACTED]` 后面跟的内容也一起换掉；反斜杠转义的字符算进值；找不到配对的 `]` 就照旧到正常结尾。
-// 已知的边界：值里有不成对、也没转义的 `]`（比如 Playwright 正则值 `[token=/a]b/]`）时，`]` 之后的部分不换。
+// selector 为真时（只用于选择器）：名字紧跟 `[` 的，值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
 function redactParamsInText(s: string, selector = false): string {
   const re = new RegExp(URL_PARAM_NAME.source, 'g');
   let out = '';
@@ -93,6 +94,16 @@ function redactParamsInText(s: string, selector = false): string {
   for (let m = re.exec(s); m !== null; m = re.exec(s)) {
     if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值
     let start = m.index + m[0].length;
+    if (selector) {
+      // 名字紧跟 `[`（中间可有空白）：属性值，到配对的 `]` 为止。别的位置不知道值在哪结束，换到串尾（失败关闭，再过一遍也不变）。
+      let b = m.index + m[1]!.length - 1;
+      while (b >= 0 && /\s/.test(s[b]!)) b--;
+      const end = b >= 0 && s[b] === '[' ? selectorValueEnd(s, start) : s.length;
+      out += s.slice(copied, start) + REDACTED;
+      copied = end;
+      re.lastIndex = end;
+      continue;
+    }
     const quote = s[start];
     if (quote === '"' || quote === "'") {
       // 值以引号开头：只换两个引号之间的内容（引号里的反斜杠跳过下一个字符），再从结束引号之后接着找。
@@ -110,20 +121,45 @@ function redactParamsInText(s: string, selector = false): string {
       continue;
     }
     let end = start;
-    let depth = 0;
-    const bracketed = selector && m[1] === '[';
-    while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) {
-      // CSS 转义：反斜杠连同下一个字符（含空白、引号）算进值（`ab\]cd`、`ab\ cd` 整个是值）。
-      if (bracketed && s[end] === '\\' && end + 1 < s.length) {
-        end += 2;
-        continue;
-      }
-      if (bracketed && s[end] === ']') {
-        if (depth === 0) break;
-        depth--;
-      } else if (bracketed && s[end] === '[') depth++;
-      end++;
+    while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) end++;
+    out += s.slice(copied, start) + REDACTED;
+    copied = end;
+    re.lastIndex = end;
+  }
+  return out + s.slice(copied);
+}
+
+// 选择器里属性值的结尾（不含）：从 start 起到配对的 `]` 为止。值里成对的方括号、反斜杠连同下一个字符、引号里的内容（含 `]`）
+// 都算进值，空白和引号外的其他字符也是；所以已换成 [REDACTED] 的值再过一遍不变。找不到配对的 `]`、或引号没闭合，就到串尾（失败关闭）。
+// 已知的边界：值里有不成对、也没转义、不在引号里的 `]`（比如 Playwright 正则值 `[token=/a]b/]`）时，`]` 之后的部分不换。
+function selectorValueEnd(s: string, start: number): number {
+  let depth = 0;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') i++;
+    else if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== c) j += s[j] === '\\' ? 2 : 1;
+      if (j >= s.length) return s.length;
+      i = j;
+    } else if (c === '[') depth++;
+    else if (c === ']') {
+      if (depth === 0) return i;
+      depth--;
     }
+  }
+  return s.length;
+}
+
+// 选择器里名字敏感的 `[名字 运算符 值]`，值换掉（含引号），名字、运算符、空白和 `]` 保留。名字不敏感时从值开头接着找。
+function redactSelectorAttrs(s: string): string {
+  const re = new RegExp(SELECTOR_ATTR.source, 'g');
+  let out = '';
+  let copied = 0;
+  for (let m = re.exec(s); m !== null; m = re.exec(s)) {
+    if (!isSensitiveKey(safeDecode(m[1]!))) continue;
+    const start = m.index + m[0].length;
+    const end = selectorValueEnd(s, start);
     out += s.slice(copied, start) + REDACTED;
     copied = end;
     re.lastIndex = end;
@@ -174,8 +210,8 @@ export function redactText(s: string): string {
   return redactTextWith(s, false);
 }
 
-// 选择器（agent 给的目标、内核生成的稳定选择器）专用：和 redactText 一样，只是 `[名字=值]` 不带引号的值在配对的 `]` 处结束，
-// 不把后面的选择器一起吞掉。自由文本仍用 redactText。
+// 选择器（agent 给的目标、内核生成的稳定选择器）专用：在 redactText 之外，名字敏感的属性 `[名字 运算符 值]`（`=` 两边可有空白）
+// 的值换到配对的 `]` 为止（见 selectorValueEnd），不把后面的选择器一起吞掉。自由文本仍用 redactText。
 export function redactSelector(s: string): string {
   return redactTextWith(s, true);
 }
@@ -187,6 +223,7 @@ function redactTextWith(s: string, selector: boolean): string {
   out = out.replace(EMAIL, REDACTED);
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
+  if (selector) out = redactSelectorAttrs(out);
   out = redactParamsInText(out, selector);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);
