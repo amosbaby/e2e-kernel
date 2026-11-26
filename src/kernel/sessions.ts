@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { lstatSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DriverError } from '../driver/types.ts';
-import type { Decision, Driver, Instance, Page } from '../driver/types.ts';
+import type { Decision, Driver, Instance, Page, RequestInfo } from '../driver/types.ts';
 import { buildResult } from '../report/result.ts';
 import type { ClosedBy, RunResult } from '../report/result.ts';
 import { pruneRuns, runDirName, writeRun } from '../report/store.ts';
@@ -15,7 +15,8 @@ import type { CloseParams, CloseResult, Mode, OpenParams, OpenResult, SessionInf
 import { redactText, redactUrl } from '../shared/redact.ts';
 import { exitFor, runOps, tally } from './executor.ts';
 import type { ModeResolver } from './mode.ts';
-import { Recorder, safely } from './recorder.ts';
+import { Recorder, isWrite, safely, toWriteRecord } from './recorder.ts';
+import type { WriteRecord } from './recorder.ts';
 import type { WritePolicy } from './write-policy.ts';
 
 // 会话管理（设计 5.2、5.5、5.6）：实例的懒启动和复用、会话的开、执行、收尾、闲置超时、关停。
@@ -29,6 +30,7 @@ export interface SessionDeps {
 const DEFAULT_NAME = 'session';
 const PROFILE = 'default';
 const MAX_SNAPSHOT = 20_000;
+const MAX_UNATTRIBUTED = 200;
 
 // opening：页面已登记、首屏还没读完，对外当作不存在；closing：收尾中，再来的 step、close 都是 busy。
 type State = 'opening' | 'idle' | 'stepping' | 'closing';
@@ -40,6 +42,7 @@ interface Session {
   readonly dirName: string;
   readonly runDir: string;
   readonly startedAt: Date;
+  readonly instance: Instance;               // 会话的页所在的实例
   readonly start: { url: string; viewport: Viewport | null; profile: string };
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
@@ -49,6 +52,13 @@ interface Session {
   lastActive: number;
   timer: NodeJS.Timeout | undefined;
   finished: Promise<CloseResult> | undefined;
+}
+
+// 登录页（设计 5.5）：内核开的那一页，加上它弹出的窗口。这些页的请求一律放行、不记录。
+interface Login {
+  readonly id: string;
+  readonly instance: Instance;
+  readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
 }
 
 function busy(): E2kError {
@@ -74,6 +84,14 @@ function cappedSnapshot(raw: string): string {
   });
 }
 
+function hostOf(url: string): string {
+  return new URL(url).hostname;
+}
+
+function randomHex(): string {
+  return randomBytes(3).toString('hex');
+}
+
 // lstat：悬空的符号链接也算占用。
 function taken(path: string): boolean {
   try {
@@ -89,6 +107,9 @@ export class SessionManager {
   private readonly sessions = new Map<string, Session>();
   // 已经抽到 id、还没建成会话（或已放弃）的 open：id → 报告目录名。
   private readonly reserved = new Map<string, string>();
+  private readonly logins = new Map<string, Login>();
+  // 内核级的「未归属的写」：归不到任何会话或登录页的写请求，只留最近 MAX_UNATTRIBUTED 条。
+  private readonly unattributed: WriteRecord[] = [];
   private instance: Instance | undefined;
   private acquiring: Promise<Instance> | undefined;
 
@@ -158,6 +179,34 @@ export class SessionManager {
       }));
   }
 
+  // 在 default profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录过程不套写策略，也不检查模式。
+  async loginBegin(p: { url: string }): Promise<{ loginId: string }> {
+    const instance = await this.acquireInstance();
+    let id = `l-${randomHex()}`;
+    while (this.logins.has(id)) id = `l-${randomHex()}`;
+    let login: Login | undefined;
+    try {
+      const page = await instance.openPage({});
+      // 先登记再导航：登录页的首个请求就按登录页放行。
+      login = { id, instance, pages: new Map([[page.id, page]]) };
+      this.logins.set(id, login);
+      await page.goto(p.url);
+      return { loginId: id };
+    } catch (e) {
+      if (login !== undefined) await this.endLogin(login);
+      if (e instanceof DriverError) throw new E2kError('action-failed', firstLine(e));
+      throw e;
+    }
+  }
+
+  // 关掉登录页和它弹出的窗口；登录态留在 user data 目录里。
+  async loginEnd(p: { loginId: string }): Promise<Record<string, never>> {
+    const login = this.logins.get(p.loginId);
+    if (login === undefined) throw new E2kError('not-found', '没有这个登录');
+    await this.endLogin(login);
+    return {};
+  }
+
   instanceState(): 'stopped' | 'running' {
     return this.instance === undefined ? 'stopped' : 'running';
   }
@@ -174,6 +223,7 @@ export class SessionManager {
       pending.push(this.finish(s, 'kernel-shutdown').catch((e: unknown) => { this.logFailure(s.id, '关停收尾', e); }));
     }
     await Promise.all(pending);
+    for (const login of [...this.logins.values()]) await this.endLogin(login);
     if (this.acquiring !== undefined) await this.acquiring.catch(() => undefined);
     const inst = this.instance;
     // 先摘掉再停：stop() 触发的 onClosed 是自己引起的，不算浏览器没了。
@@ -200,12 +250,10 @@ export class SessionManager {
     ensurePrivateDir(this.deps.home.profilesDir);
     ensurePrivateDir(profileDir);
     const inst = await this.deps.driver.launch({ name: PROFILE, userDataDir: profileDir });
-    // 15a 的占位：请求一律放行，和 M1 的 allowAllPolicy 结果相同。请求归属、写策略和记录在 15b 接上。
-    inst.setRequestHandler((): Decision => ({ action: 'continue' }));
-    // 自己摘掉或停掉的实例（this.instance 已经不是它）触发的 onClosed 不算数。
-    inst.onClosed(() => {
-      if (this.instance === inst) this.instance = undefined;
-    });
+    inst.setRequestHandler((r) => this.onRequest(r));
+    inst.onRequestDone((e) => { this.onRequestDone(e); });
+    inst.onPageOpened((page, openerId) => { this.onPageOpened(page, openerId); });
+    inst.onClosed(() => { this.browserGone(inst); });
     this.instance = inst;
     return inst;
   }
@@ -246,7 +294,7 @@ export class SessionManager {
     try {
       page = await instance.openPage(p.viewport === undefined ? {} : { viewport: p.viewport });
       const s: Session = {
-        id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt,
+        id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, profile: PROFILE },
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(),
         url: '', state: 'opening', lastActive: 0, timer: undefined, finished: undefined,
@@ -254,6 +302,7 @@ export class SessionManager {
       // 先登记再导航：首屏的请求才归得到这个会话。
       this.sessions.set(s.id, s);
       registered = true;
+      page.onClosed(() => { void this.mainPageClosed(s); });
       s.recorder.addHost(o.host, o.mode);
       await page.goto(p.url);
       const snapshot = await page.snapshot({});
@@ -313,7 +362,7 @@ export class SessionManager {
       result = buildResult({
         kernelVersion: this.deps.kernelVersion, session: s.id, name: s.name, startedAt: s.startedAt, endedAt, closedBy,
         start: s.start, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
-        actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: [], hosts: s.recorder.hosts, webSockets,
+        actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
         verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [],
       });
       paths = writeRun(s.runDir, result);
@@ -342,6 +391,149 @@ export class SessionManager {
       await page.close();
     } catch (e) {
       this.logFailure(sessionId, '关页面', e);
+    }
+  }
+
+  private unattributedDuring(from: Date, to: Date): WriteRecord[] {
+    const [a, b] = [from.getTime(), to.getTime()];
+    return this.unattributed.filter((w) => {
+      const t = Date.parse(w.at);
+      return t >= a && t <= b;
+    }).map((w) => ({ ...w }));
+  }
+
+  // ---- 页面没了、浏览器没了 ----
+
+  // 会话的主页面没了（不是会话自己在收尾）：实例不健康按浏览器没了处理，否则这个会话按 page-gone 出报告。
+  // 浏览器没了时页面的监听器先触发、此时 health() 已经不 ok；健康检查要等，实例的事件可能先到，所以等完再看一次状态。
+  private async mainPageClosed(s: Session): Promise<void> {
+    if (!this.isActive(s)) return;
+    const ok = await this.healthy(s.instance);
+    if (!this.isActive(s)) return;
+    if (!ok) {
+      this.browserGone(s.instance);
+      return;
+    }
+    this.finish(s, 'page-gone').catch((e: unknown) => { this.logFailure(s.id, '页面关闭后收尾', e); });
+  }
+
+  // 实例没了：被关、崩了，或者自己停掉的（停之前会话都已经在收尾，这里不会再出一份）。
+  // 这个实例上还在用的会话各出一份 browser-gone 报告；它的登录页表清空。可以重入：已在收尾的会话跳过。
+  private browserGone(inst: Instance): void {
+    if (this.instance === inst) this.instance = undefined;
+    for (const s of [...this.sessions.values()]) {
+      if (s.instance !== inst || !this.isActive(s)) continue;
+      this.finish(s, 'browser-gone').catch((e: unknown) => { this.logFailure(s.id, '浏览器关闭后收尾', e); });
+    }
+    for (const [id, login] of this.logins) {
+      if (login.instance === inst) this.logins.delete(id);
+    }
+  }
+
+  // 已建成、没在收尾、还登记着的会话。
+  private isActive(s: Session): boolean {
+    return this.sessions.get(s.id) === s && (s.state === 'idle' || s.state === 'stepping');
+  }
+
+  private async endLogin(login: Login): Promise<void> {
+    this.logins.delete(login.id);
+    for (const page of login.pages.values()) {
+      if (page === null) continue;
+      try {
+        await page.close();
+      } catch (e) {
+        // 已经被人关掉的页再关会抛 DriverError，不算错。
+        if (!(e instanceof DriverError)) this.logFailure(null, `登录 ${login.id} 关页面`, e);
+      }
+    }
+  }
+
+  // ---- 请求和新页面 ----
+
+  private sessionOfPage(pageId: string): Session | undefined {
+    for (const s of this.sessions.values()) if (s.pages.has(pageId)) return s;
+    return undefined;
+  }
+
+  private loginOfPage(pageId: string): Login | undefined {
+    for (const l of this.logins.values()) if (l.pages.has(pageId)) return l;
+    return undefined;
+  }
+
+  // 请求回调（写策略接在这里）。分三种：会话的页、登录页、其余。
+  // 失败关闭：主机名解析不了、模式定不下来、策略抛错，一律中止这个请求，不放行。
+  private onRequest(req: RequestInfo): Decision {
+    try {
+      return this.decideRequest(req);
+    } catch (e) {
+      this.logFailure(null, '处理请求', e);
+      return { action: 'abort' };
+    }
+  }
+
+  private decideRequest(req: RequestInfo): Decision {
+    const { pageId, openerPageId } = req;
+    let s = pageId === null ? undefined : this.sessionOfPage(pageId);
+    let login = s !== undefined || pageId === null ? undefined : this.loginOfPage(pageId);
+    // 页面还没认领、但开启者是会话或登录页的：这一页一并收过去（这时可能还没拿到页面对象，先记 id）。
+    if (s === undefined && login === undefined && pageId !== null && openerPageId !== null) {
+      s = this.sessionOfPage(openerPageId);
+      if (s !== undefined) s.pages.set(pageId, null);
+      else {
+        login = this.loginOfPage(openerPageId);
+        login?.pages.set(pageId, null);
+      }
+    }
+    if (login !== undefined) return { action: 'continue' };       // 登录过程不套写策略，也不记录
+    if (s !== undefined) {
+      // R14：topUrl 可能是 null，退回请求自己的地址。
+      const topHost = hostOf(req.topUrl ?? req.url);
+      const decision = this.deps.policy.decide(req, { mode: this.deps.modes.resolve(topHost), topHost });
+      const host = hostOf(req.url);
+      const targetMode = this.deps.modes.resolve(host);
+      s.recorder.addRequest(req, decision, targetMode, this.deps.now());
+      if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
+      return decision;
+    }
+    // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）。
+    const decision = this.deps.policy.decideUnattributed(req);
+    if (isWrite(req.method)) {
+      this.unattributed.push(toWriteRecord(req, decision, this.deps.modes.resolve(hostOf(req.url)), this.deps.now()));
+      if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
+    }
+    return decision;
+  }
+
+  private onRequestDone(e: { id: string; status: number | null; failed: boolean }): void {
+    for (const s of this.sessions.values()) {
+      if (s.recorder.completeRequest(e.id, e.status, e.failed)) return;
+    }
+    for (let i = this.unattributed.length - 1; i >= 0; i--) {
+      const w = this.unattributed[i];
+      if (w !== undefined && w.id === e.id) {
+        w.status = e.status;
+        w.failed = e.failed;
+        return;
+      }
+    }
+  }
+
+  // 弹窗和新标签页：开启者属于会话就归这个会话（close 时一起关），属于登录页就收为登录页，否则不管。
+  // 先前只凭请求记了 id 的页，这里补上对象。
+  private onPageOpened(page: Page, openerId: string | null): void {
+    let s = this.sessionOfPage(page.id);
+    let login = s === undefined ? this.loginOfPage(page.id) : undefined;
+    if (s === undefined && login === undefined && openerId !== null) {
+      s = this.sessionOfPage(openerId);
+      if (s === undefined) login = this.loginOfPage(openerId);
+    }
+    if (s !== undefined) {
+      const owner = s;
+      owner.pages.set(page.id, page);
+      // 会话的弹窗被关，只把它从会话的页面表里去掉。
+      page.onClosed(() => { owner.pages.delete(page.id); });
+    } else if (login !== undefined) {
+      login.pages.set(page.id, page);
     }
   }
 
