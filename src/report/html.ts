@@ -30,7 +30,7 @@ const MODE_REASON_TEXT: Record<ModeChange['reason'], string> = {
 };
 const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
   'method': '非读方法', 'graphql-mutation': 'GraphQL mutation', 'persisted-query': '持久化查询',
-  'redirected-write': '重定向的写', 'unattributed': '未归属的写',
+  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'unknown': '原因不明',
 };
 
 function clip(s: string, max: number): string {
@@ -145,7 +145,7 @@ function modesSection(r: RunResult): string {
 // 被拦下的写（含未归属的）：主机名、方法、原因、次数，不带路径和请求体。
 function blockedWritesSection(r: RunResult): string {
   const rows = Array.isArray(r.writes.blockedSummary) ? r.writes.blockedSummary : [];
-  const head = '<section id="blocked-writes"><h2>被拦下的写</h2>';
+  const head = '<section id="blocked-writes"><h2>被拦下的写（汇总）</h2>';
   if (rows.length === 0) return `${head}<p>没有</p></section>`;
   const body = rows.map((e) => `<tr><td>${page(e.host)}</td><td>${page(e.method)}</td><td>${escapeHtml(BLOCK_REASON_TEXT[e.reason] ?? '未知')}</td>`
     + `<td>${own(e.count)}</td><td>${e.unattributed ? '是' : '否'}</td></tr>`).join('');

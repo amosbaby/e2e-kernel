@@ -352,6 +352,30 @@ test('blockedSummary groups blocked writes by host, method and reason, includes 
   assert.deepEqual(buildResult(input({})).writes.blockedSummary, []);
 });
 
+test('a blocked write without a reason is counted under the fixed reason unknown, and shown in the report', () => {
+  const noReason = { ...write('POST', 'http://x.example.com/a', null), decision: 'blocked' as const, reason: null, mode: 'readonly' as const };
+  const r = buildResult(input({ writes: [noReason], unattributedWrites: [{ ...noReason, id: 'u9' }] }));
+  assert.deepEqual(r.writes.blockedSummary, [
+    { host: 'x.example.com', method: 'POST', reason: 'unknown', count: 1, unattributed: false },
+    { host: 'x.example.com', method: 'POST', reason: 'unknown', count: 1, unattributed: true },
+  ]);
+  const sec = section(renderReport(r), 'blocked-writes');
+  assert.ok(sec.includes('原因不明') && !sec.includes('没有'), sec);
+});
+
+test('the blockedSummary counts add up to every blocked write, attributed and unattributed, with or without a reason', () => {
+  const r = buildResult(input({
+    writes: [blockedWrite('POST', 'http://a.example.com/1', 'method'), blockedWrite('PUT', 'http://a.example.com/2', 'graphql-mutation'),
+      blockedWrite('POST', 'http://b.example.com/3', 'persisted-query'), blockedWrite('POST', 'http://b.example.com/3', 'redirected-write'),
+      { ...blockedWrite('POST', 'http://b.example.com/4', 'method'), reason: null }, write('POST', 'http://a.example.com/ok', 200)],
+    unattributedWrites: [blockedWrite('POST', 'http://c.example.com/5', 'unattributed'), { ...blockedWrite('POST', 'http://c.example.com/6', 'unattributed'), reason: null },
+      write('POST', 'http://c.example.com/ok', 200)],
+  }));
+  const total = r.writes.blockedSummary.reduce((n, e) => n + e.count, 0);
+  assert.equal(total, r.writes.blocked.length + r.writes.unattributed.filter((w) => w.decision === 'blocked').length);
+  assert.equal(total, 7);
+});
+
 test('the same host, method and reason is split into an attributed and an unattributed row', () => {
   const r = buildResult(input({
     writes: [blockedWrite('POST', 'http://x.example.com/a', 'redirected-write')],
@@ -409,7 +433,7 @@ test('the blocked-writes section shows the summary table, or says none', () => {
   assert.ok(none.includes('没有') && !none.includes('<table'), none);
 });
 
-test('hosts in the mode and blocked-writes sections are redacted and escaped', () => {
+test('hosts in the mode and blocked-writes sections are escaped', () => {
   const r = buildResult(input({
     modes: [{ at: '2026-11-26T15:30:09.000Z', host: '<img src=x onerror=alert(1)>', mode: 'readonly', reason: 'rule', rulesHash: null }],
     writes: [blockedWrite('POST', 'http://x.example.com/a', 'method', { host: '<script>alert(1)</script>.example.com' })],

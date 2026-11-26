@@ -37,7 +37,8 @@ export interface SupersededEntry {
 export interface WriteSummaryRow { host: string; method: string; graphql: WriteRecord['graphql']; allowed: number; blocked: number }
 
 // 被拦下的写按主机 × 方法 × 原因分组（含未归属的，用 unattributed 区分）。host 是已脱敏的主机名，不带路径和请求体。
-export interface BlockedSummaryRow { host: string; method: string; reason: BlockReason; count: number; unattributed: boolean }
+// reason 是 'unknown'：被拦的写没有记原因（现在没有这种路径；将来有人加了拦截路径却漏了 reason 时，它也不会从汇总里消失）。
+export interface BlockedSummaryRow { host: string; method: string; reason: BlockReason | 'unknown'; count: number; unattributed: boolean }
 
 export interface RunResult {
   schema: 1; kernelVersion: string; session: string; name: string; startedAt: string; endedAt: string; closedBy: ClosedBy;
@@ -144,16 +145,17 @@ export function summarizeWrites(writes: readonly WriteRecord[]): WriteSummaryRow
 }
 
 // 被拦下的写：已归属的和未归属的各自分组，按 host、method、reason、unattributed（false 在前）排序，码点比较。
-// 被拦的写 reason 都有值；万一是 null 就不进汇总（放行的写 reason 是 null）。
+// 被拦的写 reason 应该都有值；是 null 的归入固定的 'unknown'，保证汇总的次数加起来等于被拦的写的总数。
 export function summarizeBlocked(writes: readonly WriteRecord[], unattributed: readonly WriteRecord[]): BlockedSummaryRow[] {
   const rows = new Map<string, BlockedSummaryRow>();
   const add = (list: readonly WriteRecord[], isUnattributed: boolean): void => {
     for (const w of list) {
-      if (w.decision !== 'blocked' || w.reason === null) continue;
+      if (w.decision !== 'blocked') continue;
+      const reason = w.reason ?? 'unknown';
       const method = w.method.toUpperCase();
-      const key = JSON.stringify([w.host, method, w.reason, isUnattributed]);
+      const key = JSON.stringify([w.host, method, reason, isUnattributed]);
       const row = rows.get(key);
-      if (row === undefined) rows.set(key, { host: w.host, method, reason: w.reason, count: 1, unattributed: isUnattributed });
+      if (row === undefined) rows.set(key, { host: w.host, method, reason, count: 1, unattributed: isUnattributed });
       else row.count++;
     }
   };
