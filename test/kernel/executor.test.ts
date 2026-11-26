@@ -4,12 +4,12 @@ import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DriverError } from '../../src/driver/types.ts';
-import type { Described, Page, RequestInfo } from '../../src/driver/types.ts';
+import type { Described, Instance, Page, RequestInfo } from '../../src/driver/types.ts';
 import { exitFor, runOps, tally } from '../../src/kernel/executor.ts';
 import type { ExecCtx } from '../../src/kernel/executor.ts';
 import { Recorder, isWrite, toWriteRecord } from '../../src/kernel/recorder.ts';
 import type { Op } from '../../src/shared/ops.ts';
-import { REDACTED } from '../../src/shared/redact.ts';
+import { REDACTED, redactText } from '../../src/shared/redact.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 
@@ -19,6 +19,9 @@ const now = new Date('2026-01-02T03:04:05.000Z');
 
 const PAGE_URL = 'http://localhost/';
 const EVAL_URL = 'http://localhost/eval';
+const EVAL_PW_URL = 'http://localhost/eval-pw';
+const EVAL_UNKNOWN_URL = 'http://localhost/eval-unknown';
+const PW_VALUE = 'typed-' + 'secret-value-4821';
 
 function pageSpec(): FakePageSpec {
   return {
@@ -59,12 +62,15 @@ function withPage(base: Page, over: Partial<Page>): Page {
 let fake: FakeDriver;
 let page: Page;
 let evalPage: Page;
+let inst: Instance;
 let recorder: Recorder;
 let ctx: ExecCtx;
 
 beforeEach(async () => {
-  fake = new FakeDriver({ pages: { [PAGE_URL]: pageSpec(), [EVAL_URL]: { evalResult: { id: jwt, n: 1 } } } });
-  const inst = await fake.launch({ name: 'default', userDataDir: '/tmp/e2k-fake-profile' });
+  fake = new FakeDriver({ pages: { [PAGE_URL]: pageSpec(), [EVAL_URL]: { evalResult: { id: jwt, n: 1 } },
+    [EVAL_PW_URL]: { evalResult: PW_VALUE, passwordField: true },
+    [EVAL_UNKNOWN_URL]: { evalResult: PW_VALUE, passwordFieldFailWith: 'timeout' } } });
+  inst = await fake.launch({ name: 'default', userDataDir: '/tmp/e2k-fake-profile' });
   page = await inst.openPage({});
   await page.goto(PAGE_URL);
   evalPage = await inst.openPage({});
@@ -128,6 +134,104 @@ test('outputs are redacted first, then capped; eval results become one JSON stri
   assert.ok((long.output as string).endsWith('…[truncated 10000]')); assert.ok((long.output as string).length < 4100);
   const [ev] = await runOps(evalPage, [{ op: 'eval', js: 'x' }], ctx);       // evalPage 的 evalResult 是 { id: jwt, n: 1 }
   assert.equal(typeof ev.output, 'string'); assert.ok(!(ev.output as string).includes(jwt)); assert.match(ev.output as string, /"n":1/);
+});
+
+test('an eval result is recorded redacted and capped at 1000 characters; the step response keeps the longer form', async () => {
+  const [ev] = await runOps(evalPage, [{ op: 'eval', js: 'x' }], ctx);
+  const rec = recorder.actions[0]!;
+  assert.equal(typeof rec.output, 'string');
+  assert.match(rec.output!, /"n":1/); assert.ok(!rec.output!.includes(jwt)); assert.equal(rec.outputOmitted, undefined);
+  assert.equal(rec.output, ev.output, 'a short result is identical in the record and in the response');
+  // 5000 字符：记录截到 1000 并带标记，回应照旧给到 4000
+  const big = await inst.openPage({}); await big.goto(PAGE_URL);
+  const bigPage = withPage(big, { evaluate: async () => 'y'.repeat(5000) });
+  const [long] = await runOps(bigPage, [{ op: 'eval', js: 'x' }], ctx);
+  const recLong = recorder.actions[1]!.output!;
+  assert.ok(recLong.startsWith('"yyy') && recLong.endsWith('…[truncated 5002]'), recLong.slice(-30)); assert.ok(recLong.length <= 1000 + 20);
+  assert.ok((long.output as string).endsWith('…[truncated 5002]') && (long.output as string).length > 4000);
+});
+
+test('eval redacts the whole result before cutting it: a token straddling character 1000 leaves no fragment', async () => {
+  const straddle = 'x'.repeat(980) + ' ' + jwt + ' tail';
+  const p = withPage(page, { evaluate: async () => straddle });
+  await runOps(p, [{ op: 'eval', js: 'x' }], ctx);
+  const out = recorder.actions[0]!.output!;
+  assert.ok(!out.includes('eyJ') && !out.includes(jwt.slice(0, 30)), out);
+});
+
+test('an eval source is never recorded: only a short hash, the same for the same source', async () => {
+  const src = `fetch("/x?token=abc123", { headers: { a: "${jwt}" } })`;
+  await runOps(page, [{ op: 'eval', js: src }, { op: 'eval', js: src }, { op: 'eval', js: src + ' ' }], ctx);
+  const [a, b, c] = recorder.actions;
+  assert.match(a!.jsHash!, /^sha256:[0-9a-f]{16}$/);
+  assert.equal(a!.jsHash, b!.jsHash); assert.notEqual(a!.jsHash, c!.jsHash);
+  assert.deepEqual(a!.op, { op: 'eval', js: REDACTED });
+  const recorded = JSON.stringify(recorder.actions);
+  for (const gone of [jwt, 'abc123', 'fetch(']) assert.ok(!recorded.includes(gone));
+  assert.ok(redactText(a!.jsHash!) === a!.jsHash, 'the hash must survive redaction as it is');
+});
+
+test('only eval records output and a hash; other ops never do', async () => {
+  await runOps(page, [{ op: 'text', target: '#long' }, { op: 'snapshot' }, { op: 'click', target: '#save' }], ctx);
+  for (const a of recorder.actions) { assert.equal(a.output, undefined); assert.equal(a.jsHash, undefined); assert.equal(a.outputOmitted, undefined); }
+});
+
+test('an eval on a page with a password-like field records no output, only outputOmitted and the hash; the response is unchanged', async () => {
+  const pw = await inst.openPage({}); await pw.goto(EVAL_PW_URL);
+  const [r] = await runOps(pw, [{ op: 'eval', js: 'document.querySelector("#pw").value' }], ctx);
+  assert.equal(r.output, JSON.stringify(PW_VALUE), 'the agent still gets the value');
+  const rec = recorder.actions[0]!;
+  assert.equal(rec.outputOmitted, true); assert.equal('output' in rec, false);
+  assert.match(rec.jsHash!, /^sha256:[0-9a-f]{16}$/);
+  assert.ok(!JSON.stringify(recorder.actions).includes(PW_VALUE));
+});
+
+test('an eval whose password probe fails records no output (fail closed)', async () => {
+  const unknown = await inst.openPage({}); await unknown.goto(EVAL_UNKNOWN_URL);
+  await runOps(unknown, [{ op: 'eval', js: 'x' }], ctx);
+  assert.equal(recorder.actions[0]!.outputOmitted, true); assert.equal('output' in recorder.actions[0]!, false);
+  // 探测本身抛 DriverError（页面在换文档之类）也一样
+  const throwing = withPage(page, { hasPasswordLikeField: async () => { throw new DriverError('other', 'gone'); } });
+  await runOps(throwing, [{ op: 'eval', js: 'x' }], ctx);
+  assert.equal(recorder.actions[1]!.outputOmitted, true); assert.equal('output' in recorder.actions[1]!, false);
+});
+
+test('a password field that appears or disappears during an eval still keeps the output out of the record', async () => {
+  const probes = (...found: (boolean | null)[]): Partial<Page> => {
+    const left = [...found];
+    return { hasPasswordLikeField: async () => ({ found: left.shift() ?? null, frames: ['http://localhost/'] }) };
+  };
+  await runOps(withPage(page, probes(false, true)), [{ op: 'eval', js: 'x' }], ctx);     // 跑之前没有，跑完有
+  assert.equal(recorder.actions[0]!.outputOmitted, true);
+  await runOps(withPage(page, probes(true, false)), [{ op: 'eval', js: 'x' }], ctx);     // 跑之前有，跑完被页面脚本删了
+  assert.equal(recorder.actions[1]!.outputOmitted, true);
+  await runOps(withPage(page, probes(false, false)), [{ op: 'eval', js: 'x' }], ctx);    // 两次都确定没有：记
+  assert.equal(recorder.actions[2]!.outputOmitted, undefined); assert.equal(typeof recorder.actions[2]!.output, 'string');
+});
+
+test('an eval during which the page swapped documents records no output, even if both probes say there is no password field', async () => {
+  const urls = [['http://localhost/a'], ['http://localhost/b']];
+  const jumped = withPage(page, { hasPasswordLikeField: async () => ({ found: false, frames: urls.shift()! }) });
+  await runOps(jumped, [{ op: 'eval', js: 'x' }], ctx);
+  assert.equal(recorder.actions[0]!.outputOmitted, true); assert.equal('output' in recorder.actions[0]!, false);
+});
+
+test('an eval that throws: the agent gets the error, the record keeps only a fixed text and the hash', async () => {
+  const thrown = (msg: string): Page => withPage(page, { evaluate: async () => { throw new DriverError('other', msg); } });
+  // 页面值经 throw new Error(value) 进了错误消息；脚本源码里的标识符经 ReferenceError 进了错误消息
+  const [a] = await runOps(thrown('page.evaluate: Error: ' + PW_VALUE), [{ op: 'eval', js: 'throw new Error(document.querySelector("#pw").value)' }], ctx);
+  assert.equal(a.outcome, 'failed'); assert.ok(String((a as { error?: string }).error).includes(PW_VALUE), 'the agent still sees the error');
+  const [c] = await runOps(thrown('page.evaluate: ReferenceError: secretIdent is not defined'), [{ op: 'eval', js: 'secretIdent + 1' }], ctx);
+  assert.equal(c.outcome, 'failed'); assert.ok(String((c as { error?: string }).error).includes('secretIdent'));
+  for (const rec of recorder.actions) {
+    assert.equal(rec.outcome, 'failed'); assert.equal(rec.error, 'other: eval 抛错（消息未记录）');
+    assert.match(rec.jsHash!, /^sha256:[0-9a-f]{16}$/); assert.equal(rec.output, undefined);
+  }
+  const recorded = JSON.stringify(recorder.actions);
+  for (const gone of [PW_VALUE, 'secretIdent', 'querySelector']) assert.ok(!recorded.includes(gone), gone);
+  // 非 eval 的失败照旧记错误消息
+  await runOps(page, [{ op: 'click', target: '#gone' }], ctx);
+  assert.notEqual(recorder.actions[2]!.error, 'other: eval 抛错（消息未记录）');
 });
 
 test('wait uses the 10 second default', async () => {

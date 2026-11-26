@@ -3,7 +3,7 @@ import { isAbsolute } from 'node:path';
 import { chromium } from 'playwright';
 import type { BrowserContext, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
-import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, RequestInfo, Stable }
+import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
@@ -115,6 +115,29 @@ async function probePasswordField(frame: Frame, before: string[], navigating: ()
     return navigating() || !before.every((u, i) => u === after[i]) ? null : found;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 整个页面（所有 frame）里有没有密码类输入框，给 eval 的记录用。口径同 probePasswordField（不要求可见、locator 数、300 ms 时限），
+// 区别是数全部 frame：eval 能读同源 iframe 的 DOM。所有 frame 都数清楚且都没有才是 false；任何一个数不出、超时、
+// 数的期间有 frame 的地址变了（换文档）或 frame 数变了，一律 null，内核按失败关闭处理。
+async function probePageForPasswordField(page: PwPage): Promise<PasswordProbe> {
+  const urlsOf = (): string[] => page.frames().map((f) => f.url());
+  const before = urlsOf();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), PROBE_TIMEOUT_MS); });
+  const probe = Promise.allSettled(page.frames().map((f) => f.locator(PASSWORD_FIELD_SELECTOR).count())).then((rs): boolean | null => {
+    if (rs.some((r) => r.status === 'fulfilled' && r.value > 0)) return true;
+    return rs.every((r) => r.status === 'fulfilled') ? false : null;
+  });
+  try {
+    const found = await Promise.race([probe, timeout]);
+    const after = urlsOf();
+    return { found: before.length === after.length && before.every((u, i) => u === after[i]) ? found : null, frames: after };
+  } catch {
+    return { found: null, frames: urlsOf() };
   } finally {
     clearTimeout(timer);
   }
@@ -418,6 +441,10 @@ class PlaywrightPage implements Page {
   // 页面改写不了 DOM 的方法，CSS 选择器默认穿透 open shadow root。数不出（页面关了、导航中断）抛 DriverError，由内核当「没有」。
   hasVisiblePasswordField(): Promise<boolean> {
     return this.run(async () => (await this.page.locator(LOGIN_WALL_SELECTOR).filter({ visible: true }).count()) > 0);
+  }
+
+  hasPasswordLikeField(): Promise<PasswordProbe> {
+    return this.run(() => probePageForPasswordField(this.page));
   }
 
   private async firstStable(loc: Locator, info: ElementInfo): Promise<Stable | null> {

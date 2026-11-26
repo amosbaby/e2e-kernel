@@ -69,6 +69,9 @@ function targetCell(a: ActionRecord): string {
 function detailCell(a: ActionRecord): string {
   const parts: string[] = [];
   if (a.op.op === 'assert') parts.push(`实测 <code>${scalar(a.actual)}</code>，期望 <code>${scalar(a.expected)}</code>`);
+  if (a.output !== undefined) parts.push(`返回值 <code>${page(a.output)}</code>`);
+  if (a.outputOmitted === true) parts.push('返回值未记录（页面有密码框，或判断不出）');
+  if (a.jsHash !== undefined) parts.push(`源码哈希 <code>${own(a.jsHash)}</code>`);
   if (a.error !== undefined) parts.push(`错误 ${page(a.error)}`);
   return parts.join('<br>');
 }

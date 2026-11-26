@@ -234,6 +234,44 @@ test('hasVisiblePasswordField on a closed page is a DriverError', { timeout: 60_
   await assert.rejects(gone.hasVisiblePasswordField(), (e: DriverError) => e instanceof DriverError);
 });
 
+test('hasPasswordLikeField: true for a hidden field, an open shadow root, a same-origin iframe; false only when none; the page cannot fool it', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/index.html');
+  assert.equal((await page.hasPasswordLikeField()).found, false);
+  const add = async (html: string): Promise<boolean | null> => {
+    await page.goto(server.origin + '/index.html');
+    await page.evaluate(`document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(html)}); 1`);
+    return (await page.hasPasswordLikeField()).found;
+  };
+  assert.equal(await add('<input type="password" style="display:none">'), true, 'visibility does not matter here');
+  assert.equal(await add('<input type="text" autocomplete="new-password">'), true, 'new-password counts too');
+  assert.equal(await add('<input type="text" autocomplete="one-time-code">'), true);
+  assert.equal(await add('<input type="text">'), false);
+  await page.goto(server.origin + '/index.html');
+  await page.evaluate(`(() => { const host = document.createElement('div'); document.body.append(host); const root = host.attachShadow({ mode: 'open' });
+    const i = document.createElement('input'); i.type = 'password'; root.append(i); })()`);
+  assert.equal((await page.hasPasswordLikeField()).found, true, 'open shadow root');
+  await page.goto(server.origin + '/index.html');
+  await page.evaluate(`new Promise(res => { const f = document.createElement('iframe'); f.src = '/login.html'; f.onload = () => res(1); document.body.append(f); })`);
+  assert.equal((await page.hasPasswordLikeField()).found, true, 'a field inside an iframe counts (eval can read a same-origin iframe)');
+  await page.goto(server.origin + '/login.html');
+  await page.evaluate(`document.querySelector = () => null; Document.prototype.querySelector = () => null; Document.prototype.querySelectorAll = () => []; 1`);
+  assert.equal((await page.hasPasswordLikeField()).found, true, 'patched querySelector');
+});
+
+test('hasPasswordLikeField is null when the probe cannot finish in time, and a DriverError on a closed page', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/index.html');
+  // 同步循环占住页面线程：locator 的计数卡住，300 ms 一到给 null
+  const busy = page.evaluate('new Promise(res => setTimeout(() => { const t = Date.now(); while (Date.now() - t < 2500); res(1); }, 0))');
+  await sleep(100);
+  const probe = await page.hasPasswordLikeField();
+  assert.equal(probe.found, null);
+  assert.ok(probe.frames.every((u) => typeof u === 'string') && probe.frames.length >= 1);
+  await busy;
+  const gone = await inst.openPage({});
+  await gone.close();
+  await assert.rejects(gone.hasPasswordLikeField(), (e: DriverError) => e instanceof DriverError);
+});
+
 // 请求发出后页面立刻换掉文档：探测不能落到新文档上得出一个错的 false。窗口取决于时序，所以只断言「不是 false」。
 test('fromLoginForm is not false when the page navigates away right after sending', { timeout: 60_000 }, async () => {
   await page.goto(server.origin + '/sso.html');

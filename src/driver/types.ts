@@ -67,6 +67,8 @@ export interface Stable { selector: string; via: 'given' | 'testid' | 'id' | 'ro
 export type ElementKind = 'text-input' | 'textarea' | 'other';
 export interface Described { stable: Stable | null; isPassword: boolean; kind: ElementKind }
 
+export interface PasswordProbe { found: boolean | null; frames: string[] }
+
 export interface PageLocation { url: string; title: string; frames: { url: string; name: string }[]; popups: string[]; webSockets: number }
 
 export interface Driver {
@@ -110,5 +112,10 @@ export interface Page {
   evaluate(js: string): Promise<unknown>;                                            // 页面内执行脚本
   describe(target: Target): Promise<Described>;
   hasVisiblePasswordField(): Promise<boolean>;                                       // 主 frame（含 open shadow DOM、不含 iframe）里有没有可见的密码类字段
+  // 这一页（任何 frame，含 open shadow DOM）里有没有密码类输入框（不要求可见，同 RequestInfo.fromLoginForm 的口径）。
+  // found 只有数清楚了才给 true / false；数不出、超过 300 ms、数的时候地址变了，一律 null，内核按失败关闭处理。
+  // frames：探测结束时各 frame 的地址（对内核不透明，只用来比较两次探测之间页面有没有换文档）。
+  // 不抛 DriverError 以外的错；页面已关则抛 DriverError。
+  hasPasswordLikeField(): Promise<PasswordProbe>;
   close(): Promise<void>;                                                            // 收尾
 }

@@ -131,6 +131,13 @@ test('the kernel refuses to type into a password field', { timeout: 180_000 }, a
   }
   const typed = await e2k('step', sid, JSON.stringify([{ op: 'eval', js: 'document.querySelector("#pw").value.length' }]), '--json');
   assert.equal(JSON.parse(typed.out).results[0].output, '0', 'nothing may have been typed into the password field');
+  // eval 自己把假密码塞进密码框再读出来：agent 的 step 回应照旧拿得到，但这页有密码框，所以记录里不留这个返回值（只留哈希）
+  const read = await e2kIn(JSON.stringify([{ op: 'eval', js: `document.querySelector('#pw').value = ${JSON.stringify(server.fake.password)}; document.querySelector('#pw').value` }]), 'step', sid, '--stdin', '--json');
+  assert.equal(JSON.parse(read.out).results[0].output, JSON.stringify(server.fake.password), 'the agent still sees what eval returned');
+  // 抛错的消息也可能带着页面值：agent 看得到，记录里只有固定文字（最后那次全文件扫描兜住假密码）
+  const thrown = await e2kIn(JSON.stringify([{ op: 'eval', js: `throw new Error(document.querySelector('#pw').value)` }]), 'step', sid, '--stdin', '--json');
+  assert.equal(JSON.parse(thrown.out).results[0].outcome, 'failed');
+  assert.ok(JSON.parse(thrown.out).results[0].error.includes(server.fake.password), 'the agent sees the error text');
 });
 
 test('requests from a page with a password field leave no body; other pages are recorded as before', { timeout: 180_000 }, async () => {
@@ -162,6 +169,18 @@ test('close writes a report with evidence, writes, a replayable record, and no s
   assert.deepEqual(refused.map((a: any) => a.op.target), ['#pw', '#lab', '#sp', 'text=Password']);
   for (const a of refused) assert.equal(a.op.value, '[REDACTED]');
   assert.ok(post.body.includes('[REDACTED]'), 'the POST body had a password key, so it must show the marker');
+  // eval：普通页面记脱敏后的返回值和源码哈希；有密码框的页面不记返回值；源码从不进记录
+  const evals = result.actions.filter((a: any) => a.op.op === 'eval');
+  assert.ok(evals.length >= 3);
+  for (const a of evals) { assert.equal(a.op.js, '[REDACTED]'); assert.match(a.jsHash, /^sha256:[0-9a-f]{16}$/); }
+  const leak = evals.find((a: any) => typeof a.output === 'string' && a.output.includes('[REDACTED]'));
+  assert.ok(leak !== undefined, 'the eval on a page without a password field records its redacted result');
+  const threw = evals.filter((a: any) => a.outcome === 'failed');
+  assert.ok(threw.length >= 1);
+  for (const a of threw) assert.equal(a.error, 'other: eval 抛错（消息未记录）');
+  const omitted = evals.filter((a: any) => a.outputOmitted === true);
+  assert.ok(omitted.length >= 2, 'evals on the password page record no result');
+  for (const a of omitted) assert.equal('output' in a, false);
   assert.equal(post.bodyOmitted, false);
   // 登录页（有密码框）发出的写只记方法、URL、状态；没有密码框的页面发的写照旧记体（脱敏后）
   const allowed: any[] = result.writes.allowed;
@@ -192,6 +211,7 @@ test('close writes a report with evidence, writes, a replayable record, and no s
   assert.ok(html.includes(NAME), 'the session name must appear in report.html');
   assert.ok(!html.includes('<script'));
   assert.ok(html.includes('&lt;script&gt;window.pwned=1&lt;/script&gt;'), 'page markup must be escaped in report.html');
+  assert.ok(html.includes('源码哈希') && html.includes('返回值未记录'), 'the report shows the eval hash and says when a result was withheld');
   assert.ok(html.includes('这次动了什么'));
   assert.ok(html.includes('结论与记录不一致'));
 });

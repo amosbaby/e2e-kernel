@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DriverError } from '../../src/driver/types.ts';
-import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, RequestInfo, Stable }
+import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../src/driver/types.ts';
 import { isRef } from '../../src/shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/ops.ts';
@@ -183,6 +183,13 @@ class FakePage implements Page {
     this.enter('hasVisiblePasswordField', []);
     if (this.spec.passwordFieldFailWith !== undefined) throw new DriverError(this.spec.passwordFieldFailWith, 'password field probe failed');
     return this.spec.passwordField === true;
+  }
+
+  // 同一份 passwordField 规格；写了 passwordFieldFailWith 就当「探测失败」返回 null。
+  async hasPasswordLikeField(): Promise<PasswordProbe> {
+    this.enter('hasPasswordLikeField', []);
+    if (this.spec.passwordFieldFailWith !== undefined) return { found: null, frames: [this.url] };
+    return { found: this.spec.passwordField === true, frames: [this.url] };
   }
 
   // 规格里写了 stable 就原样返回（含 null）；没写时选择器给 given，引用给 null。kind 规格没写就是 'other'（往保守处判）。

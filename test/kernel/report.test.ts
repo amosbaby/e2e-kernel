@@ -153,12 +153,26 @@ test('a write whose body was omitted says so in the report', () => {
   assert.ok(!renderReport(buildResult(input({ writes: [write('POST', 'http://localhost/api/ok', 200, { body: 'a=1' })] }))).includes('请求体未记录'));
 });
 
+test('an eval step shows its recorded result and source hash; a token in the result does not leak', () => {
+  const hash = 'sha256:0123456789abcdef';
+  const html = renderReport(buildResult(input({ actions: [
+    act('eval', 'ok', { output: '{"n":1,"id":"<b>x</b>"}', jsHash: hash }),
+    act('eval', 'ok', { output: `"${jwt}"`, jsHash: hash }),
+    act('eval', 'ok', { outputOmitted: true, jsHash: hash }),
+  ] })));
+  assert.ok(html.includes('返回值 <code>{&quot;n&quot;:1,&quot;id&quot;:&quot;&lt;b&gt;x&lt;/b&gt;&quot;}</code>'), 'result shown, escaped');
+  assert.ok(html.includes(`源码哈希 <code>${hash}</code>`));
+  assert.ok(html.includes('返回值未记录'));
+  assert.ok(!html.includes('<b>x</b>') && !html.includes('eyJ'), 'a token in the result must not leak');
+});
+
 test('no key anywhere in buildResult output is a sensitive key', () => {
   const r = buildResult(input({
     verdict: { value: 'pass', because: 'b' }, findings: [{ claim: 'c', basis: 'b' }], notDone: ['n'], webSockets: 1,
     driver: driverWith({ nativeFormSubmit: 'unknown' }),
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: '#a', via: 'id' } }, shot: 'shots/01.jpg' }),
-      act('assert', 'match', { actual: 1, expected: 1, error: 'e' })],
+      act('assert', 'match', { actual: 1, expected: 1, error: 'e' }),
+      act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true })],
     unattributedWrites: [write('PUT', 'http://localhost/b', null)],
   }));
@@ -195,6 +209,16 @@ test('writeRun redacts page content, keeps kernel identifiers, writes 0600 files
   }
   assert.equal(statSync(runDir).mode & 0o777, 0o700);
   assert.ok(readFileSync(out.reportPath, 'utf8').includes('<h1>'));
+});
+
+test('writeRun keeps an eval hash and its output, and still redacts a token in the output', () => {
+  const hash = 'sha256:0123456789abcdef';
+  const out = writeRun(join(tmp, 'r-eval'), buildResult(input({ actions: [
+    act('eval', 'ok', { output: '{"n":1}', jsHash: hash }), act('eval', 'ok', { output: `"${jwt}"`, jsHash: hash }), act('eval', 'ok', { outputOmitted: true, jsHash: hash })] })));
+  const saved = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.equal(saved.actions[0].output, '{"n":1}'); assert.equal(saved.actions[0].jsHash, hash);
+  assert.equal(saved.actions[2].outputOmitted, true); assert.equal(saved.actions[2].jsHash, hash);
+  for (const f of [out.reportPath, out.resultPath]) assert.ok(!readFileSync(f, 'utf8').includes(jwt));
 });
 
 test('writeRun redacts host names and neutralises tags in both files', () => {

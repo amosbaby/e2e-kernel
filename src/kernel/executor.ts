@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { ACTION_TIMEOUT_MS, DriverError } from '../driver/types.ts';
-import type { Described, Page, Stable } from '../driver/types.ts';
+import type { Described, Page, PasswordProbe, Stable } from '../driver/types.ts';
 import type { Op, Target, WaitCond } from '../shared/ops.ts';
 import type { OpResult, Outcome, Tallies } from '../shared/protocol.ts';
 import { ensurePrivateDir, resolveInside } from '../shared/paths.ts';
@@ -20,6 +21,7 @@ const MAX_SNAPSHOT = 20_000;
 const DEFAULT_TEXT = 4_000;
 const MAX_TEXT = 20_000;
 const MAX_EVAL = 4_000;
+const MAX_EVAL_RECORD = 1_000;
 const MAX_CONSOLE_ENTRIES = 50;
 const MAX_CONSOLE_TEXT = 300;
 const MAX_NETWORK = 50;
@@ -37,6 +39,11 @@ interface Done {
   error?: string;
   shot?: string;
   valueCleared?: boolean;
+  // 只有 eval 带这三项，给记录用：脱敏后截到 1000 的返回值（页面有密码类字段或探测不出时没有，改为 outputOmitted）和源码哈希。
+  recordOutput?: string;
+  recordError?: string;     // 只给记录用的错误文字；有它时记录不用 error（eval 抛错的消息可能带着页面值和源码片段）
+  outputOmitted?: boolean;
+  jsHash?: string;
 }
 
 function truncate(s: string, max: number): string {
@@ -69,8 +76,9 @@ function targetOf(op: Op): Target | undefined {
   return 'target' in op ? op.target : undefined;
 }
 
-// eval 的返回值：先成一个 JSON 字符串，按 JSON 脱敏（敏感键的值换掉），再整体过一遍文本脱敏（键名里的 token），最后截断。
-function evalOutput(v: unknown): string {
+// eval 的返回值：先成一个 JSON 字符串，按 JSON 脱敏（敏感键的值换掉），再整体过一遍文本脱敏（键名里的 token）。
+// 这里不截断：回应和记录各自截到自己的上限，两处都是「整体脱敏之后再截」。
+function evalRedacted(v: unknown): string {
   let json: string | undefined;
   try {
     json = JSON.stringify(v);
@@ -78,7 +86,45 @@ function evalOutput(v: unknown): string {
     return '[unserializable]';
   }
   const text = json ?? 'undefined';
-  return safely(() => truncate(redactText(redactBody(text, 'application/json', Number.POSITIVE_INFINITY) ?? REDACTED), MAX_EVAL));
+  return safely(() => redactText(redactBody(text, 'application/json', Number.POSITIVE_INFINITY) ?? REDACTED));
+}
+
+// 源码只记哈希：'sha256:' + 十六进制前 16 位（不加盐，见 README 的 Threat model）。16 位够短，不会被 HEX 规则（32 位以上）吃掉。
+function sourceHash(js: string): string {
+  return `sha256:${createHash('sha256').update(js).digest('hex').slice(0, 16)}`;
+}
+
+// 页面（任何 frame）有没有密码类字段；探测抛 DriverError 当作探不出（found: null）。失败关闭：只有 found 为 false 才算确定没有。
+async function passwordLike(page: Page): Promise<PasswordProbe> {
+  try {
+    return await page.hasPasswordLikeField();
+  } catch (e) {
+    rethrowUnlessDriverError(e);
+    return { found: null, frames: [] };
+  }
+}
+
+// eval 跑前跑后各探一次：脚本可以往页面里插一个密码框再读，也可以把它删掉再返回它的值；
+// 两次拿到的 frame 地址不一致（eval 期间页面换了文档）也按探不出处理。
+// eval 抛错：回应里照旧给 agent 看错误（脱敏过），记录里只留固定文字：错误消息可能带着页面值（throw new Error(value)）
+// 或源码里的标识符（ReferenceError），既没探测也没截断，不能进记录。失败的那条也记 jsHash。
+async function runEval(page: Page, op: Extract<Op, { op: 'eval' }>): Promise<Done> {
+  const jsHash = sourceHash(op.js);
+  const before = await passwordLike(page);
+  let value: unknown;
+  try {
+    value = await page.evaluate(op.js);
+  } catch (e) {
+    rethrowUnlessDriverError(e);
+    return { outcome: 'failed', error: driverErrorText(e), recordError: `${e.kind}: eval 抛错（消息未记录）`, jsHash };
+  }
+  const after = await passwordLike(page);
+  const redacted = evalRedacted(value);
+  const done: Done = { outcome: 'ok', output: truncate(redacted, MAX_EVAL), jsHash };
+  const sameDocs = before.frames.length === after.frames.length && before.frames.every((u, i) => u === after.frames[i]);
+  if (before.found === false && after.found === false && sameDocs) done.recordOutput = truncate(redacted, MAX_EVAL_RECORD);
+  else done.outputOmitted = true;
+  return done;
 }
 
 function shotName(seq: number): string {
@@ -197,7 +243,7 @@ async function perform(page: Page, op: Exclude<Op, { op: 'fill' }>, seq: number,
     case 'assert':
       return runAssert(page, op);
     case 'eval':
-      return { outcome: 'ok', output: evalOutput(await page.evaluate(op.js)) };
+      return runEval(page, op);
   }
 }
 
@@ -264,12 +310,16 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpRes
     if (target !== undefined) record.target = { given: target, stable: done.stable ?? null };
     const result: OpResult = { index, op: op.op, outcome: done.outcome };
     if (done.output !== undefined) result.output = done.output;
+    if (done.jsHash !== undefined) record.jsHash = done.jsHash;
+    if (done.recordOutput !== undefined) record.output = done.recordOutput;
+    if (done.outputOmitted === true) record.outputOmitted = true;
     for (const r of [record, result]) {
       if ('actual' in done) r.actual = done.actual;
       if (done.expected !== undefined) r.expected = done.expected;
       if (done.error !== undefined) r.error = done.error;
       if (done.shot !== undefined) r.shot = done.shot;
     }
+    if (done.recordError !== undefined) record.error = done.recordError;
     ctx.recorder.addAction(record);
     results.push(result);
   }

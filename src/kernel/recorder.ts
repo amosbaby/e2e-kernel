@@ -6,7 +6,10 @@ import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts
 // 会话的记录（设计 5.7、5.8）：动作、写、请求摘要、到过的域名。进记录之前先脱敏。
 
 export interface ActionRecord { seq: number; at: string; ms: number; op: Op; target?: { given: Target; stable: Stable | null };
-  outcome: Outcome; actual?: string | number | boolean | null; expected?: string | number | boolean; error?: string; shot?: string }
+  outcome: Outcome; actual?: string | number | boolean | null; expected?: string | number | boolean; error?: string; shot?: string;
+  // 只在 eval 上出现：output 是已脱敏、截到 1000 字符的返回值；页面有密码类字段（或探测不出）时不记 output，改记 outputOmitted。
+  // jsHash 是源码的 'sha256:' + 十六进制前 16 位（源码本身不进记录）。
+  output?: string; outputOmitted?: boolean; jsHash?: string }
 export interface WriteRecord { id: string; at: string; method: string; url: string; status: number | null; failed: boolean;
   body: string | null; bodyOmitted: boolean; pageUrl: string | null; decision: 'allowed' | 'blocked'; targetMode: Mode }
 

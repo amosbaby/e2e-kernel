@@ -75,7 +75,7 @@ Other commands:
 | `viewport` | `width`, `height` | resize (320-3840 by 240-2160) |
 | `wait` | `for`, `timeoutMs?` | wait for `{text}`, `{target,state}` (visible/hidden), `{urlContains}` or `{ms}`; default 10 s, max 60 s |
 | `assert` | `kind`, `target?`, `property?`, `cmp`, `expected` | check `text`, `count`, `css`, `url` or `visible`; result is a match or a mismatch, never "pass/fail" |
-| `eval` | `js` | run a JavaScript expression in the page (result cut at 4000 characters) |
+| `eval` | `js` | run a JavaScript expression in the page (the response is cut at 4000 characters; the record keeps at most 1000, redacted, and only on a page without a password-like field) |
 
 Supported `css` assertion forms:
 
@@ -99,13 +99,13 @@ Supported `css` assertion forms:
 ## Where things live
 
 State directory: `~/.e2e-kernel/` (override with an absolute `E2K_HOME`). It holds `kernel.sock`, `kernel.pid`, `kernel.log`, `profiles/default/` (the browser profile with login cookies), `profiles/default.login.json` (time and host of the last `login`; mode 0600, kept next to the profile and not inside it) and `runs/`.
-Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` with `report.html` (no scripts; screenshots are linked from `shots/NN.jpg` and render when the file is opened from disk), `result.json` (a record of the operations; `eval` sources and any `fill` value not confirmed safe are `[REDACTED]`, so those steps cannot be replayed from it) and `shots/`. The newest 20 reports per session name are kept. A session idle for 15 minutes is closed (time spent inside a `step` does not count).
+Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` with `report.html` (no scripts; screenshots are linked from `shots/NN.jpg` and render when the file is opened from disk), `result.json` (a record of the operations; `eval` sources and any `fill` value not confirmed safe are `[REDACTED]`, so those steps cannot be replayed from it; an `eval` step carries `jsHash` and, usually, the redacted `output`) and `shots/`. The newest 20 reports per session name are kept. A session idle for 15 minutes is closed (time spent inside a `step` does not count).
 
 ## Safety
 
 - The kernel never types a password. `fill` into a password-like field is refused (exit 11, or 20 when the page is a login wall; "a person must log in"). A field counts as password-like when its `type` is `password`, or its `autocomplete` attribute contains `current-password`, `new-password` or `one-time-code`. If the kernel cannot tell, it does not fill. Log in with `login`.
 - Fill values are kept in records only when the target is a confirmed non-password `<input>` of type text, email, search, tel, url or number, or a `<textarea>`. A `contenteditable` element or any other target can still be filled, but its value is recorded as `[REDACTED]`.
-- `eval` sources are always recorded as `[REDACTED]`, so `eval` steps cannot be replayed from the record.
+- `eval` sources are recorded only as a short SHA-256 prefix (`jsHash`, 16 hex characters); the source itself is `[REDACTED]`, so `eval` steps cannot be replayed from the record. The redacted result (at most 1000 characters, redacted before it is cut) is recorded as `output`. When the page holds a password-like field in any frame, before or after the script ran, or that cannot be determined, `output` is left out and `outputOmitted` is true; the response to the agent is unchanged. If the script throws, the agent sees the (redacted) error, but the record only says that `eval` threw and keeps the hash, because an error message can carry a page value or a piece of the source.
 - In the `default` mode every write request is allowed and recorded. Writes that cannot be attributed to a page are listed separately under "writes not attributed to a page".
 - A write sent from a page that holds a password-like field (or when that cannot be determined) is recorded without its body: only the method, the (redacted) URL and the status are kept, and `bodyOmitted` is true. Native form submissions are always recorded without a body, because the page cannot be probed while it is navigating.
 - Command output, `result.json` and `report.html` are redacted (token-shaped strings, long token-shaped values in parameters, e-mail addresses, credentials in URLs, request bodies, free-text `password=…` / `"token":"…"` / `x-api-key: …`); plain passwords are not recognisable and are only kept out by the rules above. Command output is raw page text, to be treated as data: in plain text mode only control characters are made visible, in `--json` mode it is JSON-escaped, and neither HTML-escapes markup. Only `report.html` is HTML-escaped and it contains no scripts.
@@ -120,6 +120,8 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 - `press` typing key by key, and assigning an input's value inside `eval`, can get around the refusal to fill password fields.
 - Any process of the same user can read and write the state directory.
 - The terminal check on `login` only waits for Enter; it does not prove a person is there.
+- On a page without a password-like field, an `eval` result is recorded and only redacted by the rules. A secret that does not look like a token (a value in `localStorage`, a recovery code or PIN shown in plain text, personal data), or a password shown as plain text rather than in a password field, is not recognised.
+- `jsHash` is an unsalted 64-bit prefix of SHA-256. A low-entropy secret embedded in an `eval` source (a short code, a short passphrase) can be brute-forced offline from the hash, so do not write secrets into `eval` sources.
 
 ### Known M1 gaps
 
