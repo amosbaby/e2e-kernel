@@ -25,8 +25,22 @@ const HOME_PAGE: FakePageSpec = {
   elements: { e2: {}, '#status': { text: 'Added' }, '#gone': { failWith: 'not-found' }, '#pw': { password: true } },
 };
 
+// 页面能控制的文字里夹带终端控制序列：ESC[2K ESC[1A（清行并上移）、OSC 52（写剪贴板，以 BEL 结尾）、C1 的单字符 CSI。
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+const C1_CSI = String.fromCharCode(0x9b);
+const REPAINT = `fake${ESC}[2K${ESC}[1A${C1_CSI}31m`;
+const OSC52 = `${ESC}]52;c;aGk=${BEL}`;
+const HOSTILE_PAGE: FakePageSpec = {
+  title: `title${ESC}[2K`,
+  snapshot: `- text "snap${ESC}[1A"`,
+  elements: { '#status': { text: REPAINT } },
+  console: [{ level: 'log', text: `clip${OSC52}` }],
+};
+
 function pages(): Record<string, FakePageSpec> {
   return {
+    'http://localhost:5173/hostile': HOSTILE_PAGE,
     'http://localhost:5173/': HOME_PAGE,
     'http://localhost:5173/down': { gotoFailWith: 'timeout' },
     'http://localhost:5173/login-down': { gotoFailWith: 'other' },
@@ -145,6 +159,15 @@ describe('with a session', () => {
     assert.equal(lines[2], '  - button "Add" [ref=e2]');
     assert.match(lines[3] as string, /^#2 click 执行失败 \S.* shots\/\d\d\.jpg$/);
     assert.equal(lines[4], '#3 click 未执行');
+  });
+
+  test('a step on a session that is busy exits 2 (busy)', async () => {
+    const first = main(['step', sid, '[{"op":"wait","for":{"ms":300}}]'], io());
+    await sleep(50);
+    const t = io();
+    assert.equal(await main(['step', sid, '[{"op":"snapshot"}]'], t), 2);
+    assert.match(t.errText(), /错误（busy）/);
+    assert.equal(await first, 0);
   });
 
   test('step --stdin reads the ops; oversized or ambiguous input is a usage error', async () => {
@@ -286,4 +309,32 @@ test('realIo: start refuses when standard input is a pipe', async () => {
 test('realIo: an oversized --stdin is refused before it is parsed', async () => {
   const r = await runReal(['step', 's-000000', '--stdin'], { env: emptyEnv, stdin: '[' + ' '.repeat(MAX_OPS_BYTES) + ']' });
   assert.equal(r.code, 2); assert.match(r.err, new RegExp(`标准输入最多 ${MAX_OPS_BYTES} 字节`));
+});
+
+describe('terminal control characters from the page never reach the terminal', () => {
+  const RAW_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
+
+  test('a CSI sequence in a mismatch actual and an OSC 52 sequence in console text are escaped', async () => {
+    const r = await call(kernelTmp.home, 'open', { url: 'http://localhost:5173/hostile', name: 'hostile' });
+    assert.ok(r.ok); const hostileSid = (r.result as OpenResult).session;
+    const t = io();
+    const ops = '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"},{"op":"console"}]';
+    assert.equal(await main(['step', hostileSid, ops], t), 10);
+    const text = t.outText();
+    assert.ok(!text.includes(ESC), 'no raw ESC byte in the output');
+    assert.ok(!RAW_CONTROL.test(text), 'no raw control character other than the line break');
+    assert.ok(text.includes('实测=fake\\x1b[2K\\x1b[1A\\x9b31m'));
+    assert.ok(text.includes('clip\\x1b]52;c;aGk=\\x07'));
+    assert.equal(text.split('\n').length, 4);           // 汇总、不符、console 标题、console 内容：页面没能多出一行
+    await call(kernelTmp.home, 'close', { session: hostileSid });
+  });
+
+  test('open escapes the title and the snapshot', async () => {
+    const t = io();
+    assert.equal(await main(['open', 'http://localhost:5173/hostile', '--name', 'hostile2'], t), 0);
+    const text = t.outText();
+    assert.ok(!text.includes(ESC) && !RAW_CONTROL.test(text));
+    assert.ok(text.includes('标题 title\\x1b[2K'));
+    assert.ok(text.includes('- text "snap\\x1b[1A"'));
+  });
 });

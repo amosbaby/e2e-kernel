@@ -8,17 +8,38 @@ const OUTCOME_TEXT: Record<OpResult['outcome'], string> = {
   'ok': '完成', 'match': '相符', 'mismatch': '不符', 'failed': '执行失败', 'not-run': '未执行',
 };
 
-// 一个值放在一行里：换行改写成字面的 \n，不让它冒充下一行。
+// 页面给的文字原样进终端会被当成控制序列（清行、上移光标、OSC 52 写剪贴板……），能改写人看到的汇总和不符行。
+// 所以凡是可能带页面内容的字符串，C0（U+0000–U+001F）、DEL、C1（U+0080–U+009F）一律改写成可见的 \xNN；
+// 多行输出里真正的换行保留（\r\n、\r、\n 都当换行，不让单独的 \r 把光标拉回行首）。
+const LINE_BREAK = /\r\n|\r|\n/;
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+
+function escapeControls(s: string): string {
+  return s.replace(CONTROL, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+}
+
+// 多行文字：保留换行，每一行都过一遍控制字符改写。
+function lines(s: string): string[] {
+  return s.split(LINE_BREAK).map(escapeControls);
+}
+
+// 一个值放在一行里：换行改写成字面的 \n，不让它冒充下一行；其余控制字符改写成 \xNN。
 function inline(v: unknown): string {
-  return String(v).replace(/\r\n|\r|\n/g, '\\n');
+  return lines(String(v)).join('\\n');
 }
 
 function firstLine(s: string): string {
-  return s.split(/\r\n|\r|\n/)[0] ?? '';
+  return escapeControls(s.split(LINE_BREAK)[0] ?? '');
+}
+
+// 多行输出（快照、错误说明）：保留换行，不缩进。
+function block(s: string): string {
+  return lines(s).join('\n');
 }
 
 function indent(s: string): string {
-  return s.split(/\r\n|\r|\n/).map((line) => `  ${line}`).join('\n');
+  return lines(s).map((line) => `  ${line}`).join('\n');
 }
 
 function tallyText(t: Tallies): string {
@@ -34,49 +55,49 @@ function outputText(output: NonNullable<OpResult['output']>): string {
 }
 
 function opLine(r: OpResult): string {
-  let line = `#${r.index + 1} ${r.op} ${OUTCOME_TEXT[r.outcome]}`;
+  let line = `#${r.index + 1} ${inline(r.op)} ${OUTCOME_TEXT[r.outcome]}`;
   if (r.outcome === 'mismatch') line += ` 实测=${inline(r.actual ?? null)} 期望=${inline(r.expected ?? '')}`;
   if (r.outcome === 'failed' && r.error !== undefined) line += ` ${firstLine(r.error)}`;
-  if (r.shot !== undefined) line += ` ${r.shot}`;
+  if (r.shot !== undefined) line += ` ${inline(r.shot)}`;
   return r.output === undefined ? line : `${line}\n${outputText(r.output)}`;
 }
 
 export function formatOpen(r: OpenResult): string {
-  return [`${r.session} ${r.name} 模式 ${r.mode}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${r.runDir}`, r.snapshot].join('\n');
+  return [`${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`, block(r.snapshot)].join('\n');
 }
 
 export function formatStep(r: StepResult): string {
-  return [`${r.session} ${tallyText(r.tallies)}`, ...r.results.map(opLine)].join('\n');
+  return [`${inline(r.session)} ${tallyText(r.tallies)}`, ...r.results.map(opLine)].join('\n');
 }
 
 export function formatClose(r: CloseResult): string {
-  const lines = [`${r.session} 已收尾`, `报告 ${r.reportPath}`, `结果 ${r.resultPath}`, tallyText(r.tallies)];
-  if (r.consistency === 'conflict') lines.push('结论与记录不一致');
-  return lines.join('\n');
+  const out = [`${inline(r.session)} 已收尾`, `报告 ${inline(r.reportPath)}`, `结果 ${inline(r.resultPath)}`, tallyText(r.tallies)];
+  if (r.consistency === 'conflict') out.push('结论与记录不一致');
+  return out.join('\n');
 }
 
 export function formatStatus(r: StatusResult): string {
   const c = r.driver.capabilities;
   const lines = [
-    `版本 ${r.version}  pid ${r.pid}`,
-    `状态目录 ${r.home}`,
-    `驱动 ${r.driver.name}（网络拦截 ${c.networkInterception ? '能' : '不能'}，跨进程 iframe ${c.crossProcessIframes}，` +
-      `原生表单提交 ${c.nativeFormSubmit}，选择器 ${c.selectorDialect}）`,
+    `版本 ${inline(r.version)}  pid ${r.pid}`,
+    `状态目录 ${inline(r.home)}`,
+    `驱动 ${inline(r.driver.name)}（网络拦截 ${c.networkInterception ? '能' : '不能'}，跨进程 iframe ${inline(c.crossProcessIframes)}，` +
+      `原生表单提交 ${inline(c.nativeFormSubmit)}，选择器 ${inline(c.selectorDialect)}）`,
     `浏览器 ${r.instance === 'running' ? '在运行' : '未启动'}`,
     `会话 ${r.sessions.length} 个`,
-    ...r.sessions.map((s) => `  ${s.session} ${s.name} 闲置 ${s.idleSec} 秒 ${inline(s.url)}`),
+    ...r.sessions.map((s) => `  ${inline(s.session)} ${inline(s.name)} 闲置 ${s.idleSec} 秒 ${inline(s.url)}`),
   ];
   return lines.join('\n');
 }
 
 export function formatChecks(c: Check[]): string {
   return c.map((x) => {
-    const line = `${x.ok ? '[ok]  ' : '[失败]'} ${x.name}：${inline(x.detail)}`;
+    const line = `${x.ok ? '[ok]  ' : '[失败]'} ${inline(x.name)}：${inline(x.detail)}`;
     return x.fix === undefined ? line : `${line}\n  修复：${inline(x.fix)}`;
   }).join('\n');
 }
 
 export function formatError(e: { code: string; message: string; next?: string }): string {
-  const line = `错误（${e.code}）：${e.message}`;
-  return e.next === undefined ? line : `${line}\n${e.next}`;
+  const line = `错误（${inline(e.code)}）：${block(e.message)}`;
+  return e.next === undefined ? line : `${line}\n${block(e.next)}`;
 }
