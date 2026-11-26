@@ -189,10 +189,11 @@ class FakePage implements Page {
     return { stable, isPassword: el.password === true };
   }
 
-  // 内核主动关的页：只改状态，不触发 onClosed（onClosed 只报人关、页面自己关、浏览器没了）。
+  // 调用方主动关的页也触发 onClosed（和真实浏览器一致）；已关的页再 close 会在 enter 里抛错，不会再触发。
   async close(): Promise<void> {
     this.enter('close', []);
     this.closed = true;
+    this.fireClosed();
   }
 }
 
@@ -214,10 +215,19 @@ class FakeInstance implements Instance {
     return { name: 'browser', ok: !this.closed, detail: this.closed ? 'browser is closed' : 'browser is running' };
   }
 
-  // 内核主动停：只改状态，不触发 onClosed。
+  // 调用方主动停：和浏览器没了一样触发监听器。
   async stop(): Promise<void> {
+    this.shutdown();
+  }
+
+  // 先把实例和每一页都置为已关，再依次触发每页的 onClosed、实例的 onClosed：监听器里查状态已经是「已关」。
+  shutdown(): void {
+    if (this.closed) return;
+    const open = this.pages.filter((p) => !p.closed);
     this.closed = true;
-    for (const p of this.pages) p.closed = true;
+    for (const p of open) p.closed = true;
+    for (const p of open) p.fireClosed();
+    for (const l of this.closedListeners) l();
   }
 
   onClosed(listener: () => void): void {
@@ -329,15 +339,9 @@ export class FakeDriver implements Driver {
     page.fireClosed();
   }
 
-  // 模拟浏览器整个没了：先把实例和每一页都置为已关，再依次触发每页的 onClosed、实例的 onClosed。
+  // 模拟浏览器整个没了。
   closeBrowser(): void {
-    const inst = this.current;
-    if (inst === undefined || inst.closed) return;
-    const open = inst.pages.filter((p) => !p.closed);
-    inst.closed = true;
-    for (const p of open) p.closed = true;
-    for (const p of open) p.fireClosed();
-    for (const l of inst.closedListeners) l();
+    this.current?.shutdown();
   }
 
   private running(): FakeInstance {

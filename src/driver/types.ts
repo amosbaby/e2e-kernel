@@ -66,7 +66,8 @@ export interface Driver {
 export interface Instance {
   health(): Promise<Check>;                                                          // 实例：健康检查
   stop(): Promise<void>;                                                             // 实例：停止
-  onClosed(listener: () => void): void;                                              // 浏览器没了（被关、崩了）
+  // 浏览器没了：被关、崩了，也包括调用方自己 stop()。任何一种关闭都触发；自己发起关闭的调用方要自己忽略这次事件。
+  onClosed(listener: () => void): void;
   setRequestHandler(h: (r: RequestInfo) => Decision | Promise<Decision>): void;      // 拦截：请求回调，导航请求也走这里
   onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean }) => void): void;
   addInitScript(source: string): Promise<void>;                                      // 拦截：页面脚本之前的注入脚本
@@ -76,7 +77,9 @@ export interface Instance {
 
 export interface Page {
   readonly id: string;                                                               // 在驱动对象的整个生命期内唯一
-  onClosed(listener: () => void): void;                                              // 这一页没了（人关了标签页、页面自己关了）
+  // 这一页没了：人关了标签页、页面自己关了、浏览器没了，也包括调用方自己 close()。任何一种关闭都触发；
+  // 自己发起关闭的调用方要自己忽略这次事件。
+  onClosed(listener: () => void): void;
   location(): Promise<PageLocation>;                                                 // 读数：当前位置、拦截覆盖情况
   snapshot(o: { depth?: number }): Promise<string>;
   text(o: { target?: Target }): Promise<string>;

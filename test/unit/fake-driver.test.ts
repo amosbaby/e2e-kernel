@@ -200,3 +200,38 @@ test('launch options: delay, profile, capabilities, checks and failOpenWith', as
   assert.equal((await inst.health()).ok, true);
   await assert.rejects(inst.openPage({}), (e) => e === boom);
 });
+
+// 裁定 R11：onClosed 对任何关闭都触发，包括调用方自己 close() / stop()；每次关闭只触发一次。
+test('page.close() fires the page onClosed exactly once', async () => {
+  const { d, inst, page } = await setup({});
+  const second = await inst.openPage({});
+  let closed = 0, secondClosed = 0;
+  page.onClosed(() => { closed++; assert.deepEqual(d.openPages(), [second.id]); });
+  second.onClosed(() => secondClosed++);
+  await page.close();
+  assert.deepEqual([closed, secondClosed], [1, 0]);
+  assert.deepEqual(d.openPages(), [second.id]);
+  await assert.rejects(page.close(), (e: DriverError) => e.kind === 'other');
+  d.closePage(page.id);
+  d.closeBrowser();
+  assert.deepEqual([closed, secondClosed], [1, 1]);
+});
+
+test('instance.stop() sets the closed state, then fires page and instance onClosed exactly once', async () => {
+  const { d, inst, page } = await setup({});
+  const second = await inst.openPage({});
+  await second.close();
+  const order: string[] = [];
+  page.onClosed(() => { order.push('page'); assert.deepEqual(d.openPages(), []); });
+  second.onClosed(() => order.push('second'));
+  inst.onClosed(() => order.push('instance'));
+  page.onClosed(() => { void inst.health().then((c) => order.push(`health:${c.ok}`)); });
+  await inst.stop();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(order, ['page', 'instance', 'health:false']);
+  await inst.stop();
+  d.closeBrowser();
+  assert.deepEqual(order, ['page', 'instance', 'health:false']);
+  assert.equal((await inst.health()).ok, false);
+  await assert.rejects(page.snapshot({}), (e: DriverError) => e.kind === 'other');
+});
