@@ -534,11 +534,36 @@ test('toWriteRecord omits the body unless the page is known to hold no password 
   assert.equal(noBody.body, null); assert.equal(noBody.bodyOmitted, false, 'a request with no body has nothing to omit');
 });
 
+test('toWriteRecord classifies GraphQL from the original body, also when the body is not recorded, and takes the host from the raw url', () => {
+  const doc = JSON.stringify({ query: 'mutation Save { save { id } }' });
+  const post = (url: string, body: string | null, extra: Partial<RequestInfo> = {}) =>
+    toWriteRecord({ ...req('POST', url, body), contentType: 'application/json', fromLoginForm: false, ...extra }, { action: 'continue' }, 'default', now);
+  const kept = post('http://localhost/graphql', doc);
+  assert.equal(kept.graphql, 'mutation'); assert.equal(kept.host, 'localhost'); assert.equal(kept.body !== null, true);
+  for (const fromLoginForm of [true, null]) {
+    const w = post('http://localhost/graphql', doc, { fromLoginForm });
+    assert.equal(w.body, null); assert.equal(w.bodyOmitted, true);
+    assert.equal(w.graphql, 'mutation', 'the body is not recorded, but the classification still comes from it');
+    assert.ok(!JSON.stringify(w).includes('Save'));
+  }
+  assert.equal(post('http://localhost/graphql', JSON.stringify({ query: '{ a }' })).graphql, 'query');
+  assert.equal(post('http://localhost/api/x', JSON.stringify({ n: 1 })).graphql, null);
+  assert.equal(post('http://localhost/api/x', null).graphql, null);
+  // graphqlKind 抛错不能让整条记录（以及 onRequest）失败：给 'unknown'。
+  const odd = post('http://localhost/api/x', {} as unknown as string);
+  assert.equal(odd.graphql, 'unknown');
+  // host 取自原始 url（userinfo 不进来），单独脱敏；取不到给 REDACTED。
+  assert.equal(post('http://someone:pw@Example.COM:8080/a?b=1', null).host, 'example.com');
+  const longLabel = 'Ab1'.repeat(14);
+  assert.equal(post(`https://${longLabel}.example.com/x`, null).host, '[REDACTED].example.com');
+  assert.equal(post('not a url', null).host, '[REDACTED]');
+});
+
 test('isWrite, toWriteRecord and hosts', () => {
   assert.deepEqual(['POST', 'PUT', 'PATCH', 'DELETE', 'patch', 'GET', 'HEAD', 'OPTIONS'].map(isWrite), [true, true, true, true, true, false, false, false]);
   const w = toWriteRecord({ ...req('PUT', 'http://localhost/api/items/1', null), id: 'r5', topUrl: 'http://localhost/' }, { action: 'abort' }, 'readonly', now);
   assert.deepEqual(w, { id: 'r5', at: now.toISOString(), method: 'PUT', url: 'http://localhost/api/items/1', status: null, failed: false,
-    body: null, bodyOmitted: false, pageUrl: 'http://localhost/', decision: 'blocked', targetMode: 'readonly' });
+    body: null, bodyOmitted: false, pageUrl: 'http://localhost/', decision: 'blocked', targetMode: 'readonly', host: 'localhost', graphql: null });
   recorder.addHost('localhost', 'default'); recorder.addHost('localhost', 'default'); recorder.addHost('127.0.0.1', 'readonly');
   assert.deepEqual(recorder.hosts, [{ host: 'localhost', mode: 'default' }, { host: '127.0.0.1', mode: 'readonly' }]);
 });

@@ -23,7 +23,7 @@ function act(op: Op['op'], outcome: Outcome, extra: Partial<ActionRecord> = {}):
 }
 function write(method: string, url: string, status: number | null, extra: Partial<WriteRecord> = {}): WriteRecord {
   return { id: `r${++seq}`, at: '2026-11-26T15:30:06.000Z', method, url, status, failed: false, body: null, bodyOmitted: false, pageUrl: null,
-    decision: 'allowed', targetMode: 'default', ...extra };
+    decision: 'allowed', targetMode: 'default', host: new URL(url).hostname, graphql: null, ...extra };
 }
 function driverWith(caps: Partial<Capabilities> = {}): RunInput['driver'] {
   return { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'covered', nativeFormSubmit: 'covered',
@@ -97,6 +97,61 @@ test('writes section lists allowed, blocked and unattributed writes', () => {
   const html = renderReport(r);
   for (const s of ['这次动了什么', '/api/items', '201', '/api/x', '未归属的写', '/api/form-blank', '无法确定来自哪个页面']) assert.ok(html.includes(s), s);
   assert.ok(section(renderReport(buildResult(input({}))), 'writes').includes('<p>无</p>'));
+});
+
+test('the writes summary groups attributed writes by host, method and GraphQL kind, with counts and a stable order', () => {
+  const blocked = (m: string, u: string, extra: Partial<WriteRecord> = {}): WriteRecord => ({ ...write(m, u, null, extra), decision: 'blocked' });
+  const r = buildResult(input({
+    writes: [
+      write('POST', 'http://b.example.com/api/a', 200), write('post', 'http://b.example.com/api/z?x=1', 200), blocked('POST', 'http://b.example.com/api/c'),
+      write('POST', 'http://a.example.com/graphql', 200, { graphql: 'query' }), write('POST', 'http://a.example.com/graphql', 200, { graphql: 'mutation' }),
+      write('POST', 'http://a.example.com/graphql', 200, { graphql: 'mutation' }), blocked('POST', 'http://a.example.com/graphql', { graphql: 'mutation' }),
+      write('POST', 'http://a.example.com/other', 200, { graphql: 'unknown' }), write('DELETE', 'http://a.example.com/api/1', 204),
+      write('POST', 'http://a.example.com/api', 200),
+    ],
+    unattributedWrites: [write('POST', 'http://z.example.com/form', 200)],
+  }));
+  assert.deepEqual(r.writes.summary, [
+    { host: 'a.example.com', method: 'DELETE', graphql: null, allowed: 1, blocked: 0 },
+    { host: 'a.example.com', method: 'POST', graphql: null, allowed: 1, blocked: 0 },
+    { host: 'a.example.com', method: 'POST', graphql: 'mutation', allowed: 2, blocked: 1 },
+    { host: 'a.example.com', method: 'POST', graphql: 'query', allowed: 1, blocked: 0 },
+    { host: 'a.example.com', method: 'POST', graphql: 'unknown', allowed: 1, blocked: 0 },
+    { host: 'b.example.com', method: 'POST', graphql: null, allowed: 2, blocked: 1 },
+  ], 'host names only, no paths; the unattributed write is not counted; method is upper-cased');
+  assert.ok(!JSON.stringify(r.writes.summary).includes('/api'));
+  assert.deepEqual(buildResult(input({})).writes.summary, []);
+});
+
+test('the writes summary uses the recorded host, which was redacted on its own', () => {
+  const r = buildResult(input({ writes: [write('POST', 'http://x.example.com/a', 200, { host: '[REDACTED].example.com' }), write('POST', 'http://x.example.com/b', 200, { host: '[REDACTED].example.com' })] }));
+  assert.deepEqual(r.writes.summary.map((e) => [e.host, e.allowed]), [['[REDACTED].example.com', 2]]);
+});
+
+test('the report shows the writes summary table above the list, and says it leaves out unattributed writes', () => {
+  const r = buildResult(input({
+    writes: [write('POST', 'http://api.example.com/graphql', 200, { graphql: 'mutation' }), write('POST', 'http://api.example.com/graphql', 200, { graphql: 'mutation' }),
+      { ...write('POST', 'http://api.example.com/graphql', null, { graphql: 'query' }), decision: 'blocked' }, write('PUT', 'http://api.example.com/x', 200)],
+    unattributedWrites: [write('POST', 'http://api.example.com/form', 200), write('POST', 'http://api.example.com/form2', 200)],
+  }));
+  const w = section(renderReport(r), 'writes');
+  for (const s of ['<th>主机</th>', '<th>方法</th>', '<th>GraphQL</th>', '<th>放行</th>', '<th>拦下</th>']) assert.ok(w.includes(s), s);
+  assert.ok(w.includes('<td>api.example.com</td><td>POST</td><td>mutation</td><td>2</td><td>0</td>'), w);
+  assert.ok(w.includes('<td>api.example.com</td><td>POST</td><td>query</td><td>0</td><td>1</td>'), w);
+  assert.ok(w.includes('<td>api.example.com</td><td>PUT</td><td>—</td><td>1</td><td>0</td>'), w);
+  assert.ok(w.includes('不含未归属的写（2 条，见下）'), w);
+  assert.ok(w.indexOf('<table') < w.indexOf('放行的写'), 'the table comes first');
+  const none = section(renderReport(buildResult(input({ writes: [write('POST', 'http://api.example.com/a', 200)] }))), 'writes');
+  assert.ok(none.includes('不含未归属的写（0 条）') && !none.includes('见下'));
+  const onlyUnattributed = section(renderReport(buildResult(input({ unattributedWrites: [write('POST', 'http://api.example.com/f', 200)] }))), 'writes');
+  assert.ok(!onlyUnattributed.includes('<table'));
+});
+
+test('summary host and kind are escaped, and a token-shaped host never shows raw', () => {
+  const host = 'Ab1'.repeat(14) + '.example.com';
+  const html = renderReport(buildResult(input({ writes: [write('POST', 'http://x.example.com/a', 200, { host: '<i>' + host, graphql: 'unknown' })] })));
+  assert.ok(!html.includes('<i>'));
+  assert.ok(!html.includes(host));
 });
 
 test('writes to a non-default mode host are marked', () => {
@@ -189,7 +244,8 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
       act('click', 'failed', { seq: 9001, target: { given: '#b', stable: null }, error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
       act('screenshot', 'ok', { seq: 9002 }),
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
-    writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true })],
+    writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true }),
+      write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' })],
     unattributedWrites: [write('PUT', 'http://localhost/b', null)],
   }));
   const bad: string[] = [];
@@ -207,7 +263,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     else if (typeof v === 'object' && v !== null) for (const [k, val] of Object.entries(v)) { keys.add(k); collect(val); }
   };
   collect(r);
-  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly']) assert.ok(keys.has(k), k);
+  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 

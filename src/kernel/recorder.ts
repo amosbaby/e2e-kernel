@@ -1,6 +1,8 @@
 import type { Decision, RequestInfo, Stable } from '../driver/types.ts';
 import type { Op, Target } from '../shared/ops.ts';
 import type { Mode, Outcome, RequestSummary } from '../shared/protocol.ts';
+import { graphqlKind } from './graphql.ts';
+import type { GraphqlKind } from './graphql.ts';
 import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts';
 
 // 会话的记录（设计 5.7、5.8）：动作、写、请求摘要、到过的域名。进记录之前先脱敏。
@@ -13,7 +15,10 @@ export interface ActionRecord { seq: number; at: string; ms: number; op: Op; tar
   // 失败时的诊断；页面有密码类字段（或探不出）时只有一条固定说明，不记页面文字。
   hints?: string[] }
 export interface WriteRecord { id: string; at: string; method: string; url: string; status: number | null; failed: boolean;
-  body: string | null; bodyOmitted: boolean; pageUrl: string | null; decision: 'allowed' | 'blocked'; targetMode: Mode }
+  body: string | null; bodyOmitted: boolean; pageUrl: string | null; decision: 'allowed' | 'blocked'; targetMode: Mode;
+  // 主机名：取自原始 url、单独脱敏（和 addHost 一样），汇总按它分组；取不到是 REDACTED。
+  // graphql：null 表示不是 GraphQL；从原始请求体算，请求体不记录时照样算；拿不准是 'unknown'。
+  host: string; graphql: GraphqlKind | null }
 
 const MAX_REQUESTS = 200;
 
@@ -33,6 +38,19 @@ export function safely(redact: () => string): string {
   }
 }
 
+function hostOf(url: string): string {
+  return safely(() => redactText(new URL(url).hostname));
+}
+
+// 分类出错（它一抛错会让 onRequest 中止这条写请求）给 'unknown'。
+function classify(req: RequestInfo): GraphqlKind | null {
+  try {
+    return graphqlKind(req.body, req.contentType, req.url);
+  } catch {
+    return 'unknown';
+  }
+}
+
 export function toWriteRecord(req: RequestInfo, decision: Decision, targetMode: Mode, at: Date): WriteRecord {
   const { body, contentType, topUrl } = req;
   // 失败关闭：只有明确判断出「没有密码框」（false）才记体；true 和判断不出（null）都不记。
@@ -49,6 +67,8 @@ export function toWriteRecord(req: RequestInfo, decision: Decision, targetMode: 
     pageUrl: topUrl === null ? null : safely(() => redactUrl(topUrl)),
     decision: decision.action === 'continue' ? 'allowed' : 'blocked',
     targetMode,
+    host: hostOf(req.url),
+    graphql: classify(req),
   };
 }
 

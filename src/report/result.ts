@@ -29,13 +29,16 @@ export interface SupersededEntry {
   failed: number; by: number; failedOp: string; failedTarget: string | null; byOp: string; byTarget: string | null; byReadOnly: boolean;
 }
 
+// 写请求的汇总：已归属的写（放行加拦下）按主机 × 方法 × GraphQL 类型分组。host 是已脱敏的主机名，不带路径和请求体。
+export interface WriteSummaryRow { host: string; method: string; graphql: WriteRecord['graphql']; allowed: number; blocked: number }
+
 export interface RunResult {
   schema: 1; kernelVersion: string; session: string; name: string; startedAt: string; endedAt: string; closedBy: ClosedBy;
   start: RunInput['start']; driver: RunInput['driver']; hosts: RunInput['hosts'];
   verdict: Verdict | null; findings: Finding[]; notDone: string[]; superseded: SupersededEntry[];
   tallies: Tallies; consistency: 'ok' | 'conflict'; conflicts: ConflictReason[];
   actions: ActionRecord[];
-  writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[] };
+  writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[]; summary: WriteSummaryRow[] };
   approvals: never[];                 // M2 才有内容
   coverage: { serviceWorkers: 'blocked'; webSockets: number; notes: string[] };
   blocked: null;                      // M2 才有内容（等登录、等批准、身份不符、跳到不允许的域名）
@@ -112,6 +115,23 @@ function conflictsOf(input: RunInput, resolved: readonly SupersededEntry[]): Con
   return out;
 }
 
+// 只统计已归属的写。method 转大写（fetch 不规范化大小写）。排序按 host、method、graphql（null 排在最前），用码点比较，结果稳定。
+export function summarizeWrites(writes: readonly WriteRecord[]): WriteSummaryRow[] {
+  const rows = new Map<string, WriteSummaryRow>();
+  for (const w of writes) {
+    const method = w.method.toUpperCase();
+    const key = JSON.stringify([w.host, method, w.graphql]);
+    let row = rows.get(key);
+    if (row === undefined) {
+      row = { host: w.host, method, graphql: w.graphql, allowed: 0, blocked: 0 };
+      rows.set(key, row);
+    }
+    if (w.decision === 'allowed') row.allowed++; else row.blocked++;
+  }
+  const by = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  return [...rows.values()].sort((a, b) => by(a.host, b.host) || by(a.method, b.method) || by(a.graphql ?? '', b.graphql ?? ''));
+}
+
 export function buildResult(input: RunInput): RunResult {
   const tallies = tally(input.actions);
   const superseded = resolveSuperseded(input.actions, input.superseded);
@@ -139,6 +159,7 @@ export function buildResult(input: RunInput): RunResult {
       allowed: input.writes.filter((w) => w.decision === 'allowed'),
       blocked: input.writes.filter((w) => w.decision === 'blocked'),
       unattributed: [...input.unattributedWrites],
+      summary: summarizeWrites(input.writes),
     },
     approvals: [],
     coverage: { serviceWorkers: 'blocked', webSockets: input.webSockets, notes: coverageNotes(input) },

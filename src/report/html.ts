@@ -97,10 +97,22 @@ function writeItem(w: WriteRecord): string {
   return `<li><code>${page(w.method)} ${pageUrl(w.url)}</code> 时间 ${own(w.at)} 状态码 ${own(status)}${flag}${body}</li>`;
 }
 
+// 汇总表：只有主机名、方法、GraphQL 类型和计数，不带路径和请求体；不含未归属的写。
+function summaryTable(r: RunResult): string {
+  const { summary, unattributed } = r.writes;
+  if (summary.length === 0) return '';
+  const rows = summary.map((e) => `<tr><td>${page(e.host)}</td><td>${page(e.method)}</td><td>${e.graphql === null ? '—' : page(e.graphql)}</td>`
+    + `<td>${own(e.allowed)}</td><td>${own(e.blocked)}</td></tr>`).join('');
+  const n = unattributed.length;
+  return `<table id="writes-summary"><thead><tr><th>主机</th><th>方法</th><th>GraphQL</th><th>放行</th><th>拦下</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<p>不含未归属的写（${own(n)} 条${n > 0 ? '，见下' : ''}）</p>`;
+}
+
 function writesSection(r: RunResult): string {
   const { allowed, blocked, unattributed } = r.writes;
   let out = '<section id="writes"><h2>这次动了什么</h2>';
   if (allowed.length + blocked.length + unattributed.length === 0) return `${out}<p>无</p></section>`;
+  out += summaryTable(r);
   if (allowed.length > 0) out += `<h3>放行的写</h3><ul>${allowed.map(writeItem).join('')}</ul>`;
   if (blocked.length > 0) out += `<h3>被拦下的写</h3><ul>${blocked.map(writeItem).join('')}</ul>`;
   if (unattributed.length > 0) {
