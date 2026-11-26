@@ -399,6 +399,33 @@ test('login waits for Enter, then closes the login page', async () => {
   assert.equal(fake.openPages().length, before); assert.match(t.outText(), /按回车/);
 });
 
+// 在一个带 rules.json 的独立内核里跑 login：人按回车之前，页面发出 posts 条写（被只读规则拦下几条，收尾就报几条）。
+async function loginWithBlockedWrites(posts: number): Promise<string> {
+  const h = makeTmpHome();
+  const f = new FakeDriver({ pages: pages() });
+  writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] }));
+  const kernel = await startKernel({ home: h.home, driver: f });
+  try {
+    const t = io({ env: h.env, isTTY: true });
+    t.stdin.readLine = async () => {
+      const pageId = f.openPages().at(-1)!;
+      for (let i = 0; i < posts; i++) {
+        const d = await f.emitRequest({ pageId, method: 'POST', url: 'http://app.example.com/api', topUrl: 'http://app.example.com/' });
+        assert.equal(d.action, 'fulfill');
+      }
+      return '';
+    };
+    assert.equal(await main(['login', 'http://app.example.com/login'], t), 0);
+    return t.outText();
+  } finally { await kernel.stop(); h.cleanup(); }
+}
+
+test('login prints the loginHosts hint when read-only rules blocked writes during the login, and nothing when none were blocked', async () => {
+  const hinted = await loginWithBlockedWrites(2);
+  assert.match(hinted, /登录过程中有 2 条写被只读规则拦下：登录用的主机（含 SAML\/OIDC 回调所在页的主机）可能没列进 rules\.json 的 loginHosts/);
+  assert.ok(!(await loginWithBlockedWrites(0)).includes('loginHosts'));
+});
+
 test('status and doctor', async () => {
   assert.equal(await main(['status'], io()), 0); assert.equal(await main(['doctor'], io()), 0);
   const t = io({ makeDriver: async () => new FakeDriver({ checks: [{ name: 'chromium-installed', ok: false, detail: '缺', fix: 'npx playwright install chromium' }] }) });

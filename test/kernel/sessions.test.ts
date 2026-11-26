@@ -477,7 +477,7 @@ test('a login record that cannot be written is logged, and loginEnd still finish
   const loginPageId = fake.openPages().at(-1)!;
   const outside = join(home.root, 'outside.txt'); writeFileSync(outside, 'keep');
   symlinkSync(outside, join(home.profilesDir, 'default.login.json'));
-  assert.deepEqual(await sm.loginEnd({ loginId }), {});
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 0 });
   assert.ok(!fake.openPages().includes(loginPageId));
   assert.equal(readFileSync(outside, 'utf8'), 'keep');
   assert.ok(logs.some((l) => l.includes('登录记录')), logs.join('\n'));
@@ -503,7 +503,7 @@ test('loginEnd closes the login page and its popups, even if a person already cl
   const loginPageId = fake.openPages().at(-1)!;
   const popup = fake.emitPopup(loginPageId, 'http://localhost:5173/sso');
   fake.closePage(loginPageId);
-  assert.deepEqual(await sm.loginEnd({ loginId }), {});
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 0 });
   assert.ok(!fake.openPages().includes(popup.id));
   await assert.rejects(sm.loginEnd({ loginId }), (e: E2kError) => e.code === 'not-found');
 });
@@ -687,20 +687,22 @@ const RO = 'http://example.com/';
 const GRAPHQL_QUERY = { method: 'POST', url: 'http://example.com/graphql', contentType: 'application/json', body: '{"query":"{ viewer { id } }"}' };
 
 // 可以在测试里改的规则解析器：ro 里的主机只读；pending 在下一次 refresh 时生效（模拟人改了规则文件）。
-function mutableRules(readonlyHosts: string[]) {
+// readonlyHosts 里 `*.x` 形式的按后缀匹配；loginHosts 精确匹配。
+function mutableRules(readonlyHosts: string[], loginHosts: string[] = []) {
+  const isRo = (h: string): boolean => st.ro.has(h) || [...st.ro].some((p) => p.startsWith('*.') && h.endsWith(p.slice(1)));
   const st = { ro: new Set(readonlyHosts), hash: 'sha256:0000000000000001' as string | null, error: null as string | null, pending: null as (() => void) | null, refreshes: 0 };
   const resolver: ModeResolver = {
-    resolve: (h) => (st.ro.has(h) ? 'readonly' : 'default'),
-    ruleFor: (h) => (st.ro.has(h) ? 'readonly' : null),
-    isLoginHost: () => false,
+    resolve: (h) => (isRo(h) ? 'readonly' : 'default'),
+    ruleFor: (h) => (isRo(h) ? 'readonly' : null),
+    isLoginHost: (h) => loginHosts.includes(h),
     refresh: () => { st.refreshes++; const p = st.pending; st.pending = null; p?.(); },
     state: () => ({ count: st.ro.size, hash: st.hash, error: st.error }),
   };
   return { st, resolver };
 }
 
-function setupRo(readonlyHosts: string[] = ['example.com'], overrides: Partial<SessionDeps> = {}) {
-  const rules = mutableRules(readonlyHosts);
+function setupRo(readonlyHosts: string[] = ['example.com'], overrides: Partial<SessionDeps> = {}, loginHosts: string[] = []) {
+  const rules = mutableRules(readonlyHosts, loginHosts);
   return { ...setup({ modes: rules.resolver, policy, ...overrides }), ...rules };
 }
 
@@ -907,4 +909,86 @@ test('an unattributed page on a read-only host is read-only even with no read-on
   assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://example.com/api', topUrl: null })).action, 'fulfill');
   assert.equal((await fake.emitRequest({ pageId: null, method: 'GET', url: 'http://localhost:5173/', topUrl: RO })).action, 'continue');
   assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://example.com/api', topUrl: 'http://example.org/' })).action, 'continue');   // 页面在默认主机上
+});
+
+// ---- 登录窗口过写策略（loginHosts 之外） ----
+
+const LOGIN_START = 'http://app.example.com/login';
+const SSO_URL = 'http://sso.example.com/';
+const APP_URL = 'http://app.example.com/';
+
+async function loginSetup(readonlyHosts: string[] = ['*.example.com'], overrides: Partial<SessionDeps> = {}) {
+  const ctx = setupRo(readonlyHosts, overrides, ['sso.example.com']);
+  const { loginId } = await ctx.sm.loginBegin({ url: LOGIN_START });
+  return { ...ctx, loginId, loginPageId: ctx.fake.openPages().at(-1)! };
+}
+
+test('login: a write to a login host, or from a page on a login host, goes through; other writes follow the read-only rules', async () => {
+  const { sm, fake, loginId, loginPageId } = await loginSetup();
+  // 1. 顶层是 sso 的登录页向 sso 发 POST：放行（不加 followRedirects）
+  assert.deepEqual(await fake.emitRequest({ id: 'a1', pageId: loginPageId, method: 'POST', url: 'http://sso.example.com/auth', topUrl: SSO_URL }), { action: 'continue' });
+  // 2. 顶层是 sso 的页向 app 的回调 POST 导航：放行（页面的顶层主机是 loginHost）
+  assert.deepEqual(await fake.emitRequest({ id: 'a2', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/acs', topUrl: SSO_URL, isNavigation: true }), { action: 'continue' });
+  // 登录页向 loginHost 发 POST，哪怕页面本身在只读主机上：目标主机是 loginHost，放行
+  assert.deepEqual(await fake.emitRequest({ id: 'a3', pageId: loginPageId, method: 'POST', url: 'http://sso.example.com/auth', topUrl: APP_URL }), { action: 'continue' });
+  // 3. 顶层是 app 的页向 app POST：拦
+  const blocked = await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api/secret-path', topUrl: APP_URL, body: 'note=body-text', contentType: 'application/x-www-form-urlencoded' });
+  assert.equal(blocked.action, 'fulfill'); assert.equal((blocked as { status: number }).status, 403);
+  // 登录页弹出的窗口按同样的规则
+  assert.equal((await fake.emitRequest({ id: 'b2', pageId: 'p-popup', openerPageId: loginPageId, method: 'DELETE', url: 'http://app.example.com/x', topUrl: APP_URL })).action, 'fulfill');
+  // 读照旧放行
+  assert.equal((await fake.emitRequest({ id: 'r1', pageId: loginPageId, method: 'GET', url: 'http://app.example.com/', topUrl: APP_URL })).action, 'continue');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 2 });
+});
+
+test('login: a blocked write is logged as one line without the path or the body', async () => {
+  const { sm, fake, logs, loginId, loginPageId } = await loginSetup();
+  await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api/secret-path?x=1', topUrl: APP_URL, body: 'note=body-text', contentType: 'application/x-www-form-urlencoded' });
+  const lines = logs.filter((l) => l.includes(loginId));
+  assert.deepEqual(lines, [`登录 ${loginId}：拦下 POST app.example.com`]);
+  assert.ok(!logs.join('\n').includes('secret-path') && !logs.join('\n').includes('body-text'));
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});
+
+test('login: a login that starts on a read-only host stays read-only for a page on a default host; login requests never enter any record', async () => {
+  const { sm, fake, loginId, loginPageId } = await loginSetup(['app.example.com']);
+  // 登录起点只读：页面顶层在默认主机上，写仍按只读拦
+  assert.equal((await fake.emitRequest({ id: 'b1', pageId: loginPageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://localhost:5173/' })).action, 'fulfill');
+  // 起点只读，登录页顶层在 loginHost 上：放行
+  assert.equal((await fake.emitRequest({ id: 'a1', pageId: loginPageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: SSO_URL })).action, 'continue');
+  const s = await opened(sm, fake, 'other');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+  const w = readResult((await sm.close({ session: s.session })).runDir).writes;
+  assert.deepEqual([w.allowed.length, w.blocked.length, w.unattributed.length], [0, 0, 0]);
+});
+
+test('login: with no rules the login page can write anywhere (regression)', async () => {
+  const { sm, fake, loginId, loginPageId } = await loginSetup([]);
+  assert.deepEqual(await fake.emitRequest({ id: 'a1', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api', topUrl: APP_URL }), { action: 'continue' });
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 0 });
+});
+
+test('login: a rules file with an error refuses loginBegin and opens no page', async () => {
+  const { sm, fake, st } = setupRo();
+  st.error = 'rules.json: bad json';
+  await assert.rejects(sm.loginBegin({ url: LOGIN_START }), (e: E2kError) => e.code === 'usage' && e.message.includes('规则文件有错') && e.next === 'e2k rule list 看错误');
+  assert.equal(fake.openPages().length, 0);
+});
+
+test('login: loginBegin refreshes the rules first', async () => {
+  const { sm, st } = setupRo();
+  const before = st.refreshes;
+  const { loginId } = await sm.loginBegin({ url: LOGIN_START });
+  assert.ok(st.refreshes > before);
+  await sm.loginEnd({ loginId });
+});
+
+test('login: a strict query let through without following redirects counts as blocked when the redirect is refused', async () => {
+  const { sm, fake, logs, loginId, loginPageId } = await loginSetup();
+  assert.deepEqual(await fake.emitRequest({ id: 'q1', pageId: loginPageId, ...GRAPHQL_QUERY, url: 'http://app.example.com/graphql', topUrl: APP_URL }), { action: 'continue', followRedirects: false });
+  assert.deepEqual(await fake.emitRequest({ id: 'q2', pageId: loginPageId, ...GRAPHQL_QUERY, url: 'http://app.example.com/graphql', topUrl: APP_URL }), { action: 'continue', followRedirects: false });
+  fake.emitRequestDone('q1', 307, { redirectRefused: true });
+  fake.emitRequestDone('q2', 200);
+  assert.deepEqual(logs.filter((l) => l.includes(loginId)), [`登录 ${loginId}：拦下 POST app.example.com`]);
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
 });

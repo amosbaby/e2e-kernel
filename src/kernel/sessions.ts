@@ -61,12 +61,17 @@ interface Session {
   finished: Promise<CloseResult> | undefined;
 }
 
-// 登录页（设计 5.5）：内核开的那一页，加上它弹出的窗口。这些页的请求一律放行、不记录。
+// 登录页（设计 5.5）：内核开的那一页，加上它弹出的窗口。这些页的请求不进任何会话记录；
+// loginHosts 之外的写照只读规则拦（目标主机或请求所在页的顶层主机在 loginHosts 里的免拦）。
 interface Login {
   readonly id: string;
   readonly instance: Instance;
   readonly host: string;                     // 起始地址的主机（URL.hostname），人按回车结束时记进登录记录
+  readonly mode: Mode;                       // resolve(起始主机)：起点只读，登录里的写就都按只读
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
+  blocked: number;                           // 登录期间被拦下的写（含放行后发现重定向被拒的）
+  // 放行时带 followRedirects: false 的请求 id → 日志行，onRequestDone 发现重定向被拒时用它补记一条拦截。
+  readonly requestIds: Map<string, string>;
 }
 
 function busy(): E2kError {
@@ -239,12 +244,15 @@ export class SessionManager {
       }));
   }
 
-  // 在 default profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录过程不套写策略，也不检查模式。
+  // 在 default profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录窗口里 loginHosts 之外的写照只读规则拦。
   loginBegin(p: { url: string }): Promise<{ loginId: string }> {
     return this.track(() => this.beginLogin(p));
   }
 
   private async beginLogin(p: { url: string }): Promise<{ loginId: string }> {
+    // 规则先刷新一遍：文件有错就不开登录页（和 open 一致）。
+    this.deps.modes.refresh();
+    if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
     const instance = await this.acquireInstance();
     if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;
@@ -256,10 +264,12 @@ export class SessionManager {
     } catch {
       // 取不到主机不挡登录；登录记录写不出来时只记日志。
     }
+    // 取不到主机：resolve('') 会失败关闭成只读，登录里的写（loginHosts 之外）就都拦。
+    const mode = this.deps.modes.resolve(host);
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, host, pages: new Map([[page.id, page]]) };
+      login = { id, instance, host, mode, pages: new Map([[page.id, page]]), blocked: 0, requestIds: new Map() };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -274,7 +284,7 @@ export class SessionManager {
   }
 
   // 关掉登录页和它弹出的窗口；登录态留在 user data 目录里。
-  async loginEnd(p: { loginId: string }): Promise<Record<string, never>> {
+  async loginEnd(p: { loginId: string }): Promise<{ writesBlocked: number }> {
     if (this.stopping) throw stopping();
     const login = this.logins.get(p.loginId);
     if (login === undefined) throw new E2kError('not-found', '没有这个登录');
@@ -285,7 +295,7 @@ export class SessionManager {
     } catch (e) {
       this.logFailure(null, `写登录记录`, e);
     }
-    return {};
+    return { writesBlocked: login.blocked };
   }
 
   instanceState(): 'stopped' | 'running' {
@@ -594,7 +604,7 @@ export class SessionManager {
         login?.pages.set(pageId, null);
       }
     }
-    if (login !== undefined) return { action: 'continue' };       // 登录过程不套写策略，也不记录
+    if (login !== undefined) return this.decideForLogin(login, req);
     if (s !== undefined) return this.decideForSession(s, req);
     // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）：有任一只读会话活着就按「只读」拦写。
     // 请求所在页自己的顶层主机只读也算（模式跟着页面走），不用等有只读会话。
@@ -605,6 +615,25 @@ export class SessionManager {
       const targetMode = this.deps.modes.resolve(hostOf(req.url));
       this.unattributed.push(toWriteRecord(req, verdict, { mode: anyReadonly ? 'readonly' : 'default', targetMode }, this.deps.now()));
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
+    }
+    return verdict.decision;
+  }
+
+  // 登录页（和它弹出的窗口）的请求：不进任何记录。请求目标主机或所在页的顶层主机是 loginHost 的免拦；
+  // 其余按只读规则：登录起点主机只读，或请求所在页的顶层主机只读，都算只读。
+  private decideForLogin(login: Login, req: RequestInfo): Decision {
+    const { modes } = this.deps;
+    const topHost = hostOf(req.topUrl ?? req.url);
+    if (modes.isLoginHost(hostOf(req.url)) || modes.isLoginHost(topHost)) return { action: 'continue' };
+    const modeList = [login.mode, modes.resolve(topHost)];
+    const mode: Mode = modeList.includes('readonly') ? 'readonly' : modeList.includes('denied') ? 'denied' : 'default';
+    const verdict = this.deps.policy.decide(req, { mode });
+    const line = `登录 ${login.id}：拦下 ${req.method} ${safely(() => redactText(hostOf(req.url)))}`;
+    if (verdict.reason !== null) {
+      login.blocked++;
+      this.logLine(line);
+    } else if (verdict.decision.action === 'continue' && verdict.decision.followRedirects === false) {
+      login.requestIds.set(req.id, line);
     }
     return verdict.decision;
   }
@@ -680,6 +709,17 @@ export class SessionManager {
     for (const s of this.sessions.values()) {
       if (s.recorder.completeRequest(e.id, e.status, e.failed, e.redirectRefused)) return;
     }
+    for (const login of this.logins.values()) {
+      const line = login.requestIds.get(e.id);
+      if (line === undefined) continue;
+      login.requestIds.delete(e.id);
+      // 登录页放行的严格查询在首跳 3xx 被驱动中止：那条写没有跟过去，算被拦下的。
+      if (e.redirectRefused === true) {
+        login.blocked++;
+        this.logLine(line);
+      }
+      return;
+    }
     for (let i = this.unattributed.length - 1; i >= 0; i--) {
       const w = this.unattributed[i];
       if (w !== undefined && w.id === e.id) {
@@ -737,6 +777,15 @@ export class SessionManager {
   }
 
   // ---- 日志 ----
+
+  // 写一行内核日志；写日志本身出错也不往外抛。
+  private logLine(line: string): void {
+    try {
+      this.deps.log(line);
+    } catch {
+      // 日志写不了也不能影响请求判定。
+    }
+  }
 
   // 日志里的错误一律脱敏；写日志本身出错也不往外抛。
   private logFailure(sessionId: string | null, what: string, e: unknown): void {

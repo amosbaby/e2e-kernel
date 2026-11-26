@@ -272,8 +272,13 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   }
   ctx.io.out('请在浏览器窗口里登录，完成后回到这里按回车');
   await ctx.io.stdin.readLine();
-  await send(ctx, home, 'login.end', end);
+  const ended = await send(ctx, home, 'login.end', end);
   ctx.io.out('登录页已关闭，登录状态留在专用 profile 里');
+  // 老内核不返回 writesBlocked：当作 0。
+  const blocked = isObject(ended) && typeof ended.writesBlocked === 'number' ? ended.writesBlocked : 0;
+  if (blocked > 0) {
+    ctx.io.out(`登录过程中有 ${blocked} 条写被只读规则拦下：登录用的主机（含 SAML/OIDC 回调所在页的主机）可能没列进 rules.json 的 loginHosts`);
+  }
   return ExitCode.OK;
 }
 
