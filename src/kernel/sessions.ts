@@ -535,7 +535,7 @@ export class SessionManager {
     }
     if (login !== undefined) return { action: 'continue' };       // 登录过程不套写策略，也不记录
     if (s !== undefined) {
-      // R14：topUrl 可能是 null，退回请求自己的地址。
+      // topUrl 可能是 null（判断不出顶层页面），这时退回请求自己的地址。
       const topHost = hostOf(req.topUrl ?? req.url);
       const mode = this.deps.modes.resolve(topHost);
       const host = hostOf(req.url);

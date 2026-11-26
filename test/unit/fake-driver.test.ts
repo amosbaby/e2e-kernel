@@ -72,7 +72,7 @@ test('closePage and closeBrowser fire the right listeners', async () => {
   assert.deepEqual([pageClosed, secondClosed, browserClosed], [1, 1, 1]); assert.equal((await inst.health()).ok, false);
 });
 
-// 裁定 6.3：先置为已关闭，再依次触发每页的 onClosed、实例的 onClosed；监听器里查状态必须已经是「已关」。
+// 约定：先置为已关闭，再依次触发每页的 onClosed、实例的 onClosed；监听器里查状态必须已经是「已关」。
 test('closeBrowser sets the closed state before any listener runs', async () => {
   const { d, inst, page } = await setup({});
   const order: string[] = [];
@@ -94,7 +94,7 @@ test('a closed page rejects every method with DriverError other', async () => {
   await assert.rejects(page.goto('http://localhost/a'), (e: DriverError) => e.kind === 'other');
 });
 
-// 裁定 3.1：页面 id 和请求 id 在驱动对象的整个生命期内唯一，不按实例或按启动重置。
+// 约定：页面 id 和请求 id 在驱动对象的整个生命期内唯一，不按实例或按启动重置。
 test('page and request ids stay unique across browser restarts', async () => {
   const d = new FakeDriver();
   const pageIds: string[] = [];
@@ -132,7 +132,7 @@ test('emitRequest fills in RequestInfo and emitRequestDone reaches listeners', a
   assert.deepEqual(done, [{ id: r.id, status: 200, failed: false }]);
 });
 
-// 裁定 R1 / 6.2：{ ms } 真的睡这么久，其他条件立刻成功，都记下 (cond, timeoutMs)。
+// 约定：{ ms } 真的睡这么久，其他条件立刻成功，都记下 (cond, timeoutMs)。
 test('waitFor sleeps for ms conditions and succeeds immediately otherwise', async () => {
   const { d, page } = await setup({});
   const t0 = performance.now();
@@ -146,7 +146,7 @@ test('waitFor sleeps for ms conditions and succeeds immediately otherwise', asyn
   assert.deepEqual(d.calls.at(-1), { pageId: page.id, method: 'waitFor', args: [{ target: '#absent', state: 'visible' }, 5000] });
 });
 
-// 裁定 6.1：规格里有 stable 键就原样返回（含 null）；没有时选择器给 given，引用给 null。
+// 约定：规格里有 stable 键就原样返回（含 null）；没有时选择器给 given，引用给 null。
 test('describe: explicit stable wins, otherwise selector is given and ref is unresolved', async () => {
   const testid = { selector: '[data-testid="save"]', via: 'testid' as const };
   const { page } = await setup({ elements: {
@@ -202,7 +202,7 @@ test('launch options: delay, profile, capabilities, checks and failOpenWith', as
   await assert.rejects(inst.openPage({}), (e) => e === boom);
 });
 
-// 裁定 R11：onClosed 对任何关闭都触发，包括调用方自己 close() / stop()；每次关闭只触发一次。
+// 约定：onClosed 对任何关闭都触发，包括调用方自己 close() / stop()；每次关闭只触发一次。
 test('page.close() fires the page onClosed exactly once', async () => {
   const { d, inst, page } = await setup({});
   const second = await inst.openPage({});

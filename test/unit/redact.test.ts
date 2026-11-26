@@ -127,7 +127,7 @@ test('redactDeep: __proto__ key and non-string leaves', () => {
   assert.equal(redactDeep({ myField: 'v' }, { extraKeys: ['MYFIELD'] }).myField, '[REDACTED]');   // extraKeys 不分大小写
 });
 
-// 评审修复回归：嵌套在别的参数值里的敏感参数、深层嵌套 JSON。
+// 回归：嵌套在别的参数值里的敏感参数、深层嵌套 JSON。
 test('nested sensitive params inside another param value are replaced', () => {
   const v = 'V' + 'q7'.repeat(3);
   for (const out of [redactText(`see /login?next=/cb?token=${v}`), redactUrl(`http://localhost/login?next=/cb?access_token=${v}`),

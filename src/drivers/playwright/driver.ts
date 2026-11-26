@@ -209,7 +209,7 @@ class PlaywrightPage implements Page {
   // 状态马上置为已关，但 onClosed 的触发推迟一个宏任务：浏览器没了的时候 Playwright 先发页面的 close、
   // 紧接着（同一个宏任务里）发 context 的 close，推迟之后才分得清「只关了一页」和「浏览器没了」。
   // 后一种情形由实例的 handleClosed 先把实例置为已关，再同步冲刷各页的通知（flushClosed），所以页面监听器里
-  // health() 已经是 ok: false，和 fake 驱动一致（Ruling 6.3）。每页的通知只触发一次。
+  // health() 已经是 ok: false，和 fake 驱动一致。每页的通知只触发一次。
   markClosed(): void {
     if (this.closed) return;
     this.closed = true;
