@@ -11,7 +11,7 @@ export interface Hit { file: string; line: number; rule: 'word' | 'path' | 'host
 export interface Commit { hash: string; an: string; ae: string; cn: string; ce: string }
 
 export const ALLOWED_HOSTS: readonly string[] = [
-  'example.com', 'example.org', 'example.net', 'localhost', '127.0.0.1', '[::1]',
+  'example.com', 'example.org', 'example.net', 'localhost', '127.0.0.1', '[::1]', '[::ffff:127.0.0.1]', '[::ffff:7f00:1]',
   'playwright.dev', 'nodejs.org', 'www.typescriptlang.org',
 ];
 const ALLOWED_HOST_SUFFIXES: readonly string[] = ['.example.com', '.example.org', '.example.net', '.localhost'];

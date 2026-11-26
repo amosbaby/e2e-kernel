@@ -93,6 +93,12 @@ test('hosts: example family, loopback and doc hosts pass; others hit, lock file 
   assert.equal(scanText('package-lock.json', badUrl, [], { extraHosts: ['registry.npmjs.org'] })[0].rule, 'host');
 });
 
+test('hosts: IPv4-mapped loopback is allowed in both spellings, other mapped addresses still hit', () => {
+  assert.deepEqual(scanText('a.md', 'http://[::ffff:127.0.0.1]/ http://[::ffff:7f00:1]:9/', []), []);
+  const mapped = '[::ffff:' + ['8', '8', '8', '8'].join('.') + ']';   // 拼出来，免得本文件自己命中检查
+  assert.deepEqual(scanText('a.md', `http://${mapped}/`, []).map((h) => h.ref), [mapped]);
+});
+
 test('emails: example family and the commit trailer pass; version specs are not emails', () => {
   assert.deepEqual(scanText('a.md', 'a@example.com noreply@anthropic.com playwright@1.65.0 npm@latest', []), []);
   assert.deepEqual(scanText('a.md', badEmail, []), [{ file: 'a.md', line: 1, rule: 'email', ref: 'mail.invalid' }]);
