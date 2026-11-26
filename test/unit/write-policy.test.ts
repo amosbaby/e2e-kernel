@@ -114,3 +114,36 @@ test('allowAllPolicy allows everything and is frozen', () => {
   assert.deepEqual(allowAllPolicy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true }), { decision: { action: 'continue' }, reason: null });
   assert.ok(Object.isFrozen(allowAllPolicy));
 });
+
+test('OPTIONS with a body is not a safe read: it goes through the write checks', () => {
+  blocked(ro(req({ method: 'OPTIONS', url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'mutation{b}' }) })), 'graphql-mutation');
+  blocked(ro(req({ method: 'OPTIONS', url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'query{a}' }) })), 'method');
+  blocked(ro(req({ method: 'options', body: '' })), 'method');
+  assert.deepEqual(ro(req({ method: 'OPTIONS' })), { decision: { action: 'continue' }, reason: null });
+});
+
+test('a GET whose query parameter hides a mutation behind odd whitespace or a semicolon is blocked', () => {
+  for (const q of ['%0Bmutation%7Ba%7D', '%0Cmutation%7Ba%7D', '%C2%A0mutation%7Ba%7D']) {
+    blocked(ro(req({ url: `http://localhost/graphql?query=${q}` })), 'graphql-mutation');
+  }
+  blocked(ro(req({ url: 'http://localhost/graphql?x=1;query=mutation%7Ba%7D' })), 'graphql-mutation');
+  blocked(ro(req({ method: 'HEAD', url: 'http://localhost/graphql?x=1;query=%0Bmutation%7Ba%7D' })), 'graphql-mutation');
+  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?query=query%7Ba%7D&x=mutation' })), { decision: { action: 'continue' }, reason: null });
+});
+
+test('a strict query body is not enough when the url carries a query parameter in semicolon style', () => {
+  blocked(ro(post(j({ query: 'query{a}' }), JSON_CT, { url: 'http://localhost/graphql?x=1;query=mutation%7Bb%7D' })), 'graphql-mutation');
+  blocked(ro(post(j({ query: 'query{a}' }), JSON_CT, { url: 'http://localhost/graphql?x=1;query=query%7Ba%7D' })), 'method');
+});
+
+test('a repeated query key or an extra key in the body is blocked', () => {
+  blocked(ro(post('{"query":"mutation{b}","query":"query{a}"}')), 'method');
+  blocked(ro(post('{"query":"mutation{b}","quer\\u0079":"query{a}"}')), 'method');
+  blocked(ro(post('{"query":"query{a}","query":"query{a}"}')), 'method');
+  blocked(ro(req({ method: 'POST', url: 'http://localhost/api/saved-searches', contentType: JSON_CT, body: j({ query: '{status: open}', name: 'x' }) })), 'method');
+});
+
+test('an unattributed block answers with JSON even for a navigation', () => {
+  const v = policy.decideUnattributed(req({ method: 'POST', isNavigation: true, topFrame: true }), { anyReadonly: true });
+  assert.deepEqual(v, { decision: BLOCK_JSON, reason: 'unattributed' });
+});

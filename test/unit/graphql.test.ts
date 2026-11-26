@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { graphqlKind, isPersistedOnly, isStrictQuery } from '../../src/kernel/graphql.ts';
+import { graphqlKind, isMutationLikeUrl, isPersistedOnly, isStrictQuery } from '../../src/kernel/graphql.ts';
 
 const JSON_CT = 'application/json';
 const URL_GQL = 'http://localhost/graphql';
@@ -275,4 +275,46 @@ test('isStrictQuery: an optional url makes a query parameter count too', () => {
   assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql'), true);
   assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?query=query%7Ba%7D'), false, 'a url query parameter is ambiguous, so it fails closed');
   assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?query=mutation%7Ba%7D'), false);
+});
+
+test('isStrictQuery: a repeated query key is rejected, however it is written', () => {
+  assert.equal(isStrictQuery('POST', '{"query":"mutation{b}","query":"query{a}"}', JSON_CT), false);
+  assert.equal(isStrictQuery('POST', '{"query":"query{a}","query":"query{a}"}', JSON_CT), false);
+  assert.equal(isStrictQuery('POST', '{"query":"mutation{b}","quer\\u0079":"query{a}"}', JSON_CT), false);
+  assert.equal(isStrictQuery('POST', '{"query":"query{a}","Query":"mutation{b}"}', JSON_CT), false);
+  assert.equal(isStrictQuery('POST', '[{"query":"query{a}"},{"query":"query{b}","query":"query{c}"}]', JSON_CT), false);
+  assert.equal(isStrictQuery('POST', '{"query":"query{a}","variables":{"query":1}}', JSON_CT), true, 'a nested object is not an operation');
+  assert.equal(isStrictQuery('POST', '[{"query":"query{a}"},{"query":"query{b}"}]', JSON_CT), true, 'one key per operation is fine');
+  assert.equal(isStrictQuery('POST', '{"query":"query{a(s: \\"query\\":)}"}', JSON_CT), true, 'text inside a string is not a key');
+});
+
+test('isStrictQuery: a url-side query parameter in any separator style is rejected', () => {
+  const q = j({ query: 'query{a}' });
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?x=1;query=mutation%7Bb%7D'), false);
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?x=1;QUERY=query%7Ba%7D'), false);
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?x=1&query=query%7Ba%7D'), false);
+  assert.equal(isStrictQuery('POST', q, JSON_CT, 'http://localhost/graphql?x=1&notquery=1'), true);
+});
+
+test('isStrictQuery: an operation object may only carry the standard keys', () => {
+  assert.equal(isStrictQuery('POST', j({ query: '{a}', variables: { a: 1 }, operationName: 'X', extensions: { tracing: true } }), JSON_CT), true);
+  assert.equal(isStrictQuery('POST', j({ query: '{status: open}', name: 'x' }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ query: '{a}', extra: 1 }), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j([{ query: '{a}' }, { query: '{b}', name: 'x' }]), JSON_CT), false);
+  assert.equal(isStrictQuery('POST', j({ query: '{a}', extensions: { persistedQuery: { sha256Hash: 'x' } } }), JSON_CT), false);
+});
+
+test('isMutationLikeUrl: a mutation, or an unreadable query parameter that mentions one, in any separator style', () => {
+  const u = (q: string): string => `http://localhost/graphql${q}`;
+  assert.equal(isMutationLikeUrl(u('?query=mutation%7Ba%7D')), true);
+  assert.equal(isMutationLikeUrl(u('?query=%0Bmutation%7Ba%7D')), true, 'vertical tab');
+  assert.equal(isMutationLikeUrl(u('?query=%0Cmutation%7Ba%7D')), true, 'form feed');
+  assert.equal(isMutationLikeUrl(u('?query=%C2%A0mutation%7Ba%7D')), true, 'no-break space');
+  assert.equal(isMutationLikeUrl(u('?x=1;query=mutation%7Ba%7D')), true);
+  assert.equal(isMutationLikeUrl(u('?x=1;QUERY=%0Bmutation%7Ba%7D')), true);
+  assert.equal(isMutationLikeUrl(u('?query=query%7Ba%7D')), false);
+  assert.equal(isMutationLikeUrl(u('?query=query%7Ba%7D&note=mutation')), false);
+  assert.equal(isMutationLikeUrl(u('?q=mutation')), false);
+  assert.equal(isMutationLikeUrl(u('')), false);
+  assert.equal(isMutationLikeUrl(u('?query=%0Bmutational%7Ba%7D')), false, 'a longer word is not the keyword');
 });

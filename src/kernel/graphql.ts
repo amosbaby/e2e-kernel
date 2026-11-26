@@ -104,7 +104,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // 一个 JSON 对象（单个操作）。不是 GraphQL 形状给 null。
 // `query` 键不分大小写匹配：只有唯一一个、而且恰好是小写 `query` 的键才按普通情形处理；
 // 多于一个、或唯一的键不是小写，都对每个字符串值各扫一遍，有 mutation 就是 mutation，否则 unknown。
-// （同一个键重复出现时 JSON.parse 取最后一个，前面的读不到；README 写明了这个边界。）
+// （同一个键重复出现时 JSON.parse 取最后一个，前面的读不到：这只是报告分组的边界，README 写明了；拦截不靠它，isStrictQuery 看到重复的 query 键就不放行。）
 function ofOperation(o: Record<string, unknown>): GraphqlKind | null {
   const keys = Object.keys(o).filter((k) => k.toLowerCase() === 'query');
   if (keys.length === 1 && keys[0] === 'query') return typeof o.query === 'string' ? scanDocument(o.query) : 'unknown';
@@ -198,12 +198,56 @@ export function isPersistedOnly(body: string | null): boolean {
   return items.some((o) => isRecord(o) && isRecord(o.extensions) && Object.hasOwn(o.extensions, 'persistedQuery') && typeof o.query !== 'string');
 }
 
-// 注释只从 `#` 删到行尾，不分字符串里外：多删只会让「含 `{`」更难成立，只会更严，不会更松。
+// 注释只从 `#` 删到行尾，不分字符串里外。这个检查只是挡掉 `query builder` 这类明显当不了操作的文本，不是文法校验：
+// 字符串里藏着 `{` 的非法文档也能通过它（合规的服务端会拒绝这种文档，真正的把关是 graphqlKind 判成 query）。
 function hasSelectionSet(doc: string): boolean {
   return doc.replace(/#[^\r\n]*/g, '').includes('{');
 }
 
-// 每个操作的文档：application/graphql 且体不是 JSON 时是整个体；JSON 时是每个操作的 query 字符串（有一个不是字符串就读不出来，返回 null）。
+const OPERATION_KEYS = new Set(['query', 'variables', 'operationName', 'extensions']);
+
+// 操作对象里的键只能是标准那四个，extensions 里不能有 persistedQuery；多余的键可能让服务端把它当成别的接口的写请求。
+function isPlainOperation(o: Record<string, unknown>): boolean {
+  if (!Object.keys(o).every((k) => OPERATION_KEYS.has(k))) return false;
+  return !(isRecord(o.extensions) && Object.hasOwn(o.extensions, 'persistedQuery'));
+}
+
+// 同一个对象里有没有两个（不分大小写）等于 `query` 的键。JSON.parse 对重复键取最后一个，取第一个的服务端会执行另一份文档，
+// 所以要看原文。body 已经是合法 JSON：逐字符走，字符串读到结尾（认转义），后面紧跟 `:` 的字符串就是键。
+// 跨对象的数量不合并，但出错只会多拦，不会少拦。
+function hasRepeatedQueryKey(body: string): boolean {
+  const counts: (number | null)[] = [];   // 每层一个：对象是 query 键的个数，数组是 null
+  const n = body.length;
+  let i = 0;
+  while (i < n) {
+    const c = body[i]!;
+    if (c === '{') counts.push(0);
+    else if (c === '[') counts.push(null);
+    else if (c === '}' || c === ']') counts.pop();
+    else if (c === '"') {
+      let j = i + 1;
+      while (j < n && body[j] !== '"') j += body[j] === '\\' ? 2 : 1;
+      let k = j + 1;
+      while (k < n && /\s/.test(body[k]!)) k++;
+      const top = counts.length - 1;
+      if (body[k] === ':' && top >= 0 && counts[top] !== null) {
+        let key: unknown;
+        try {
+          key = JSON.parse(body.slice(i, j + 1));
+        } catch {
+          return true;   // 读不了就当重复
+        }
+        if (typeof key === 'string' && key.toLowerCase() === 'query' && (counts[top] = (counts[top] as number) + 1) > 1) return true;
+      }
+      i = j;
+    }
+    i++;
+  }
+  return false;
+}
+
+// 每个操作的文档：application/graphql 且体不是 JSON 时是整个体；JSON 时是每个操作的 query 字符串
+// （有一个不是字符串、键不标准、或有重复的 query 键，就返回 null）。
 function documentsOf(body: string, isDoc: boolean): string[] | null {
   let value: unknown;
   try {
@@ -211,24 +255,59 @@ function documentsOf(body: string, isDoc: boolean): string[] | null {
   } catch {
     return isDoc ? [body] : null;
   }
+  if (hasRepeatedQueryKey(body)) return null;
   const items = Array.isArray(value) ? value : [value];
   if (items.length === 0) return null;
   const docs: string[] = [];
   for (const o of items) {
-    if (!isRecord(o) || typeof o.query !== 'string') return null;
+    if (!isRecord(o) || typeof o.query !== 'string' || !isPlainOperation(o)) return null;
     docs.push(o.query);
   }
   return docs;
 }
 
+const URL_QUERY_PARAM = /[?&;]query=/i;
+
 // 只读模式里唯一放行的写：方法 POST，Content-Type 的 MIME 是 application/json 或 application/graphql，
 // graphqlKind 判成 'query'（批量、subscription、unknown 都不行），并且每个操作的文档去掉注释后含 `{`
-// （挡住 `query builder` 这种当不了操作的文本）。url 可选：给了就连 URL 的 query 参数一起判（有这个参数就不放行，失败关闭）。
+// （挡住 `query builder` 这种当不了操作的文本），JSON 的键和重复键也要合规（见 documentsOf）。
+// url 可选：给了就连 URL 一起看，URL 里有 query 参数（`;` 分隔的写法也算）就不放行，失败关闭。
 export function isStrictQuery(method: string, body: string | null, contentType: string | null, url = ''): boolean {
   if (method.toUpperCase() !== 'POST' || body === null) return false;
   const mime = (contentType ?? '').split(';')[0]!.trim().toLowerCase();
   if (mime !== 'application/json' && mime !== 'application/graphql') return false;
+  if (URL_QUERY_PARAM.test(url)) return false;
   if (graphqlKind(body, contentType, url) !== 'query') return false;
   const docs = documentsOf(body, mime === 'application/graphql');
   return docs !== null && docs.every(hasSelectionSet);
+}
+
+function decodeParam(v: string): string {
+  const s = v.replace(/\+/g, ' ');
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+// 一个 query 参数值看起来是不是 mutation：扫描器判成 mutation，或判不出（unknown）但出现了 mutation 这个词。
+// 扫描器遇到 VT、FF、NBSP 这类不是 GraphQL 空白的字符会判 unknown，词检查把这种藏法也算上。
+function looksLikeMutation(value: string): boolean {
+  const kind = scanDocument(value);
+  return kind === 'mutation' || (kind === 'unknown' && /\bmutation\b/i.test(value));
+}
+
+// GET/HEAD 的 URL 里有没有看起来像 mutation 的 query 参数。除了 URLSearchParams 读到的，
+// 还按 `?` `&` `;` 三种分隔符各读一遍（有的服务端把 `;` 当参数分隔符，URLSearchParams 不当）。多拦只会更严。
+export function isMutationLikeUrl(url: string): boolean {
+  if (graphqlKind(null, null, url) === 'mutation') return true;
+  try {
+    for (const [k, v] of new URL(url).searchParams) if (k.toLowerCase() === 'query' && looksLikeMutation(v)) return true;
+  } catch {
+    // 读不了 URL：下面按原文再找一遍
+  }
+  const re = /[?&;]query=([^&;#]*)/gi;
+  for (let m = re.exec(url); m !== null; m = re.exec(url)) if (looksLikeMutation(decodeParam(m[1]!))) return true;
+  return false;
 }

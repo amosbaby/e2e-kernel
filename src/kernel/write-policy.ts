@@ -1,6 +1,6 @@
 import type { Decision, RequestInfo } from '../driver/types.ts';
 import type { Mode } from '../shared/protocol.ts';
-import { graphqlKind, isPersistedOnly, isStrictQuery } from './graphql.ts';
+import { graphqlKind, isMutationLikeUrl, isPersistedOnly, isStrictQuery } from './graphql.ts';
 
 // 写策略（设计 5.3）。只读模式里只放行读（GET/HEAD/OPTIONS）和严格的 GraphQL query，其余一律拦；拿不准的也拦（失败关闭）。
 // reason 只给报告分组用，放行时是 null。
@@ -28,11 +28,12 @@ function block(req: RequestInfo, reason: BlockReason): PolicyVerdict {
 }
 
 function decideReadonly(req: RequestInfo): PolicyVerdict {
-  if (isSafeMethod(req.method)) {
-    return graphqlKind(null, null, req.url) === 'mutation' ? block(req, 'graphql-mutation') : PASS;
+  // OPTIONS 带体不算读：和其他方法一样走下面的写检查（带体的 OPTIONS 永远过不了 isStrictQuery，最后落到 method）。
+  if (isSafeMethod(req.method) && !(req.method.toUpperCase() === 'OPTIONS' && req.body !== null)) {
+    return isMutationLikeUrl(req.url) ? block(req, 'graphql-mutation') : PASS;
   }
   if (isPersistedOnly(req.body)) return block(req, 'persisted-query');
-  if (graphqlKind(req.body, req.contentType, req.url) === 'mutation') return block(req, 'graphql-mutation');
+  if (graphqlKind(req.body, req.contentType, req.url) === 'mutation' || isMutationLikeUrl(req.url)) return block(req, 'graphql-mutation');
   if (isStrictQuery(req.method, req.body, req.contentType, req.url)) return PASS_NO_REDIRECT;
   return block(req, 'method');
 }
