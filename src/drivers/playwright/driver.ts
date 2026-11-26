@@ -384,6 +384,7 @@ class PlaywrightInstance implements Instance, Host {
   private readonly open = new Set<PlaywrightPage>();
   private readonly closing = new Set<PlaywrightPage>();   // 已关、onClosed 还没触发的页
   private readonly requestIds = new WeakMap<PwRequest, string>();
+  private readonly requestsDone = new WeakSet<PwRequest>();
   private readonly reportListenerError: (e: unknown) => void;
   private readonly closedListeners: (() => void)[] = [];
   private readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean }) => void)[] = [];
@@ -413,8 +414,11 @@ class PlaywrightInstance implements Instance, Host {
       if (this.opening > 0) this.deferred.add(p);
       else this.register(p, false);
     });
-    this.context.on('requestfinished', (r) => { void this.requestDone(r, false); });
-    this.context.on('requestfailed', (r) => { void this.requestDone(r, true); });
+    // 响应头一到就算这个请求有了结果：只发出去不读响应体的请求（信标式的 fetch）不会触发 requestfinished，
+    // 页面一跳转还会被报成 requestfailed。所以以 response 事件为准，requestfinished 和 requestfailed 只补没有响应的情形。
+    this.context.on('response', (r) => { this.requestDone(r.request(), r.status(), false); });
+    this.context.on('requestfinished', (r) => { void this.requestFinished(r); });
+    this.context.on('requestfailed', (r) => { this.requestDone(r, null, true); });
     await this.context.route('**/*', (route) => this.handleRoute(route));
   }
 
@@ -603,16 +607,22 @@ class PlaywrightInstance implements Instance, Host {
     } catch { /* 页面或浏览器在回答之前就没了，没有什么可答的了 */ }
   }
 
-  private async requestDone(request: PwRequest, failed: boolean): Promise<void> {
+  // 每个请求只通知一次：先到的事件为准，之后的 requestfinished / requestfailed 一律忽略。
+  private requestDone(request: PwRequest, status: number | null, failed: boolean): void {
     const id = this.requestIds.get(request);
-    if (id === undefined) return;
-    let status: number | null = null;
-    if (!failed) {
-      try {
-        status = (await request.response())?.status() ?? null;
-      } catch { /* 页面没了，拿不到响应 */ }
-    }
+    if (id === undefined || this.requestsDone.has(request)) return;
+    this.requestsDone.add(request);
     emit(this.reportListenerError, this.requestDoneListeners, { id, status, failed });
+  }
+
+  // 正常情况下 response 事件已经通知过了；没收到响应事件就读响应，读不到（页面没了）状态为 null。
+  private async requestFinished(request: PwRequest): Promise<void> {
+    if (this.requestsDone.has(request)) return;
+    let status: number | null = null;
+    try {
+      status = (await request.response())?.status() ?? null;
+    } catch { /* 页面没了，拿不到响应 */ }
+    this.requestDone(request, status, false);
   }
 }
 

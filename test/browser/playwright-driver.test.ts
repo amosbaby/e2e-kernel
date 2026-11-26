@@ -168,6 +168,29 @@ test('an abort decision stops the request, and the finished request is reported'
   assert.deepEqual(done.filter(e => e.id === get.id), [{ id: get.id, status: 200, failed: false }]);
 });
 
+test('a fire-and-forget POST with an unread body is reported with its status, also after the page navigates away', { timeout: 60_000 }, async () => {
+  const done: { id: string; status: number | null; failed: boolean }[] = [];
+  inst.onRequestDone(e => { done.push(e); });
+  await page.click('[data-testid="add"]'); await settle();   // 首页的 fetch 不读响应体
+  const post = seen.find(r => r.method === 'POST' && r.url.endsWith('/api/items'))!;
+  assert.deepEqual(done.filter(e => e.id === post.id), [{ id: post.id, status: 200, failed: false }]);
+  await page.goto(server.origin + '/index.html'); await settle();
+  assert.deepEqual(done.filter(e => e.id === post.id), [{ id: post.id, status: 200, failed: false }]);
+});
+
+test('every request is reported exactly once', { timeout: 60_000 }, async () => {
+  const done: { id: string; status: number | null; failed: boolean }[] = [];
+  inst.onRequestDone(e => { done.push(e); });
+  const first = seen.length;   // 监听器是现在才挂上的，之前已经完成的请求不算
+  await page.evaluate(`fetch('/api/items?read=1', { method: 'POST', body: '{}' }).then(r => r.text())`);
+  await page.evaluate(`fetch('/api/items?unread=1', { method: 'POST', body: '{}' })`);
+  await settle();
+  await page.goto(server.origin + '/login.html'); await settle();
+  const mine = seen.slice(first);
+  assert.ok(mine.length >= 3);
+  for (const r of mine) assert.equal(done.filter(e => e.id === r.id).length, 1, `${r.method} ${r.url} reported ${done.filter(e => e.id === r.id).length} times`);
+});
+
 test('writes issued by an evaluated script go through the handler too', { timeout: 60_000 }, async () => {
   await page.evaluate(`fetch('/api/items?from=eval', { method: 'POST', body: '{}' })`); await settle();
   assert.ok(seen.some(r => r.method === 'POST' && r.url.includes('from=eval') && r.pageId === page.id));
