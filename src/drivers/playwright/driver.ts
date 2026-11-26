@@ -41,6 +41,10 @@ function mapError(e: unknown): DriverError {
   return new DriverError(e.name === 'TimeoutError' ? 'timeout' : 'other', firstLine(e.message));
 }
 
+function httpUrlOrNull(url: string): string | null {
+  return /^https?:/i.test(url) ? url : null;
+}
+
 function notYet(what: string): never {
   throw new DriverError('other', `${what} is not implemented yet`);
 }
@@ -339,7 +343,11 @@ class PlaywrightInstance implements Instance, Host {
   }
 
   // 请求 → RequestInfo。归属判断不出来（request.frame() 抛错）时 pageId、openerPageId、topUrl 都是 null。
-  // topUrl 是请求发出时那一页顶层文档的地址，所以顶层导航请求带的是导航之前的地址。
+  // topUrl（内核拿它的主机去定模式，空就退回请求自己的地址）：
+  // - 顶层框架的导航请求：就是请求自己的地址，即正要打开的那份文档；
+  // - 其他请求：请求发出时那一页顶层文档的地址，但只认 http: 和 https:，
+  //   about:blank、data:、chrome-error: 之类一律 null，让内核退回请求的地址；
+  // - request.frame() 抛错：null。
   private async describeRequest(request: PwRequest): Promise<RequestInfo> {
     const isNavigation = request.isNavigationRequest();
     let pageId: string | null = null;
@@ -350,7 +358,7 @@ class PlaywrightInstance implements Instance, Host {
       const frame: Frame = request.frame();
       const pwPage = frame.page();
       topFrame = frame.parentFrame() === null;
-      topUrl = pwPage.mainFrame().url();
+      topUrl = isNavigation && topFrame ? request.url() : httpUrlOrNull(pwPage.mainFrame().url());
       const w = this.register(pwPage, false);
       if (w !== null) {
         await w.ready;   // 请求到来时就查得到开启者：别处开出来的页，先等它登记完

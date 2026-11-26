@@ -181,6 +181,34 @@ test('writes from a cross-process iframe reach the handler with the right page i
   assert.ok(post.url.startsWith(server.altOrigin), post.url);
 });
 
+test('topUrl is the document being navigated to, else the page http url, else null', { timeout: 60_000 }, async () => {
+  const fresh = await inst.openPage({});
+  try {
+    seen = [];
+    const target = server.origin + '/index.html';
+    await fresh.goto(target);
+    const nav = seen.find(r => r.isNavigation && r.url === target)!;
+    assert.ok(nav.topFrame);
+    assert.equal(nav.topUrl, target);
+    await fresh.evaluate(`fetch('/api/items?top=1', { method: 'POST', body: '{}' })`); await settle();
+    const post = seen.find(r => r.url.includes('top=1'))!;
+    assert.equal(post.topUrl, target);
+    // 页面在 about:blank 上发的请求：顶层地址不是 http，所以是 null。
+    const blank = await inst.openPage({});
+    try {
+      seen = [];
+      await blank.evaluate(`fetch('${server.origin}/api/items?blank=1', { method: 'POST', body: '{}', mode: 'no-cors' })`); await settle();
+      const fromBlank = seen.find(r => r.url.includes('blank=1'))!;
+      assert.ok(fromBlank, 'the request from about:blank was not seen');
+      assert.equal(fromBlank.topUrl, null);
+    } finally {
+      await blank.close().catch(() => {});
+    }
+  } finally {
+    await fresh.close().catch(() => {});
+  }
+});
+
 test('popup requests carry their opener; a popup closing itself fires Page.onClosed', { timeout: 60_000 }, async () => {
   await page.goto(server.origin + '/popup.html');
   await page.click('#open-popup');
