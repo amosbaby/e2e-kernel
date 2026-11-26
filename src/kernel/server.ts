@@ -68,6 +68,23 @@ class KernelLog {
   }
 }
 
+// 给驱动的 onListenerError（CLI 建驱动时传入）：每个监听器错误往 kernel.log 追加一行，先脱敏再并成一行；
+// 脱敏出错写固定标记。本身绝不抛错：抛出去会被驱动当成未捕获异常。
+export function listenerErrorLogger(home: Home): (e: unknown) => void {
+  return (e) => {
+    try {
+      const log = new KernelLog(resolveInside(home.root, relative(home.root, home.logFile)));
+      try {
+        log.write(`驱动监听器出错：${safely(() => redactText(String(e instanceof Error ? e.message : e)).replace(/[\r\n]+/g, ' '))}`);
+      } finally {
+        log.close();
+      }
+    } catch {
+      // 日志打不开也不能带垮内核。
+    }
+  };
+}
+
 // ---- 单实例 ----
 
 function exists(path: string): boolean {

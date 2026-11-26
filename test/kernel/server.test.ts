@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { Driver, Instance, Page } from '../../src/driver/types.ts';
-import { startKernel } from '../../src/kernel/server.ts';
+import { listenerErrorLogger, startKernel } from '../../src/kernel/server.ts';
 import type { KernelHandle, KernelOptions, StatusResult } from '../../src/kernel/server.ts';
 import { call } from '../../src/shared/client.ts';
 import { E2kError } from '../../src/shared/errors.ts';
@@ -298,4 +298,13 @@ test('stop() has its own deadline: a drain that never settles still stops the br
   assert.ok(!existsSync(slow.socket)); assert.ok(!existsSync(slow.pidFile));
   assert.match(readFileSync(slow.logFile, 'utf8'), /关停超过 300 毫秒/);
   assert.equal(((await pending) as E2kError).code, 'internal');                  // 没等到回话的连接被断开
+});
+
+test('listenerErrorLogger writes one redacted line to a 0600 kernel.log', () => {
+  const quiet = tmpHome();
+  listenerErrorLogger(quiet)(new Error(`listener failed at http://localhost:5173/x?token=abc123\nnext line ${jwt}`));
+  const log = readFileSync(quiet.logFile, 'utf8');
+  assert.equal(log.split('\n').filter((l) => l !== '').length, 1);
+  assert.ok(log.includes('listener failed')); assert.ok(!log.includes(jwt)); assert.ok(!log.includes('abc123'));
+  assert.equal(statSync(quiet.logFile).mode & 0o777, 0o600);
 });
