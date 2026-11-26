@@ -29,7 +29,7 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
     'results', 'tallies', 'exit', 'index', 'op', 'outcome', 'output', 'actual', 'expected', 'consistency', 'sessions', 'idleSec', 'version', 'pid',
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
     'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm',
-    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash'];
+    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
 

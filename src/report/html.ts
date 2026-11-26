@@ -73,6 +73,7 @@ function detailCell(a: ActionRecord): string {
   if (a.outputOmitted === true) parts.push('返回值未记录（页面有密码框，或判断不出）');
   if (a.jsHash !== undefined) parts.push(`源码哈希 <code>${own(a.jsHash)}</code>`);
   if (a.error !== undefined) parts.push(`错误 ${page(a.error)}`);
+  if (Array.isArray(a.hints) && a.hints.length > 0) parts.push(`诊断<br>${a.hints.map((h) => page(h)).join('<br>')}`);
   return parts.join('<br>');
 }
 

@@ -22,6 +22,24 @@ const EVAL_URL = 'http://localhost/eval';
 const EVAL_PW_URL = 'http://localhost/eval-pw';
 const EVAL_UNKNOWN_URL = 'http://localhost/eval-unknown';
 const PW_VALUE = 'typed-' + 'secret-value-4821';
+const HINTS_URL = 'http://localhost/hints';
+const HINTS_PW_URL = 'http://localhost/hints-pw';
+const HINTS_UNKNOWN_URL = 'http://localhost/hints-unknown';
+const FILL_VALUE = 'typed-' + 'value-7391';
+const HEX_CHARS = '0123456789abcdef';
+
+// 运行时拼出的 64 位十六进制串：仓库里没有字面量。
+function hex64(): string {
+  let s = '';
+  for (let i = 0; i < 64; i++) s += HEX_CHARS[Math.floor(Math.random() * 16)];
+  return s;
+}
+
+// 长度 ≥ 8 的片段里，有没有原值的子串。
+function leaksFragment(text: string, secret: string, min = 8): boolean {
+  for (let i = 0; i + min <= secret.length; i++) if (text.includes(secret.slice(i, i + min))) return true;
+  return false;
+}
 
 function pageSpec(): FakePageSpec {
   return {
@@ -59,6 +77,17 @@ function withPage(base: Page, over: Partial<Page>): Page {
   return Object.assign(Object.create(base) as Page, over);
 }
 
+// 失败时带诊断的元素：#amb 点击失败，#in 是普通输入框（wait、describe、fill 各有一个会失败的版本）。
+function hintsSpec(extra: FakePageSpec): FakePageSpec {
+  const hints = [`3 matches`, `1) 可写 #amb >> nth=0 · button @(1,2 3x4) "Save"`, `token ${jwt}`, `value ${FILL_VALUE} here`];
+  return { ...extra, elements: {
+    '#amb': { failWith: 'other', hints },
+    '#in-fill': { kind: 'text-input', failWith: 'other', hints },
+    '#in-describe': { kind: 'text-input', describeFails: 1, hints },
+    '#in-wait': { kind: 'text-input', waitFails: true, hints },
+  } };
+}
+
 let fake: FakeDriver;
 let page: Page;
 let evalPage: Page;
@@ -69,7 +98,9 @@ let ctx: ExecCtx;
 beforeEach(async () => {
   fake = new FakeDriver({ pages: { [PAGE_URL]: pageSpec(), [EVAL_URL]: { evalResult: { id: jwt, n: 1 } },
     [EVAL_PW_URL]: { evalResult: PW_VALUE, passwordField: true },
-    [EVAL_UNKNOWN_URL]: { evalResult: PW_VALUE, passwordFieldFailWith: 'timeout' } } });
+    [EVAL_UNKNOWN_URL]: { evalResult: PW_VALUE, passwordFieldFailWith: 'timeout' },
+    [HINTS_URL]: hintsSpec({}), [HINTS_PW_URL]: hintsSpec({ passwordField: true }),
+    [HINTS_UNKNOWN_URL]: hintsSpec({ passwordFieldFailWith: 'timeout' }) } });
   inst = await fake.launch({ name: 'default', userDataDir: '/tmp/e2k-fake-profile' });
   page = await inst.openPage({});
   await page.goto(PAGE_URL);
@@ -487,4 +518,95 @@ test('isWrite, toWriteRecord and hosts', () => {
     body: null, bodyOmitted: false, pageUrl: 'http://localhost/', decision: 'blocked', targetMode: 'readonly' });
   recorder.addHost('localhost', 'default'); recorder.addHost('localhost', 'default'); recorder.addHost('127.0.0.1', 'readonly');
   assert.deepEqual(recorder.hosts, [{ host: 'localhost', mode: 'default' }, { host: '127.0.0.1', mode: 'readonly' }]);
+});
+
+// ---- P8：失败时的诊断（hints） ----
+
+async function hintsPage(url: string): Promise<Page> {
+  const p = await inst.openPage({});
+  await p.goto(url);
+  return p;
+}
+
+test('hints from a failed click are redacted, capped, and reach both the result and the record', async () => {
+  const p = await hintsPage(HINTS_URL);
+  const [r] = await runOps(p, [{ op: 'click', target: '#amb' }], ctx);
+  assert.equal(r.outcome, 'failed');
+  assert.equal(r.hints!.length, 4);
+  assert.equal(r.hints![0], '3 matches'); assert.ok(r.hints![1]!.includes('>> nth=0'));
+  assert.ok(!JSON.stringify(r.hints).includes(jwt));
+  assert.deepEqual(recorder.actions[0]!.hints, r.hints);
+  // 没有诊断的失败不带 hints 键
+  const [g] = await runOps(page, [{ op: 'click', target: '#gone' }], ctx);
+  assert.equal('hints' in g!, false); assert.equal('hints' in recorder.actions[1]!, false);
+});
+
+test('hints are redacted before they are cut: a token that straddles the 200 or 300 mark does not survive in pieces', async () => {
+  // 64 位十六进制串从第 180 个和第 290 个字符起：先截到 200 或 300 再脱敏，都会留下 20 位或 10 位的半截，HEX 规则（32 位起）认不出来
+  for (const pad of [170, 280]) {
+    const secret = hex64();
+    const p = await withHints(`${'p'.repeat(pad)} data-x="${secret}" tail`);
+    const [r] = await runOps(p, [{ op: 'click', target: '#amb' }], ctx);
+    const text = r.hints!.join('\n');
+    assert.ok(!leaksFragment(text, secret), `${pad}: ${text}`);
+    assert.ok(!leaksFragment(JSON.stringify(recorder.actions), secret));
+    assert.ok(r.hints![0]!.includes('[REDACTED]'));
+  }
+  // 一个很长的条目：脱敏之后截到 300
+  const long = await withHints(`${'w '.repeat(500)}${jwt}`);
+  const [r2] = await runOps(long, [{ op: 'click', target: '#amb' }], ctx);
+  assert.ok(r2!.hints![0]!.length <= 300 + 30, String(r2!.hints![0]!.length)); assert.ok(r2!.hints![0]!.includes('[truncated'));
+});
+
+// 一页上只有 #amb，它的第一条 hint 由测试指定。
+async function withHints(first: string): Promise<Page> {
+  const url = `http://localhost/hints-${Math.random().toString(16).slice(2)}`;
+  const f = new FakeDriver({ pages: { [url]: { elements: { '#amb': { failWith: 'other', hints: [first] } } } } });
+  const i = await f.launch({ name: 'default', userDataDir: '/tmp/e2k-fake-profile' });
+  const p = await i.openPage({});
+  await p.goto(url);
+  return p;
+}
+
+test('at most 6 hints are kept', async () => {
+  const url = 'http://localhost/many';
+  const f = new FakeDriver({ pages: { [url]: { elements: { '#amb': { failWith: 'other', hints: Array.from({ length: 10 }, (_, i) => `h${i}`) } } } } });
+  const p = await (await f.launch({ name: 'default', userDataDir: '/tmp/e2k-fake-profile' })).openPage({});
+  await p.goto(url);
+  const [r] = await runOps(p, [{ op: 'click', target: '#amb' }], ctx);
+  assert.deepEqual(r!.hints, ['h0', 'h1', 'h2', 'h3', 'h4', 'h5']);
+});
+
+test('every fill failure path carries hints, and the typed value is replaced first', async () => {
+  const p = await hintsPage(HINTS_URL);
+  for (const target of ['#in-wait', '#in-describe', '#in-fill']) {
+    ctx.recorder.actions.length = 0;
+    const [r] = await runOps(p, [{ op: 'fill', target, value: FILL_VALUE }], ctx);
+    assert.equal(r!.outcome, 'failed', target);
+    assert.ok(r!.hints !== undefined && r!.hints.length === 4, target);
+    assert.equal(r!.hints![0], '3 matches'); assert.ok(r!.hints![1]!.includes('>> nth=0'));
+    assert.ok(r!.hints![3]!.includes('[REDACTED]'), r!.hints![3]);
+    for (const text of [JSON.stringify(r), JSON.stringify(recorder.actions)]) {
+      assert.ok(!text.includes(FILL_VALUE), target); assert.ok(!text.includes(jwt), target);
+    }
+  }
+});
+
+test('the typed value is replaced even when it is too short for the generic redaction to know it', async () => {
+  const p = await hintsPage(HINTS_URL);
+  const [r] = await runOps(p, [{ op: 'fill', target: '#in-fill', value: 'v' }], ctx);
+  assert.ok(r!.hints!.every(h => !h.includes('v')), JSON.stringify(r!.hints));
+  assert.ok(r!.hints![1]!.includes('Sa[REDACTED]e'));
+});
+
+test('on a page with a password field, or when that cannot be told, the record keeps a fixed note instead of the hints; the response still has them', async () => {
+  for (const url of [HINTS_PW_URL, HINTS_UNKNOWN_URL]) {
+    ctx.recorder.actions.length = 0;
+    const p = await hintsPage(url);
+    const [r] = await runOps(p, [{ op: 'click', target: '#amb' }], ctx);
+    assert.equal(r!.hints![0], '3 matches', url);
+    const rec = recorder.actions[0]!;
+    assert.equal(rec.hints!.length, 1, url); assert.match(rec.hints![0]!, /^\[诊断未记录/);
+    assert.ok(!JSON.stringify(recorder.actions).includes('matches'), url);
+  }
 });

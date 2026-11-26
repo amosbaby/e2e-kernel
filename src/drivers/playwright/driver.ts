@@ -27,6 +27,14 @@ const CAPABILITIES: Capabilities = {
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_MESSAGE_CHARS = 300;
+// 失败诊断（DriverError.hints）：驱动只做保护性的截断，不脱敏也不截短（内核先脱敏、再截到 300），
+// 免得一个长条目的截断点正好落在 token 中间。最多 6 条：第一条是总数或遮挡说明，其余是前 5 个候选。
+const MAX_HINTS = 6;
+const MAX_HINT_CHARS = 4000;
+const MAX_CANDIDATES = 5;
+const DIAGNOSE_TIMEOUT_MS = 2000;
+const STRICT_VIOLATION = 'strict mode violation';
+const INTERCEPTS = 'intercepts pointer events';
 
 // 页面 id 和请求 id 的计数挂在驱动对象上：整个生命期内唯一，不随实例或 launch 重置。
 // id 都由这里生成，从不取自页面内容。
@@ -41,6 +49,75 @@ function mapError(e: unknown): DriverError {
   if (e instanceof DriverError) return e;
   if (!(e instanceof Error)) return new DriverError('other', 'unknown error');
   return new DriverError(e.name === 'TimeoutError' ? 'timeout' : 'other', firstLine(e.message));
+}
+
+// 一个候选元素的描述：标签、角色、名字（不截短）、位置和大小。
+// 作为函数交给 locator.evaluateAll 序列化，所以必须自成一体：不引用这个文件里的任何东西。不取元素的值。
+export function describeCandidates(els: Element[], max: number): { tag: string; role: string; name: string; x: number; y: number; w: number; h: number }[] {
+  const norm = (v: string): string => v.replace(/\s+/g, ' ').trim();
+  return els.slice(0, max).map((el) => {
+    const tag = el.localName;
+    const type = el instanceof HTMLInputElement ? el.type : '';
+    let role = (el.getAttribute('role') ?? '').trim().split(/\s+/)[0] ?? '';
+    if (role === '') {
+      if (tag === 'button') role = 'button';
+      else if (tag === 'a' && el.hasAttribute('href')) role = 'link';
+      else if (tag === 'input') role = type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio' : 'textbox';
+      else if (tag === 'textarea') role = 'textbox';
+      else if (tag === 'select') role = 'combobox';
+      else if (/^h[1-6]$/.test(tag)) role = 'heading';
+    }
+    // 名字在页内先截到 4000：整页的 innerText 不经 CDP 传回来。
+    const cap = (v: string): string => norm(v.slice(0, 4000));
+    let name = cap(el.getAttribute('aria-label') ?? '');
+    if (name === '') {
+      const labels = 'labels' in el ? Array.from((el as HTMLInputElement).labels ?? []) : [];
+      name = cap(labels.map((l) => l.textContent ?? '').join(' '));
+    }
+    if (name === '' && (role === 'button' || role === 'link' || role === 'heading')) name = cap((el as HTMLElement).innerText ?? '');
+    const r = el.getBoundingClientRect();
+    return { tag, role, name, x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+  });
+}
+
+// Playwright 的元素预览（previewNode）会在两处截断并补一个 `…`：属性文字超过 500 字符（最后一个属性只剩半截）、
+// 文字内容超过 50 字符（文字只剩半截）。截断点上的半截 token 脱敏认不出来，而页面还能在值里伪造 `…` 和 `>`，
+// 所以不去解析哪里是真的截断点：对行里每一个 `…`，删掉紧挨在它前面、连续的「非空白且不是 " ' = >」的字符。
+// 单遍线性扫描，不用正则。文字里本来就有 `…` 时会多删一点，可以接受。
+export function dropTruncatedRuns(line: string): string {
+  const out: string[] = [];
+  for (const ch of line) {
+    if (ch === '…') {
+      while (out.length > 0) {
+        const last = out[out.length - 1]!;
+        if (last.trim() === '' || last === '"' || last === "'" || last === '=' || last === '>') break;
+        out.pop();
+      }
+    }
+    out.push(ch);
+  }
+  return out.join('');
+}
+
+// Playwright 的调用记录里最后一条「谁挡住了点击」。记录在 error.message 里（第一行之后），行文是 `… intercepts pointer events`。
+export function interceptHint(message: string): string | null {
+  const lines = message.split('\n').filter((l) => l.includes(INTERCEPTS));
+  const last = lines[lines.length - 1];
+  if (last === undefined) return null;
+  return `被遮挡：${dropTruncatedRuns(last.trim().replace(/^-\s*/, ''))}`.slice(0, MAX_HINT_CHARS);
+}
+
+// 诊断永远不抛：失败、超时都当没有诊断（原错误照给）。
+export async function guardedHints(collect: () => Promise<string[]>, timeoutMs: number): Promise<string[]> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const work = collect().catch((): string[] => []);
+    return await Promise.race([work, new Promise<string[]>((resolve) => { timer = setTimeout(() => resolve([]), timeoutMs); })]);
+  } catch {
+    return [];
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function httpUrlOrNull(url: string): string | null {
@@ -292,13 +369,38 @@ class PlaywrightPage implements Page {
     emit((e) => this.host.reportError(e), this.closedListeners);
   }
 
-  private async run<T>(fn: () => Promise<T>): Promise<T> {
+  // diagnose 给了目标时，动作失败会尽力带上诊断（hints）：选择器匹配了好几个、或点击被别的元素挡住。
+  // 诊断本身出任何错（包括卡住）都不能盖掉原来的错误：那时只给原错误。
+  private async run<T>(fn: () => Promise<T>, diagnose?: Target): Promise<T> {
     if (this.closed) throw new DriverError('other', 'page is closed');
     try {
       return await fn();
     } catch (e) {
-      throw mapError(e);
+      const err = mapError(e);
+      if (diagnose === undefined || e instanceof DriverError || !(e instanceof Error)) throw err;
+      throw new DriverError(err.kind, err.message, await this.diagnose(diagnose, e.message));
     }
+  }
+
+  private diagnose(target: Target, message: string): Promise<string[]> {
+    return guardedHints(() => this.collectHints(target, message), DIAGNOSE_TIMEOUT_MS);
+  }
+
+  private async collectHints(target: Target, message: string): Promise<string[]> {
+    const hints: string[] = [];
+    if ((message.split('\n')[0] ?? '').includes(STRICT_VIOLATION)) {
+      const loc = locate(this.page, target);
+      hints.push(`共 ${await loc.count()} 个匹配`);
+      const found = await loc.evaluateAll(describeCandidates, MAX_CANDIDATES);
+      found.forEach((c, i) => {
+        const name = c.name === '' ? '' : ` "${c.name}"`;
+        // 可写的选择器和位置放在名字前面：名字很长时，内核截断丢掉的是名字的尾巴。
+        hints.push(`${i + 1}) 可写 ${target} >> nth=${i} · ${c.role === '' ? c.tag : c.role} @(${c.x},${c.y} ${c.w}x${c.h})${name}`.slice(0, MAX_HINT_CHARS));
+      });
+    }
+    const covered = interceptHint(message);
+    if (covered !== null) hints.push(covered);
+    return hints.slice(0, MAX_HINTS);
   }
 
   location(): Promise<PageLocation> {
@@ -340,7 +442,7 @@ class PlaywrightPage implements Page {
     return this.run(async () => {
       if (o.target === undefined) return await this.page.evaluate(() => document.body?.innerText ?? '');
       return await (await this.resolve(o.target, false)).first().innerText();
-    });
+    }, o.target);
   }
 
   screenshot(o: { path: string; fullPage: boolean }): Promise<void> {
@@ -354,22 +456,22 @@ class PlaywrightPage implements Page {
   }
 
   click(target: Target): Promise<void> {
-    return this.run(async () => { await (await this.resolve(target, true)).click(); });
+    return this.run(async () => { await (await this.resolve(target, true)).click(); }, target);
   }
 
   hover(target: Target): Promise<void> {
-    return this.run(async () => { await (await this.resolve(target, true)).hover(); });
+    return this.run(async () => { await (await this.resolve(target, true)).hover(); }, target);
   }
 
   fill(target: Target, value: string): Promise<void> {
-    return this.run(async () => { await (await this.resolve(target, true)).fill(value); });
+    return this.run(async () => { await (await this.resolve(target, true)).fill(value); }, target);
   }
 
   press(key: string, target?: Target): Promise<void> {
     return this.run(async () => {
       if (target === undefined) await this.page.keyboard.press(key);
       else await (await this.resolve(target, true)).press(key);
-    });
+    }, target);
   }
 
   // 有目标就滚到它可见；没有目标就让页面按 dx、dy 滚动。
@@ -379,7 +481,7 @@ class PlaywrightPage implements Page {
     return this.run(async () => {
       if (o.target !== undefined) await (await this.resolve(o.target, true)).scrollIntoViewIfNeeded();
       else await this.page.evaluate(([dx, dy]) => { window.scrollBy({ left: dx, top: dy, behavior: 'instant' }); }, [o.dx ?? 0, o.dy ?? 0]);
-    });
+    }, o.target);
   }
 
   goto(url: string): Promise<void> {

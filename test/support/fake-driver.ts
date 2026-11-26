@@ -10,7 +10,8 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/op
 // 页面内容来自构造时给的规格（按 URL 查）；openPage 和页面上的方法都记进 calls。
 
 export interface FakeElement { text?: string; visible?: boolean; css?: Record<string, string>; count?: number;
-  password?: boolean; kind?: Described['kind']; stable?: Stable | null; failWith?: 'not-found' | 'timeout'; describeFails?: number }
+  password?: boolean; kind?: Described['kind']; stable?: Stable | null; failWith?: 'not-found' | 'timeout' | 'other'; describeFails?: number;
+  hints?: string[]; waitFails?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
   console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other';
   passwordField?: boolean; passwordFieldFailWith?: 'timeout' | 'other' }
@@ -80,7 +81,7 @@ class FakePage implements Page {
 
   private act(target: Target): FakeElement {
     const el = this.element(target);
-    if (el.failWith !== undefined) throw new DriverError(el.failWith, `element action failed: ${el.failWith}`);
+    if (el.failWith !== undefined) throw new DriverError(el.failWith, `element action failed: ${el.failWith}`, [...(el.hints ?? [])]);
     return el;
   }
 
@@ -151,6 +152,10 @@ class FakePage implements Page {
   // { ms } 真的睡这么久（内核测试靠它）；其他条件一律立刻成功。
   async waitFor(cond: WaitCond, timeoutMs: number): Promise<void> {
     this.enter('waitFor', [cond, timeoutMs]);
+    if ('target' in cond) {
+      const el = this.elements.get(cond.target);
+      if (el?.waitFails === true) throw new DriverError('timeout', 'wait timed out', [...(el.hints ?? [])]);
+    }
     if ('ms' in cond) await sleep(cond.ms);
   }
 
@@ -198,7 +203,7 @@ class FakePage implements Page {
     const el = this.element(target);
     if ((el.describeFails ?? 0) > 0) {
       el.describeFails = (el.describeFails ?? 0) - 1;
-      throw new DriverError('other', 'describe failed');
+      throw new DriverError('other', 'describe failed', [...(el.hints ?? [])]);
     }
     const stable = 'stable' in el ? (el.stable ?? null) : isRef(target) ? null : { selector: target, via: 'given' as const };
     return { stable, isPassword: el.password === true, kind: el.kind ?? 'other' };

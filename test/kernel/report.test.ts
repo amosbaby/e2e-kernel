@@ -147,6 +147,19 @@ test('if redaction throws, a fixed marker is shown and the raw value never is', 
   assert.ok(!html.includes(secret)); assert.ok(html.includes(REDACTED));
 });
 
+test('hints show in the report, redacted and escaped, and nowhere raw in either file', () => {
+  const secret = 'f'.repeat(8) + 'a1'.repeat(28);
+  const hints = ['2 matches', `1) <b>button</b> "${jwt}"`, `被遮挡：<div data-x="${secret}">`];
+  const input1 = input({ actions: [act('click', 'failed', { error: 'other: boom', hints })] });
+  const html = renderReport(buildResult(input1));
+  assert.ok(html.includes('诊断<br>2 matches<br>1) &lt;b&gt;button&lt;/b&gt;'), html);
+  assert.ok(!html.includes(jwt)); assert.ok(!html.includes(secret));
+  const out = writeRun(join(tmp, 'r-hints'), buildResult(input1));
+  for (const f of [out.reportPath, out.resultPath]) { const t = readFileSync(f, 'utf8'); assert.ok(!t.includes(jwt)); assert.ok(!t.includes(secret)); }
+  assert.deepEqual(JSON.parse(readFileSync(out.resultPath, 'utf8')).actions[0].hints.length, 3);
+  assert.ok(!renderReport(buildResult(input({ actions: [act('click', 'failed', { error: 'other: boom' })] }))).includes('诊断'));
+});
+
 test('a write whose body was omitted says so in the report', () => {
   const html = renderReport(buildResult(input({ writes: [write('POST', 'http://localhost/api/sso', 200, { bodyOmitted: true })] })));
   assert.ok(html.includes('请求体未记录'));
@@ -172,6 +185,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     driver: driverWith({ nativeFormSubmit: 'unknown' }),
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: '#a', via: 'id' } }, shot: 'shots/01.jpg' }),
       act('assert', 'match', { actual: 1, expected: 1, error: 'e' }),
+      act('click', 'failed', { error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true })],
     unattributedWrites: [write('PUT', 'http://localhost/b', null)],

@@ -24,7 +24,8 @@ const jwt = ['eyJ' + 'hbGciOiJIUzI1NiJ9', 'eyJ' + 'zdWIiOiIxMjM0NSJ9', 'c2lnbmF0
 
 const HOME_PAGE: FakePageSpec = {
   snapshot: '- button "Add" [ref=e2]',
-  elements: { e2: {}, '#status': { text: 'Added' }, '#gone': { failWith: 'not-found' } },
+  elements: { e2: {}, '#status': { text: 'Added' }, '#gone': { failWith: 'not-found' },
+    '#amb': { failWith: 'other', hints: ['2 matches', `1) 可写 #amb >> nth=0 · button @(1,2 3x4) "Save ${jwt}"`] } },
 };
 
 function pages(): Record<string, FakePageSpec> {
@@ -222,6 +223,17 @@ test('a login wall comes back as blocked + next, and neither key is sensitive', 
   const keys = [...keysOf(open), ...keysOf(step)];
   assert.ok(keys.includes('blocked') && keys.includes('next'));
   for (const key of keys) assert.ok(!isSensitiveKey(key), key);
+});
+
+test('a failed action comes back with redacted hints, and the key is not sensitive', async () => {
+  const open = await call(home, 'open', { url: 'http://localhost:5173/' });
+  assert.ok(open.ok);
+  const step = await call(home, 'step', { session: (open.result as OpenResult).session, ops: [{ op: 'click', target: '#amb' }] });
+  assert.ok(step.ok); const r = (step.result as StepResult).results[0]!;
+  assert.equal(r.outcome, 'failed'); assert.equal(r.hints?.length, 2); assert.equal(r.hints?.[0], '2 matches');
+  assert.ok(r.hints?.[1]?.includes('>> nth=0')); assert.ok(!JSON.stringify(step).includes(jwt));
+  const keys = keysOf(step);
+  assert.ok(keys.includes('hints')); for (const key of keys) assert.ok(!isSensitiveKey(key), key);
 });
 
 test('responses are redacted but kernel identifiers survive', async () => {

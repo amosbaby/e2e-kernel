@@ -61,6 +61,7 @@ function opLine(r: OpResult): string {
   if (r.outcome === 'mismatch') line += ` 实测=${inline(r.actual ?? null)} 期望=${inline(r.expected ?? '')}`;
   if (r.outcome === 'failed' && r.error !== undefined) line += ` ${firstLine(r.error)}`;
   if (r.shot !== undefined) line += ` ${inline(r.shot)}`;
+  if (r.outcome === 'failed' && r.hints !== undefined && r.hints.length > 0) line += `\n${r.hints.map((h) => `  ${inline(h)}`).join('\n')}`;
   return r.output === undefined ? line : `${line}\n${outputText(r.output)}`;
 }
 

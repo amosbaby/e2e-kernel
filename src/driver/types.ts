@@ -31,13 +31,18 @@ export interface Capabilities {
 
 export interface Check { name: string; ok: boolean; detail: string; fix?: string }
 
+// hints：失败时的诊断（选择器匹配了哪几个、谁挡住了点击），最多 6 条，默认没有。
+// 驱动只做保护性的截断（每条 4000 字符），不脱敏也不截短：条目里可能带页面文字（元素名、遮挡元素的属性），
+// 由内核先脱敏、再截断；message 仍是一行。
 export class DriverError extends Error {
   kind: 'not-found' | 'timeout' | 'other';
+  hints: string[];
 
-  constructor(kind: DriverError['kind'], message: string) {
+  constructor(kind: DriverError['kind'], message: string, hints: string[] = []) {
     super(message);
     this.name = 'DriverError';
     this.kind = kind;
+    this.hints = hints;
   }
 }
 

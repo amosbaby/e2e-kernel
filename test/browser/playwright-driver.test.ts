@@ -5,9 +5,13 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { chromium } from 'playwright';
+import { redactText } from '../../src/shared/redact.ts';
 import { DriverError } from '../../src/driver/types.ts';
 import type { Decision, Instance, Page, RequestInfo } from '../../src/driver/types.ts';
-import { createPlaywrightDriver } from '../../src/drivers/playwright/driver.ts';
+import { createPlaywrightDriver, describeCandidates, dropTruncatedRuns, guardedHints, interceptHint } from '../../src/drivers/playwright/driver.ts';
+import { runOps } from '../../src/kernel/executor.ts';
+import { Recorder } from '../../src/kernel/recorder.ts';
 import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 
@@ -656,6 +660,199 @@ test('action errors: a missing target is not-found, messages are one line', { ti
   await assert.rejects(page.press('NoSuchKey'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
   await assert.rejects(page.evaluate('throw new Error("page threw")'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
   await assert.rejects(page.goto('http://127.0.0.1:9/'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
+});
+
+// 运行时生成的十六进制串，仓库里没有字面量。
+function randomHex(n: number): string {
+  let s = '';
+  for (let i = 0; i < n; i++) s += '0123456789abcdef'[Math.floor(Math.random() * 16)];
+  return s;
+}
+
+function hasFragment(text: string, secret: string, min = 8): boolean {
+  for (let i = 0; i + min <= secret.length; i++) if (text.includes(secret.slice(i, i + min))) return true;
+  return false;
+}
+
+async function failureOf(act: () => Promise<unknown>): Promise<DriverError> {
+  const e = await act().then(() => null, (x: unknown) => x);
+  assert.ok(e instanceof DriverError, String(e));
+  return e;
+}
+
+function execCtx() {
+  return { recorder: new Recorder(), runDir: makeTmp('e2k-hints-'), now: () => new Date() };
+}
+
+test('a selector that matches several elements: one-line message, a count, and the candidates with a way to pick one', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  const err = await failureOf(() => page.click('.dup'));
+  assert.equal(err.kind, 'other'); assert.ok(!err.message.includes('\n'));
+  assert.equal(err.hints[0], '共 2 个匹配');
+  assert.equal(err.hints.length, 3);
+  assert.match(err.hints[1]!, /^1\) 可写 \.dup >> nth=0 · button @\(-?\d+,-?\d+ \d+x\d+\) "First duplicate"$/);
+  assert.match(err.hints[2]!, /^2\) 可写 \.dup >> nth=1 · button @\(.*\) "Second duplicate"$/);
+  assert.equal(await page.text({ target: '.dup >> nth=1' }), 'Second duplicate');     // 提示里的写法真的能用
+  const fillErr = await failureOf(() => page.fill('.dup-in', 'v'));
+  assert.equal(fillErr.hints[0], '共 2 个匹配');
+  assert.match(fillErr.hints[1]!, /^1\) 可写 \.dup-in >> nth=0 · textbox @\(.*\) "First field"$/);
+  for (const act of [() => page.hover('.dup'), () => page.press('Enter', '.dup'), () => page.scroll({ target: '.dup' })])
+    assert.equal((await failureOf(act)).hints[0], '共 2 个匹配');
+  // 找不到的目标没有 hints：不提前失败，也不另外探测
+  const gone = await failureOf(() => page.click('#nope'));
+  assert.equal(gone.kind, 'not-found'); assert.deepEqual(gone.hints, []);
+});
+
+test('a click covered by another element: the intercepting element comes back as a hint, in full', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  const secret = randomHex(160);
+  // Playwright 的预览把属性值短的排在前面：140 字符的填充在前、160 位的 data-x 在后，旧的 200 字符截断点正好落在 data-x 中间
+  await page.evaluate(`(() => { document.getElementById('veil').outerHTML = '<div id="veil" style="position:fixed;inset:0" data-a="${'p'.repeat(140)}" data-x="${secret}"></div>'; })()`);
+  const err = await failureOf(() => page.click('#covered'));
+  assert.equal(err.kind, 'timeout'); assert.ok(!err.message.includes('\n'));
+  const hint = err.hints.find(h => h.includes('veil') && h.includes('intercepts pointer events'));
+  assert.ok(hint !== undefined, JSON.stringify(err.hints));
+  assert.ok(hint.startsWith('被遮挡：<div')); assert.ok(hint.length > 200);
+  assert.ok(hint.includes(secret), 'the driver only guards the length; it does not cut the line short');
+  assert.equal(err.hints.length, 1);
+});
+
+test('the kernel redacts the real driver\'s hints before cutting them', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  const secret = randomHex(160);
+  const nameSecret = randomHex(64);
+  await page.evaluate(`(() => { document.getElementById('veil').outerHTML = '<div id="veil" style="position:fixed;inset:0" data-a="${'p'.repeat(140)}" data-x="${secret}"></div>';
+    document.querySelectorAll('.dup')[1].setAttribute('aria-label', '${'n'.repeat(60)} ${nameSecret}'); })()`);
+  const ctx = execCtx();
+  const covered = await runOps(page, [{ op: 'click', target: '#covered' }], ctx);
+  assert.equal(covered[0]!.outcome, 'failed');
+  assert.ok(!hasFragment(JSON.stringify([covered, ctx.recorder.actions]), secret));
+  assert.ok(covered[0]!.hints!.some(h => h.startsWith('被遮挡：') && h.includes('[REDACTED]')));
+  const dup = await runOps(page, [{ op: 'click', target: '.dup' }], ctx);
+  assert.ok(!hasFragment(JSON.stringify([dup, ctx.recorder.actions]), nameSecret));
+  assert.ok(dup[0]!.hints!.some(h => h.startsWith('2) 可写 .dup >> nth=1 · button @(')));
+  assert.ok(dup[0]!.hints!.every(h => h.length <= 330));
+});
+
+test('a long candidate name is cut at its tail: the way to pick it and its position stay in the hint', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  await page.evaluate(`document.querySelectorAll('.dup')[0].setAttribute('aria-label', '${'n'.repeat(9000)}')`);
+  const err = await failureOf(() => page.click('.dup'));
+  assert.ok(err.hints[1]!.length <= 4000);                 // 页内先截到 4000，驱动再留保护上限
+  const ctx = execCtx();
+  const [r] = await runOps(page, [{ op: 'click', target: '.dup' }], ctx);
+  assert.ok(r!.hints![1]!.startsWith('1) 可写 .dup >> nth=0 · button @('), r!.hints![1]);
+  assert.ok(r!.hints![1]!.length <= 330);
+});
+
+test('Playwright cuts the element preview at 500 characters: a token across that point is not left in pieces', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  const secret = randomHex(480);
+  // 属性按长度升序拼：451 字符的填充在前，480 位的 data-x 在后，从第 480 个字符起只剩 data-x 的开头
+  await page.evaluate(`(() => { document.getElementById('veil').outerHTML = '<div id="veil" style="position:fixed;inset:0" data-a="${'p'.repeat(451)}" data-x="${secret}"></div>'; })()`);
+  const err = await failureOf(() => page.click('#covered'));
+  const hint = err.hints.find(h => h.startsWith('被遮挡：'));
+  assert.ok(hint !== undefined, JSON.stringify(err.hints));
+  assert.ok(!hasFragment(hint, secret), hint);
+  assert.ok(hint.includes('data-a=') && hint.includes('data-x="…></div>'), hint);
+  const ctx = execCtx();
+  const [r] = await runOps(page, [{ op: 'click', target: '#covered' }], ctx);
+  assert.ok(!hasFragment(JSON.stringify([r, ctx.recorder.actions]), secret));
+});
+
+test('dropTruncatedRuns: drops the run in front of every ellipsis, keeps everything else, and is linear on hostile input', () => {
+  assert.equal(dropTruncatedRuns('<div id="a" data-x="1234…></div>'), '<div id="a" data-x="…></div>');
+  assert.equal(dropTruncatedRuns('<input id="a" data-x="1234…/>'), '<input id="a" data-x="…/>');
+  assert.equal(dropTruncatedRuns('<div id="a">kkkab12…</div>'), '<div id="a">…</div>');
+  assert.equal(dropTruncatedRuns('<div id="a" data-x="12 34 56…>t</div>'), '<div id="a" data-x="12 34 …>t</div>');
+  assert.equal(dropTruncatedRuns('<div id="a" data-x="1234"></div>'), '<div id="a" data-x="1234"></div>');
+  assert.equal(dropTruncatedRuns('<div id=\'a\' q=b…>x</div>'), '<div id=\'a\' q=…>x</div>');
+  assert.equal(dropTruncatedRuns('<div>…</div>'), '<div>…</div>');
+  for (const hostile of ['…'.repeat(40_000), 'a…'.repeat(40_000), '…>'.repeat(40_000), '="'.repeat(40_000) + '…>', 'a'.repeat(40_000) + '…', ' a="'.repeat(40_000) + '…/>']) {
+    const t = Date.now();
+    dropTruncatedRuns(hostile); interceptHint(`x\n  - ${hostile} intercepts pointer events`);
+    assert.ok(Date.now() - t < 2000);
+  }
+});
+
+// 预览里整段属性文字截在 500 个字符：数学上等价的 Playwright 行文，用来在单元里构造（真浏览器的版本见下）
+function previewLine(attrs: [string, string][], text: string): string {
+  const cut = (s: string, cap: number): string => ([...s].length > cap ? [...s].slice(0, cap - 1).join('') + '…' : s);
+  const a = attrs.map(([n, v]) => ` ${n}="${v}"`).sort((x, y) => x.length - y.length);
+  return `<div${cut(a.join(''), 500)}>${cut(text, 50)}</div>`;
+}
+
+test('a fake ellipsis-and-bracket in a short attribute does not stop the real cut from being cleaned (pads 436-459, several variants)', () => {
+  const secret = randomHex(700);
+  for (const fake of ['…>', '…/>', '…>q']) {
+    for (let pad = 436; pad <= 459; pad++) {
+      const line = previewLine([['id', 'veil'], ['data-f', 'p'.repeat(pad) + fake], ['data-x', secret]], '');
+      const hint = interceptHint(`x\nCall log:\n  - ${line} intercepts pointer events`)!;
+      assert.ok(!hasFragment(redactText(hint).slice(0, 300), secret), `${fake} ${pad}`);
+      assert.ok(!hasFragment(hint, secret), `${fake} ${pad}`);
+    }
+  }
+});
+
+test('real browser: a fake ellipsis in an early attribute, and a token cut by the text-content limit, are not left in pieces', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  const secret = randomHex(700);
+  await page.evaluate(`(() => { document.getElementById('veil').outerHTML = '<div id="veil" style="position:fixed;inset:0" data-f="${'p'.repeat(447)}…&gt;" data-x="${secret}"></div>'; })()`);
+  const fake = await failureOf(() => page.click('#covered'));
+  const h1 = fake.hints.find(h => h.startsWith('被遮挡：'))!;
+  assert.ok(h1 !== undefined && !hasFragment(h1, secret), String(h1));
+  // 文字内容在 50 字符处截断：30 个 k 加 64 位十六进制，只剩 20 位的开头
+  const textSecret = randomHex(64);
+  await page.evaluate(`(() => { document.getElementById('veil').outerHTML = '<div id="veil" style="position:fixed;inset:0">${'k'.repeat(30)}${textSecret}</div>'; })()`);
+  const ctx = execCtx();
+  const [r] = await runOps(page, [{ op: 'click', target: '#covered' }], ctx);
+  assert.ok(r!.hints!.some(h => h.startsWith('被遮挡：')), JSON.stringify(r!.hints));
+  assert.ok(!hasFragment(JSON.stringify([r, ctx.recorder.actions]), textSecret), JSON.stringify(r!.hints));
+  const raw = await failureOf(() => page.click('#covered'));
+  assert.ok(!hasFragment(raw.hints.join('\n'), textSecret), raw.hints.join('\n'));
+});
+
+test('describeCandidates caps every name at 4000 characters inside the page', { timeout: 60_000 }, async () => {
+  const browser = await chromium.launch();
+  try {
+    const p = await browser.newPage();
+    await p.setContent(`<button class="c" aria-label="${'a'.repeat(9000)}">x</button><button class="c">${'b'.repeat(9000)}</button><input class="c" aria-label="${'d'.repeat(9000)}">`);
+    const found = await p.locator('.c').evaluateAll(describeCandidates, 5);
+    assert.deepEqual(found.map(c => c.name.length), [4000, 4000, 4000]);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('a strict-mode text that is not on the first line of the message is not a strict violation', { timeout: 60_000 }, async () => {
+  // 页面文字可以出现在调用记录里；只有第一行里有 strict mode violation 才取候选
+  await page.goto(server.origin + '/overlay.html');
+  await page.evaluate(`document.getElementById('veil').outerHTML = '<div id="veil" style="position:fixed;inset:0" title="strict mode violation"></div>'`);
+  const err = await failureOf(() => page.click('#covered'));
+  assert.ok(err.hints.every(h => !h.startsWith('共 ')), JSON.stringify(err.hints));
+  assert.ok(err.hints.some(h => h.startsWith('被遮挡：') && h.includes('strict mode violation')));
+});
+
+test('guardedHints: a collector that throws or hangs gives no hints, and a good one passes through', async () => {
+  assert.deepEqual(await guardedHints(async () => ['a'], 1000), ['a']);
+  assert.deepEqual(await guardedHints(() => Promise.reject(new Error('boom')), 1000), []);
+  assert.deepEqual(await guardedHints(() => { throw new Error('sync boom'); }, 1000), []);
+  const t = Date.now();
+  assert.deepEqual(await guardedHints(() => new Promise<string[]>(() => {}), 100), []);   // 永不返回
+  assert.ok(Date.now() - t < 1500);
+  assert.deepEqual(await guardedHints(() => new Promise<string[]>((_, reject) => setTimeout(() => reject(new Error('late')), 200)), 50), []);
+  await sleep(300);        // 超时之后才失败的收集不能变成未处理的拒绝
+});
+
+test('a failed fill carries >> nth hints, and the typed value is not in them', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/overlay.html');
+  const value = 'typed-' + randomHex(6);
+  await page.evaluate(`document.querySelectorAll('.dup-in')[1].setAttribute('aria-label', 'field ${value}')`);
+  const ctx = execCtx();
+  const [r] = await runOps(page, [{ op: 'fill', target: '.dup-in', value }], ctx);
+  assert.equal(r!.outcome, 'failed');
+  assert.ok(r!.hints!.some(h => h.includes('>> nth=0')), JSON.stringify(r!.hints));
+  assert.ok(!JSON.stringify([r, ctx.recorder.actions]).includes(value));
 });
 
 test('actions wait for a late target to attach; one that never appears is not-found after the action timeout', { timeout: 60_000 }, async () => {

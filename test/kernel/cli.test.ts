@@ -23,7 +23,8 @@ const secret = ['pw', 'Zq7', 'x91', 'Lk'].join('-');
 
 const HOME_PAGE: FakePageSpec = {
   snapshot: '- button "Add" [ref=e2]',
-  elements: { e2: {}, '#status': { text: 'Added' }, '#gone': { failWith: 'not-found' }, '#pw': { password: true } },
+  elements: { e2: {}, '#status': { text: 'Added' }, '#gone': { failWith: 'not-found' }, '#pw': { password: true },
+    '#amb': { failWith: 'other', hints: ['2 matches', `1) 可写 #amb >> nth=0 · button @(1,2 3x4) "Save${String.fromCharCode(0x1b)}[2K"`] } },
 };
 
 // 页面能控制的文字里夹带终端控制序列：ESC[2K ESC[1A（清行并上移）、OSC 52（写剪贴板，以 BEL 结尾）、C1 的单字符 CSI。
@@ -183,6 +184,16 @@ describe('with a session', () => {
     assert.equal(lines[2], '  - button "Add" [ref=e2]');
     assert.match(lines[3] as string, /^#2 click 执行失败 \S.* shots\/\d\d\.jpg$/);
     assert.equal(lines[4], '#3 click 未执行');
+  });
+
+  test('step text output: hints of a failed op follow it, indented, one per line', async () => {
+    const t = io();
+    assert.equal(await main(['step', sid, '[{"op":"click","target":"#amb"},{"op":"click","target":"e2"}]'], t), 11);
+    const lines = t.outText().split('\n');
+    assert.match(lines[1] as string, /^#1 click 执行失败 /);
+    assert.equal(lines[2], '  2 matches'); assert.equal(lines[3], '  1) 可写 #amb >> nth=0 · button @(1,2 3x4) "Save\\x1b[2K"');
+    assert.equal(lines[4], '#2 click 未执行');
+    assert.ok(!t.outText().includes(ESC), 'a control character in a hint is shown, not sent to the terminal');
   });
 
   test('a step on a session that is busy exits 2 (busy)', async () => {

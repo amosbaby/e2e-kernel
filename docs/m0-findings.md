@@ -152,6 +152,13 @@ Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调�
 - 页面发写请求后马上 `location.href` 跳走：路由回调里先看到的是跳转的导航请求，探测的 locator 可能已经落在新文档上，而 `frame.url()` 还是旧地址，只比地址会判成确切的 `false`（实测每次都是）。所以驱动登记「已发起、未提交」的导航（`framenavigated`、请求失败或结束时撤销，10 秒过期），探测开始前或结束后它为真、或地址变了，都给 `null`。
 - 子 frame 里发的写，顶层文档有密码框：判为有；`fetch` 在没有密码框的页面上判为没有。
 
+## 9.7 动作失败的诊断
+
+动作失败时驱动要带回两种诊断：选择器匹配了多个元素，和点击被别的元素挡住。依据是 Playwright 的错误消息，实测（`test/browser/playwright-driver.test.ts`「a selector that matches several elements」「a click covered by another element」，Playwright 1.65）：
+- 调用记录在 `error.message` 里，第一行之后：`Call log:` 下面逐行 `  - …`。被遮挡时每次重试都有一行 `- <div id="veil" …></div> intercepts pointer events`，超时后消息里有好几行相同的；取最后一行、去掉 `- ` 前缀。元素预览（`previewNode`）把属性按长度升序拼起来（`style` 不输出），**整段属性文字超过 500 字符就截断并补一个 `…`**（最后一个属性只剩半截，`…` 紧挨在 `>` 或 `/>` 前），**文字内容另截到 50 个字符并补 `…`**（文字只剩半截）。500 以内属性值是完整的，所以遮挡行里的长 token 会完整出现（内核先脱敏再截断才认得出）；而落在任一截断点上的 token 只剩半截，脱敏认不出来。页面还能在属性值里伪造 `…` 和 `>`，所以不能靠找「真正的截断点」来处理。驱动的规则（`dropTruncatedRuns`）：对行里每一个 `…`，删掉紧挨在它前面、连续的「非空白且不是 `"` `'` `=` `>`」的字符；单遍线性扫描、不用正则；文字里本来就有 `…` 时会多删一点，可以接受。
+- 严格模式冲突的第一行是 `locator.click: Error: strict mode violation: locator('.dup') resolved to 2 elements:`，后面是 `1) <button …> aka getByRole(…)` 这样的候选预览。这是给人看的行文，驱动不解析它：只看消息第一行里有没有 `strict mode violation` 来判断类型（调用记录里可能带页面文字，不看），再自己用 `locator.count()` 和 `evaluateAll` 取前 5 个候选（标签、角色、名字、位置大小，不取元素的值）。
+- 两种诊断都是页面文字：遮挡元素的属性、候选的名字。驱动只做每条 4000 字符的保护性截断，不脱敏也不截短；内核先脱敏、再截到 300，否则一个跨在截断点上的 token 会留下认不出来的半截。
+
 ## 10. 复测
 
 运行 `npm run m0`。Playwright 升级后必须重跑并更新本文件。

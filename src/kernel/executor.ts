@@ -39,6 +39,8 @@ interface Done {
   error?: string;
   shot?: string;
   valueCleared?: boolean;
+  // 失败时驱动给的诊断，已脱敏、每条截到 300、最多 6 条。回应照给；记录里要先看页面有没有密码类字段（见 recordHints）。
+  hints?: string[];
   // 只有 eval 带这三项，给记录用：脱敏后截到 1000 的返回值（页面有密码类字段或探测不出时没有，改为 outputOmitted）和源码哈希。
   recordOutput?: string;
   recordError?: string;     // 只给记录用的错误文字；有它时记录不用 error（eval 抛错的消息可能带着页面值和源码片段）
@@ -57,6 +59,20 @@ function redactCap(raw: string, max: number): string {
 
 function redactValue<T>(v: T): T | string {
   return typeof v === 'string' ? safely(() => redactText(v)) : v;
+}
+
+const MAX_HINTS = 6;
+const MAX_HINT = 300;
+const HINTS_NOT_RECORDED = '[诊断未记录：页面有密码框，或判断不出]';
+
+// 驱动的诊断条目可能带页面文字：先把要填的值换掉（fill 才有），再脱敏、最后截到 300。空值不换（split('') 会把每个字符隔开）。
+function redactHints(e: DriverError, value?: string): string[] | undefined {
+  if (!Array.isArray(e.hints) || e.hints.length === 0) return undefined;
+  return e.hints.slice(0, MAX_HINTS).map((h) => redactCap(value === undefined || value === '' ? String(h) : String(h).split(value).join(REDACTED), MAX_HINT));
+}
+
+function withHints(done: Done, hints: string[] | undefined): Done {
+  return hints === undefined ? done : { ...done, hints };
 }
 
 function driverErrorText(e: DriverError): string {
@@ -170,14 +186,14 @@ async function runFill(page: Page, op: Extract<Op, { op: 'fill' }>): Promise<Don
     await page.waitFor({ target: op.target, state: 'visible' }, ACTION_TIMEOUT_MS);
   } catch (e) {
     rethrowUnlessDriverError(e);
-    return { outcome: 'failed', stable: null, error: fillErrorText(e, op.value) };
+    return withHints({ outcome: 'failed', stable: null, error: fillErrorText(e, op.value) }, redactHints(e, op.value));
   }
   let described: Described;
   try {
     described = await page.describe(op.target);
   } catch (e) {
     rethrowUnlessDriverError(e);
-    return { outcome: 'failed', stable: null, error: `${FILL_UNCHECKED}（${fillErrorText(e, op.value)}）` };
+    return withHints({ outcome: 'failed', stable: null, error: `${FILL_UNCHECKED}（${fillErrorText(e, op.value)}）` }, redactHints(e, op.value));
   }
   const { stable, isPassword, kind } = described;
   if (isPassword === true) return { outcome: 'failed', stable, error: PASSWORD_REFUSAL };
@@ -186,7 +202,7 @@ async function runFill(page: Page, op: Extract<Op, { op: 'fill' }>): Promise<Don
     await page.fill(op.target, op.value);
   } catch (e) {
     rethrowUnlessDriverError(e);
-    return { outcome: 'failed', stable, error: fillErrorText(e, op.value) };
+    return withHints({ outcome: 'failed', stable, error: fillErrorText(e, op.value) }, redactHints(e, op.value));
   }
   // 值只在确认是普通输入框或多行文本框时才留进记录；contenteditable 等认不出的目标照填，但记成 [REDACTED]。
   return { outcome: 'ok', stable, valueCleared: kind === 'text-input' || kind === 'textarea' };
@@ -257,7 +273,7 @@ async function runOne(page: Page, op: Op, seq: number, ctx: ExecCtx): Promise<Do
     done = await perform(page, op, seq, ctx);
   } catch (e) {
     rethrowUnlessDriverError(e);
-    return { outcome: 'failed', stable: before.stable, error: driverErrorText(e) };
+    return withHints({ outcome: 'failed', stable: before.stable, error: driverErrorText(e) }, redactHints(e));
   }
   const stable = target !== undefined && !before.ok ? (await tryDescribe(page, target)).stable : before.stable;
   return { ...done, stable };
@@ -287,6 +303,11 @@ function recordedOp(op: Op, valueCleared: boolean): Op {
   }
 }
 
+// 记录里的诊断：页面确定没有密码类字段才留（失败关闭：有、或探不出都只留一句固定的话）。回应给 agent 的不受这个限制。
+async function recordHints(page: Page, hints: string[]): Promise<string[]> {
+  return (await passwordLike(page)).found === false ? hints : [HINTS_NOT_RECORDED];
+}
+
 export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpResult[]> {
   const results: OpResult[] = [];
   let stopped = false;
@@ -310,6 +331,8 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx): Promise<OpRes
     if (target !== undefined) record.target = { given: target, stable: done.stable ?? null };
     const result: OpResult = { index, op: op.op, outcome: done.outcome };
     if (done.output !== undefined) result.output = done.output;
+    if (done.hints !== undefined) result.hints = done.hints;
+    if (done.hints !== undefined) record.hints = await recordHints(page, done.hints);
     if (done.jsHash !== undefined) record.jsHash = done.jsHash;
     if (done.recordOutput !== undefined) record.output = done.recordOutput;
     if (done.outputOmitted === true) record.outputOmitted = true;

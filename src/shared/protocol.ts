@@ -54,6 +54,7 @@ export interface OpResult {
   index: number; op: Op['op']; outcome: Outcome;
   output?: string | { level: string; text: string }[] | RequestSummary[];
   actual?: string | number | boolean | null; expected?: string | number | boolean; error?: string; shot?: string;
+  hints?: string[];   // 失败时的诊断（匹配了哪几个、谁挡住了点击），已脱敏，每条不超过 300 字符，最多 6 条
 }
 export interface Tallies { ok: number; match: number; mismatch: number; failed: number; notRun: number }
 export interface SessionInfo { session: string; name: string; url: string; idleSec: number }
