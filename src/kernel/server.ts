@@ -25,7 +25,8 @@ export interface KernelOptions {
   home: Home; driver: Driver; idleMs?: number; keepRuns?: number;
   stopDeadlineMs?: number;   // stop() 等会话收尾的期限，过了就直接停浏览器实例并退出
 }
-export interface KernelHandle { stop(): Promise<void> }
+// abort()：关停进行中时再来一次停止信号用——不再等任何期限，直接停浏览器实例、断开连接、清理文件。
+export interface KernelHandle { stop(): Promise<void>; abort(): Promise<void> }
 export interface StatusResult { version: string; pid: number; home: string;
   driver: { name: string; capabilities: Capabilities }; instance: 'stopped' | 'running'; sessions: SessionInfo[]; profiles: ProfileInfo[] }
 
@@ -33,6 +34,8 @@ const DEFAULT_IDLE_MS = 15 * 60_000;
 const DEFAULT_KEEP_RUNS = 20;
 // 关停要等进行中的 open 落定，最长一次导航超时；驱动卡住时会更久，所以另给一个期限。
 const DEFAULT_STOP_DEADLINE_MS = NAVIGATION_TIMEOUT_MS + 15_000;
+// drain 用完整个期限还没完时，直接停实例至少再给这么久；关停总时长因此不超过「期限 + 这段」。
+const INSTANCE_STOP_GRACE_MS = 1_000;
 const READ_LINE_MS = 5_000;
 const PROBE_WINDOW_MS = 2_000;
 const PROBE_INTERVAL_MS = 200;
@@ -45,7 +48,7 @@ function alreadyRunning(): E2kError {
 // ---- 日志 ----
 
 // kernel.log：0600，不跟随符号链接。每行先脱敏；脱敏出错写固定标记，写不了也不影响内核。
-class KernelLog {
+export class KernelLog {
   private fd: number | undefined;
 
   constructor(path: string) {
@@ -56,7 +59,8 @@ class KernelLog {
   write(line: string): void {
     if (this.fd === undefined) return;
     try {
-      writeSync(this.fd, `${new Date().toISOString()} ${safely(() => redactText(line))}\n`);
+      // 一条日志一行：CR、LF 各换成一个空格，调用方没处理好换行（比如多行 stack）也伪造不出多行。
+      writeSync(this.fd, `${new Date().toISOString()} ${safely(() => redactText(line)).replace(/[\r\n]/g, ' ')}\n`);
     } catch {
       // 日志写不了也不能影响请求和收尾。
     }
@@ -188,10 +192,11 @@ function listen(server: Server, path: string): Promise<void> {
 
 // ---- 关停 ----
 
-function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+// p 在 ms 内成功落定返回 true；超时、被拒绝、或 cancel 先到（abort）都返回 false，并清掉计时器。
+function completesWithin(p: Promise<unknown>, ms: number, cancel: Promise<unknown>): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<boolean>((resolve) => { timer = setTimeout(() => { resolve(false); }, ms); });
-  return Promise.race([p.then(() => true, () => true), timeout]).finally(() => { clearTimeout(timer); });
+  return Promise.race([p.then(() => true, () => false), timeout, cancel.then(() => false)]).finally(() => { clearTimeout(timer); });
 }
 
 // 记下驱动启动过、还没关掉的实例：关停超过期限时绕过 SessionManager 直接停它们。
@@ -356,17 +361,24 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   server.on('error', (e: Error) => { log.write(`socket 服务出错：${e.message}`); });
 
   // 顺序：会话收尾（关停开始后 SessionManager 对新调用一律回 busy）→ 关 socket 服务 → 删 pid 文件。
-  // 收尾有期限：过了就直接停驱动实例，照样往下走。
+  // 收尾有期限：过了、或收尾本身出错，就直接停驱动实例，照样往下走。总时长不超过「期限 + INSTANCE_STOP_GRACE_MS」。
+  // abort()：所有等待立刻作废，只发出停实例的调用，然后断开连接、清理文件。
+  let abortNow = (): void => {};
+  const aborted = new Promise<void>((resolve) => { abortNow = resolve; });
   const shutdown = async (): Promise<void> => {
     const until = Date.now() + stopDeadlineMs;
-    const drained = await settlesWithin(sessions.shutdown(), stopDeadlineMs);
+    const drain = sessions.shutdown().catch((e: unknown) => {
+      log.write(`关停收尾失败：${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+      throw e;
+    });
+    const drained = await completesWithin(drain, stopDeadlineMs, aborted);
     if (!drained) {
       log.write(`关停超过 ${stopDeadlineMs} 毫秒仍未完成，直接停浏览器实例`);
-      await settlesWithin(Promise.allSettled([...instances].map((i) => i.stop())), stopDeadlineMs);
+      await completesWithin(Promise.allSettled([...instances].map((i) => i.stop())), INSTANCE_STOP_GRACE_MS, aborted);
     }
     const closed = new Promise<void>((resolve) => { server.close(() => { resolve(); }); });
     // 已经在回话的连接等它写完（同一个期限内），其余的连接直接断开。
-    await settlesWithin(Promise.allSettled([...answering]), Math.max(0, until - Date.now()));
+    await completesWithin(Promise.allSettled([...answering]), Math.max(0, until - Date.now()), aborted);
     for (const sock of connections) sock.destroy();
     await closed;
     removeOwnPidFile(pidFile);
@@ -374,5 +386,8 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   };
 
   let stopped: Promise<void> | undefined;
-  return { stop: () => (stopped ??= shutdown()) };
+  return {
+    stop: () => (stopped ??= shutdown()),
+    abort: () => { abortNow(); return (stopped ??= shutdown()); },
+  };
 }

@@ -17,6 +17,7 @@ import { MAX_OPS_BYTES } from '../../src/shared/protocol.ts';
 import type { OpenResult } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
+import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 
 // 一个不能出现在任何输出里的值：运行时拼出来，不写成字面量。
@@ -71,7 +72,7 @@ after(async () => {
   for (const t of [kernelTmp, empty, freshTmp]) t.cleanup();
 });
 
-interface TestIo extends Io { outText(): string; errText(): string; fireStopSignal(): void }
+interface TestIo extends Io { outText(): string; errText(): string; fireStopSignal(): void; exits: number[] }
 
 // 收集输出的测试替身。stdinText 不给时，读标准输入得到空串。
 function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: () => Promise<Driver>;
@@ -79,6 +80,7 @@ function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; m
   const out: string[] = [];
   const err: string[] = [];
   const stops: (() => void)[] = [];
+  const exits: number[] = [];
   const text = o.stdinText ?? '';
   return {
     out: (s) => { out.push(s); },
@@ -95,6 +97,8 @@ function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; m
     },
     makeDriver: o.makeDriver ?? (async () => new FakeDriver({ pages: pages() })),
     onStopSignal: (cb) => { stops.push(cb); },
+    exit: (code) => { exits.push(code); },
+    exits,
     outText: () => out.join('\n'),
     errText: () => err.join('\n'),
     fireStopSignal: () => { for (const cb of stops) cb(); },
@@ -448,6 +452,26 @@ test('start runs until the stop signal and cleans up', async () => {
   await until(() => existsSync(fresh.socket)); t.fireStopSignal();
   assert.equal(await done, 0); assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
   assert.match(t.outText(), /Ctrl-C/);
+});
+
+test('a second stop signal while stopping exits at once with 1 instead of waiting for the deadline', async () => {
+  const h = hangingDriver(pages(), { hangStop: true });
+  const t = io({ env: freshEnv, makeDriver: async () => h.driver });
+  const done = main(['start'], t);
+  await until(() => existsSync(fresh.socket));
+  void call(fresh, 'open', { url: 'http://localhost:5173/' }).catch(() => undefined);
+  await until(() => h.opened());
+  t.fireStopSignal();
+  await until(() => t.outText().includes('正在停止内核'));
+  assert.deepEqual(t.exits, []);                                 // 第一次信号：只是开始收尾
+  const t0 = Date.now();
+  t.fireStopSignal();
+  assert.equal(await done, 1);
+  assert.ok(Date.now() - t0 < 3000);
+  assert.deepEqual(t.exits, [1]);
+  assert.ok(h.stops() >= 1);
+  assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
+  assert.ok(!t.outText().includes('内核已停止'));
 });
 
 test('start refuses a second kernel on the same home (exit 2)', async () => {

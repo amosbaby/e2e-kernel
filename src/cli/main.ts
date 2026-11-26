@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import type { Driver } from '../driver/types.ts';
 import { listenerErrorLogger, startKernel } from '../kernel/server.ts';
+import type { KernelHandle } from '../kernel/server.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
 import { E2kError } from '../shared/errors.ts';
@@ -24,7 +25,8 @@ export interface Io {
   selfCmd: string;                        // 这个 CLI 实际该怎么调用，用在提示里
   stdin: { isTTY: boolean; readLine(): Promise<string>; readAll(maxBytes: number): Promise<string> };   // 超过 maxBytes 抛 E2kError('usage')
   makeDriver(): Promise<Driver>;
-  onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP
+  onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP；每收到一次调用一次 cb
+  exit(code: number): void;               // 真实实现是 process.exit：第二次停止信号时不再等收尾
 }
 
 type Options = Record<string, { type: 'string' | 'boolean' }>;
@@ -137,13 +139,24 @@ async function start(ctx: Ctx, args: string[]): Promise<number> {
   const home = resolveHome(ctx.io.env);
   let wake = (): void => {};
   const stopSignal = new Promise<void>((resolve) => { wake = resolve; });
-  ctx.io.onStopSignal(() => { wake(); });
-  const kernel = await startKernel({ home, driver: await ctx.io.makeDriver() });
+  let kernel: KernelHandle | undefined;
+  let signals = 0;
+  // 第一次信号开始收尾；收尾期间再来一次就直接停浏览器实例并以 1 退出，不等关停期限。
+  ctx.io.onStopSignal(() => {
+    if (signals++ === 0) {
+      wake();
+      return;
+    }
+    ctx.io.out('再次收到停止信号，立即退出');
+    void (kernel?.abort() ?? Promise.resolve()).finally(() => { ctx.io.exit(ExitCode.INTERNAL); });
+  });
+  kernel = await startKernel({ home, driver: await ctx.io.makeDriver() });
   ctx.io.out(`内核已启动，状态目录 ${home.root}`);
-  ctx.io.out('按 Ctrl-C 或发送 SIGTERM 停止');
+  ctx.io.out('按 Ctrl-C 或发送 SIGTERM 停止（收尾期间再按一次立即退出）');
   await stopSignal;
   ctx.io.out('正在停止内核……');
   await kernel.stop();
+  if (signals > 1) return ExitCode.INTERNAL;
   ctx.io.out('内核已停止');
   return ExitCode.OK;
 }
@@ -339,5 +352,6 @@ export function realIo(): Io {
       process.on('SIGTERM', cb);
       process.on('SIGHUP', cb);
     },
+    exit: (code) => { process.exit(code); },
   };
 }

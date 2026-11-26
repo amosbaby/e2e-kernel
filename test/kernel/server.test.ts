@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, test } from 'node:test';
+import { afterEach, beforeEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
@@ -7,8 +7,8 @@ import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
-import type { Driver, Instance, Page } from '../../src/driver/types.ts';
-import { listenerErrorLogger, startKernel } from '../../src/kernel/server.ts';
+import { KernelLog, listenerErrorLogger, startKernel } from '../../src/kernel/server.ts';
+import { SessionManager } from '../../src/kernel/sessions.ts';
 import type { KernelHandle, KernelOptions, StatusResult } from '../../src/kernel/server.ts';
 import { call } from '../../src/shared/client.ts';
 import { E2kError } from '../../src/shared/errors.ts';
@@ -17,6 +17,7 @@ import type { CloseResult, OpenResult, StepResult } from '../../src/shared/proto
 import { isSensitiveKey } from '../../src/shared/redact.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
+import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 
 // 长得像 token 的串在运行时拼出来，不写成字面量。
@@ -314,34 +315,9 @@ test('a second stop() just returns', async () => {
   await assert.rejects(call(home, 'status', {}), (e: E2kError) => e.code === 'needs-human');
 });
 
-// 一个 openPage 永远不落定的驱动：关停时的 drain 会一直等下去。
-function hangingDriver(): { driver: Driver; stops: () => number; opened: () => boolean } {
-  const fake = new FakeDriver({ pages: pages() });
-  let stops = 0;
-  let opened = false;
-  const driver: Driver = {
-    name: fake.name, capabilities: fake.capabilities, selfCheck: () => fake.selfCheck(),
-    async launch(profile) {
-      const inst = await fake.launch(profile);
-      const wrapped: Instance = {
-        health: () => inst.health(),
-        stop: async () => { stops++; await inst.stop(); },
-        onClosed: (l) => { inst.onClosed(l); },
-        setRequestHandler: (h) => { inst.setRequestHandler(h); },
-        onRequestDone: (l) => { inst.onRequestDone(l); },
-        addInitScript: (s) => inst.addInitScript(s),
-        onPageOpened: (l) => { inst.onPageOpened(l); },
-        openPage: () => { opened = true; return new Promise<Page>(() => {}); },
-      };
-      return wrapped;
-    },
-  };
-  return { driver, stops: () => stops, opened: () => opened };
-}
-
 test('stop() has its own deadline: a drain that never settles still stops the browser and exits', async () => {
   const slow = tmpHome();
-  const h = hangingDriver();
+  const h = hangingDriver(pages());
   const k2 = await started({ home: slow, driver: h.driver, stopDeadlineMs: 300 });
   const pending = call(slow, 'open', { url: 'http://localhost:5173/' }).catch((e: unknown) => e);
   while (!h.opened()) await sleep(10);
@@ -353,6 +329,68 @@ test('stop() has its own deadline: a drain that never settles still stops the br
   assert.ok(!existsSync(slow.socket)); assert.ok(!existsSync(slow.pidFile));
   assert.match(readFileSync(slow.logFile, 'utf8'), /关停超过 300 毫秒/);
   assert.equal(((await pending) as E2kError).code, 'internal');                  // 没等到回话的连接被断开
+});
+
+test('stop() is bounded by the deadline plus a short grace even when the browser instance never stops', async () => {
+  const slow = tmpHome();
+  const h = hangingDriver(pages(), { hangStop: true });
+  const k2 = await started({ home: slow, driver: h.driver, stopDeadlineMs: 2000 });
+  void call(slow, 'open', { url: 'http://localhost:5173/' }).catch(() => undefined);
+  while (!h.opened()) await sleep(10);
+  const t0 = Date.now();
+  await k2.stop();
+  const took = Date.now() - t0;
+  assert.ok(took >= 1900, `stop() should wait for the drain deadline first (${took} ms)`);
+  assert.ok(took < 3500, `stop() took ${took} ms: more than the deadline plus the grace`);   // 以前约是期限的 2 倍（4000 毫秒）
+  assert.equal(h.stops(), 1);
+  assert.ok(!existsSync(slow.socket)); assert.ok(!existsSync(slow.pidFile));
+});
+
+test('abort() cuts the shutdown short: the instance is stopped, connections dropped, files removed', async () => {
+  const slow = tmpHome();
+  const h = hangingDriver(pages(), { hangStop: true });
+  const k2 = await started({ home: slow, driver: h.driver });   // 默认期限 45 秒：不靠它
+  void call(slow, 'open', { url: 'http://localhost:5173/' }).catch(() => undefined);
+  while (!h.opened()) await sleep(10);
+  const stopping = k2.stop();
+  await sleep(50);
+  const t0 = Date.now();
+  await k2.abort();
+  await stopping;
+  assert.ok(Date.now() - t0 < 1500, 'abort() must not wait for the deadline');
+  assert.ok(h.stops() >= 1);
+  assert.ok(!existsSync(slow.socket)); assert.ok(!existsSync(slow.pidFile));
+});
+
+test('a rejected sessions.shutdown() is logged and treated as not drained: the instance is stopped directly', async () => {
+  const bad = tmpHome();
+  const h = hangingDriver(pages());
+  const k2 = await started({ home: bad, driver: h.driver, stopDeadlineMs: 300 });
+  void call(bad, 'open', { url: 'http://localhost:5173/' }).catch(() => undefined);
+  while (!h.opened()) await sleep(10);
+  const m = mock.method(SessionManager.prototype, 'shutdown', () => Promise.reject(new Error(`drain blew up ${jwt}`)));
+  try {
+    await k2.stop();
+  } finally {
+    m.mock.restore();
+  }
+  const log = readFileSync(bad.logFile, 'utf8');
+  assert.match(log, /关停收尾失败：Error: drain blew up/);
+  assert.equal(log.split('\n').filter((l) => l.includes('关停收尾失败')).length, 1);   // 带 stack 的失败也只占一行
+  assert.ok(!log.includes(jwt));
+  assert.equal(h.stops(), 1);                                   // 按没 drain 完处理：直接停了实例
+  assert.ok(!existsSync(bad.socket)); assert.ok(!existsSync(bad.pidFile));
+});
+
+test('KernelLog.write keeps every entry on one line: CR and LF become spaces', () => {
+  const quiet = tmpHome();
+  const log = new KernelLog(quiet.logFile);
+  log.write('a\nb\rc\r\nd');
+  log.close();
+  const lines = readFileSync(quiet.logFile, 'utf8').split('\n');
+  assert.equal(lines.length, 2); assert.equal(lines[1], '');    // 一行加结尾换行
+  assert.ok(!lines[0]!.includes('\r'));
+  assert.ok(lines[0]!.endsWith(' a b c  d'));
 });
 
 test('listenerErrorLogger writes one redacted line to a 0600 kernel.log', () => {

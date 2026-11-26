@@ -22,7 +22,7 @@ Commands below are written as `node bin/e2k.js <command>` and run from the repos
 
 ## Usage
 
-1. Start the kernel (a person or an agent; it runs in the foreground, run it in the background if needed; Ctrl-C, SIGTERM or SIGHUP stops it and cleans up). The CLI never starts it for you. If you put it in the background with `&` from an interactive terminal, closing the terminal sends SIGHUP and output to the closed terminal is dropped; the kernel still cleans up on SIGHUP, but `nohup` with the output redirected to a file keeps it running after the terminal closes.
+1. Start the kernel (a person or an agent; it runs in the foreground, run it in the background if needed; Ctrl-C, SIGTERM or SIGHUP stops it and cleans up; if the browser hangs, stopping gives up after the shutdown deadline plus 1 second, and a second Ctrl-C while it is stopping exits at once with code 1). The CLI never starts it for you. If you put it in the background with `&` from an interactive terminal, closing the terminal sends SIGHUP and output to the closed terminal is dropped; the kernel still cleans up on SIGHUP, but `nohup` with the output redirected to a file keeps it running after the terminal closes.
 
 ```sh
 node bin/e2k.js start
