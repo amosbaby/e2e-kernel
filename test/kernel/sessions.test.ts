@@ -1055,3 +1055,30 @@ test('session: a top-level form POST converges the main page to its initiator ho
   assert.equal(post.action, 'fulfill');
   assert.equal(inner(sm, session).topHost, 'example.com'); assert.equal(inner(sm, session).pendingHosts.size, 0);
 });
+
+// ---- initiatorUrl 为 null（主框架在 about:blank / 错误页，或归属判断失败）时的退路 ----
+
+test('session: with no initiator address, an allowed navigation that never commits still keeps the cross-host form POST blocked (pending hosts)', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
+  assert.equal((await nav({ fake }, pageId, 'GET', 'http://example.org/file.zip', null)).action, 'continue');
+  assert.deepEqual([inner(sm, r.session).topHost, [...inner(sm, r.session).pendingHosts]], ['example.com', ['example.org']]);
+  assert.equal((await nav({ fake }, pageId, 'POST', 'http://localhost:5173/submit', null)).action, 'fulfill');
+  assert.equal(inner(sm, r.session).topHost, 'example.com');
+});
+
+test('login: a popup of a login-host page with no initiator address starts from its opener host, so its callback form POST goes through', async () => {
+  const c = await loginSetup(); const { sm, fake, loginId, loginPageId } = c;
+  await nav(c, loginPageId, 'GET', SSO_URL, LOGIN_START); await commit(c, loginPageId, SSO_URL);
+  const popup = fake.emitPopup(loginPageId, 'about:blank');
+  assert.deepEqual(await nav(c, popup.id, 'POST', 'http://app.example.com/acs', null), { action: 'continue' });
+  await sm.loginEnd({ loginId });
+});
+
+test('login: a popup of a read-only page with no initiator address starts from its opener host, so a form POST elsewhere is blocked', async () => {
+  const D = 'http://localhost:5173/login'; const R = 'http://app.example.com/';
+  const c = await loginSetup(['app.example.com'], D); const { sm, fake, loginId, loginPageId } = c;   // 起点是默认主机：靠开启者已提交的只读主机才拦得住
+  await nav(c, loginPageId, 'GET', R, D); await commit(c, loginPageId, R);
+  const popup = fake.emitPopup(loginPageId, 'about:blank');
+  assert.equal((await nav(c, popup.id, 'POST', 'http://example.org/post', null)).action, 'fulfill');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});

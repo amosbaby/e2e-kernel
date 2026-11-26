@@ -18,8 +18,9 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../shared/ops.ts';
 // - describe 对选择器写法的目标返回 { selector: 原样, via: 'given' }；对引用返回解析出的稳定选择器，
 //   解析不出返回 null。元素找不到时抛 DriverError。
 // - RequestInfo.initiatorUrl：顶层框架的导航请求（表单提交、整页跳转）是请求发出时主框架已提交的地址（路由回调运行时、
-//   导航提交之前读到的 mainFrame().url()，只认 http: 和 https:，其他是 null），也就是「是哪一页发起了这次导航」；
-//   这和 topUrl（导航目标）不同。其他请求和 topUrl 取同一个值。内核用它判断发起页在哪个主机上。
+//   导航提交之前读到的 mainFrame().url()，只认 http: 和 https:，其他是 null），也就是「即将被这次导航替换掉的那份文档」；
+//   这和 topUrl（导航目标）不同。它通常就是发起导航的页，但不总是：iframe 的 target=_top、别的窗口的 target=<窗口名>
+//   发起的导航，报的是被替换的那一页，不是真正的发送者。其他请求和 topUrl 取同一个值。内核用它判断导航前页面在哪个主机上。
 // - 驱动不得往页面里暴露任何能调回驱动或内核的函数。
 
 export const ACTION_TIMEOUT_MS = 10_000;

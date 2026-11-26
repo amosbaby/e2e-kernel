@@ -939,10 +939,10 @@ class PlaywrightInstance implements Instance, Host {
   // 请求 → RequestInfo。归属判断不出来（request.frame() 抛错）时 pageId、openerPageId、topUrl 都是 null。
   // topUrl（内核拿它的主机去定模式，空就退回请求自己的地址）：
   // - 顶层框架的导航请求：就是请求自己的地址，即正要打开的那份文档；
-  // initiatorUrl：请求发出时主框架已提交的地址（只认 http(s)，否则 null）；非顶层导航时和 topUrl 一样。
   // - 其他请求：请求发出时那一页顶层文档的地址，但只认 http: 和 https:，
   //   about:blank、data:、chrome-error: 之类一律 null，让内核退回请求的地址；
   // - request.frame() 抛错：null。
+  // initiatorUrl：请求发出时主框架已提交的地址（只认 http(s)，否则 null），顶层导航里它是「将被替换的那份文档」；其他请求和 topUrl 一样。
   private async describeRequest(request: PwRequest): Promise<RequestInfo> {
     const isNavigation = request.isNavigationRequest();
     let pageId: string | null = null;
