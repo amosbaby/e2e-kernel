@@ -11,11 +11,14 @@ import type { FixtureServer } from '../../test/support/fixture-server.ts';
 
 export interface M0Row { case: string; seenByRoute: boolean; reachedServer: boolean; isNavigation: boolean | null; frameAvailable: boolean | null }
 export interface M0Result { playwright: string; chromium: string; crossProcessConfirmed: boolean; rows: M0Row[];
+  control: M0Row; // positive control, not one of the 13 scenarios
   serviceWorker: { register: 'resolved' | 'rejected' | 'unsupported'; registration: 'none' | 'present' } }
 
 const LABELS = ['top', 'same', 'cross'] as const;
 const KINDS = ['fetch', 'xhr', 'beacon', 'form'] as const;
 const BLANK_FORM = 'blank-form';
+// Positive control: a write the route handler lets through, so the server must see it.
+const CONTROL = 'control-continued-fetch';
 const SETTLE_MS = 1000;
 
 interface Seen { isNavigation: boolean; frameAvailable: boolean }
@@ -76,6 +79,10 @@ export async function measure(): Promise<M0Result> {
       const request = route.request();
       const name = caseOf(request.url());
       if (name === null) return route.continue();
+      if (name === CONTROL) {
+        seen.set(name, { isNavigation: request.isNavigationRequest(), frameAvailable: true });
+        return route.continue();
+      }
       let frameAvailable = true;
       try {
         request.frame();
@@ -126,6 +133,20 @@ export async function measure(): Promise<M0Result> {
       };
     });
 
+    const controlPage = await context.newPage();
+    await closeOtherPages(context, controlPage);
+    await controlPage.goto(`${server.origin}/frames.html`, { waitUntil: 'load' });
+    await controlPage.evaluate((c) => fetch(`/api/sink?case=${c}`, { method: 'POST', body: 'control' }).then((r) => r.status), CONTROL);
+    await sleep(SETTLE_MS);
+    const controlSeen = seen.get(CONTROL);
+    const control: M0Row = {
+      case: CONTROL,
+      seenByRoute: controlSeen !== undefined,
+      reachedServer: reached(server, CONTROL),
+      isNavigation: controlSeen?.isNavigation ?? null,
+      frameAvailable: controlSeen?.frameAvailable ?? null,
+    };
+
     const swPage = await context.newPage();
     await closeOtherPages(context, swPage);
     await swPage.goto(`${server.origin}/sw.html`, { waitUntil: 'load' });
@@ -140,6 +161,7 @@ export async function measure(): Promise<M0Result> {
       chromium: chromiumVersion,
       crossProcessConfirmed,
       rows,
+      control,
       serviceWorker: { register, registration },
     };
   } finally {
@@ -161,6 +183,11 @@ function printResult(r: M0Result): void {
   for (const row of r.rows) {
     console.log(`| ${row.case} | ${cell(row.seenByRoute)} | ${cell(row.reachedServer)} | ${cell(row.isNavigation)} | ${cell(row.frameAvailable)} |`);
   }
+  console.log('');
+  console.log('positive control (not a scenario: the route handler continues this request, so it must reach the server)');
+  console.log('| case | seenByRoute | reachedServer | isNavigation | frameAvailable |');
+  console.log('| --- | --- | --- | --- | --- |');
+  console.log(`| ${r.control.case} | ${cell(r.control.seenByRoute)} | ${cell(r.control.reachedServer)} | ${cell(r.control.isNavigation)} | ${cell(r.control.frameAvailable)} |`);
   console.log('');
   console.log(`crossProcessConfirmed: ${r.crossProcessConfirmed}`);
   console.log(`serviceWorker: register=${r.serviceWorker.register} registration=${r.serviceWorker.registration}`);
