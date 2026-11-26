@@ -148,8 +148,16 @@ test('status reports pid, driver and sessions, and no key in it is a sensitive k
   assert.equal(s.pid, process.pid); assert.equal(s.instance, 'running');
   assert.equal(s.driver.name, 'fake'); assert.equal(s.driver.capabilities.selectorDialect, 'playwright');
   assert.deepEqual(s.sessions.map((x) => x.name), ['orders']);
-  const keys = keysOf(r);
+  assert.deepEqual(s.profiles, [{ name: 'default', state: 'never-launched', lastLogin: null }]);
+  const lb = await call(home, 'login.begin', { url: 'http://localhost:5173/' });
+  assert.ok(lb.ok); assert.ok((await call(home, 'login.end', { loginId: (lb.result as { loginId: string }).loginId })).ok);
+  const after = await call(home, 'status', {});
+  assert.ok(after.ok);
+  const login = (after.result as StatusResult).profiles[0]!.lastLogin;
+  assert.equal(login?.host, 'localhost'); assert.match(login?.at ?? '', /^\d{4}-\d{2}-\d{2}T/);
+  const keys = keysOf(after);
   assert.ok(keys.includes('idleSec') && keys.includes('networkInterception'));
+  assert.ok(['profiles', 'state', 'lastLogin', 'at', 'host'].every((k) => keys.includes(k)), keys.join());
   assert.deepEqual(keys.filter(isSensitiveKey), []);
   assert.equal(statSync(home.logFile).mode & 0o777, 0o600);
 });

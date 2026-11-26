@@ -1,12 +1,13 @@
 import { afterEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DriverError } from '../../src/driver/types.ts';
 import { defaultOnlyResolver } from '../../src/kernel/mode.ts';
+import { DEFAULT_PROFILE, profileInfo } from '../../src/kernel/profiles.ts';
 import { SessionManager } from '../../src/kernel/sessions.ts';
 import type { SessionDeps } from '../../src/kernel/sessions.ts';
 import { allowAllPolicy } from '../../src/kernel/write-policy.ts';
@@ -355,6 +356,39 @@ test('a request whose mode cannot be decided is aborted (fail closed)', async ()
   const { pageId } = await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'GET', url: 'http://localhost:5173/x' }), { action: 'abort' });
   assert.ok(logs.some((l) => l.includes('rule error')));
+});
+
+test('loginEnd records the time and host of the login next to the profile directory', async () => {
+  const at = new Date('2026-11-26T08:09:10.000Z');
+  const { sm, home } = setup({ now: () => at });
+  assert.deepEqual(profileInfo(home, DEFAULT_PROFILE).lastLogin, null);
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/login.html?next=%2Fa#frag' });
+  assert.deepEqual(profileInfo(home, DEFAULT_PROFILE).lastLogin, null);          // 还没按回车：不记
+  await sm.loginEnd({ loginId });
+  const file = join(home.profilesDir, 'default.login.json');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { schema: 1, at: at.toISOString(), host: 'localhost' });
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(join(home.profilesDir, 'default')), []);          // 不在 user data 目录里
+});
+
+test('a login whose navigation failed is not recorded', async () => {
+  const { sm, home } = setup();
+  await assert.rejects(sm.loginBegin({ url: 'http://localhost:5173/login-down' }));
+  assert.equal(profileInfo(home, DEFAULT_PROFILE).lastLogin, null);
+  assert.ok(!existsSync(join(home.profilesDir, 'default.login.json')));
+});
+
+test('a login record that cannot be written is logged, and loginEnd still finishes', async () => {
+  const { sm, fake, home, logs } = setup();
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  const loginPageId = fake.openPages().at(-1)!;
+  const outside = join(home.root, 'outside.txt'); writeFileSync(outside, 'keep');
+  symlinkSync(outside, join(home.profilesDir, 'default.login.json'));
+  assert.deepEqual(await sm.loginEnd({ loginId }), {});
+  assert.ok(!fake.openPages().includes(loginPageId));
+  assert.equal(readFileSync(outside, 'utf8'), 'keep');
+  assert.ok(logs.some((l) => l.includes('登录记录')), logs.join('\n'));
+  await assert.rejects(sm.loginEnd({ loginId }), (e: E2kError) => e.code === 'not-found');
 });
 
 test('login: a failed navigation closes the page; unknown ids are not-found; shutdown closes login pages', async () => {

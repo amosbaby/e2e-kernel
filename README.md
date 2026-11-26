@@ -54,7 +54,8 @@ The kernel only flags one contradiction: a `pass` verdict while the record holds
 Other commands:
 
 - `node bin/e2k.js login https://example.com/login` opens the dedicated profile so a person can sign in; must be run in a terminal, where a person presses Enter after signing in. The cookie stays in the profile for later sessions.
-- `node bin/e2k.js status` shows version, driver, browser and sessions. `node bin/e2k.js doctor` checks Node, platform, state directory permissions, socket path length, Chromium (fix: `npx playwright install chromium`), whether the kernel is running, and the kernel version. It exits 22 if any check fails, including "kernel not running"; most failing checks print a fix.
+- `node bin/e2k.js status` shows version, driver, browser, sessions and the profile (`profile default <state>, last login <time host | none>`). `node bin/e2k.js doctor` checks Node, platform, state directory permissions, socket path length, the profile (read-only: it creates nothing; a profile that was never used with `login` is not a failure, and it fails only when `profiles/` or `profiles/default/` exists but is open to group or others), Chromium (fix: `npx playwright install chromium`), whether the kernel is running, and the kernel version. It exits 22 if any check fails, including "kernel not running"; most failing checks print a fix.
+- In the text output the profile line and the doctor check are written in Chinese; the enum values (`missing`, `never-launched`, `launched`) appear only in `--json`. The profile state only says whether the browser has used the directory. To tell whether a profile holds a login, look at `lastLogin` (JSON) or the "last login" part of the line: it is written only when a person finishes `login` by pressing Enter. A login done by hand in a session window is not recorded, so "none" does not prove the profile is signed out. `lastLogin` keeps only the time and the host name of the start URL (no path, query or cookie), and the host is redacted like other output.
 - `--json` (on commands that support it) prints exactly one line on stdout: the result, or `{ "error": ... }`.
 
 ## Operations
@@ -97,7 +98,7 @@ Supported `css` assertion forms:
 
 ## Where things live
 
-State directory: `~/.e2e-kernel/` (override with an absolute `E2K_HOME`). It holds `kernel.sock`, `kernel.pid`, `kernel.log`, `profiles/default/` (the browser profile with login cookies) and `runs/`.
+State directory: `~/.e2e-kernel/` (override with an absolute `E2K_HOME`). It holds `kernel.sock`, `kernel.pid`, `kernel.log`, `profiles/default/` (the browser profile with login cookies), `profiles/default.login.json` (time and host of the last `login`; mode 0600, kept next to the profile and not inside it) and `runs/`.
 Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` with `report.html` (no scripts; screenshots are linked from `shots/NN.jpg` and render when the file is opened from disk), `result.json` (a record of the operations; `eval` sources and any `fill` value not confirmed safe are `[REDACTED]`, so those steps cannot be replayed from it) and `shots/`. The newest 20 reports per session name are kept. A session idle for 15 minutes is closed (time spent inside a `step` does not count).
 
 ## Safety

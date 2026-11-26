@@ -1,7 +1,10 @@
 import { lstatSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Check, Driver } from '../driver/types.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
+import { PROFILE_STATE_TEXT, lastLoginText } from './format.ts';
+import { DEFAULT_PROFILE, profileInfo } from '../kernel/profiles.ts';
 import { E2kError } from '../shared/errors.ts';
 import { assertSocketPathFits, ensurePrivateDir } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
@@ -56,6 +59,32 @@ function socketCheck(home: Home): Check {
   }
 }
 
+function exists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// profile 的状态和最近一次 login。只查不建；「没 login 过」不算失败（R7）：fresh home 上这一项是 ok。
+// ok 只在 profiles 目录或 profile 目录已存在、却不满足状态目录的权限规则时为 false。
+function profileCheck(home: Home): Check {
+  const name = `profile-${DEFAULT_PROFILE}`;
+  const profileDir = join(home.profilesDir, DEFAULT_PROFILE);
+  try {
+    for (const dir of [home.profilesDir, profileDir]) if (exists(dir)) ensurePrivateDir(dir);   // 已存在：只检查，不改
+  } catch (e) {
+    return failed(name, e);
+  }
+  const info = profileInfo(home, DEFAULT_PROFILE);
+  const login = info.lastLogin === null
+    ? '从没用 login 登录过（会话窗口里手动登录不会记在这里）'
+    : `最近一次 login ${lastLoginText(info)}`;
+  return { name, ok: true, detail: `profiles/${DEFAULT_PROFILE} ${PROFILE_STATE_TEXT[info.state]}；${login}` };
+}
+
 async function kernelChecks(home: Home, selfCmd: string): Promise<Check[]> {
   let status: StatusResult;
   try {
@@ -87,6 +116,7 @@ export async function runDoctor(home: Home, driver: Driver, selfCmd = 'e2k'): Pr
     platformCheck(),
     homeCheck(home),
     socketCheck(home),
+    profileCheck(home),
     ...await driver.selfCheck(),
     ...await kernelChecks(home, selfCmd),
   ];

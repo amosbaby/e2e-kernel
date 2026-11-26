@@ -15,6 +15,7 @@ import type { CloseParams, CloseResult, Mode, OpenParams, OpenResult, SessionInf
 import { redactText, redactUrl } from '../shared/redact.ts';
 import { exitFor, runOps, tally } from './executor.ts';
 import type { ModeResolver } from './mode.ts';
+import { DEFAULT_PROFILE, recordLogin } from './profiles.ts';
 import { Recorder, isWrite, safely, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import type { WritePolicy } from './write-policy.ts';
@@ -28,7 +29,6 @@ export interface SessionDeps {
 }
 
 const DEFAULT_NAME = 'session';
-const PROFILE = 'default';
 const MAX_SNAPSHOT = 20_000;
 const MAX_UNATTRIBUTED = 200;
 
@@ -58,6 +58,7 @@ interface Session {
 interface Login {
   readonly id: string;
   readonly instance: Instance;
+  readonly host: string;                     // 起始地址的主机（URL.hostname），人按回车结束时记进登录记录
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
 }
 
@@ -227,10 +228,16 @@ export class SessionManager {
     let id = `l-${randomHex()}`;
     while (this.logins.has(id)) id = `l-${randomHex()}`;
     let login: Login | undefined;
+    let host = '';
+    try {
+      host = hostOf(p.url);
+    } catch {
+      // 取不到主机不挡登录；登录记录写不出来时只记日志。
+    }
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, pages: new Map([[page.id, page]]) };
+      login = { id, instance, host, pages: new Map([[page.id, page]]) };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -250,6 +257,12 @@ export class SessionManager {
     const login = this.logins.get(p.loginId);
     if (login === undefined) throw new E2kError('not-found', '没有这个登录');
     await this.endLogin(login);
+    // 登录记录只用来给 doctor 和 status 看：写不了就记日志，不影响这次 login 结束。
+    try {
+      recordLogin(this.deps.home, DEFAULT_PROFILE, this.deps.now(), login.host);
+    } catch (e) {
+      this.logFailure(null, `写登录记录`, e);
+    }
     return {};
   }
 
@@ -309,10 +322,10 @@ export class SessionManager {
       await this.stopQuietly(current);
     }
     if (this.stopping) throw stopping();
-    const profileDir = resolveInside(this.deps.home.profilesDir, PROFILE);
+    const profileDir = resolveInside(this.deps.home.profilesDir, DEFAULT_PROFILE);
     ensurePrivateDir(this.deps.home.profilesDir);
     ensurePrivateDir(profileDir);
-    const inst = await this.deps.driver.launch({ name: PROFILE, userDataDir: profileDir });
+    const inst = await this.deps.driver.launch({ name: DEFAULT_PROFILE, userDataDir: profileDir });
     inst.setRequestHandler((r) => this.onRequest(r));
     inst.onRequestDone((e) => { this.onRequestDone(e); });
     inst.onPageOpened((page, openerId) => { this.onPageOpened(page, openerId); });
@@ -359,7 +372,7 @@ export class SessionManager {
       if (this.stopping) throw stopping();
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
-        start: { url: p.url, viewport: p.viewport ?? null, profile: PROFILE },
+        start: { url: p.url, viewport: p.viewport ?? null, profile: DEFAULT_PROFILE },
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(),
         url: '', state: 'opening', lastActive: 0, timer: undefined, finished: undefined,
       };

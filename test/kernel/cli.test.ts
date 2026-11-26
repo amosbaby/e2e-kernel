@@ -1,7 +1,8 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
 import type { Io } from '../../src/cli/main.ts';
@@ -290,6 +291,67 @@ test('status and doctor', async () => {
   assert.equal(await main(['doctor'], t), 22); assert.ok(t.outText().includes('npx playwright install chromium'));
 });
 
+type DocCheck = { name: string; ok: boolean; detail: string; fix?: string };
+async function doctorChecks(e: NodeJS.ProcessEnv): Promise<{ code: number; checks: DocCheck[] }> {
+  const t = io({ env: e }); const code = await main(['doctor', '--json'], t);
+  return { code, checks: JSON.parse(t.outText()) as DocCheck[] };
+}
+
+test('doctor on a fresh home: profile-default is ok, creates nothing, and does not add its own exit 22', async () => {
+  const h = makeTmpHome();
+  try {
+    rmSync(h.home.root, { recursive: true });
+    const { checks } = await doctorChecks(h.env);
+    const p = checks.find((c) => c.name === 'profile-default');
+    assert.equal(p?.ok, true); assert.match(p?.detail ?? '', /从没用 login 登录过/);
+    assert.ok(!existsSync(h.home.root));                              // doctor 不建任何东西
+  } finally { h.cleanup(); }
+});
+
+test('doctor: a profile that only holds browser files still says nobody logged in with login; a record shows time and host', async () => {
+  const h = makeTmpHome();
+  try {
+    mkdirSync(join(h.home.profilesDir, 'default'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(h.home.profilesDir, 'default', 'Local State'), '{}');
+    let p = (await doctorChecks(h.env)).checks.find((c) => c.name === 'profile-default');
+    assert.equal(p?.ok, true); assert.match(p?.detail ?? '', /用过；从没用 login 登录过（会话窗口里手动登录不会记在这里）/);
+    writeFileSync(join(h.home.profilesDir, 'default.login.json'), JSON.stringify({ schema: 1, at: '2026-11-26T08:09:10.000Z', host: 'app.example.com' }));
+    p = (await doctorChecks(h.env)).checks.find((c) => c.name === 'profile-default');
+    assert.equal(p?.ok, true); assert.ok((p?.detail ?? '').includes('2026-11-26T08:09:10.000Z app.example.com'), p?.detail);
+    assert.deepEqual(readdirSync(h.home.profilesDir).sort(), ['default', 'default.login.json']);
+  } finally { h.cleanup(); }
+});
+
+test('doctor: the host from the login record is redacted before it is printed', async () => {
+  const h = makeTmpHome();
+  try {
+    mkdirSync(h.home.profilesDir, { recursive: true, mode: 0o700 });
+    const label = 'Ab1'.repeat(14);
+    writeFileSync(join(h.home.profilesDir, 'default.login.json'), JSON.stringify({ schema: 1, at: '2026-11-26T08:09:10.000Z', host: `${label}.example.com` }));
+    const t = io({ env: h.env }); await main(['doctor'], t);
+    assert.ok(!t.outText().includes(label)); assert.match(t.outText(), /\[REDACTED\]\.example\.com/);
+  } finally { h.cleanup(); }
+});
+
+test('doctor: a profiles directory others can enter fails the profile check (the same state-directory rule as home), and nothing is changed', async () => {
+  const h = makeTmpHome();
+  try {
+    mkdirSync(h.home.profilesDir, { mode: 0o755 }); chmodSync(h.home.profilesDir, 0o755);
+    const { code, checks } = await doctorChecks(h.env);
+    const p = checks.find((c) => c.name === 'profile-default');
+    assert.equal(p?.ok, false); assert.equal(code, 22);
+    assert.equal(statSync(h.home.profilesDir).mode & 0o777, 0o755);
+  } finally { h.cleanup(); }
+});
+
+test('status prints a profile line; --json carries profiles[0].state and lastLogin', async () => {
+  const j = io(); assert.equal(await main(['status', '--json'], j), 0);
+  const r = JSON.parse(j.outText()) as { profiles: { name: string; state: string; lastLogin: unknown }[] };
+  assert.equal(r.profiles[0]?.name, 'default'); assert.ok(['missing', 'never-launched', 'launched'].includes(r.profiles[0]?.state ?? ''));
+  const t = io(); assert.equal(await main(['status'], t), 0);
+  assert.match(t.outText(), /^profile default (?:目录还不存在|没启动过|用过)，最近一次 login (?:无|\S+ \S+)$/m);
+});
+
 test('doctor without a kernel says how to start one', async () => {
   const t = io({ env: emptyEnv });
   assert.equal(await main(['doctor', '--json'], t), 22);
@@ -298,7 +360,7 @@ test('doctor without a kernel says how to start one', async () => {
   assert.equal(running?.ok, false); assert.equal(running?.fix, 'node bin/e2k.js start');
   assert.equal(checks.find((c) => c.name === 'kernel-version')?.ok, true);
   assert.deepEqual(checks.map((c) => c.name),
-    ['node-version', 'platform', 'home-permissions', 'socket-path-length', 'fake', 'kernel-running', 'kernel-version']);
+    ['node-version', 'platform', 'home-permissions', 'socket-path-length', 'profile-default', 'fake', 'kernel-running', 'kernel-version']);
 });
 
 test('start runs until the stop signal and cleans up', async () => {

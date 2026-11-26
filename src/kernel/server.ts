@@ -13,6 +13,8 @@ import type { Request, Response, SessionInfo } from '../shared/protocol.ts';
 import { redactDeep, redactText } from '../shared/redact.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { defaultOnlyResolver } from './mode.ts';
+import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
+import type { ProfileInfo } from './profiles.ts';
 import { safely } from './recorder.ts';
 import { SessionManager } from './sessions.ts';
 import { allowAllPolicy } from './write-policy.ts';
@@ -25,7 +27,7 @@ export interface KernelOptions {
 }
 export interface KernelHandle { stop(): Promise<void> }
 export interface StatusResult { version: string; pid: number; home: string;
-  driver: { name: string; capabilities: Capabilities }; instance: 'stopped' | 'running'; sessions: SessionInfo[] }
+  driver: { name: string; capabilities: Capabilities }; instance: 'stopped' | 'running'; sessions: SessionInfo[]; profiles: ProfileInfo[] }
 
 const DEFAULT_IDLE_MS = 15 * 60_000;
 const DEFAULT_KEEP_RUNS = 20;
@@ -260,6 +262,7 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   const status = (): StatusResult => ({
     version, pid: process.pid, home: home.root, driver: { name: driver.name, capabilities: { ...driver.capabilities } },
     instance: sessions.instanceState(), sessions: sessions.list(),
+    profiles: [profileInfo(home, DEFAULT_PROFILE)],
   });
 
   const dispatch = async (req: Request): Promise<unknown> => {

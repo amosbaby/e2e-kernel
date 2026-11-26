@@ -1,6 +1,8 @@
 import type { Check } from '../driver/types.ts';
+import type { ProfileInfo } from '../kernel/profiles.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import type { CloseResult, OpResult, OpenResult, StepResult, Tallies } from '../shared/protocol.ts';
+import { redactText } from '../shared/redact.ts';
 
 // CLI 的紧凑文本输出。打印的内容都来自内核的回应（内核已经脱敏），这里只排版，不加回任何调用方给的原值。
 
@@ -81,6 +83,18 @@ export function formatClose(r: CloseResult): string {
   return out.join('\n');
 }
 
+// doctor 和 status 共用的措辞；枚举值只出现在 --json 里。
+export const PROFILE_STATE_TEXT: Record<ProfileInfo['state'], string> = { missing: '目录还不存在', 'never-launched': '没启动过', launched: '用过' };
+
+export function lastLoginText(p: ProfileInfo): string {
+  return p.lastLogin === null ? '无' : `${inline(p.lastLogin.at)} ${inline(redactText(p.lastLogin.host))}`;
+}
+
+// 判断有没有登录态看最近一次 login，不看状态：浏览器用过的目录里不一定登录过，会话窗口里手动登录也不记在这里。
+function profileLine(p: ProfileInfo): string {
+  return `profile ${inline(p.name)} ${PROFILE_STATE_TEXT[p.state]}，最近一次 login ${lastLoginText(p)}`;
+}
+
 export function formatStatus(r: StatusResult): string {
   const c = r.driver.capabilities;
   const lines = [
@@ -91,6 +105,7 @@ export function formatStatus(r: StatusResult): string {
     `浏览器 ${r.instance === 'running' ? '在运行' : '未启动'}`,
     `会话 ${r.sessions.length} 个`,
     ...r.sessions.map((s) => `  ${inline(s.session)} ${inline(s.name)} 闲置 ${s.idleSec} 秒 ${inline(s.url)}`),
+    ...(r.profiles ?? []).map(profileLine),
   ];
   return lines.join('\n');
 }
