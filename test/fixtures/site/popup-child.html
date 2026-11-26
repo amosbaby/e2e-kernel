@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Popup Child</title>
+</head>
+<body>
+<button id="close-self">Close</button>
+<script>
+  fetch('/api/sink?case=popup-fetch', { method: 'POST' }).catch(() => {});
+  document.getElementById('close-self').addEventListener('click', () => {
+    window.close();
+  });
+</script>
+</body>
+</html>

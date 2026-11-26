@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Service Worker</title>
+</head>
+<body>
+<p id="sw-register"></p>
+<p id="sw-state"></p>
+<script>
+  (async () => {
+    const register = document.getElementById('sw-register');
+    const state = document.getElementById('sw-state');
+    if (!('serviceWorker' in navigator)) {
+      register.textContent = 'unsupported';
+      state.textContent = 'none';
+      return;
+    }
+    try {
+      await navigator.serviceWorker.register('/sw.js');
+      register.textContent = 'resolved';
+    } catch {
+      register.textContent = 'rejected';
+    }
+    let registration;
+    try {
+      registration = await navigator.serviceWorker.getRegistration();
+    } catch {
+      registration = undefined;
+    }
+    state.textContent = registration ? 'present' : 'none';
+  })();
+</script>
+</body>
+</html>

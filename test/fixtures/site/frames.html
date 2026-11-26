@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Frames</title>
+</head>
+<body data-label="top">
+<button id="do-fetch">fetch</button>
+<button id="do-xhr">xhr</button>
+<button id="do-beacon">beacon</button>
+<form id="sink-form" method="post">
+  <button id="do-form">form</button>
+</form>
+<iframe title="same" src="/frame-child.html?label=same"></iframe>
+<iframe title="cross" src="{{ALT_ORIGIN}}/frame-child.html?label=cross"></iframe>
+<script src="/controls.js"></script>
+</body>
+</html>

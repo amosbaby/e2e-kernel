@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tricky &lt;b&gt;title&lt;/b&gt;</title>
+</head>
+<body>
+<p id="markup">&lt;script&gt;window.pwned=1&lt;/script&gt;</p>
+<p id="leak">{{FAKE_JWT}}</p>
+<a href="/cb?token={{FAKE_BEARER}}">callback</a>
+<script>
+  console.log('token {{FAKE_JWT}}');
+</script>
+</body>
+</html>

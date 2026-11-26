@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Items</title>
+</head>
+<body>
+<h1>Items</h1>
+<ul id="list">
+  <li>Alpha</li>
+  <li>Beta</li>
+</ul>
+<label for="new-item">New item</label><input id="new-item">
+<button data-testid="add">Add</button>
+<button id="save">Save</button>
+<button>Plain</button>
+<p role="status" id="status"></p>
+<p id="styled" style="color: rgb(0, 128, 0); font-size: 18px; margin-top: 12px">Styled</p>
+<p id="login-state"></p>
+<script>
+  const status = document.getElementById('status');
+  const signedIn = document.cookie.split(';').some((c) => c.trim() === 'fixture_login=1');
+  document.getElementById('login-state').textContent = signedIn ? 'signed-in' : 'signed-out';
+
+  document.querySelector('[data-testid="add"]').addEventListener('click', () => {
+    const name = document.getElementById('new-item').value;
+    const li = document.createElement('li');
+    li.textContent = name;
+    document.getElementById('list').append(li);
+    status.textContent = 'Added';
+    fetch('/api/items', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer {{FAKE_BEARER}}' },
+      body: JSON.stringify({ name, password: '{{FAKE_PASSWORD}}', note: 'ok' }),
+    }).catch(() => {});
+  });
+
+  document.getElementById('save').addEventListener('click', () => {
+    status.textContent = 'Saved';
+    fetch('/api/items/1', { method: 'PUT' }).catch(() => {});
+  });
+
+  document.querySelector('button:not([id]):not([data-testid])').addEventListener('click', () => {
+    status.textContent = 'Plain clicked';
+  });
+</script>
+</body>
+</html>
