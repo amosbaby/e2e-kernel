@@ -72,6 +72,8 @@ export interface DriverOptions {
   // 监听器（onClosed、onPageOpened、onRequestDone）抛出的异常交给它；不给就异步重抛（rethrowAsync）。
   // 每个抛错的监听器调用一次，其余监听器照常运行。
   onListenerError?: (e: unknown) => void;
+  // 动作等目标出现、以及 Playwright 动作本身的超时（毫秒），默认 ACTION_TIMEOUT_MS。测试用来把「永远不出现」的等待缩短。
+  actionTimeoutMs?: number;
 }
 
 // 统一写法 → Playwright 的 Locator：引用 → getByRef；role=…[name="…"] → getByRole（我们自己解析）；其余 → locator。
@@ -150,6 +152,7 @@ function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boole
 interface Host {
   popupsOf(pageId: string): string[];
   reportError(e: unknown): void;
+  readonly actionTimeoutMs: number;
 }
 
 class PlaywrightPage implements Page {
@@ -221,11 +224,22 @@ class PlaywrightPage implements Page {
     });
   }
 
-  // 目标翻译之后先数一数：一个都没有就是 not-found（不等它出现，要等用 wait）。
+  // 目标翻译之后确认有这个元素，没有就是 not-found。
+  // wait 为真（动作：click、hover、fill、press、scroll）时最多等 actionTimeoutMs 让它出现在 DOM 里，等不到才是 not-found；
+  // 为假（text、describe）时不等，数一数就定。
   // 匹配多个时交给 Playwright 的严格模式：动作不会悄悄落在第一个上，那样的错归 other。
-  private async resolve(target: Target): Promise<Locator> {
+  private async resolve(target: Target, wait: boolean): Promise<Locator> {
     const loc = locate(this.page, target);
-    if ((await loc.count()) === 0) throw new DriverError('not-found', 'element not found');
+    if (!wait) {
+      if ((await loc.count()) === 0) throw new DriverError('not-found', 'element not found');
+      return loc;
+    }
+    try {
+      await loc.first().waitFor({ state: 'attached', timeout: this.host.actionTimeoutMs });
+    } catch (e) {
+      if (e instanceof Error && e.name === 'TimeoutError') throw new DriverError('not-found', 'element not found');
+      throw e;
+    }
     return loc;
   }
 
@@ -236,7 +250,7 @@ class PlaywrightPage implements Page {
   text(o: { target?: Target }): Promise<string> {
     return this.run(async () => {
       if (o.target === undefined) return await this.page.evaluate(() => document.body?.innerText ?? '');
-      return await (await this.resolve(o.target)).first().innerText();
+      return await (await this.resolve(o.target, false)).first().innerText();
     });
   }
 
@@ -251,29 +265,31 @@ class PlaywrightPage implements Page {
   }
 
   click(target: Target): Promise<void> {
-    return this.run(async () => { await (await this.resolve(target)).click(); });
+    return this.run(async () => { await (await this.resolve(target, true)).click(); });
   }
 
   hover(target: Target): Promise<void> {
-    return this.run(async () => { await (await this.resolve(target)).hover(); });
+    return this.run(async () => { await (await this.resolve(target, true)).hover(); });
   }
 
   fill(target: Target, value: string): Promise<void> {
-    return this.run(async () => { await (await this.resolve(target)).fill(value); });
+    return this.run(async () => { await (await this.resolve(target, true)).fill(value); });
   }
 
   press(key: string, target?: Target): Promise<void> {
     return this.run(async () => {
       if (target === undefined) await this.page.keyboard.press(key);
-      else await (await this.resolve(target)).press(key);
+      else await (await this.resolve(target, true)).press(key);
     });
   }
 
-  // 有目标就滚到它可见；没有目标就在当前鼠标位置滚轮 dx、dy。
+  // 有目标就滚到它可见；没有目标就让页面按 dx、dy 滚动。
+  // 页面滚动用页内同步的 scrollBy（behavior: 'instant'），返回时 scrollX/scrollY 已经到位；
+  // 不用 mouse.wheel：它在滚动落地之前就返回了。
   scroll(o: { target?: Target; dx?: number; dy?: number }): Promise<void> {
     return this.run(async () => {
-      if (o.target !== undefined) await (await this.resolve(o.target)).scrollIntoViewIfNeeded();
-      else await this.page.mouse.wheel(o.dx ?? 0, o.dy ?? 0);
+      if (o.target !== undefined) await (await this.resolve(o.target, true)).scrollIntoViewIfNeeded();
+      else await this.page.evaluate(([dx, dy]) => { window.scrollBy({ left: dx, top: dy, behavior: 'instant' }); }, [o.dx ?? 0, o.dy ?? 0]);
     });
   }
 
@@ -324,7 +340,7 @@ class PlaywrightPage implements Page {
   // 第一个「匹配数正好是 1，且就是这个元素」的就是结果，都不行就是 null。元素找不到抛 not-found。
   describe(target: Target): Promise<{ stable: Stable | null; isPassword: boolean }> {
     return this.run(async () => {
-      const loc = (await this.resolve(target)).first();
+      const loc = (await this.resolve(target, false)).first();
       const { info, isPassword } = await loc.evaluate(collectElementInfo);
       if (!isRef(target)) return { stable: { selector: target, via: 'given' as const }, isPassword };
       if (target.startsWith('f')) return { stable: null, isPassword };
@@ -380,7 +396,10 @@ class PlaywrightInstance implements Instance, Host {
   private opening = 0;
   private readonly deferred = new Set<PwPage>();
 
-  constructor(context: BrowserContext, counters: Counters, reportListenerError: (e: unknown) => void) {
+  readonly actionTimeoutMs: number;
+
+  constructor(context: BrowserContext, counters: Counters, reportListenerError: (e: unknown) => void, actionTimeoutMs: number) {
+    this.actionTimeoutMs = actionTimeoutMs;
     this.context = context;
     this.counters = counters;
     this.reportListenerError = reportListenerError;
@@ -602,9 +621,11 @@ class PlaywrightDriver implements Driver {
   readonly capabilities: Capabilities = { ...CAPABILITIES };
   private readonly counters: Counters = { page: 0, request: 0 };
   private readonly reportListenerError: (e: unknown) => void;
+  private readonly actionTimeoutMs: number;
 
   constructor(opts: DriverOptions) {
     this.reportListenerError = opts.onListenerError ?? rethrowAsync;
+    this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
   }
 
   async selfCheck(): Promise<Check[]> {
@@ -627,9 +648,9 @@ class PlaywrightDriver implements Driver {
     } catch (e) {
       throw mapError(e);
     }
-    context.setDefaultTimeout(ACTION_TIMEOUT_MS);
+    context.setDefaultTimeout(this.actionTimeoutMs);
     context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-    const instance = new PlaywrightInstance(context, this.counters, this.reportListenerError);
+    const instance = new PlaywrightInstance(context, this.counters, this.reportListenerError, this.actionTimeoutMs);
     try {
       await instance.attach();
     } catch (e) {

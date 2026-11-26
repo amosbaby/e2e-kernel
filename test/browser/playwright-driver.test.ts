@@ -12,7 +12,9 @@ import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 
 // 整份文件共用一个 fixture 服务和一个浏览器实例；每条测试自己开一页。
-const driver = createPlaywrightDriver();
+// 动作等目标的上限压到 1.5 秒：「永远不出现」的目标也只等这么久，测试才快。
+const ACTION_WAIT_MS = 1500;
+const driver = createPlaywrightDriver({ actionTimeoutMs: ACTION_WAIT_MS });
 const tmpDirs: string[] = [];
 let server: FixtureServer;
 let inst: Instance;
@@ -391,6 +393,29 @@ test('action errors: a missing target is not-found, messages are one line', { ti
   await assert.rejects(page.goto('http://127.0.0.1:9/'), (e: DriverError) => e instanceof DriverError && e.kind === 'other' && !e.message.includes('\n'));
 });
 
+test('actions wait for a late target to attach; one that never appears is not-found after the action timeout', { timeout: 60_000 }, async () => {
+  await page.evaluate(`setTimeout(() => {
+    const b = document.createElement('button'); b.id = 'late-btn'; b.textContent = 'Late'; b.onclick = () => { b.dataset.clicked = 'yes'; };
+    const i = document.createElement('input'); i.id = 'late-input';
+    document.body.append(b, i);
+  }, 400)`);
+  assert.equal(await page.read({ kind: 'count', target: '#late-btn' }), 0);   // read 不等待
+  await page.click('#late-btn');
+  assert.equal(await page.read({ kind: 'css', target: '#late-btn', property: 'display' }), 'inline-block');
+  assert.equal(await page.evaluate(`document.querySelector('#late-btn').dataset.clicked`), 'yes');
+  await page.fill('#late-input', 'typed');
+  assert.equal(await page.evaluate(`document.querySelector('#late-input').value`), 'typed');
+  // 永远不出现：等满上限才 not-found（不会立刻失败，也不会拖到 Playwright 默认的更长时间）。
+  const t0 = Date.now();
+  await assert.rejects(page.click('#never'), (e: DriverError) => e instanceof DriverError && e.kind === 'not-found');
+  const waited = Date.now() - t0;
+  assert.ok(waited >= ACTION_WAIT_MS - 200 && waited < ACTION_WAIT_MS + 3000, `waited ${waited} ms`);
+  // read 照旧不等待。
+  const t1 = Date.now();
+  await assert.rejects(page.read({ kind: 'text', target: '#never' }), (e: DriverError) => e instanceof DriverError && e.kind === 'not-found');
+  assert.ok(Date.now() - t1 < ACTION_WAIT_MS / 2);
+});
+
 test('screenshot is a JPEG', { timeout: 60_000 }, async () => {
   const file = join(makeTmp('e2k-shot-'), 'shot.jpg');
   await page.screenshot({ path: file, fullPage: false });
@@ -441,15 +466,16 @@ test('scroll by target and by dx/dy', { timeout: 60_000 }, async () => {
     const d = document.createElement('div'); d.id = 'bottom'; d.style.marginTop = '3000px'; d.textContent = 'bottom'; document.body.append(d);
   })()`);
   assert.equal(await page.evaluate('window.scrollY'), 0);
+  // 每一步 resolve 之后立刻读：不轮询、不等待，滚动已经落地才算 scroll 完成。
   await page.scroll({ target: '#bottom' });
-  await untilEval(page, 'window.scrollY > 1000');
+  assert.ok((await page.evaluate('window.scrollY')) as number > 1000);
   await page.evaluate('window.scrollTo(0, 0)');
   await page.scroll({ dy: 300 });
-  await untilEval(page, 'window.scrollY === 300');
+  assert.equal(await page.evaluate('window.scrollY'), 300);
   await page.scroll({ dx: 200 });
-  await untilEval(page, 'window.scrollX === 200');
+  assert.equal(await page.evaluate('window.scrollX'), 200);
   await page.scroll({ dy: -100 });
-  await untilEval(page, 'window.scrollY === 200');
+  assert.equal(await page.evaluate('window.scrollY'), 200);
 });
 
 test('setViewport resizes the page, and openPage applies a requested viewport', { timeout: 60_000 }, async () => {
