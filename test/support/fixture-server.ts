@@ -136,6 +136,13 @@ export async function startFixtureServer(): Promise<FixtureServer> {
       return;
     }
 
+    // /redir-form：302 到 form.html（先经过重定向再落到有表单的页）。
+    if (url.pathname === '/redir-form') {
+      res.writeHead(302, { location: '/form.html', 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     // /slow?ms=N：N 毫秒（默认 5000）之后才回应；连接提前断了就不再回。
     if (url.pathname === '/slow') {
       const ms = Math.min(Number(url.searchParams.get('ms') ?? '5000') || 5000, 30_000);

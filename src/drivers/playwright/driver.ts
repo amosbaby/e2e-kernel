@@ -939,6 +939,7 @@ class PlaywrightInstance implements Instance, Host {
   // 请求 → RequestInfo。归属判断不出来（request.frame() 抛错）时 pageId、openerPageId、topUrl 都是 null。
   // topUrl（内核拿它的主机去定模式，空就退回请求自己的地址）：
   // - 顶层框架的导航请求：就是请求自己的地址，即正要打开的那份文档；
+  // initiatorUrl：请求发出时主框架已提交的地址（只认 http(s)，否则 null）；非顶层导航时和 topUrl 一样。
   // - 其他请求：请求发出时那一页顶层文档的地址，但只认 http: 和 https:，
   //   about:blank、data:、chrome-error: 之类一律 null，让内核退回请求的地址；
   // - request.frame() 抛错：null。
@@ -947,6 +948,7 @@ class PlaywrightInstance implements Instance, Host {
     let pageId: string | null = null;
     let openerPageId: string | null = null;
     let topUrl: string | null = null;
+    let initiatorUrl: string | null = null;
     let topFrame = isNavigation;
     let fromLoginForm: boolean | null = null;
     let urlsAtStart: string[] = [];
@@ -957,7 +959,8 @@ class PlaywrightInstance implements Instance, Host {
       urlsAtStart = frameUrls(frame);
       if (isNavigation) this.navigating.set(frame, { request, at: Date.now() });
       topFrame = frame.parentFrame() === null;
-      topUrl = isNavigation && topFrame ? request.url() : httpUrlOrNull(pwPage.mainFrame().url());
+      initiatorUrl = httpUrlOrNull(pwPage.mainFrame().url());   // 路由回调里、导航提交之前：还是发起页自己的地址
+      topUrl = isNavigation && topFrame ? request.url() : initiatorUrl;
       const w = this.register(pwPage, false);
       if (w !== null) {
         await w.ready;   // 请求到来时就查得到开启者：别处开出来的页，先等它登记完
@@ -968,7 +971,7 @@ class PlaywrightInstance implements Instance, Host {
       // 都会一直挂着（Playwright 要等导航结束，导航又在等这个回调），白白拖满 300 ms 还是 null，所以直接 null，请求体不记。
       if (post !== null && !isNavigation) fromLoginForm = await probePasswordField(frame, urlsAtStart, () => this.isNavigating(frame));
     } catch {
-      pageId = null; openerPageId = null; topUrl = null; topFrame = isNavigation; fromLoginForm = null;
+      pageId = null; openerPageId = null; topUrl = null; initiatorUrl = null; topFrame = isNavigation; fromLoginForm = null;
     }
     return {
       id: `r${++this.counters.request}`,
@@ -976,7 +979,7 @@ class PlaywrightInstance implements Instance, Host {
       method: request.method(),
       url: request.url(),
       resourceType: request.resourceType(),
-      isNavigation, topFrame, topUrl,
+      isNavigation, topFrame, topUrl, initiatorUrl,
       contentType: request.headers()['content-type'] ?? null,
       body: post === null ? null : post.subarray(0, MAX_BODY_BYTES).toString('utf8'),
       fromLoginForm,

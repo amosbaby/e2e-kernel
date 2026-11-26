@@ -8,7 +8,7 @@ const JSON_CT = 'application/json';
 const j = (v: unknown): string => JSON.stringify(v);
 const req = (o: Partial<RequestInfo> = {}): RequestInfo => ({
   id: 'r1', pageId: 'p1', openerPageId: null, method: 'GET', url: 'http://localhost/api', resourceType: 'fetch',
-  isNavigation: false, topFrame: false, topUrl: 'http://localhost/', contentType: null, body: null, fromLoginForm: null, ...o,
+  isNavigation: false, topFrame: false, topUrl: 'http://localhost/', initiatorUrl: 'http://localhost/', contentType: null, body: null, fromLoginForm: null, ...o,
 });
 const post = (body: string | null, contentType: string | null = JSON_CT, o: Partial<RequestInfo> = {}): RequestInfo =>
   req({ method: 'POST', url: 'http://localhost/graphql', contentType, body, ...o });

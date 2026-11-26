@@ -73,7 +73,7 @@ function pageSpec(): FakePageSpec {
 
 function req(method: string, url: string, body: string | null): RequestInfo {
   return { id: 'r0', pageId: 'p1', openerPageId: null, method, url, resourceType: 'fetch', isNavigation: false, topFrame: true,
-    topUrl: null, contentType: body === null ? null : 'application/json', body, fromLoginForm: body === null ? null : false };
+    topUrl: null, initiatorUrl: null, contentType: body === null ? null : 'application/json', body, fromLoginForm: body === null ? null : false };
 }
 
 // 在一个页面对象上换掉几个方法，其余照旧走假驱动。

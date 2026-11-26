@@ -17,6 +17,9 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../shared/ops.ts';
 // - read 不等待：text、css 的目标不存在立刻抛 DriverError('not-found')；count 返回 0；visible 返回 false。
 // - describe 对选择器写法的目标返回 { selector: 原样, via: 'given' }；对引用返回解析出的稳定选择器，
 //   解析不出返回 null。元素找不到时抛 DriverError。
+// - RequestInfo.initiatorUrl：顶层框架的导航请求（表单提交、整页跳转）是请求发出时主框架已提交的地址（路由回调运行时、
+//   导航提交之前读到的 mainFrame().url()，只认 http: 和 https:，其他是 null），也就是「是哪一页发起了这次导航」；
+//   这和 topUrl（导航目标）不同。其他请求和 topUrl 取同一个值。内核用它判断发起页在哪个主机上。
 // - 驱动不得往页面里暴露任何能调回驱动或内核的函数。
 
 export const ACTION_TIMEOUT_MS = 10_000;
@@ -55,7 +58,7 @@ export class DriverError extends Error {
 // pageId：发出请求的页面，判断不出来时是 null；openerPageId：那一页的开启者，没有或不知道时是 null。
 export interface RequestInfo {
   id: string; pageId: string | null; openerPageId: string | null; method: string; url: string; resourceType: string;
-  isNavigation: boolean; topFrame: boolean; topUrl: string | null; contentType: string | null; body: string | null;
+  isNavigation: boolean; topFrame: boolean; topUrl: string | null; initiatorUrl: string | null; contentType: string | null; body: string | null;
   // 有请求体时：发出请求的 frame，或它所在页面的顶层文档里，有没有密码类输入框（type=password，或 autocomplete 含
   // current-password / new-password / one-time-code；不要求可见）。没有请求体、导航请求（原生表单提交，路由回调里探测不了）、
   // 探测失败或超时都是 null。

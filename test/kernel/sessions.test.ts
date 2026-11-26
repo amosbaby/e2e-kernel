@@ -857,7 +857,7 @@ test('rules changed to default: the next main-page top-level navigation picks th
   assert.equal(st.refreshes, before + 1);
   assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.org/api', topUrl: 'http://example.org/' })).action, 'continue');
   assert.deepEqual(inner(sm, r.session).recorder.modes.map((m) => [m.mode, m.host, m.rulesHash]),
-    [['readonly', 'example.com', 'sha256:0000000000000001'], ['default', 'example.org', 'sha256:0000000000000002']]);
+    [['readonly', 'example.com', 'sha256:0000000000000001'], ['default', 'example.com', 'sha256:0000000000000002']]);   // 规则变的时候页面还在 example.com（发起页地址为证）：变更记在它名下，之后落到 example.org 模式没变就不再记
 });
 
 test('an allowed navigation that never commits does not move the session off its read-only host: a later cross-host form POST is still blocked', async () => {
@@ -926,9 +926,9 @@ async function loginSetup(readonlyHosts: string[] = ['*.example.com'], start: st
 
 type LoginCtx = Awaited<ReturnType<typeof loginSetup>>;
 
-// 顶层导航（GET 或表单 POST）：topUrl 就是导航目标。
-function nav(c: LoginCtx, pageId: string, method: string, url: string) {
-  return c.fake.emitRequest({ id: `n${++navSeq}`, pageId, method, url, topUrl: url, isNavigation: true, topFrame: true,
+// 顶层导航（GET 或表单 POST）：topUrl 是导航目标，initiatorUrl 是发起页此刻已提交的地址。
+function nav(c: Pick<LoginCtx, 'fake'>, pageId: string, method: string, url: string, initiatorUrl: string | null) {
+  return c.fake.emitRequest({ id: `n${++navSeq}`, pageId, method, url, topUrl: url, initiatorUrl, isNavigation: true, topFrame: true,
     ...(method === 'POST' ? { contentType: 'application/x-www-form-urlencoded', body: 'SAMLResponse=x' } : {}) });
 }
 let navSeq = 0;
@@ -940,11 +940,11 @@ async function commit(c: LoginCtx, pageId: string, topUrl: string): Promise<void
 
 test('login: a form POST navigation from a login-host page (SAML/OIDC callback) goes through; a fetch from it to another host is judged by the rules', async () => {
   const c = await loginSetup(); const { sm, fake, loginId, loginPageId } = c;
-  assert.deepEqual(await nav(c, loginPageId, 'GET', SSO_URL), { action: 'continue' });            // 去身份提供方：目标是 loginHost
+  assert.deepEqual(await nav(c, loginPageId, 'GET', SSO_URL, LOGIN_START), { action: 'continue' });            // 去身份提供方：目标是 loginHost
   await commit(c, loginPageId, SSO_URL);
   const fetchPost = await fake.emitRequest({ id: 'b0', pageId: loginPageId, method: 'POST', url: 'http://app.example.com/api', topUrl: SSO_URL, contentType: 'application/json', body: '{}' });
   assert.equal(fetchPost.action, 'fulfill');                                                        // 登录主机页上的脚本写别的主机：不免拦
-  assert.deepEqual(await nav(c, loginPageId, 'POST', 'http://app.example.com/acs'), { action: 'continue' });   // 回调：发起页在 loginHost，免拦且不加 followRedirects
+  assert.deepEqual(await nav(c, loginPageId, 'POST', 'http://app.example.com/acs', SSO_URL), { action: 'continue' });   // 回调：发起页在 loginHost，免拦且不加 followRedirects
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
 });
 
@@ -960,25 +960,24 @@ test('login: a write to a login host goes through; other writes from a page on a
 
 test('login: a popup opened by a login-host page can form-POST the callback; one opened by a read-only page cannot', async () => {
   const c = await loginSetup(); const { sm, fake, loginId, loginPageId } = c;
-  await nav(c, loginPageId, 'GET', SSO_URL); await commit(c, loginPageId, SSO_URL);
+  await nav(c, loginPageId, 'GET', SSO_URL, LOGIN_START); await commit(c, loginPageId, SSO_URL);
   const popup = fake.emitPopup(loginPageId, SSO_URL);
-  assert.deepEqual(await nav(c, popup.id, 'POST', 'http://app.example.com/acs'), { action: 'continue' });
+  assert.deepEqual(await nav(c, popup.id, 'POST', 'http://app.example.com/acs', SSO_URL), { action: 'continue' });
   // 另一条登录：弹窗的开启者停在只读的 app 上，表单 POST 被拦
   const other = await sm.loginBegin({ url: LOGIN_START }); const otherPage = fake.openPages().at(-1)!;
   const popup2 = fake.emitPopup(otherPage, APP_URL);
-  assert.equal((await nav(c, popup2.id, 'POST', 'http://app.example.com/acs')).action, 'fulfill');
+  assert.equal((await nav(c, popup2.id, 'POST', 'http://app.example.com/acs', APP_URL)).action, 'fulfill');
   await sm.loginEnd(other); await sm.loginEnd({ loginId });
 });
 
 test('login: starting on a default host, going to a read-only host and committing there, a form POST to a default host is blocked', async () => {
   const D = 'http://localhost:5173/login'; const R = 'http://app.example.com/';
   const c = await loginSetup(['app.example.com'], D); const { sm, fake, loginId, loginPageId } = c;
-  assert.equal((await nav(c, loginPageId, 'GET', R)).action, 'continue');
-  assert.equal((await nav(c, loginPageId, 'POST', 'http://example.org/post')).action, 'fulfill');   // 只是待定的 R，也算
+  assert.equal((await nav(c, loginPageId, 'GET', R, D)).action, 'continue');
   await commit(c, loginPageId, R);                                                                  // 提交了 R
-  assert.equal((await nav(c, loginPageId, 'POST', 'http://example.org/post')).action, 'fulfill');
+  assert.equal((await nav(c, loginPageId, 'POST', 'http://example.org/post', R)).action, 'fulfill');
   assert.equal((await fake.emitRequest({ id: 'b9', pageId: loginPageId, method: 'POST', url: 'http://example.org/api', topUrl: R })).action, 'fulfill');
-  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 3 });
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 2 });
 });
 
 test('login: a blocked write is logged as one line without the path or the body, and an odd method is logged as OTHER', async () => {
@@ -1030,4 +1029,29 @@ test('login: a strict query let through without following redirects counts as bl
   fake.emitRequestDone('q2', 200);
   assert.deepEqual(logs.filter((l) => l.includes(loginId)), [`登录 ${loginId}：拦下 POST app.example.com`]);
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});
+
+test('login: the callback is allowed when the identity provider was entered by a redirect and its page sent no subresource (initiatorUrl on a login host)', async () => {
+  const c = await loginSetup(); const { sm, loginId, loginPageId } = c;   // 从只读的 app 起登录
+  assert.deepEqual(await nav(c, loginPageId, 'GET', 'http://app.example.com/saml/start', LOGIN_START), { action: 'continue' });
+  // 路由只见重定向的首跳：页面其实停在身份提供方的自动提交页上，内核没见过它的任何请求；回调的发起页地址在 sso 上。
+  assert.deepEqual(await nav(c, loginPageId, 'POST', 'http://app.example.com/acs', SSO_URL), { action: 'continue' });
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 0 });
+});
+
+test('login: the same form POST with an initiator that is not a login host is judged by the rules', async () => {
+  const c = await loginSetup(); const { sm, loginId, loginPageId } = c;
+  assert.deepEqual(await nav(c, loginPageId, 'GET', 'http://app.example.com/saml/start', LOGIN_START), { action: 'continue' });
+  assert.equal((await nav(c, loginPageId, 'POST', 'http://app.example.com/acs', 'http://other.example.com/')).action, 'fulfill');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});
+
+test('session: a top-level form POST converges the main page to its initiator host before the mode is computed', async () => {
+  const { sm, fake } = setupRo(['example.com']); const { session, pageId } = await opened(sm, fake);   // 默认主机上的会话
+  assert.equal((await nav({ fake }, pageId, 'GET', 'http://example.org/', 'http://localhost:5173/')).action, 'continue');   // 待定的 example.org
+  assert.deepEqual(inner(sm, session).topHost, 'localhost');
+  // 页面其实已经落在只读的 example.com（内核没见过它的请求）：这次提交的发起页是它
+  const post = await nav({ fake }, pageId, 'POST', 'http://localhost:5173/api', 'http://example.com/');
+  assert.equal(post.action, 'fulfill');
+  assert.equal(inner(sm, session).topHost, 'example.com'); assert.equal(inner(sm, session).pendingHosts.size, 0);
 });

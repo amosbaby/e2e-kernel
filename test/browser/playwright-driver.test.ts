@@ -616,6 +616,32 @@ test('topUrl is the document being navigated to, else the page http url, else nu
   }
 });
 
+test('initiatorUrl of a form-submit navigation is the page that was committed when it was sent, also after a 302; other requests carry topUrl', { timeout: 60_000 }, async () => {
+  seen = [];
+  const formUrl = server.origin + '/form.html';
+  await page.goto(formUrl);
+  await page.click('#submit-form'); await settle();
+  const nav = seen.find(r => r.method === 'POST' && r.url.endsWith('/api/form') && r.isNavigation)!;
+  assert.ok(nav, 'the form navigation was not seen');
+  assert.equal(nav.topFrame, true);
+  assert.equal(nav.topUrl, server.origin + '/api/form');   // 目标
+  assert.equal(nav.initiatorUrl, formUrl);                 // 发起页
+  // 经 302 落到 form.html，再提交表单：发起页是 302 的最终地址。
+  seen = [];
+  await page.goto(server.origin + '/redir-form');
+  assert.equal((await page.location()).url, formUrl);
+  await page.click('#submit-form'); await settle();
+  const after = seen.find(r => r.method === 'POST' && r.url.endsWith('/api/form') && r.isNavigation)!;
+  assert.ok(after, 'the form navigation after the redirect was not seen');
+  assert.equal(after.initiatorUrl, formUrl);
+  // 非导航请求：initiatorUrl 和 topUrl 一样；落地页之后发起的 fetch 也一样。
+  seen = [];
+  await page.goto(server.origin + '/index.html');
+  await page.evaluate(`fetch('/api/items?init=1', { method: 'POST', body: '{}' })`); await settle();
+  const post = seen.find(r => r.url.includes('init=1'))!;
+  assert.equal(post.initiatorUrl, post.topUrl); assert.equal(post.initiatorUrl, server.origin + '/index.html');
+});
+
 test('popup requests carry their opener; a popup closing itself fires Page.onClosed', { timeout: 60_000 }, async () => {
   await page.goto(server.origin + '/popup.html');
   await page.click('#open-popup');

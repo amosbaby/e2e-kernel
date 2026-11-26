@@ -341,8 +341,12 @@ export class FakeDriver implements Driver {
     const page = r.pageId === null ? undefined : this.pages.find((p) => p.id === r.pageId);
     const info: RequestInfo = {
       id: `r${++this.requestSeq}`, openerPageId: page?.openerId ?? null, resourceType: 'fetch', isNavigation: false,
-      topFrame: true, topUrl: page?.url ?? null, contentType: null, body: null, fromLoginForm: false, ...r,
+      topFrame: true, topUrl: page?.url ?? null, initiatorUrl: null, contentType: null, body: null, fromLoginForm: false, ...r,
     };
+    // 没指定发起页地址就照真驱动取：顶层导航是页面此刻的 http(s) 地址（不是导航目标），其他请求和 topUrl 一样。
+    if (r.initiatorUrl === undefined) {
+      info.initiatorUrl = info.isNavigation && info.topFrame ? (page !== undefined && /^https?:/i.test(page.url) ? page.url : null) : info.topUrl;
+    }
     if (inst.requestHandler === undefined) return { action: 'abort' };
     try {
       const decision = await inst.requestHandler(info);

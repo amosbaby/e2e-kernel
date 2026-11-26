@@ -634,6 +634,12 @@ export class SessionManager {
     const topHost = hostOf(req.topUrl ?? req.url);
     const place = this.loginPlace(login, req.pageId, req.openerPageId);
     const isNav = req.isNavigation && req.topFrame;
+    // 顶层导航带着发起页已提交的地址（initiatorUrl）：这是页面在哪的直接证据（经重定向进入、又没发过子资源的页面也靠它），
+    // 先据此定下发起页的主机，再判断；没有就用跟踪到的 committed/pending。
+    if (isNav && req.initiatorUrl !== null) {
+      place.committed = hostOf(req.initiatorUrl);
+      place.pending.clear();
+    }
     const exempt = modes.isLoginHost(hostOf(req.url))
       || (isNav && [place.committed, ...place.pending].some((h) => modes.isLoginHost(h)));
     let decision: Decision;
@@ -682,6 +688,8 @@ export class SessionManager {
     const mainNav = isMain && req.isNavigation && req.topFrame;
     // 主页面的顶层导航：规则可能刚被人改过，先刷新。导航前的主机（s.topHost）和目标一起算，所以只读页跨主机的表单 POST 也拦得住。
     if (mainNav) this.deps.modes.refresh();
+    // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
+    if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
     const mode = this.sessionMode(s, [topHost]);
     const host = hostOf(req.url);
     const targetMode = this.deps.modes.resolve(host);
