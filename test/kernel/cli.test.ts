@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeF
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
+import { formatClose } from '../../src/cli/format.ts';
 import type { Io } from '../../src/cli/main.ts';
 import { startKernel } from '../../src/kernel/server.ts';
 import type { KernelHandle } from '../../src/kernel/server.ts';
@@ -247,8 +248,38 @@ describe('with a session', () => {
 
   test('close reports a verdict that conflicts with the record', async () => {
     assert.equal(await main(['step', sid, '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"}]'], io()), 10);
-    const t = io(); assert.equal(await main(['close', sid, '--verdict', 'pass', '--findings', '[{"claim":"a","basis":"b"}]'], t), 10);
-    assert.match(t.outText(), /结论与记录不一致/);
+    const t = io(); assert.equal(await main(['close', sid, '--verdict', 'pass', '--findings', '[{"claim":"a","basis":"b"}]', '--not-done', '["x"]'], t), 10);
+    assert.match(t.outText(), /结论与记录不一致\n原因：有不符的断言；agent 自己列了没做的事$/);
+  });
+
+  test('close --json carries the conflict reasons', async () => {
+    assert.equal(await main(['step', sid, '[{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Nope"}]'], io()), 10);
+    const j = io(); assert.equal(await main(['close', sid, '--verdict', 'pass', '--json'], j), 10);
+    assert.deepEqual(JSON.parse(j.outText()).conflicts, ['mismatch']);
+  });
+
+  test('close with no conflict prints no reason line', async () => {
+    const t = io(); assert.equal(await main(['close', sid, '--verdict', 'pass'], t), 0);
+    assert.ok(!t.outText().includes('原因'));
+  });
+
+  test('close --superseded is passed through: recovered failures do not make a pass conflict', async () => {
+    assert.equal(await main(['step', sid, '[{"op":"click","target":"#gone"},{"op":"click","target":"e2"}]', '--keep-going'], io()), 11);
+    const t = io(); const out = await main(['close', sid, '--verdict', 'pass', '--superseded', '[{"failed":1,"by":2}]'], t);
+    assert.equal(out, 0, t.errText()); assert.ok(!/结论与记录不一致/.test(t.outText()));
+  });
+
+  test('close --superseded with a pair the record does not support is a usage error and the session stays open', async () => {
+    assert.equal(await main(['step', sid, '[{"op":"click","target":"e2"}]'], io()), 0);
+    const t = io(); assert.equal(await main(['close', sid, '--superseded', '[{"failed":1,"by":2}]'], t), 2);
+    assert.ok(t.errText().length > 0);
+    const again = io(); assert.equal(await main(['close', sid, '--verdict', 'pass'], again), 0);
+  });
+
+  test('a finding with verdict fail under a pass verdict is reported as a conflict', async () => {
+    const t = io();
+    assert.equal(await main(['close', sid, '--verdict', 'pass', '--findings', '[{"claim":"a","basis":"b","verdict":"fail"}]'], t), 0);
+    assert.match(t.outText(), /结论与记录不一致\n原因：有一条结论的判定是不通过$/);
   });
 
   test('a refused password fill is an execution failure (11) and the value is never printed', async () => {
@@ -276,6 +307,11 @@ describe('with a session', () => {
       ['status', secret],
       [secret],
       ['close', sid, '--findings', `[{"claim":"${secret}"`],
+      ['close', sid, '--superseded', `[{"failed":"${secret}"`],                       // 不是合法 JSON
+      ['close', sid, '--superseded', secret],
+      ['close', sid, '--superseded', `[{"failed":1,"by":"${secret}","extra":3}]`],            // 多余的键
+      ['close', sid, '--superseded', `{"failed":1,"by":"${secret}"}`],                  // 不是数组
+      ['close', sid, '--findings', `[{"claim":"a","basis":"b","verdict":"${secret}"}]`],
     ];
     for (const argv of cases) {
       const t = io(); assert.equal(await main(argv, t), 2, argv.join(' '));
@@ -284,6 +320,17 @@ describe('with a session', () => {
       assert.ok(t.errText().length > 0);
     }
   });
+});
+
+test('formatClose prints a fixed text for a reason it does not know, never the raw value', () => {
+  const base = { session: 's-a41f00', runDir: '/r', reportPath: '/r/report.html', resultPath: '/r/result.json',
+    tallies: { ok: 0, match: 0, mismatch: 1, failed: 0, notRun: 0 }, consistency: 'conflict' as const, exit: 10 as const };
+  const odd = [secret, 'constructor', 'toString', 7] as unknown as NonNullable<Parameters<typeof formatClose>[0]['conflicts']>;
+  const out = formatClose({ ...base, conflicts: odd });
+  assert.ok(out.endsWith('原因：未知原因；未知原因；未知原因；未知原因'), out);
+  assert.ok(!out.includes(secret));
+  assert.ok(!formatClose({ ...base, conflicts: [] }).includes('原因'));
+  assert.ok(!formatClose({ ...base }).includes('原因'));
 });
 
 test('this build has no approve, rule, run or save-case command', async () => {

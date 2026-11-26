@@ -10,6 +10,7 @@ import { buildResult } from '../../src/report/result.ts';
 import type { RunInput } from '../../src/report/result.ts';
 import { RUN_DIR_RE, pruneRuns, runDirName, writeRun } from '../../src/report/store.ts';
 import type { Op } from '../../src/shared/ops.ts';
+import { E2kError } from '../../src/shared/errors.ts';
 import type { Mode, Outcome } from '../../src/shared/protocol.ts';
 import { REDACTED, isSensitiveKey } from '../../src/shared/redact.ts';
 
@@ -32,7 +33,7 @@ function input(o: Partial<RunInput> = {}): RunInput {
   return { kernelVersion: '0.1.0', session: 's-a41f00', name: 'session', startedAt: new Date('2026-11-26T15:30:00Z'),
     endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, profile: 'default' },
     driver: driverWith(), actions: [], writes: [], unattributedWrites: [], hosts: [{ host: 'localhost', mode: 'default' }], webSockets: 0,
-    verdict: null, findings: [], notDone: [], ...o };
+    verdict: null, findings: [], notDone: [], superseded: [], ...o };
 }
 function textOf(html: string, id: string): string {
   const m = new RegExp(`<p id="${id}">([^<]*)</p>`).exec(html);
@@ -181,11 +182,12 @@ test('an eval step shows its recorded result and source hash; a token in the res
 
 test('no key anywhere in buildResult output is a sensitive key', () => {
   const r = buildResult(input({
-    verdict: { value: 'pass', because: 'b' }, findings: [{ claim: 'c', basis: 'b' }], notDone: ['n'], webSockets: 1,
+    verdict: { value: 'pass', because: 'b' }, findings: [{ claim: 'c', basis: 'b', verdict: 'fail' }], notDone: ['n'], webSockets: 1, superseded: [{ failed: 9001, by: 9002 }],
     driver: driverWith({ nativeFormSubmit: 'unknown' }),
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: '#a', via: 'id' } }, shot: 'shots/01.jpg' }),
       act('assert', 'match', { actual: 1, expected: 1, error: 'e' }),
-      act('click', 'failed', { error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
+      act('click', 'failed', { seq: 9001, target: { given: '#b', stable: null }, error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
+      act('screenshot', 'ok', { seq: 9002 }),
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true })],
     unattributedWrites: [write('PUT', 'http://localhost/b', null)],
@@ -199,6 +201,184 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   walk(r);
   assert.deepEqual(bad, []);
+  const keys = new Set<string>();
+  const collect = (v: unknown): void => {
+    if (Array.isArray(v)) v.forEach(collect);
+    else if (typeof v === 'object' && v !== null) for (const [k, val] of Object.entries(v)) { keys.add(k); collect(val); }
+  };
+  collect(r);
+  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly']) assert.ok(keys.has(k), k);
+  assert.ok(Array.isArray(r.conflicts));
+});
+
+// 序号固定的动作：[失败(1), 未执行(2), 完成(3), 完成(4)]
+function recoverable(): ActionRecord[] {
+  return [
+    act('click', 'failed', { seq: 1, target: { given: '#submit', stable: null }, error: 'other: boom' }),
+    act('fill', 'not-run', { seq: 2, target: { given: '#name', stable: null } }),
+    act('click', 'ok', { seq: 3, target: { given: '#submit', stable: null } }),
+    act('screenshot', 'ok', { seq: 4 }),
+  ];
+}
+
+test('superseded failures are shown as recovered, and a pass verdict then has no conflict', () => {
+  const r = buildResult(input({ actions: recoverable(), verdict: { value: 'pass' }, superseded: [{ failed: 1, by: 3 }, { failed: 2, by: 4 }] }));
+  assert.equal(r.consistency, 'ok'); assert.deepEqual(r.conflicts, []);
+  assert.deepEqual(r.tallies, { ok: 2, match: 0, mismatch: 0, failed: 1, notRun: 1 });          // 原始计数不动
+  assert.deepEqual(r.superseded, [
+    { failed: 1, by: 3, failedOp: 'click', failedTarget: '#submit', byOp: 'click', byTarget: '#submit', byReadOnly: false },
+    { failed: 2, by: 4, failedOp: 'fill', failedTarget: '#name', byOp: 'screenshot', byTarget: null, byReadOnly: true },
+  ]);
+  const html = renderReport(r);
+  assert.ok(!html.includes('id="conflict"'));
+  const sec = section(html, 'failures');
+  assert.ok(sec.includes('已恢复的失败') && sec.includes('未解决的失败'), sec);
+  const recovered = sec.slice(sec.indexOf('已恢复的失败'), sec.indexOf('未解决的失败'));
+  assert.equal(recovered.match(/<li>/g)?.length, 2);
+  for (const n of [1, 2, 3, 4]) assert.ok(recovered.includes(`序号 ${n}`), recovered);
+  assert.ok(sec.slice(sec.indexOf('未解决的失败')).includes('<p>无</p>'), sec);
+  assert.ok(!section(html, 'not-done').includes('步骤 2'), 'a recovered not-run step is not listed as not done');
+  assert.ok(section(html, 'not-done').includes('<p>无</p>'));
+});
+
+test('the report shows both ops and targets side by side, and marks a read-only replacement of an action', () => {
+  const html = renderReport(buildResult(input({ actions: recoverable(), superseded: [{ failed: 1, by: 3 }, { failed: 2, by: 4 }] })));
+  const recovered = section(html, 'failures');
+  assert.ok(/序号 1 click <code>#submit<\/code>[^<]*→[^<]*序号 3 click <code>#submit<\/code>/.test(recovered), recovered);
+  assert.ok(/序号 2 fill <code>#name<\/code>[^<]*→[^<]*序号 4 screenshot/.test(recovered), recovered);
+  assert.equal(recovered.match(/取代者是只读操作/g)?.length, 1, 'only the read-only replacement of an action is marked');
+  assert.ok(recovered.indexOf('取代者是只读操作') > recovered.indexOf('序号 4'));
+});
+
+test('a wait counts as a non-action: replacing an action by it is marked, replacing a wait by it is not', () => {
+  const acts = [
+    act('click', 'failed', { seq: 1 }), act('wait', 'ok', { seq: 2 }), act('wait', 'failed', { seq: 3 }), act('wait', 'ok', { seq: 4 }),
+    act('snapshot', 'failed', { seq: 5 }), act('wait', 'ok', { seq: 6 }), act('click', 'ok', { seq: 7 }),
+  ];
+  const r = buildResult(input({ actions: acts, superseded: [{ failed: 1, by: 2 }, { failed: 3, by: 4 }, { failed: 5, by: 6 }] }));
+  assert.deepEqual(r.superseded.map((e) => e.byReadOnly), [true, false, false]);
+  const html = renderReport(r);
+  assert.equal(html.match(/取代者是只读操作/g)?.length, 1);
+  assert.ok(/序号 1 click[^<]*→[^<]*序号 2 wait[^<]*取代（取代者是只读操作）/.test(section(html, 'failures')), section(html, 'failures'));
+  assert.ok(buildResult(input({ actions: acts, superseded: [{ failed: 1, by: 7 }] })).superseded[0]!.byReadOnly === false);
+});
+
+test('a replacement used for several failures is marked next to each of those rows', () => {
+  const acts = [
+    act('click', 'failed', { seq: 1 }), act('fill', 'failed', { seq: 2 }), act('click', 'not-run', { seq: 3 }), act('click', 'failed', { seq: 4 }),
+    act('click', 'ok', { seq: 5 }), act('click', 'ok', { seq: 6 }),
+  ];
+  const html = renderReport(buildResult(input({ actions: acts, superseded: [{ failed: 1, by: 5 }, { failed: 2, by: 5 }, { failed: 3, by: 5 }, { failed: 4, by: 6 }] })));
+  const rows = [...section(html, 'failures').matchAll(/<li>(.*?)<\/li>/g)].map((m) => m[1]!);
+  assert.equal(rows.length, 4);
+  for (const row of rows.slice(0, 3)) assert.ok(row.includes('（此取代者同时取代了 3 个失败）'), row);
+  assert.ok(!rows[3]!.includes('同时取代'), rows[3]);
+  assert.equal(html.match(/同时取代了/g)?.length, 3);
+});
+
+test('only part of the failures superseded: still a conflict, with the reason', () => {
+  const r = buildResult(input({ actions: recoverable(), verdict: { value: 'pass' }, superseded: [{ failed: 1, by: 3 }] }));
+  assert.equal(r.consistency, 'conflict'); assert.deepEqual(r.conflicts, ['unresolved-not-run']);
+  const html = renderReport(r);
+  assert.ok(html.includes('id="conflict"'));
+  assert.ok(section(html, 'not-done').includes('步骤 2'));
+  const r2 = buildResult(input({ actions: recoverable(), verdict: { value: 'pass' }, superseded: [{ failed: 2, by: 4 }] }));
+  assert.equal(r2.consistency, 'conflict'); assert.deepEqual(r2.conflicts, ['unresolved-failed']);
+  const sec = section(renderReport(r2), 'failures');
+  assert.ok(sec.slice(sec.indexOf('未解决的失败')).includes('序号 1'), sec);
+});
+
+test('each conflict reason is reported on its own, and listed in the conclusion section', () => {
+  const pass = { value: 'pass' } as const;
+  const cases: [string, Partial<RunInput>][] = [
+    ['mismatch', { actions: [act('assert', 'mismatch', { seq: 1 })] }],
+    ['unresolved-failed', { actions: [act('click', 'failed', { seq: 1 })] }],
+    ['unresolved-not-run', { actions: [act('click', 'not-run', { seq: 1 })] }],
+    ['not-done', { notDone: ['没查分页'] }],
+    ['finding-fail', { findings: [{ claim: 'a', basis: 'b', verdict: 'fail' }] }],
+  ];
+  const reasonText: Record<string, string> = {
+    'mismatch': '有不符的断言', 'unresolved-failed': '有未解决的执行失败', 'unresolved-not-run': '有未解决的未执行操作',
+    'not-done': 'agent 自己列了没做的事', 'finding-fail': '有一条结论的判定是不通过',
+  };
+  for (const [reason, extra] of cases) {
+    const r = buildResult(input({ verdict: pass, ...extra }));
+    assert.equal(r.consistency, 'conflict', reason); assert.deepEqual(r.conflicts, [reason], reason);
+    const html = renderReport(r);
+    assert.ok(section(html, 'sec-verdict').includes(reasonText[reason]!), `${reason}: ${section(html, 'sec-verdict')}`);
+    for (const other of Object.keys(reasonText).filter((k) => k !== reason)) assert.ok(!section(html, 'sec-verdict').includes(reasonText[other]!), `${reason} shows ${other}`);
+  }
+  const all = buildResult(input({ verdict: pass, notDone: ['x'], findings: [{ claim: 'a', basis: 'b', verdict: 'fail' }],
+    actions: [act('assert', 'mismatch', { seq: 1 }), act('click', 'failed', { seq: 2 }), act('click', 'not-run', { seq: 3 })] }));
+  assert.deepEqual(all.conflicts, ['mismatch', 'unresolved-failed', 'unresolved-not-run', 'not-done', 'finding-fail']);
+  // 不是 pass 就没有冲突
+  for (const v of [null, { value: 'fail' as const }, { value: 'exists' as const }, { value: 'undetermined' as const, because: 'x' }]) {
+    const r = buildResult(input({ verdict: v, notDone: ['x'], actions: [act('assert', 'mismatch', { seq: 1 })] }));
+    assert.equal(r.consistency, 'ok'); assert.deepEqual(r.conflicts, []);
+  }
+});
+
+test('a finding verdict other than fail is no conflict, and each finding shows its own verdict', () => {
+  const r = buildResult(input({ verdict: { value: 'pass' }, findings: [
+    { claim: 'one', basis: 'b', verdict: 'pass' }, { claim: 'two', basis: 'b', verdict: 'undetermined' }, { claim: 'three', basis: 'b' },
+  ] }));
+  assert.equal(r.consistency, 'ok');
+  const html = renderReport(buildResult(input({ findings: [
+    { claim: 'one', basis: 'b', verdict: 'pass' }, { claim: 'two', basis: 'b', verdict: 'fail' }, { claim: 'three', basis: 'b', verdict: 'exists' },
+    { claim: 'four', basis: 'b', verdict: 'absent' }, { claim: 'five', basis: 'b', verdict: 'undetermined' }, { claim: 'six', basis: 'b' },
+  ] })));
+  const items = [...section(html, 'findings').matchAll(/<li>(.*?)<\/li>/g)].map((m) => m[1]!);
+  assert.equal(items.length, 6);
+  ['通过', '不通过', '存在', '不存在', '无法判断'].forEach((l, i) => assert.ok(items[i]!.startsWith(`[${l}] `), items[i]));
+  assert.ok(items[5]!.startsWith('<strong>six</strong>'), items[5]);
+});
+
+test('a superseded pair must point at a failed or not-run action and a later ok or match action; nothing else is accepted', () => {
+  const acts = [
+    act('click', 'failed', { seq: 1 }), act('assert', 'mismatch', { seq: 2 }), act('click', 'ok', { seq: 3 }), act('assert', 'match', { seq: 4 }),
+    act('click', 'failed', { seq: 5 }), act('click', 'not-run', { seq: 6 }),
+  ];
+  const usage = (e: unknown): boolean => e instanceof E2kError && e.code === 'usage';
+  const bad: { failed: number; by: number }[][] = [
+    [{ failed: 3, by: 4 }],                 // failed 指向 ok
+    [{ failed: 2, by: 3 }],                 // mismatch 不可被取代
+    [{ failed: 4, by: 6 }],                 // match 不是失败
+    [{ failed: 1, by: 2 }],                 // by 指向 mismatch
+    [{ failed: 1, by: 5 }],                 // by 指向 failed
+    [{ failed: 1, by: 6 }],                 // by 指向 not-run
+    [{ failed: 1, by: 99 }], [{ failed: 99, by: 100 }],   // 不存在的序号
+    [{ failed: 5, by: 3 }],                 // by 在前
+    [{ failed: 1, by: 3 }, { failed: 1, by: 4 }],         // 同一个 failed 两次
+  ];
+  for (const superseded of bad) assert.throws(() => buildResult(input({ actions: acts, superseded })), usage, JSON.stringify(superseded));
+  assert.equal(buildResult(input({ actions: acts, superseded: [{ failed: 1, by: 3 }] })).superseded.length, 1);
+  // mismatch 取代不了：即使其他失败都被取代，pass 仍然冲突
+  const r = buildResult(input({ actions: [act('assert', 'mismatch', { seq: 1 }), act('click', 'failed', { seq: 2 }), act('click', 'ok', { seq: 3 })],
+    verdict: { value: 'pass' }, superseded: [{ failed: 2, by: 3 }] }));
+  assert.deepEqual(r.conflicts, ['mismatch']); assert.equal(r.consistency, 'conflict');
+});
+
+test('superseded targets come from the record, are redacted, escaped and capped', () => {
+  const secret = 'f'.repeat(8) + 'a1'.repeat(28);
+  const html = renderReport(buildResult(input({ superseded: [{ failed: 1, by: 2 }], actions: [
+    act('click', 'failed', { seq: 1, target: { given: `text="<b>x</b>" ${jwt} ${secret}`, stable: null } }),
+    act('click', 'ok', { seq: 2, target: { given: `#a${'z'.repeat(2000)}`, stable: null } }),
+  ] })));
+  const sec = section(html, 'failures');
+  assert.ok(!sec.includes('<b>x</b>') && sec.includes('&lt;b&gt;x&lt;/b&gt;'), sec);
+  assert.ok(!sec.includes(jwt) && !sec.includes(secret));          // 步骤表里的 target 是原样留的（重放要用），这里只看新增的段
+  assert.ok(sec.includes('已截断'), 'long target is capped');
+});
+
+test('superseded entries are sanitized in result.json and in the failures section of report.html alike', () => {
+  const out = writeRun(join(tmp, 'r-sup'), buildResult(input({ superseded: [{ failed: 1, by: 2 }], actions: [
+    act('click', 'failed', { seq: 1, target: { given: `text=${jwt}`, stable: null } }),
+    act('click', 'ok', { seq: 2, target: { given: `text=${jwt}`, stable: null } }),
+  ] })));
+  const j = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.ok(!JSON.stringify(j.superseded).includes(jwt));
+  assert.ok(!section(readFileSync(out.reportPath, 'utf8'), 'failures').includes(jwt));
+  assert.equal(j.superseded[0].failed, 1); assert.equal(j.superseded[0].by, 2); assert.deepEqual(j.conflicts, []);
 });
 
 test('runDirName is UTC and matches RUN_DIR_RE', () => {

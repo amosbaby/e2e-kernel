@@ -1,9 +1,10 @@
 import type { ActionRecord, WriteRecord } from '../kernel/recorder.ts';
 import { safely } from '../kernel/recorder.ts';
 import { escapeHtml } from '../shared/escape.ts';
+import { conflictText } from '../shared/protocol.ts';
 import type { Outcome, VerdictValue } from '../shared/protocol.ts';
 import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts';
-import type { ClosedBy, RunResult } from './result.ts';
+import type { ClosedBy, RunResult, SupersededEntry } from './result.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。
 // 页面内容的处理顺序固定：先脱敏、再截断、最后 escapeHtml。脱敏出错时给固定标记，绝不输出原值。
@@ -119,20 +120,50 @@ function verdictSection(r: RunResult): string {
   }
   const t = r.tallies;
   out += `<p id="tallies">相符 ${own(t.match)} / 不符 ${own(t.mismatch)} / 执行失败 ${own(t.failed)} / 未执行 ${own(t.notRun)}</p>`;
-  if (r.consistency === 'conflict') out += '<p id="conflict">结论与记录不一致</p>';
+  if (r.consistency === 'conflict') {
+    out += '<p id="conflict">结论与记录不一致</p>';
+    const reasons = Array.isArray(r.conflicts) ? r.conflicts.map((c) => escapeHtml(conflictText(c))) : [];
+    if (reasons.length > 0) out += `<ul id="conflict-reasons">${reasons.map((c) => `<li>${c}</li>`).join('')}</ul>`;
+  }
   return `${out}</section>`;
 }
 
+// 被取代的失败；记录坏了（不是数组）就当作没有取代：失败关闭，宁可多列。
+function recoveries(r: RunResult): SupersededEntry[] {
+  return Array.isArray(r.superseded) ? r.superseded : [];
+}
+
+function opWithTarget(seq: unknown, op: unknown, target: unknown): string {
+  return `序号 ${own(seq)} ${own(op)}${typeof target === 'string' ? ` <code>${page(target)}</code>` : ''}`;
+}
+
+function recoveredItem(e: SupersededEntry, sharedBy: number): string {
+  const note = e.byReadOnly === true ? '（取代者是只读操作）' : '';
+  const shared = sharedBy > 1 ? `（此取代者同时取代了 ${sharedBy} 个失败）` : '';
+  return `${opWithTarget(e.failed, e.failedOp, e.failedTarget)} → 由 ${opWithTarget(e.by, e.byOp, e.byTarget)} 取代${note}${shared}`;
+}
+
+// 失败分两组：agent 声明已恢复的（内核对着记录校验过，并列出两边的操作），和没解决的。未执行的操作在「没做的」里。
+function failuresSection(r: RunResult): string {
+  const recovered = new Set(recoveries(r).map((e) => e.failed));
+  const unresolved = r.actions.filter((a) => a.outcome === 'failed' && !recovered.has(a.seq))
+    .map((a) => `${opWithTarget(a.seq, a.op.op, a.target?.given)}（执行失败）`);
+  return '<section id="failures"><h2>失败的操作</h2>'
+    + `<h3>已恢复的失败</h3>${listOrNone(recoveries(r).map((e, _i, all) => recoveredItem(e, all.filter((x) => x.by === e.by).length)))}`
+    + `<h3>未解决的失败</h3>${listOrNone(unresolved)}</section>`;
+}
+
 function notDoneSection(r: RunResult): string {
+  const recovered = new Set(recoveries(r).map((e) => e.failed));
   const items = [
     ...r.notDone.map((s) => page(s)),
-    ...r.actions.filter((a) => a.outcome === 'not-run').map((a) => `步骤 ${own(a.seq)}：${own(a.op.op)}（未执行）`),
+    ...r.actions.filter((a) => a.outcome === 'not-run' && !recovered.has(a.seq)).map((a) => `步骤 ${own(a.seq)}：${own(a.op.op)}（未执行）`),
   ];
   return `<section id="not-done"><h2>没做的</h2>${listOrNone(items)}</section>`;
 }
 
 function findingsSection(r: RunResult): string {
-  const items = r.findings.map((f) => `<strong>${page(f.claim)}</strong><br>依据 ${page(f.basis)}`);
+  const items = r.findings.map((f) => `${f.verdict === undefined ? '' : `[${escapeHtml(VERDICT_TEXT[f.verdict] ?? '未知')}] `}<strong>${page(f.claim)}</strong><br>依据 ${page(f.basis)}`);
   return `<section id="findings"><h2>agent 的各条结论和依据</h2>${listOrNone(items)}</section>`;
 }
 
@@ -173,6 +204,6 @@ export function renderReport(r: RunResult): string {
     + `<meta http-equiv="Content-Security-Policy" content="${CSP}">`
     + `<title>e2e 报告 ${own(r.name)}</title><style>${STYLE}</style></head><body>`
     + `<h1>e2e 报告：${own(r.name)}（${own(r.session)}）</h1>`
-    + verdictSection(r) + notDoneSection(r) + findingsSection(r) + writesSection(r) + stepsSection(r) + envSection(r)
+    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + writesSection(r) + stepsSection(r) + envSection(r)
     + '</body></html>\n';
 }

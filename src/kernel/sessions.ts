@@ -3,7 +3,7 @@ import { lstatSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DriverError } from '../driver/types.ts';
 import type { Decision, Driver, Instance, Page, RequestInfo } from '../driver/types.ts';
-import { buildResult } from '../report/result.ts';
+import { buildResult, resolveSuperseded } from '../report/result.ts';
 import type { ClosedBy, RunResult } from '../report/result.ts';
 import { pruneRuns, runDirName, writeRun } from '../report/store.ts';
 import { E2kError } from '../shared/errors.ts';
@@ -204,6 +204,8 @@ export class SessionManager {
     if (this.stopping) throw stopping();
     const s = this.live(p.session);
     if (s.state !== 'idle') throw busy();
+    // 声明的「谁取代谁」在收尾之前对着记录校验：不合格就 usage，会话保持打开，可以改好再 close。
+    resolveSuperseded(s.recorder.actions, p.superseded ?? []);
     return this.finish(s, closedBy, p);
   }
 
@@ -450,7 +452,7 @@ export class SessionManager {
         kernelVersion: this.deps.kernelVersion, session: s.id, name: s.name, startedAt: s.startedAt, endedAt, closedBy,
         start: s.start, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
         actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
-        verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [],
+        verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [],
       });
       paths = writeRun(s.runDir, result);
     } catch (e) {
@@ -463,7 +465,7 @@ export class SessionManager {
     }
     if (result === undefined || paths === undefined) throw new E2kError('internal', '报告没有写成，详见内核日志');
     return {
-      session: s.id, runDir: s.runDir, ...paths, tallies: result.tallies, consistency: result.consistency,
+      session: s.id, runDir: s.runDir, ...paths, tallies: result.tallies, consistency: result.consistency, conflicts: result.conflicts,
       exit: result.tallies.mismatch > 0 ? 10 : 0,
     };
   }

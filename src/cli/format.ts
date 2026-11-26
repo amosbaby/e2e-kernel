@@ -1,6 +1,7 @@
 import type { Check } from '../driver/types.ts';
 import type { ProfileInfo } from '../kernel/profiles.ts';
 import type { StatusResult } from '../kernel/server.ts';
+import { conflictText } from '../shared/protocol.ts';
 import type { CloseResult, OpResult, OpenResult, StepResult, Tallies } from '../shared/protocol.ts';
 import { redactText } from '../shared/redact.ts';
 
@@ -80,7 +81,13 @@ export function formatStep(r: StepResult): string {
 
 export function formatClose(r: CloseResult): string {
   const out = [`${inline(r.session)} 已收尾`, `报告 ${inline(r.reportPath)}`, `结果 ${inline(r.resultPath)}`, tallyText(r.tallies)];
-  if (r.consistency === 'conflict') out.push('结论与记录不一致');
+  if (r.consistency === 'conflict') {
+    out.push('结论与记录不一致');
+    // 原因来自内核的回应；不认识的值（版本不一致）不打印原文，只给固定说明。
+    if (Array.isArray(r.conflicts) && r.conflicts.length > 0) {
+      out.push(`原因：${r.conflicts.map(conflictText).join('；')}`);
+    }
+  }
   return out.join('\n');
 }
 

@@ -29,7 +29,8 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
     'results', 'tallies', 'exit', 'index', 'op', 'outcome', 'output', 'actual', 'expected', 'consistency', 'sessions', 'idleSec', 'version', 'pid',
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
     'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm',
-    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing'];
+    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing',
+    'superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
 
@@ -93,6 +94,32 @@ test('step takes an optional boolean keepGoing and nothing else new', () => {
   assert.deepEqual(validateParams('step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], keepGoing: false }), { session: 's-a41f00', ops: [{ op: 'snapshot' }], keepGoing: false });
   for (const bad of [{ keepGoing: 'yes' }, { keepGoing: 1 }, { keepGoing: null }, { keepGoing_: true }, { keep_going: true }])
     assert.throws(() => validateParams('step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], ...bad }), isUsage, JSON.stringify(bad));
+});
+
+test('close takes superseded pairs and a verdict per finding', () => {
+  const close = { session: 's-a41f00', verdict: { value: 'pass' }, superseded: [{ failed: 1, by: 3 }, { failed: 2, by: 4 }],
+    findings: [{ claim: 'a', basis: 'b', verdict: 'fail' }, { claim: 'c', basis: 'd' }] };
+  assert.deepEqual(validateParams('close', close), close);
+  assert.deepEqual(validateParams('close', { session: 's-a41f00', superseded: [] }), { session: 's-a41f00', superseded: [] });
+  assert.equal(validateParams('close', { session: 's-a41f00', superseded: Array.from({ length: 50 }, (_, i) => ({ failed: i + 1, by: i + 100 })) }).superseded?.length, 50);
+  for (const v of ['pass', 'fail', 'exists', 'absent', 'undetermined'])
+    assert.ok(validateParams('close', { session: 's-a41f00', findings: [{ claim: 'a', basis: 'b', verdict: v }] }));
+});
+
+test('close rejects malformed superseded and finding verdicts with usage', () => {
+  const sess = 's-a41f00';
+  const bad: unknown[] = [
+    { superseded: Array.from({ length: 51 }, (_, i) => ({ failed: i + 1, by: i + 100 })) },
+    { superseded: { failed: 1, by: 2 } }, { superseded: [1] }, { superseded: [null] }, { superseded: [{ failed: 1 }] }, { superseded: [{ by: 2 }] },
+    { superseded: [{ failed: 3, by: 3 }] }, { superseded: [{ failed: 4, by: 3 }] },        // failed < by
+    { superseded: [{ failed: 0, by: 3 }] }, { superseded: [{ failed: 1, by: 0 }] }, { superseded: [{ failed: -1, by: 3 }] },
+    { superseded: [{ failed: 1.5, by: 3 }] }, { superseded: [{ failed: '1', by: 3 }] }, { superseded: [{ failed: 1, by: Number.MAX_SAFE_INTEGER + 1 }] },
+    { superseded: [{ failed: 1, by: 3, why: 'x' }] },
+    { findings: [{ claim: 'a', basis: 'b', verdict: 'maybe' }] }, { findings: [{ claim: 'a', basis: 'b', verdict: 1 }] },
+    { findings: [{ claim: 'a', basis: 'b', verdict: { value: 'pass' } }] },
+  ];
+  for (const b of bad) assert.throws(() => validateParams('close', { session: sess, ...(b as object) }), isUsage, JSON.stringify(b).slice(0, 80));
+  assert.ok(validateParams('close', { session: sess, superseded: [{ failed: 1, by: Number.MAX_SAFE_INTEGER }] }));
 });
 
 test('validateParams rejects bad parameters with usage', () => {

@@ -44,10 +44,12 @@ export type Response =
   | { v: 1; id: string; ok: false; error: { code: ErrorCode; message: string; next?: string } };
 export type VerdictValue = 'pass' | 'fail' | 'exists' | 'absent' | 'undetermined';
 export interface Verdict { value: VerdictValue; because?: string }
-export interface Finding { claim: string; basis: string }
+export interface Finding { claim: string; basis: string; verdict?: VerdictValue }
+// 「序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代」。序号是整个会话从 1 起的序号（OpResult.seq）。
+export interface Supersede { failed: number; by: number }
 export interface OpenParams { url: string; viewport?: Viewport; name?: string }
 export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean }
-export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[] }
+export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[]; superseded?: Supersede[] }
 export type Outcome = 'ok' | 'match' | 'mismatch' | 'failed' | 'not-run';
 export interface RequestSummary { id: string; method: string; url: string; status: number | null; resourceType: string }
 export interface OpResult {
@@ -65,8 +67,19 @@ export interface OpenResult {
 export interface StepResult {
   session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 | 20; blocked: 'login' | null; next: string | null;
 }
+// 结论为 pass 时和记录矛盾的原因（每种至多出现一次，顺序固定）。
+export type ConflictReason = 'mismatch' | 'unresolved-failed' | 'unresolved-not-run' | 'not-done' | 'finding-fail';
+export const CONFLICT_TEXT: Record<ConflictReason, string> = {
+  'mismatch': '有不符的断言', 'unresolved-failed': '有未解决的执行失败', 'unresolved-not-run': '有未解决的未执行操作',
+  'not-done': 'agent 自己列了没做的事', 'finding-fail': '有一条结论的判定是不通过',
+};
+// 不认识的原因（含 'constructor' 这类原型上的名字）一律给固定说明。
+export function conflictText(c: unknown): string {
+  return typeof c === 'string' && Object.hasOwn(CONFLICT_TEXT, c) ? CONFLICT_TEXT[c as ConflictReason] : '未知原因';
+}
 export interface CloseResult {
   session: string; runDir: string; reportPath: string; resultPath: string; tallies: Tallies; consistency: 'ok' | 'conflict'; exit: 0 | 10;
+  conflicts?: ConflictReason[];   // consistency 为 conflict 时的原因，和 result.json 的 conflicts 一致
 }
 
 const METHODS: readonly Method[] = ['status', 'open', 'step', 'close', 'login.begin', 'login.end'];
@@ -76,6 +89,7 @@ const SESSION_ID = /^s-[0-9a-f]{6}$/;
 const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const LOGIN_ID = /^l-[0-9a-f]{6}$/;
 const MAX_LIST = 20;
+const MAX_SUPERSEDED = 50;
 
 function usage(message: string): E2kError {
   return new E2kError('usage', message);
@@ -124,8 +138,19 @@ function verdict(v: unknown, name: string): Verdict {
 }
 
 function finding(v: unknown, name: string): Finding {
-  const o = plainObject(v, name, ['claim', 'basis']);
-  return { claim: text500(o.claim, `${name}.claim`), basis: text500(o.basis, `${name}.basis`) };
+  const o = plainObject(v, name, ['claim', 'basis', 'verdict']);
+  const out: Finding = { claim: text500(o.claim, `${name}.claim`), basis: text500(o.basis, `${name}.basis`) };
+  if (o.verdict !== undefined) out.verdict = oneOf(o.verdict, `${name}.verdict`, VERDICT_VALUES);
+  return out;
+}
+
+function supersede(v: unknown, name: string): Supersede {
+  const o = plainObject(v, name, ['failed', 'by']);
+  const range = { min: 1, max: Number.MAX_SAFE_INTEGER };
+  const failed = int(o.failed, `${name}.failed`, range);
+  const by = int(o.by, `${name}.by`, range);
+  if (failed >= by) throw usage(`${name}.failed must be smaller than ${name}.by`);
+  return { failed, by };
 }
 
 function session(v: unknown): string {
@@ -157,7 +182,7 @@ export function validateParams(method: Method, p: unknown): unknown {
       return out;
     }
     case 'close': {
-      const o = plainObject(p, 'params', ['session', 'verdict', 'findings', 'notDone']);
+      const o = plainObject(p, 'params', ['session', 'verdict', 'findings', 'notDone', 'superseded']);
       const out: CloseParams = { session: session(o.session) };
       if (o.verdict !== undefined) out.verdict = verdict(o.verdict, 'params.verdict');
       if (o.findings !== undefined) {
@@ -165,6 +190,9 @@ export function validateParams(method: Method, p: unknown): unknown {
       }
       if (o.notDone !== undefined) {
         out.notDone = list(o.notDone, 'params.notDone', MAX_LIST).map((s, i) => text500(s, `params.notDone[${i}]`));
+      }
+      if (o.superseded !== undefined) {
+        out.superseded = list(o.superseded, 'params.superseded', MAX_SUPERSEDED).map((x, i) => supersede(x, `params.superseded[${i}]`));
       }
       return out;
     }

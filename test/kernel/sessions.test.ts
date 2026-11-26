@@ -149,6 +149,54 @@ test('close reports mismatch through exit 10 and flags a contradicting verdict',
   assert.ok(existsSync(r.reportPath)); assert.ok(existsSync(r.resultPath));
 });
 
+// [#gone 点击失败(1), 点击 e2 完成(2), assert 相符(3), assert 不符(4), 点击 #gone 失败(5)]，keepGoing
+const SUP_OPS: Op[] = [
+  { op: 'click', target: '#gone' }, { op: 'click', target: 'e2' },
+  { op: 'assert', kind: 'text', target: '#status', cmp: 'eq', expected: 'Added' },
+  { op: 'assert', kind: 'text', target: '#status', cmp: 'eq', expected: 'Nope' },
+  { op: 'click', target: '#gone' },
+];
+
+test('close with superseded: the record gets both ops and targets from the kernel, and the verdict has no conflict', async () => {
+  const { sm, fake } = setup(); const { session } = await opened(sm, fake);
+  const st = await sm.step({ session, ops: [SUP_OPS[0]!, SUP_OPS[1]!, SUP_OPS[2]!], keepGoing: true });
+  assert.deepEqual(st.results.map((x) => [x.seq, x.outcome]), [[1, 'failed'], [2, 'ok'], [3, 'match']]);
+  const r = await sm.close({ session, verdict: { value: 'pass' }, superseded: [{ failed: 1, by: 2 }] });
+  assert.equal(r.consistency, 'ok');
+  const res = readResult(r.runDir);
+  assert.deepEqual(res.superseded, [{ failed: 1, by: 2, failedOp: 'click', failedTarget: '#gone', byOp: 'click', byTarget: 'e2', byReadOnly: false }]);
+  assert.deepEqual(res.conflicts, []);
+  assert.equal(res.tallies.failed, 1); assert.equal(r.exit, 0);
+  assert.ok(readFileSync(join(r.runDir, 'report.html'), 'utf8').includes('已恢复的失败'));
+});
+
+test('close with a bad superseded is usage, writes nothing, and the session stays open and can be closed again', async () => {
+  const { sm, fake } = setup(); const { session, runDir } = await opened(sm, fake);
+  const st = await sm.step({ session, ops: SUP_OPS, keepGoing: true });
+  assert.deepEqual(st.results.map((x) => x.outcome), ['failed', 'ok', 'match', 'mismatch', 'failed']);
+  const bad: { failed: number; by: number }[][] = [
+    [{ failed: 2, by: 3 }],                 // failed 指向 ok
+    [{ failed: 3, by: 4 }],                 // failed 指向 match
+    [{ failed: 4, by: 5 }],                 // mismatch 不可被取代，by 也不是 ok
+    [{ failed: 1, by: 4 }],                 // by 指向 mismatch
+    [{ failed: 1, by: 5 }],                 // by 指向 failed
+    [{ failed: 1, by: 99 }], [{ failed: 77, by: 99 }],   // 不存在的序号
+    [{ failed: 1, by: 2 }, { failed: 1, by: 3 }],         // 同一个 failed 两次
+  ];
+  for (const superseded of bad) {
+    await assert.rejects(sm.close({ session, verdict: { value: 'pass' }, superseded }), (e: E2kError) => e.code === 'usage', JSON.stringify(superseded));
+    assert.equal(sm.list().length, 1); assert.equal(sm.list()[0]!.session, session);
+    assert.ok(!existsSync(join(runDir, 'result.json')) && !existsSync(join(runDir, 'report.html')), 'no half-written report');
+  }
+  await assert.rejects(sm.close({ session, superseded: [{ failed: 2, by: 3 }] }), (e: E2kError) => !e.message.includes('#gone') && /superseded\[0\]/.test(e.message));
+  const step = await sm.step({ session, ops: [{ op: 'snapshot' }] });          // 会话还能用
+  assert.equal(step.results[0]!.outcome, 'ok');
+  const r = await sm.close({ session, verdict: { value: 'pass' }, superseded: [{ failed: 1, by: 2 }, { failed: 5, by: 6 }] });
+  assert.equal(r.consistency, 'conflict');                                       // mismatch 还在
+  assert.deepEqual(readResult(r.runDir).conflicts, ['mismatch']);
+  assert.deepEqual(r.conflicts, ['mismatch']);                                   // 回应里也带
+});
+
 test('idle sessions are closed with a report, but not while a step is running', async () => {
   const { sm, fake } = setup({ idleMs: 60 }); const { session, runDir } = await opened(sm, fake);
   await sm.step({ session, ops: [{ op: 'wait', for: { ms: 200 } }] });          // 比闲置超时长

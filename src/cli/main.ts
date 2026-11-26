@@ -52,7 +52,8 @@ function helpText(selfCmd: string): string {
     '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
     '  step <会话> --stdin [--keep-going] [--json]        从标准输入读 JSON 数组',
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
-    '               [--findings <JSON>] [--not-done <JSON>] [--json]',
+    '               [--findings <JSON>] [--not-done <JSON>] [--superseded <JSON>] [--json]',
+    '                                          --findings 每条可带 "verdict"；--superseded 如 [{"failed":3,"by":5}]：序号 3 的失败由之后的序号 5 取代',
     '  login <url>                            在专用 profile 里登录（要在终端里由人按回车确认）',
     '  --version',
     '  help',
@@ -193,7 +194,7 @@ async function step(ctx: Ctx, args: string[]): Promise<number> {
 
 async function close(ctx: Ctx, args: string[]): Promise<number> {
   const p = parse(ctx, args, {
-    ...JSON_OPTION, verdict: { type: 'string' }, because: { type: 'string' }, findings: { type: 'string' }, 'not-done': { type: 'string' },
+    ...JSON_OPTION, verdict: { type: 'string' }, because: { type: 'string' }, findings: { type: 'string' }, 'not-done': { type: 'string' }, superseded: { type: 'string' },
   });
   const [session] = positionals(ctx, p, 1, '<会话>');
   const raw: Record<string, unknown> = { session };
@@ -201,10 +202,12 @@ async function close(ctx: Ctx, args: string[]): Promise<number> {
   const because = optString(p, 'because');
   const findings = optString(p, 'findings');
   const notDone = optString(p, 'not-done');
+  const superseded = optString(p, 'superseded');
   if (verdict !== undefined) raw.verdict = because === undefined ? { value: verdict } : { value: verdict, because };
   else if (because !== undefined) throw usage('--because 要和 --verdict 一起用');
   if (findings !== undefined) raw.findings = parseJson(findings, '--findings 必须是 JSON 数组');
   if (notDone !== undefined) raw.notDone = parseJson(notDone, '--not-done 必须是 JSON 数组');
+  if (superseded !== undefined) raw.superseded = parseJson(superseded, '--superseded 必须是 JSON 数组');
   const params = validateParams('close', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'close', params) as CloseResult;
   if (result.exit !== 0 && result.exit !== 10) throw malformed();
