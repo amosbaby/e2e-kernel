@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
 import type { BrowserContext, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
@@ -33,6 +34,8 @@ const MAX_HINTS = 6;
 const MAX_HINT_CHARS = 4000;
 const MAX_CANDIDATES = 5;
 const DIAGNOSE_TIMEOUT_MS = 2000;
+const IDLE_POLL_MS = 50;
+const IDLE_MAX_URLS = 3;
 const STRICT_VIOLATION = 'strict mode violation';
 const INTERCEPTS = 'intercepts pointer events';
 
@@ -315,8 +318,48 @@ function collectElementInfo(el: Element): { info: ElementInfo; isPassword: boole
 }
 
 // 实例对页面开放的那一小块：页面登记、弹窗列表。
+// 在页面里观察 quiet 毫秒：这期间有任何 DOM 变动（主文档，含子树、属性、文字）就返回 false，安静到时返回 true。
+// 不管哪种结果，observer 都先 disconnect 再返回；到时的定时器也在，页面没有任何东西要回调内核。
+// 作为函数交给 page.evaluate 序列化，所以必须自成一体。
+export function observeQuietWindow(quiet: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (isQuiet: boolean): void => {
+      if (done) return;
+      done = true;
+      if (timer !== undefined) clearTimeout(timer);
+      observer.disconnect();
+      resolve(isQuiet);
+    };
+    const observer = new MutationObserver(() => finish(false));
+    try {
+      observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    } catch {
+      finish(false);
+      return;
+    }
+    timer = setTimeout(() => finish(true), quiet);
+  });
+}
+
+// 等 work，最多 ms 毫秒；到点还没完就当「这一轮没成」（false），work 之后的结果或错误都丢掉。
+async function raceDeadline(work: Promise<boolean>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  work.catch(() => {});
+  try {
+    return await Promise.race([work, new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); })]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+// idle 等待看的一页的请求动态：进行中的个数、一个只增不减的活动序号（每个请求开始或结束加一）、进行中的前几个 URL。
+export interface IdleState { count: number; seq: number; urls: string[] }
+
 interface Host {
   popupsOf(pageId: string): string[];
+  idleState(page: PwPage): IdleState;
   reportError(e: unknown): void;
   readonly actionTimeoutMs: number;
 }
@@ -512,10 +555,41 @@ class PlaywrightPage implements Page {
       } else if ('urlContains' in cond) {
         // 子串判断，不用通配也不用正则；commit 就够了（单页应用的 pushState 也算）。
         await this.page.waitForURL((u) => u.href.includes(cond.urlContains), { timeout: timeoutMs, waitUntil: 'commit' });
+      } else if ('idle' in cond) {
+        await this.waitIdle(cond.idle, timeoutMs);
       } else {
         await this.page.waitForTimeout(cond.ms);
       }
     });
+  }
+
+  // 「安静」：这一页没有进行中的请求（不算 eventsource），在 quiet 毫秒里没有请求开始或结束，主文档也没有 DOM 变动。
+  // 循环：先等进行中的请求归零；再在页面里观察 quiet 毫秒（一有变动就返回，重新来过）；最后核对这期间没有请求活动。
+  // 观察只在 quiet 毫秒之内：窗口放得下才开，所以不会跑过截止时间；observer 在变动、到时、出错三种情形下都先 disconnect，
+  // 导航把执行环境销毁时 observer 随环境一起没了，这一轮重试。页面里不留任何回调或全局。
+  private async waitIdle(quiet: number, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (this.closed || this.page.isClosed()) throw new DriverError('other', 'page is closed');
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new DriverError('timeout', 'page did not become idle', this.host.idleState(this.page).urls);
+      const before = this.host.idleState(this.page);
+      if (before.count > 0 || remaining < quiet) {
+        await sleep(Math.min(IDLE_POLL_MS, remaining));
+        continue;
+      }
+      let quietWindow = false;
+      try {
+        quietWindow = await raceDeadline(this.page.evaluate(observeQuietWindow, quiet), remaining);
+      } catch (e) {
+        if (this.closed || this.page.isClosed()) throw mapError(e);
+        // 一律当作导航销毁了执行环境（或页面还在加载）：这一轮作废，重试。持久的错误只会表现为超时（失败关闭）。
+        await sleep(IDLE_POLL_MS);
+        continue;
+      }
+      const after = this.host.idleState(this.page);
+      if (quietWindow && after.count === 0 && after.seq === before.seq) return;
+    }
   }
 
   // read 不等待：text、css 目标不存在立刻 not-found；count 给 0；visible 给 false。
@@ -597,6 +671,11 @@ class PlaywrightInstance implements Instance, Host {
   private readonly closing = new Set<PlaywrightPage>();   // 已关、onClosed 还没触发的页
   private readonly requestIds = new WeakMap<PwRequest, string>();
   private readonly requestsDone = new WeakSet<PwRequest>();
+  // idle 等待用的「进行中的请求」：单独维护，和 requestsDone（路由里登记过的请求）无关——重定向的后续跳不进路由。
+  // request 事件加一，requestfinished / requestfailed 减一；Set 天然去重，settled 挡住先到的完成事件之后才来的 request。
+  private readonly inFlight = new WeakMap<PwPage, { active: Set<PwRequest>; seq: number }>();
+  private readonly flightPage = new WeakMap<PwRequest, PwPage>();
+  private readonly settled = new WeakSet<PwRequest>();
   // 已经发起、还没提交（也没失败或结束）的导航：frame → 发起它的请求和时间。给密码框探测用，见 probePasswordField。
   private readonly navigating = new WeakMap<Frame, { request: PwRequest; at: number }>();
   private readonly reportListenerError: (e: unknown) => void;
@@ -631,8 +710,11 @@ class PlaywrightInstance implements Instance, Host {
     // 响应头一到就算这个请求有了结果：只发出去不读响应体的请求（信标式的 fetch）不会触发 requestfinished，
     // 页面一跳转还会被报成 requestfailed。所以以 response 事件为准，requestfinished 和 requestfailed 只补没有响应的情形。
     this.context.on('response', (r) => { this.requestDone(r.request(), r.status(), false); });
-    this.context.on('requestfinished', (r) => { this.navigationEnded(r); void this.requestFinished(r); });
-    this.context.on('requestfailed', (r) => { this.navigationEnded(r); this.requestDone(r, null, true); });
+    // idle 的「请求结束」同样以响应头为准（理由同上：不读响应体的 fetch 不会触发 requestfinished），先到的事件为准。
+    this.context.on('request', (r) => { this.flightStarted(r); });
+    this.context.on('response', (r) => { this.flightEnded(r.request()); });
+    this.context.on('requestfinished', (r) => { this.flightEnded(r); this.navigationEnded(r); void this.requestFinished(r); });
+    this.context.on('requestfailed', (r) => { this.flightEnded(r); this.navigationEnded(r); this.requestDone(r, null, true); });
     await this.context.route('**/*', (route) => this.handleRoute(route));
   }
 
@@ -715,6 +797,40 @@ class PlaywrightInstance implements Instance, Host {
     this.reportListenerError(e);
   }
 
+  idleState(page: PwPage): IdleState {
+    const flight = this.inFlight.get(page);
+    if (flight === undefined) return { count: 0, seq: 0, urls: [] };
+    return { count: flight.active.size, seq: flight.seq, urls: [...flight.active].slice(0, IDLE_MAX_URLS).map((r) => r.url().slice(0, MAX_HINT_CHARS)) };
+  }
+
+  // 一个请求开始：记在发它的那一页名下（request.frame() 抛错，比如 service worker 的请求，就不算）。
+  // eventsource 是长连接，不算；页面已经关了的也不算。
+  private flightStarted(request: PwRequest): void {
+    if (this.settled.has(request) || this.flightPage.has(request)) return;
+    try {
+      if (request.resourceType() === 'eventsource') return;
+      const page = request.frame().page();
+      if (page.isClosed()) return;
+      let flight = this.inFlight.get(page);
+      if (flight === undefined) {
+        flight = { active: new Set(), seq: 0 };
+        this.inFlight.set(page, flight);
+      }
+      flight.active.add(request);
+      flight.seq++;
+      this.flightPage.set(request, page);
+    } catch { /* 归属不明：不计入 */ }
+  }
+
+  private flightEnded(request: PwRequest): void {
+    if (this.settled.has(request)) return;
+    this.settled.add(request);
+    const page = this.flightPage.get(request);
+    if (page === undefined) return;
+    const flight = this.inFlight.get(page);
+    if (flight !== undefined && flight.active.delete(request)) flight.seq++;
+  }
+
   popupsOf(pageId: string): string[] {
     return [...this.open].filter(w => w.openerId === pageId).map(w => w.page.url());
   }
@@ -738,6 +854,7 @@ class PlaywrightInstance implements Instance, Host {
     this.byPage.set(p, w);
     this.open.add(w);
     p.on('framenavigated', (f) => { this.navigating.delete(f); });
+    p.on('close', () => { this.inFlight.delete(p); });
     if (p.isClosed()) {
       w.markClosed();
     } else if (!own) {

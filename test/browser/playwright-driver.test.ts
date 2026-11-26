@@ -1170,3 +1170,112 @@ test('without a hook, a listener error is rethrown asynchronously (uncaughtExcep
   assert.equal(caught.length, 1);
   assert.equal((caught[0] as Error).message, 'kernel handler bug');
 });
+
+// ---- waitFor { idle } ----
+
+const startFetches = (urls: string[]): Promise<unknown> =>
+  page.evaluate(`(() => { for (const u of ${JSON.stringify(urls)}) fetch(u).catch(() => {}); return 1; })()`);
+
+// 给页面装一个会数「还连着的 observer」的 MutationObserver（在页面里自己数：只用来查内核有没有留下残留）。
+const trackObservers = (): Promise<unknown> => page.evaluate(`(() => {
+  window.__live = 0;
+  const Orig = window.MutationObserver;
+  window.MutationObserver = class extends Orig {
+    observe(...a) { if (!this.__on) { this.__on = true; window.__live++; } return super.observe(...a); }
+    disconnect() { if (this.__on) { this.__on = false; window.__live--; } return super.disconnect(); }
+  };
+  return 1;
+})()`);
+
+test('idle returns after a quiet window on a quiet page, and not before the window has passed', { timeout: 60_000 }, async () => {
+  const t0 = Date.now();
+  await page.waitFor({ idle: 300 }, 5000);
+  const took = Date.now() - t0;
+  assert.ok(took >= 290 && took < 4000, `took ${took} ms`);
+});
+
+test('idle waits for a late DOM change and then for a full quiet window after it', { timeout: 60_000 }, async () => {
+  await page.evaluate(`setTimeout(() => { document.body.append(document.createElement('hr')); window.__inserted = performance.now(); }, 300)`);
+  const t0 = Date.now();
+  await page.waitFor({ idle: 500 }, 5000);
+  const took = Date.now() - t0;
+  assert.equal(typeof await page.evaluate('window.__inserted'), 'number', 'returned before the DOM change');
+  assert.ok(took >= 750, `returned only ${took} ms in`);
+});
+
+test('idle times out while a request is in flight, naming at most 3 of them', { timeout: 60_000 }, async () => {
+  await startFetches(['/slow?n=1']);
+  const t0 = Date.now();
+  await assert.rejects(page.waitFor({ idle: 200 }, 1000), (e: DriverError) => {
+    assert.ok(e instanceof DriverError && e.kind === 'timeout', String(e));
+    assert.equal(e.message, 'page did not become idle');
+    assert.equal(e.hints.length, 1);
+    assert.ok(e.hints[0]!.endsWith('/slow?n=1'), e.hints[0]);
+    return true;
+  });
+  assert.ok(Date.now() - t0 < 4000);
+  await startFetches(['/slow?n=2', '/slow?n=3', '/slow?n=4', '/slow?n=5']);
+  await assert.rejects(page.waitFor({ idle: 200 }, 1000), (e: DriverError) => e.hints.length === 3 && e.hints.every((h) => h.includes('/slow?n=')));
+});
+
+test('idle does not return when a request starts and ends inside the first quiet window', { timeout: 60_000 }, async () => {
+  // 150 ms 时发一个快请求：它在窗口里整个开始又结束，返回时刻的进行中个数是 0，只有活动序号看得出窗口不安静。
+  await page.evaluate(`setTimeout(() => { fetch('/index.html').then((r) => r.text()); }, 150)`);
+  const t0 = Date.now();
+  await page.waitFor({ idle: 500 }, 5000);
+  const took = Date.now() - t0;
+  assert.ok(took >= 900, `returned after ${took} ms`);
+});
+
+test('idle comes back once the request has finished', { timeout: 60_000 }, async () => {
+  await startFetches(['/slow?ms=700']);
+  const t0 = Date.now();
+  await page.waitFor({ idle: 200 }, 5000);
+  assert.ok(Date.now() - t0 >= 700, `returned after ${Date.now() - t0} ms`);
+});
+
+test('idle is not stuck by a redirect chain, from fetch or from navigation', { timeout: 60_000 }, async () => {
+  await startFetches(['/redir', '/redir']);
+  await page.waitFor({ idle: 200 }, 5000);
+  await page.evaluate(`setTimeout(() => { location.href = '/redir'; }, 50)`);
+  await page.waitFor({ idle: 300 }, 8000);
+  assert.equal(await page.read({ kind: 'url' }), server.origin + '/index.html');
+});
+
+test('idle does not count an event stream that is still waiting for its response, but a plain request waiting for one still counts', { timeout: 60_000 }, async () => {
+  await page.evaluate(`(() => { window.__es = new EventSource('/events?late=1'); return 1; })()`);
+  await page.waitFor({ idle: 300 }, 2000);
+  await startFetches(['/slow?ms=30000']);
+  await assert.rejects(page.waitFor({ idle: 300 }, 1000), (e: DriverError) => e.kind === 'timeout' && e.hints.length === 1 && e.hints[0]!.includes('/slow'));
+});
+
+test('idle leaves no observer behind: on success, on timeout, and the page gets nothing exposed', { timeout: 60_000 }, async () => {
+  await trackObservers();
+  const globals = (): Promise<unknown> => page.evaluate(`Object.getOwnPropertyNames(window).sort()`);
+  const globalsBefore = await globals();
+  await page.waitFor({ idle: 300 }, 5000);
+  assert.equal(await page.evaluate('window.__live'), 0);
+  // 之后再改 DOM：没有残留的 observer
+  await page.evaluate(`document.body.append(document.createElement('hr'))`);
+  await sleep(300);
+  assert.equal(await page.evaluate('window.__live'), 0);
+  // 超时路径：页面一直在变
+  await page.evaluate(`window.__tick = setInterval(() => { document.body.append(document.createElement('i')); }, 100)`);
+  await assert.rejects(page.waitFor({ idle: 1000 }, 1500), (e: DriverError) => e.kind === 'timeout' && e.hints.length === 0);
+  assert.equal(await page.evaluate('window.__live'), 0);
+  await page.evaluate(`clearInterval(window.__tick)`);
+  // 页面里没有内核留下的全局或回调
+  assert.deepEqual((await globals() as string[]).filter((k) => k !== '__tick'), globalsBefore);
+});
+
+test('idle retries when a navigation destroys the page context, and a page closed mid-wait is an error', { timeout: 60_000 }, async () => {
+  await page.evaluate(`setTimeout(() => { location.href = '/index.html?again=1'; }, 150)`);
+  await page.waitFor({ idle: 1000 }, 8000);
+  assert.equal(await page.read({ kind: 'url' }), server.origin + '/index.html?again=1');
+  await startFetches(['/slow?n=9']);
+  const pending = page.waitFor({ idle: 300 }, 8000);
+  const outcome = assert.rejects(pending, (e: DriverError) => e instanceof DriverError);
+  await sleep(200);
+  await page.close();
+  await outcome;
+});

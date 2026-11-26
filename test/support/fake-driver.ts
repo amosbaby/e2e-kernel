@@ -14,7 +14,8 @@ export interface FakeElement { text?: string; visible?: boolean; css?: Record<st
   hints?: string[]; waitFails?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
   console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other';
-  passwordField?: boolean; passwordFieldFailWith?: 'timeout' | 'other' }
+  passwordField?: boolean; passwordFieldFailWith?: 'timeout' | 'other';
+  idleHints?: string[] }   // idleHints 给了：{ idle } 的等待会超时，带这些 hints
 
 const DEFAULT_CAPABILITIES: Capabilities = {
   networkInterception: true,
@@ -155,9 +156,10 @@ class FakePage implements Page {
     this.viewport = { ...v };
   }
 
-  // { ms } 真的睡这么久（内核测试靠它）；其他条件一律立刻成功。
+  // { ms } 真的睡这么久（内核测试靠它）；{ idle } 立刻成功，除非页面 spec 给了 idleHints；其他条件一律立刻成功。
   async waitFor(cond: WaitCond, timeoutMs: number): Promise<void> {
     this.enter('waitFor', [cond, timeoutMs]);
+    if ('idle' in cond && this.spec.idleHints !== undefined) throw new DriverError('timeout', 'page did not become idle', [...this.spec.idleHints]);
     if ('target' in cond) {
       const el = this.elements.get(cond.target);
       if (el?.waitFails === true) throw new DriverError('timeout', 'wait timed out', [...(el.hints ?? [])]);

@@ -116,6 +116,39 @@ export async function startFixtureServer(): Promise<FixtureServer> {
       return;
     }
 
+    // /redir：302 到 index.html（重定向链：idle 计数在中间跳上不能漏减）。
+    if (url.pathname === '/redir') {
+      res.writeHead(302, { location: '/index.html', 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
+    // /slow?ms=N：N 毫秒（默认 5000）之后才回应；连接提前断了就不再回。
+    if (url.pathname === '/slow') {
+      const ms = Math.min(Number(url.searchParams.get('ms') ?? '5000') || 5000, 30_000);
+      const timer = setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+        res.end('slow');
+      }, ms);
+      res.on('close', () => clearTimeout(timer));
+      return;
+    }
+
+    // /events：一个一直开着的 SSE 流；?late=1 则 3 秒后才发响应头（idle 不算 eventsource 请求）。
+    if (url.pathname === '/events') {
+      const open = (): void => {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
+        res.write(': open\n\n');
+      };
+      if (url.searchParams.get('late') === '1') {
+        const timer = setTimeout(open, 3000);
+        res.on('close', () => clearTimeout(timer));
+      } else {
+        open();
+      }
+      return;
+    }
+
     if (WRITE_METHODS.includes(method) && url.pathname.startsWith('/api/')) {
       const contentType = req.headers['content-type'] ?? null;
       const body = await readBody(req);

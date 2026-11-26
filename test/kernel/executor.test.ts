@@ -80,7 +80,8 @@ function withPage(base: Page, over: Partial<Page>): Page {
 // 失败时带诊断的元素：#amb 点击失败，#in 是普通输入框（wait、describe、fill 各有一个会失败的版本）。
 function hintsSpec(extra: FakePageSpec): FakePageSpec {
   const hints = [`3 matches`, `1) 可写 #amb >> nth=0 · button @(1,2 3x4) "Save"`, `token ${jwt}`, `value ${FILL_VALUE} here`];
-  return { ...extra, elements: {
+  const idleHints = [`http://localhost/poll?token=${jwt}`, `http://localhost/${'ab/'.repeat(150)}`];
+  return { ...extra, idleHints, elements: {
     '#amb': { failWith: 'other', hints },
     '#in-fill': { kind: 'text-input', failWith: 'other', hints },
     '#in-describe': { kind: 'text-input', describeFails: 1, hints },
@@ -286,6 +287,30 @@ test('an eval that throws: the agent gets the error, the record keeps only a fix
   // 非 eval 的失败照旧记错误消息
   await runOps(page, [{ op: 'click', target: '#gone' }], ctx);
   assert.notEqual(recorder.actions[2]!.error, 'other: eval 抛错（消息未记录）');
+});
+
+test('an idle wait that times out returns in-flight request URLs redacted and capped, and records them only on a page without a password field', async () => {
+  const p = await hintsPage(HINTS_URL);
+  const [r] = await runOps(p, [{ op: 'wait', for: { idle: 300 }, timeoutMs: 1000 }], ctx);
+  assert.equal(r!.outcome, 'failed');
+  assert.equal(r!.hints?.length, 2);
+  assert.ok(r!.hints![0]!.includes('[REDACTED]'), r!.hints![0]);
+  assert.ok(r!.hints![1]!.includes('…[truncated'), r!.hints![1]);
+  for (const text of [JSON.stringify(r), JSON.stringify(recorder.actions)]) assert.ok(!text.includes(jwt));
+  assert.deepEqual(recorder.actions.at(-1)!.hints, r!.hints);
+  const pw = await hintsPage(HINTS_PW_URL);
+  const [q] = await runOps(pw, [{ op: 'wait', for: { idle: 300 }, timeoutMs: 1000 }], ctx);
+  assert.equal(q!.hints?.length, 2);
+  assert.ok(!JSON.stringify(q).includes(jwt));
+  assert.equal(recorder.actions.at(-1)!.hints?.length, 1);
+  assert.ok(!JSON.stringify(recorder.actions).includes(jwt));
+});
+
+test('an idle wait goes to the driver with its timeout, or a default that always fits the window', async () => {
+  await runOps(page, [{ op: 'wait', for: { idle: 300 }, timeoutMs: 2000 }, { op: 'wait', for: { idle: 300 } }, { op: 'wait', for: { idle: 9000 } }], ctx);
+  // 不给 timeoutMs：取 max(10 秒, 窗口 + 5 秒)，窗口再大也放得下
+  assert.deepEqual(fake.calls.filter(c => c.method === 'waitFor').map(c => [c.args[0], c.args[1]]), [[{ idle: 300 }, 2000], [{ idle: 300 }, 10_000], [{ idle: 9000 }, 14_000]]);
+  assert.equal(recorder.actions.at(-1)!.outcome, 'ok');
 });
 
 test('wait uses the 10 second default', async () => {

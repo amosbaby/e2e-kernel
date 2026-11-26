@@ -76,7 +76,7 @@ Other commands:
 | `scroll` | `target?`, `dx?`, `dy?` | scroll an element into view, or the page window by dx/dy |
 | `goto` | `url` | navigate (http/https only) |
 | `viewport` | `width`, `height` | resize (320-3840 by 240-2160) |
-| `wait` | `for`, `timeoutMs?` | wait for `{text}`, `{target,state}` (visible/hidden), `{urlContains}` or `{ms}`; default 10 s, max 60 s |
+| `wait` | `for`, `timeoutMs?` | wait for `{text}`, `{target,state}` (visible/hidden), `{urlContains}`, `{ms}` or `{idle}`; default 10 s, max 60 s. `{idle: <ms>}` (100 to 10000) waits for that many ms of quiet: no request waiting for its response, no request started or answered, and no DOM change in the main document. Long-lived requests (a request that keeps waiting for its response) keep it from settling and end in a timeout, whose hints name up to 3 of them; event streams are not counted. A request whose response headers have arrived but whose body is still streaming no longer counts, so an app that updates the page from a long chunked response can be judged idle before the body ends. `timeoutMs` must be at least 500 ms longer than the idle window (a usage error otherwise); when omitted it defaults to the larger of 10 s and the idle window plus 5 s. Page animations that keep changing the DOM also keep it from settling |
 | `assert` | `kind`, `target?`, `property?`, `cmp`, `expected` | check `text`, `count`, `css`, `url` or `visible`; result is a match or a mismatch, never "pass/fail" |
 | `eval` | `js` | run a JavaScript expression in the page (the response is cut at 4000 characters; the record keeps at most 1000, redacted, and only on a page without a password-like field) |
 

@@ -61,6 +61,8 @@ function redactValue<T>(v: T): T | string {
   return typeof v === 'string' ? safely(() => redactText(v)) : v;
 }
 
+// idle 等待没给 timeoutMs 时，默认超时比安静窗口多这么久（至少 10 秒）：窗口放不下就永远等不到。
+const IDLE_DEFAULT_SLACK_MS = 5000;
 const MAX_HINTS = 6;
 const MAX_HINT = 300;
 const HINTS_NOT_RECORDED = '[诊断未记录：页面有密码框，或判断不出]';
@@ -261,7 +263,7 @@ async function perform(page: Page, op: Exclude<Op, { op: 'fill' }>, seq: number,
       await page.setViewport({ width: op.width, height: op.height });
       return { outcome: 'ok' };
     case 'wait':
-      await page.waitFor(op.for, op.timeoutMs ?? ACTION_TIMEOUT_MS);
+      await page.waitFor(op.for, op.timeoutMs ?? ('idle' in op.for ? Math.max(ACTION_TIMEOUT_MS, op.for.idle + IDLE_DEFAULT_SLACK_MS) : ACTION_TIMEOUT_MS));
       return { outcome: 'ok' };
     case 'assert':
       return runAssert(page, op);

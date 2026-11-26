@@ -8,7 +8,7 @@ export interface Viewport { width: number; height: number }   // 宽 320..3840�
 export type AssertKind = 'text' | 'count' | 'css' | 'url' | 'visible';
 export type ShotFormat = 'jpeg' | 'png';
 export type Cmp = 'eq' | 'ne' | 'contains' | 'gt' | 'gte' | 'lt' | 'lte';
-export type WaitCond = { text: string } | { target: Target; state: 'visible' | 'hidden' } | { urlContains: string } | { ms: number };
+export type WaitCond = { text: string } | { target: Target; state: 'visible' | 'hidden' } | { urlContains: string } | { ms: number } | { idle: number };
 export type Op =
   | { op: 'snapshot'; depth?: number }
   | { op: 'text'; target?: Target; max?: number }
@@ -70,7 +70,8 @@ const KEYS_BY_OP: Record<OpName, readonly string[]> = {
 const OP_NAMES = Object.keys(KEYS_BY_OP) as OpName[];
 const ALL_OP_KEYS = [...new Set(Object.values(KEYS_BY_OP).flat())];
 
-const WAIT_VARIANTS: readonly (readonly string[])[] = [['text'], ['target', 'state'], ['urlContains'], ['ms']];
+const IDLE_MIN_SLACK_MS = 500;
+const WAIT_VARIANTS: readonly (readonly string[])[] = [['text'], ['target', 'state'], ['urlContains'], ['ms'], ['idle']];
 const ALL_WAIT_KEYS = WAIT_VARIANTS.flat();
 
 function target(v: unknown, name: string): Target {
@@ -101,11 +102,12 @@ function waitCond(v: unknown, name: string): WaitCond {
   const first = Object.keys(o)[0] ?? '';
   // 由第一个键定变体，再按这个变体的键重新检查：混了别的变体的键、或一个键都没有，都拒绝。
   const variant = WAIT_VARIANTS.find((keys) => keys.includes(first));
-  if (variant === undefined) throw new E2kError('usage', `${name} must have exactly one of: text, target and state, urlContains, ms`);
+  if (variant === undefined) throw new E2kError('usage', `${name} must have exactly one of: text, target and state, urlContains, ms, idle`);
   plainObject(o, name, variant);
   if ('text' in o) return { text: str(o.text, `${name}.text`, { min: 1, max: 500 }) };
   if ('urlContains' in o) return { urlContains: str(o.urlContains, `${name}.urlContains`, { min: 1, max: 500 }) };
   if ('ms' in o) return { ms: int(o.ms, `${name}.ms`, { min: 0, max: 10000 }) };
+  if ('idle' in o) return { idle: int(o.idle, `${name}.idle`, { min: 100, max: 10000 }) };   // 安静窗口（毫秒）
   return { target: target(o.target, `${name}.target`), state: oneOf(o.state, `${name}.state`, ['visible', 'hidden'] as const) };
 }
 
@@ -178,8 +180,13 @@ function validateOp(v: unknown, name: string): Op {
       return { op, url: httpUrl(o.url, `${name}.url`) };
     case 'viewport':
       return { op, width: int(o.width, `${name}.width`, { min: 320, max: 3840 }), height: int(o.height, `${name}.height`, { min: 240, max: 2160 }) };
-    case 'wait':
-      return present({ op, for: waitCond(o.for, `${name}.for`), timeoutMs: optInt('timeoutMs', 0, 60000) });
+    case 'wait': {
+      const cond = waitCond(o.for, `${name}.for`);
+      const timeoutMs = optInt('timeoutMs', 0, 60000);
+      // 超时给不出一个完整的安静窗口外加余量，永远等不到：当场拒绝，不等到超时才发现。
+      if ('idle' in cond && timeoutMs !== undefined && timeoutMs < cond.idle + IDLE_MIN_SLACK_MS) throw new E2kError('usage', `${name}.timeoutMs must be at least 500 more than for.idle`);
+      return present({ op, for: cond, timeoutMs });
+    }
     case 'assert':
       return assertOp(o, name);
     case 'eval':

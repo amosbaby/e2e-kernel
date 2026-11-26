@@ -26,7 +26,8 @@ test('validateOps accepts every other operation shape', () => {
     { op: 'press', key: 'Enter', target: 'e4' }, { op: 'scroll', dx: -10000, dy: 10000 }, { op: 'scroll', target: 'e5' },
     { op: 'goto', url: 'http://localhost:5173/a' }, { op: 'viewport', width: 3840, height: 2160 },
     { op: 'wait', for: { target: 'e1', state: 'hidden' } }, { op: 'wait', for: { urlContains: '/done' }, timeoutMs: 60000 },
-    { op: 'wait', for: { ms: 0 } },
+    { op: 'wait', for: { ms: 0 } }, { op: 'wait', for: { idle: 100 } }, { op: 'wait', for: { idle: 9500 }, timeoutMs: 10000 },
+    { op: 'wait', for: { idle: 500 }, timeoutMs: 1000 },
     { op: 'assert', kind: 'count', target: 'li', cmp: 'lte', expected: 3 },
     { op: 'assert', kind: 'visible', target: 'e1', cmp: 'ne', expected: false },
     { op: 'assert', kind: 'css', target: '#a', property: 'color', cmp: 'eq', expected: 'rgb(0, 0, 0)' },
@@ -115,6 +116,18 @@ test('a wait condition must match exactly one variant', () => {
   for (const cond of [{}, { text: 'a', ms: 5 }, { urlContains: '/a', text: 'a' }, { target: 'e1' },
     { state: 'visible' }, { target: 'e1', state: 'gone' }, { ms: 1, target: 'e1', state: 'visible' }, null, 'Added'])
     assert.throws(() => validateOps([{ op: 'wait', for: cond }]), isUsage, JSON.stringify(cond));
+});
+
+test('an idle wait takes 100..10000 ms, stands alone, and needs a timeout 500 ms longer', () => {
+  for (const b of [
+    { op: 'wait', for: { idle: 50 } }, { op: 'wait', for: { idle: 99 } }, { op: 'wait', for: { idle: 10001 } },
+    { op: 'wait', for: { idle: 100.5 } }, { op: 'wait', for: { idle: '200' } }, { op: 'wait', for: { idle: null } },
+    { op: 'wait', for: { idle: 500, ms: 1 } }, { op: 'wait', for: { idle: 500, text: 'a' } },
+    { op: 'wait', for: { idle: 500 }, timeoutMs: 499 }, { op: 'wait', for: { idle: 500 }, timeoutMs: 0 },
+    { op: 'wait', for: { idle: 500 }, timeoutMs: 500 }, { op: 'wait', for: { idle: 500 }, timeoutMs: 999 },
+    { op: 'wait', for: { idle: 10000 }, timeoutMs: 10000 }, { op: 'wait', for: { idle: 10000 }, timeoutMs: 10499 },
+  ]) assert.throws(() => validateOps([b]), isUsage, JSON.stringify(b));
+  assert.deepEqual(validateOps([{ op: 'wait', for: { idle: 10000 }, timeoutMs: 10500 }]), [{ op: 'wait', for: { idle: 10000 }, timeoutMs: 10500 }]);
 });
 
 test('error messages name the field and never echo the value', () => {

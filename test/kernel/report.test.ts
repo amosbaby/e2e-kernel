@@ -262,6 +262,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
       act('click', 'failed', { seq: 9001, target: { given: '#b', stable: null }, error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
       act('screenshot', 'ok', { seq: 9002 }),
       act('screenshot', 'ok', { op: { op: 'screenshot', label: 'a', format: 'png', mask: ['#m'] }, shot: 'shots/04-a.png' }),
+      act('wait', 'ok', { op: { op: 'wait', for: { idle: 300 }, timeoutMs: 2000 } }),
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true }),
       write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' })],
@@ -282,7 +283,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     else if (typeof v === 'object' && v !== null) for (const [k, val] of Object.entries(v)) { keys.add(k); collect(val); }
   };
   collect(r);
-  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask']) assert.ok(keys.has(k), k);
+  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 
