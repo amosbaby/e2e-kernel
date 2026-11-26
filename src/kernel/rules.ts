@@ -26,7 +26,8 @@ function isIp(host: string): boolean {
 }
 
 // 规范化主机：取 `new URL` 解析出的主机名（去端口、小写、punycode），再去掉末尾一个点。
-// 含空白、控制字符或 / @ ? # \ % 的一律报错（它们会让 URL 解析成别的主机）。IP 字面量保持原样（IPv6 带方括号）。
+// 含空白、控制字符或 / @ ? # \ % 的一律报错（它们会让 URL 解析成别的主机）。IP 字面量保持原样（IPv6 带方括号），
+// 只有 IPv4 映射的 IPv6（`[::ffff:7f00:1]`，浏览器对 `[::ffff:127.0.0.1]` 给出的写法）折成点分 IPv4，让 IPv4 规则能命中它。
 export function normalizeHost(host: string): string {
   if (typeof host !== 'string' || host === '' || /[\s\x00-\x1f\x7f/@?#\\%]/.test(host)) throw usage(NOT_A_HOST);
   let name: string;
@@ -34,6 +35,12 @@ export function normalizeHost(host: string): string {
     name = new URL(`http://${host}`).hostname;
   } catch {
     throw usage(NOT_A_HOST);
+  }
+  const mapped = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(name);
+  if (mapped !== null) {
+    const hi = Number.parseInt(mapped[1]!, 16);
+    const lo = Number.parseInt(mapped[2]!, 16);
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
   }
   if (!name.startsWith('[') && name.endsWith('.')) name = name.slice(0, -1);
   if (name === '' || (!name.startsWith('[') && (name.startsWith('.') || name.endsWith('.') || name.includes('..')))) throw usage(NOT_A_HOST);
@@ -80,7 +87,7 @@ export function parseRules(text: string): Rules {
   }
   const top = plainObject(raw, 'rules file', ['version', 'rules', 'loginHosts']);
   if (top.version !== 1) throw usage('version must be 1');
-  const list = top.rules ?? [];
+  const list = top.rules === undefined ? [] : top.rules;
   if (!Array.isArray(list)) throw usage('rules must be an array');
   if (list.length > MAX_RULES) throw usage(`rules must have at most ${MAX_RULES} entries`);
   const seen = new Set<string>();
@@ -93,7 +100,7 @@ export function parseRules(text: string): Rules {
     seen.add(match);
     return { match, mode };
   });
-  const loginHosts = parseHostList(top.loginHosts ?? [], 'loginHosts', MAX_LOGIN_HOSTS);
+  const loginHosts = parseHostList(top.loginHosts === undefined ? [] : top.loginHosts, 'loginHosts', MAX_LOGIN_HOSTS);
   return { rules, loginHosts };
 }
 

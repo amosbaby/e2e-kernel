@@ -13,6 +13,19 @@ test('normalizeHost lowercases, drops the port and one trailing dot, applies pun
   assert.equal(normalizeHost('[::1]:8080'), '[::1]');
 });
 
+test('normalizeHost folds an IPv4-mapped IPv6 literal to the dotted IPv4 and leaves other IPv6 alone', () => {
+  assert.equal(normalizeHost('[::ffff:127.0.0.1]'), '127.0.0.1');
+  assert.equal(normalizeHost('[::ffff:7f00:1]'), '127.0.0.1');
+  assert.equal(normalizeHost('[::FFFF:C0A8:101]:8080'), '192.168.1.1');
+  assert.equal(new URL('http://[::ffff:127.0.0.1]/').hostname, '[::ffff:7f00:1]');   // 浏览器给出的就是这种写法
+  assert.equal(normalizeHost('[::1]'), '[::1]');
+  assert.equal(normalizeHost('[2001:db8::1]'), '[2001:db8::1]');
+  assert.equal(normalizeHost('[::ffff:1:2:3]'), '[::ffff:1:2:3]');
+  const r = parseRules('{"version":1,"rules":[{"match":"127.0.0.1","mode":"readonly"}],"loginHosts":["[::ffff:10.0.0.1]"]}');
+  assert.equal(matchRule(r.rules, '[::ffff:7f00:1]')?.mode, 'readonly');
+  assert.equal(hostListed(r.loginHosts, '[::ffff:a00:1]'), true);
+});
+
 test('normalizeHost rejects anything that is not a bare host', () => {
   for (const bad of ['evil.com/app.example.com', 'a@example.com', 'a b.com', '', 'a?b.com', 'a#b.com', 'a\\b.com', 'a\tb.com', 'a:b', '.', 'a..b.com', '.a.com']) {
     assert.throws(() => normalizeHost(bad), { code: 'usage' }, JSON.stringify(bad));
@@ -64,6 +77,9 @@ test('invalid patterns and files are config errors that do not echo the value', 
   assert.throws(() => parseRules('{"rules":[]}'), { code: 'usage' });
   assert.throws(() => parseRules('{"version":1,"rules":[],"extra":1}'), { code: 'usage' });
   assert.throws(() => parseRules('{"version":1,"rules":{}}'), { code: 'usage' });
+  assert.throws(() => parseRules('{"version":1,"rules":null}'), { code: 'usage', message: /rules must be an array/ });
+  assert.throws(() => parseRules('{"version":1,"rules":[],"loginHosts":null}'), { code: 'usage', message: /loginHosts must be an array/ });
+  assert.deepEqual(parseRules('{"version":1}'), { rules: [], loginHosts: [] });   // 键不写才是空
   assert.throws(() => parseRules('[]'), { code: 'usage' });
   assert.throws(() => parseRules('not json'), { code: 'usage' });
   const secret = 'secret-host-name.example.com';
