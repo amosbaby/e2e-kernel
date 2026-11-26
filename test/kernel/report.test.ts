@@ -1,0 +1,258 @@
+import { afterEach, beforeEach, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Capabilities } from '../../src/driver/types.ts';
+import type { ActionRecord, WriteRecord } from '../../src/kernel/recorder.ts';
+import { renderReport } from '../../src/report/html.ts';
+import { buildResult } from '../../src/report/result.ts';
+import type { RunInput } from '../../src/report/result.ts';
+import { RUN_DIR_RE, pruneRuns, runDirName, writeRun } from '../../src/report/store.ts';
+import type { Op } from '../../src/shared/ops.ts';
+import type { Mode, Outcome } from '../../src/shared/protocol.ts';
+import { REDACTED, isSensitiveKey } from '../../src/shared/redact.ts';
+
+// 长得像 token 的串在运行时拼出来，不写成字面量。
+const jwt = 'eyJ' + 'a'.repeat(21) + '.' + 'b'.repeat(24) + '.' + 'c'.repeat(24);
+
+let seq = 0;
+function act(op: Op['op'], outcome: Outcome, extra: Partial<ActionRecord> = {}): ActionRecord {
+  return { seq: ++seq, at: '2026-11-26T15:30:05.000Z', ms: 3, op: { op } as Op, outcome, ...extra };
+}
+function write(method: string, url: string, status: number | null, extra: Partial<WriteRecord> = {}): WriteRecord {
+  return { id: `r${++seq}`, at: '2026-11-26T15:30:06.000Z', method, url, status, failed: false, body: null, pageUrl: null,
+    decision: 'allowed', targetMode: 'default', ...extra };
+}
+function driverWith(caps: Partial<Capabilities> = {}): RunInput['driver'] {
+  return { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'covered', nativeFormSubmit: 'covered',
+    sharesUserProfile: false, canHeadless: false, selectorDialect: 'css', ...caps } };
+}
+function input(o: Partial<RunInput> = {}): RunInput {
+  return { kernelVersion: '0.1.0', session: 's-a41f00', name: 'session', startedAt: new Date('2026-11-26T15:30:00Z'),
+    endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, profile: 'default' },
+    driver: driverWith(), actions: [], writes: [], unattributedWrites: [], hosts: [{ host: 'localhost', mode: 'default' }], webSockets: 0,
+    verdict: null, findings: [], notDone: [], ...o };
+}
+function textOf(html: string, id: string): string {
+  const m = new RegExp(`<p id="${id}">([^<]*)</p>`).exec(html);
+  assert.ok(m, `no element #${id}`);
+  return m[1]!;
+}
+function outcomes(html: string): string[] {
+  return [...html.matchAll(/<td class="outcome">([^<]*)<\/td>/g)].map((m) => m[1]!);
+}
+function section(html: string, id: string): string {
+  return new RegExp(`<section id="${id}">.*?</section>`, 's').exec(html)?.[0] ?? '';
+}
+
+let tmp: string;
+beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'e2k-report-')); });
+afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+test('tallies line and per-step outcome wording', () => {
+  const r = buildResult(input({ actions: [act('assert', 'match'), act('assert', 'mismatch'), act('click', 'ok'), act('click', 'failed'), act('click', 'not-run')] }));
+  assert.deepEqual(r.tallies, { ok: 1, match: 1, mismatch: 1, failed: 1, notRun: 1 });
+  const html = renderReport(r);
+  assert.equal(textOf(html, 'tallies'), '相符 1 / 不符 1 / 执行失败 1 / 未执行 1');
+  assert.deepEqual(outcomes(html), ['相符', '不符', '完成', '执行失败', '未执行']);
+});
+
+test('assert steps carry the measured and the expected value', () => {
+  const html = renderReport(buildResult(input({ actions: [act('assert', 'mismatch', { actual: 'Saved', expected: 'Done' })] })));
+  assert.ok(html.includes('实测 <code>Saved</code>，期望 <code>Done</code>'));
+});
+
+test('verdict wording is exact', () => {
+  for (const [v, label] of [['pass', '通过'], ['fail', '不通过'], ['exists', '存在'], ['absent', '不存在'], ['undetermined', '无法判断']] as const) {
+    const html = renderReport(buildResult(input({ verdict: { value: v, because: '依据甲' } })));
+    assert.equal(textOf(html, 'verdict'), label); assert.equal(textOf(html, 'verdict-by'), 'agent 判定'); assert.ok(html.includes('依据甲'));
+  }
+  const none = renderReport(buildResult(input({ verdict: null })));
+  assert.equal(textOf(none, 'verdict'), 'agent 未提交结论'); assert.ok(!none.includes('id="verdict-by"'));
+});
+
+test('a pass verdict that contradicts the record is flagged', () => {
+  for (const patch of [{ actions: [act('assert', 'mismatch')] }, { actions: [act('click', 'failed')] },
+    { actions: [act('click', 'not-run')] }, { notDone: ['没查分页'] }]) {
+    const r = buildResult(input({ verdict: { value: 'pass' }, ...patch }));
+    assert.equal(r.consistency, 'conflict'); assert.equal(textOf(renderReport(r), 'conflict'), '结论与记录不一致');
+  }
+  const ok = buildResult(input({ verdict: { value: 'fail' }, actions: [act('assert', 'mismatch')] }));
+  assert.equal(ok.consistency, 'ok'); assert.ok(!renderReport(ok).includes('id="conflict"'));
+  assert.ok(renderReport(buildResult(input({ notDone: ['没查分页'] }))).includes('没查分页'));
+});
+
+test('not-run steps and notDone are listed together under the not-done section', () => {
+  const html = renderReport(buildResult(input({ notDone: ['没查分页'], actions: [act('click', 'not-run')] })));
+  const s = section(html, 'not-done');
+  assert.ok(s.includes('没查分页')); assert.ok(s.includes('click'));
+});
+
+test('writes section lists allowed, blocked and unattributed writes', () => {
+  const r = buildResult(input({ writes: [write('POST', 'http://localhost:5173/api/items', 201), { ...write('PUT', 'http://localhost:5173/api/x', null), decision: 'blocked' }],
+    unattributedWrites: [write('POST', 'http://localhost:5173/api/form-blank', 200)] }));
+  assert.deepEqual([r.writes.allowed.length, r.writes.blocked.length, r.writes.unattributed.length], [1, 1, 1]);
+  const html = renderReport(r);
+  for (const s of ['这次动了什么', '/api/items', '201', '/api/x', '未归属的写', '/api/form-blank', '无法确定来自哪个页面']) assert.ok(html.includes(s), s);
+  assert.ok(section(renderReport(buildResult(input({}))), 'writes').includes('<p>无</p>'));
+});
+
+test('writes to a non-default mode host are marked', () => {
+  const html = renderReport(buildResult(input({ writes: [write('POST', 'http://localhost/a', 200, { targetMode: 'readonly' as Mode }), write('POST', 'http://localhost/b', 200)] })));
+  assert.equal(html.match(/非默认模式域名/g)?.length, 1);
+});
+
+test('coverage notes and next', () => {
+  const r = buildResult(input({ webSockets: 2, driver: driverWith({ nativeFormSubmit: 'not-covered' }) }));
+  assert.ok(r.coverage.notes.includes('有 WebSocket 连接，不受写策略管'));
+  assert.ok(r.coverage.notes.some((n) => n.includes('docs/m0-findings.md')));
+  assert.equal(r.coverage.notes.length, 2);
+  assert.equal(buildResult(input({ closedBy: 'browser-gone' })).next, '浏览器已关闭，需要时重新 open');
+  assert.equal(buildResult(input({ closedBy: 'page-gone' })).next, '会话的页面被关闭，需要时重新 open');
+  assert.equal(buildResult(input({ closedBy: 'agent' })).next, null);
+});
+
+test('html escapes everything that came from the page', () => {
+  const html = renderReport(buildResult(input({ start: { url: 'http://localhost/?q=<b>x</b>', viewport: null, profile: 'default' },
+    actions: [act('click', 'failed', { error: '<script>window.pwned=1</script>', shot: 'shots/01.jpg"><img src=x onerror=1' })] })));
+  assert.ok(!html.includes('<script')); assert.ok(!html.includes('<b>x</b>')); assert.ok(!html.includes('onerror=1"'));
+  assert.ok(!html.includes('<img src=x'));
+  assert.ok(html.includes('&lt;script&gt;')); assert.ok(html.includes('Content-Security-Policy'));
+});
+
+test('a valid screenshot path becomes an img, anything else does not', () => {
+  const html = renderReport(buildResult(input({ actions: [act('screenshot', 'ok', { shot: 'shots/01.jpg' }), act('screenshot', 'ok', { shot: '../x.jpg' })] })));
+  assert.equal(html.match(/<img /g)?.length, 1); assert.ok(html.includes('<img src="shots/01.jpg"'));
+});
+
+test('page content is redacted before it is truncated and escaped in the html', () => {
+  // 脱敏必须在截断之前：token 跨过显示上限时，先截断会留下半截 token。
+  const body = JSON.stringify({ note: 'x'.repeat(470) + ' ' + jwt + ' <img src=x onerror=1>' });
+  const html = renderReport(buildResult(input({
+    writes: [write('POST', 'http://localhost/api', 200, { body })],
+    findings: [{ claim: '<b>c</b> ' + jwt, basis: 'y'.repeat(480) + ' ' + jwt }],
+    actions: [act('assert', 'mismatch', { actual: 'z'.repeat(490) + ' ' + jwt, expected: 'e' })],
+  })));
+  assert.ok(!html.includes('eyJ'), 'token fragment leaked');
+  assert.ok(!html.includes('<b>c</b>')); assert.ok(!html.includes('<img src=x'));
+  assert.ok(html.includes(REDACTED));
+});
+
+test('if redaction throws, a fixed marker is shown and the raw value never is', () => {
+  const secret = 'raw-secret-marker-7731';
+  const odd = { toString: () => secret } as unknown as string;   // 不是字符串：redactText 会抛错
+  const html = renderReport(buildResult(input({ findings: [{ claim: odd, basis: odd }], notDone: [odd],
+    verdict: { value: 'fail', because: odd }, actions: [act('assert', 'mismatch', { error: odd })] })));
+  assert.ok(!html.includes(secret)); assert.ok(html.includes(REDACTED));
+});
+
+test('no key anywhere in buildResult output is a sensitive key', () => {
+  const r = buildResult(input({
+    verdict: { value: 'pass', because: 'b' }, findings: [{ claim: 'c', basis: 'b' }], notDone: ['n'], webSockets: 1,
+    driver: driverWith({ nativeFormSubmit: 'unknown' }),
+    actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: '#a', via: 'id' } }, shot: 'shots/01.jpg' }),
+      act('assert', 'match', { actual: 1, expected: 1, error: 'e' })],
+    writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' })],
+    unattributedWrites: [write('PUT', 'http://localhost/b', null)],
+  }));
+  const bad: string[] = [];
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (typeof v === 'object' && v !== null) {
+      for (const [k, val] of Object.entries(v)) { if (isSensitiveKey(k)) bad.push(k); walk(val); }
+    }
+  };
+  walk(r);
+  assert.deepEqual(bad, []);
+});
+
+test('runDirName is UTC and matches RUN_DIR_RE', () => {
+  const name = runDirName(new Date('2026-11-26T15:30:05Z'), 's-a41f00');
+  assert.equal(name, '20261126-153005-s-a41f00'); assert.match(name, RUN_DIR_RE);
+  assert.throws(() => runDirName(new Date(), '../x'));
+});
+
+test('writeRun redacts page content, keeps kernel identifiers, writes 0600 files in a 0700 dir', () => {
+  const runDir = join(tmp, 'runs', 'session', 'one');
+  const longName = 'a'.repeat(40);
+  const longSelector = '[data-testid="' + 'Ab1'.repeat(20) + '"]';
+  const out = writeRun(runDir, buildResult(input({ name: longName, findings: [{ claim: 'c', basis: jwt }],
+    start: { url: 'http://localhost/?token=abc123', viewport: null, profile: 'default' },
+    actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: longSelector, via: 'testid' } } })] })));
+  const saved = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.equal(saved.name, longName); assert.equal(saved.actions[0].target.stable.selector, longSelector);
+  assert.equal(saved.session, 's-a41f00');
+  for (const f of [out.reportPath, out.resultPath]) {
+    const text = readFileSync(f, 'utf8');
+    assert.ok(!text.includes(jwt)); assert.ok(!text.includes('abc123')); assert.equal(statSync(f).mode & 0o777, 0o600);
+  }
+  assert.equal(statSync(runDir).mode & 0o777, 0o700);
+  assert.ok(readFileSync(out.reportPath, 'utf8').includes('<h1>'));
+});
+
+test('writeRun redacts host names and neutralises tags in both files', () => {
+  const out = writeRun(join(tmp, 'r1'), buildResult(input({ hosts: [{ host: 'Ab1'.repeat(14) + '.example.com', mode: 'default' }],
+    findings: [{ claim: '<img src=x onerror=1>', basis: jwt }] })));
+  const json = readFileSync(out.resultPath, 'utf8');
+  assert.ok(!json.includes(jwt)); assert.ok(!json.includes('Ab1'.repeat(14)));
+  const html = readFileSync(out.reportPath, 'utf8');
+  assert.ok(!html.includes(jwt)); assert.ok(!html.includes('<img src=x'));
+});
+
+test('writeRun: if redaction of a field throws, that field becomes a fixed marker, never the raw value', () => {
+  const secret = 'raw-secret-marker-9921';
+  const r = buildResult(input());
+  r.findings = [{ claim: 'ok', get basis(): string { throw new Error(secret); } }];
+  const out = writeRun(join(tmp, 'r2'), r);
+  const json = readFileSync(out.resultPath, 'utf8');
+  assert.equal(JSON.parse(json).findings, REDACTED); assert.ok(!json.includes(secret));
+  const html = readFileSync(out.reportPath, 'utf8');
+  assert.ok(!html.includes(secret)); assert.ok(html.includes('<html'));
+});
+
+test('op parameters are shown redacted and escaped', () => {
+  const op = { op: 'fill', target: 'e2', value: `<b>v</b> ${jwt}` } as Op;
+  const html = renderReport(buildResult(input({ actions: [act('fill', 'ok', { op })] })));
+  assert.ok(!html.includes('eyJ')); assert.ok(!html.includes('<b>v</b>')); assert.ok(html.includes('参数'));
+});
+
+test('writeRun refuses to write through a symlink that leaves the run directory', () => {
+  const runDir = join(tmp, 'r3'); const outside = join(tmp, 'outside.json');
+  mkdirSync(runDir, { mode: 0o700 }); writeFileSync(outside, 'keep');
+  symlinkSync(outside, join(runDir, 'result.json'));
+  assert.throws(() => writeRun(runDir, buildResult(input())));
+  assert.equal(readFileSync(outside, 'utf8'), 'keep');
+});
+
+function makeRuns(nameDir: string, count: number): string[] {
+  mkdirSync(nameDir, { recursive: true });
+  const names = Array.from({ length: count }, (_, i) => runDirName(new Date(Date.UTC(2026, 10, 1, 0, 0, i)), 's-a41f00'));
+  for (const n of names) mkdirSync(join(nameDir, n));
+  return names;
+}
+
+test('pruneRuns keeps the newest N and touches nothing else', () => {
+  const nameDir = join(tmp, 'name'); const names = makeRuns(nameDir, 22);
+  mkdirSync(join(nameDir, 'notes'));
+  const outsideTarget = join(tmp, 'outside'); mkdirSync(outsideTarget);
+  const link = join(nameDir, runDirName(new Date(Date.UTC(2026, 9, 1)), 's-b00001'));   // 合规命名，比所有真目录都老
+  symlinkSync(outsideTarget, link);
+  writeFileSync(join(nameDir, runDirName(new Date(Date.UTC(2026, 9, 2)), 's-b00002')), 'a file, not a directory');
+  const removed = pruneRuns(nameDir, 20, new Set());
+  assert.deepEqual(removed, [names[0], names[1]]);
+  assert.ok(existsSync(join(nameDir, 'notes'))); assert.ok(existsSync(outsideTarget)); assert.ok(lstatSync(link).isSymbolicLink());
+  assert.ok(existsSync(join(nameDir, names[2]!)));
+});
+
+test('pruneRuns: oldest dir is kept when excluded', () => {
+  const nameDir = join(tmp, 'name'); const names = makeRuns(nameDir, 5);
+  const removed = pruneRuns(nameDir, 3, new Set([names[0]!]));
+  assert.deepEqual(removed, [names[1]]);
+  assert.ok(existsSync(join(nameDir, names[0]!))); assert.ok(!existsSync(join(nameDir, names[1]!)));
+});
+
+test('pruneRuns on a missing directory removes nothing and rejects a bad keep', () => {
+  assert.deepEqual(pruneRuns(join(tmp, 'nope'), 20, new Set()), []);
+  assert.throws(() => pruneRuns(tmp, -1, new Set()));
+});
