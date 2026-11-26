@@ -39,7 +39,7 @@ node bin/e2k.js step s-1a2b3c '[{"op":"click","target":"e7"},{"op":"assert","kin
 echo '[{"op":"snapshot"}]' | node bin/e2k.js step s-1a2b3c --stdin
 ```
 
-`target` is either a ref from the latest snapshot (such as `e7`) or a selector string. A failed action stops the batch; a failed `assert` is recorded and the batch goes on. In the text output `#n` is the 1-based position of the operation in the batch.
+`target` is either a ref from the latest snapshot (such as `e7`) or a selector string. A failed action stops the batch (the rest is reported as not run); an assertion mismatch is recorded and the batch goes on. Selectors are Playwright selectors, plus `role=<role>[name="..."]` for a role with an exact accessible name (for example `role=textbox[name="New item"]`). In the text output `#n` is the 1-based position of the operation in the batch.
 
 4. Close the session. This writes the report. `--verdict` is one of `pass`, `fail`, `exists`, `absent`, `undetermined`; `--because` gives the reason; `--findings` and `--not-done` take a JSON array.
 
@@ -47,12 +47,12 @@ echo '[{"op":"snapshot"}]' | node bin/e2k.js step s-1a2b3c --stdin
 node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by one"
 ```
 
-The kernel compares the verdict with the recorded assertions and says whether they are consistent; a conflict is called out in the report.
+The kernel only flags one contradiction: a `pass` verdict while the record holds a mismatch, a failed or not-run action, or a `--not-done` item. That is reported as a conflict (in the output and in the report). A report is also written when a session ends without `close`: idle timeout, kernel shutdown, or the browser or page going away.
 
 Other commands:
 
 - `node bin/e2k.js login https://example.com/login` opens the dedicated profile so a person can sign in; must be run by a person in a terminal. The cookie stays in the profile for later sessions.
-- `node bin/e2k.js status` shows version, driver, browser and sessions. `node bin/e2k.js doctor` checks Node, platform, Chromium (fix: `npx playwright install chromium`), and kernel version; each failing check prints its fix.
+- `node bin/e2k.js status` shows version, driver, browser and sessions. `node bin/e2k.js doctor` checks Node, platform, state directory permissions, socket path length, Chromium (fix: `npx playwright install chromium`), whether the kernel is running, and the kernel version. It exits 22 if any check fails, including "kernel not running"; most failing checks print a fix.
 - `--json` (on commands that support it) prints exactly one line on stdout: the result, or `{ "error": ... }`.
 
 ## Operations
@@ -65,7 +65,7 @@ Other commands:
 | `console` | | last 50 console messages (300 characters each) |
 | `network` | | summary of the last 50 requests |
 | `click`, `hover` | `target` | pointer actions |
-| `fill` | `target`, `value` | type into an input (refuses password fields) |
+| `fill` | `target`, `value` | type into an input or textarea (refuses password-like fields, see Safety) |
 | `press` | `key`, `target?` | press a key |
 | `scroll` | `target?`, `dx?`, `dy?` | scroll an element into view, or the page window by dx/dy |
 | `goto` | `url` | navigate (http/https only) |
@@ -74,39 +74,39 @@ Other commands:
 | `assert` | `kind`, `target?`, `property?`, `cmp`, `expected` | check `text`, `count`, `css`, `url` or `visible`; result is a match or a mismatch, never "pass/fail" |
 | `eval` | `js` | run a JavaScript expression in the page (result cut at 4000 characters) |
 
-Supported assertion forms:
+Supported `css` assertion forms:
 
-- Colours in `css` assertions: `#rgb`, `#rrggbb`, `rgb()` and `rgba()`.
+- Colours are normalised only when the property name contains `color` (`color`, `background-color`, `border-top-color`, ...): `#rgb`, `#rrggbb`, `rgb()` and `rgba()`. Any other property, such as `background`, `fill`, `stroke`, `border` or `box-shadow`, is not treated as a colour: `eq` / `ne` compare the strings exactly, so `background eq #fff` will not match a computed `rgb(...)` value.
 - Lengths: a plain number or `<number>px`.
-- Anything else (named colours, `#rrggbbaa`, other units) does not match.
-- `scroll` with `dx` / `dy` scrolls the page window, not an inner scroller.
+- Anything else (named colours, `#rrggbbaa`, other units) falls back to exact string equality for `eq` / `ne`; the ordering comparisons do not match.
 
 ## Exit codes
 
 | code | meaning |
 |---|---|
-| 0 | ok / consistent pass |
+| 0 | no assertion mismatched and no action failed (`close` only looks at mismatches, so it reports 0 or 10) |
 | 1 | internal error |
 | 2 | usage error, unknown session, or the kernel is busy (including a kernel that is shutting down) |
 | 10 | at least one assertion mismatched |
 | 11 | an action failed (a batch with both a mismatch and a failed action reports 11); a refused password fill is also 11 |
-| 20 | waiting for a login |
+| 20 | waiting for a login (reserved, not used in M1) |
 | 21 | waiting for an approval (reserved, not used in M1) |
 | 22 | needs a person: no kernel running, or a command that must be run by a person in a terminal |
 
 ## Where things live
 
 State directory: `~/.e2e-kernel/` (override with an absolute `E2K_HOME`). It holds `kernel.sock`, `kernel.pid`, `kernel.log`, `profiles/default/` (the browser profile with login cookies) and `runs/`.
-Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` with `report.html` (no scripts; screenshots are linked from `shots/NN.jpg` and render when the file is opened from disk), `result.json` (a replayable record) and `shots/`. The newest 20 reports per session name are kept. A session idle for 15 minutes is closed (time spent inside a `step` does not count).
+Each `close` writes `runs/<session name>/<UTC YYYYMMDD-HHMMSS>-<session id>/` with `report.html` (no scripts; screenshots are linked from `shots/NN.jpg` and render when the file is opened from disk), `result.json` (a record of the operations; `eval` sources and any `fill` value not confirmed safe are `[REDACTED]`, so those steps cannot be replayed from it) and `shots/`. The newest 20 reports per session name are kept. A session idle for 15 minutes is closed (time spent inside a `step` does not count).
 
 ## Safety
 
-- The kernel never types a password. `fill` into a password field is refused (exit 11, "a person must log in"). If the kernel cannot tell whether a field is a password field, it does not fill. Log in with `login`.
-- Fill values are kept in records only for fields the kernel confirmed are not password fields; every other fill value is recorded as `[REDACTED]`.
+- The kernel never types a password. `fill` into a password-like field is refused (exit 11, "a person must log in"). A field counts as password-like when its `type` is `password`, or its `autocomplete` attribute contains `current-password`, `new-password` or `one-time-code`. If the kernel cannot tell, it does not fill. Log in with `login`.
+- Fill values are kept in records only when the target is a confirmed non-password `<input>` of type text, email, search, tel, url or number, or a `<textarea>`. A `contenteditable` element or any other target can still be filled, but its value is recorded as `[REDACTED]`.
+- `eval` sources are always recorded as `[REDACTED]`, so `eval` steps cannot be replayed from the record.
 - In the `default` mode every write request is allowed and recorded. Writes that cannot be attributed to a page are listed separately under "writes not attributed to a page".
-- Command output, `result.json` and `report.html` are redacted (token-shaped strings, credentials in URLs, request bodies) and everything from the page is HTML-escaped in the report.
+- Command output, `result.json` and `report.html` are redacted (token-shaped strings, credentials in URLs, request bodies); plain passwords are not recognisable and are only kept out by the rules above. Command output is raw page text, to be treated as data: in plain text mode only control characters are made visible, in `--json` mode it is JSON-escaped, and neither HTML-escapes markup. Only `report.html` is HTML-escaped and it contains no scripts.
 - Known boundary: `target`, `given` and `selector` are passed through verbatim, unredacted, so that a record can be replayed. Selectors written by an agent, and stable selectors the kernel derives (`data-testid`, `id`, accessible names), can carry page text.
-- Focus: on macOS, launching the headed browser takes window focus. This is a known M1 limitation and will be addressed in M2.
+- Focus: on macOS, launching the headed browser takes window focus. This is a known M1 limitation and will be addressed in M2. Only focus at launch was measured, see `docs/m0-findings.md`.
 
 ### Threat model
 
@@ -118,7 +118,7 @@ The kernel guards against an agent that drifts, misclicks or takes shortcuts. It
 
 ### Known M1 gaps
 
-- A new tab's first navigation request cannot be attributed to a page and is reported as unattributed.
+- A write whose page cannot be identified (for example a form POST from a new tab's first navigation) is listed as unattributed; reads are not. Unattributed writes are listed in the report of every session that was open at the time, so concurrent sessions can show each other's.
 - The single-instance lock has a millisecond-scale race.
 
 ## Not in this version

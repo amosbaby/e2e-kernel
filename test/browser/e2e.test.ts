@@ -1,6 +1,7 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createPlaywrightDriver } from '../../src/drivers/playwright/driver.ts';
@@ -21,6 +22,8 @@ const home = tmp.home;
 let server: FixtureServer;
 let origin: string;
 let kernel: KernelHandle;
+// 36 个十六进制字符、运行时生成：够长，脱敏的 hex 规则（32 位以上）若误伤内核自己的值（会话名）就会暴露；不写成字面量。
+const NAME = randomBytes(18).toString('hex');
 let sid = '';
 let ref = '';
 
@@ -80,7 +83,10 @@ test('a page opened by login leaves its cookie for later sessions', { timeout: 1
 });
 
 test('open, act by ref and by selector, assert, screenshot', { timeout: 180_000 }, async () => {
-  const open = JSON.parse((await e2k('open', origin + '/index.html', '--name', 'items', '--json')).out);
+  const opened = await e2k('open', origin + '/index.html', '--name', NAME, '--json');
+  const open = JSON.parse(opened.out);
+  assert.equal(open.name, NAME);
+  assert.ok(open.runDir.includes(NAME));
   sid = open.session;
   ref = /button "Add" \[ref=(e\d+)\]/.exec(open.snapshot)![1]!;
   const r = await e2k('step', sid, JSON.stringify([
@@ -97,15 +103,20 @@ test('open, act by ref and by selector, assert, screenshot', { timeout: 180_000 
   assert.ok(server.hits.some((h) => h.method === 'POST' && h.path === '/api/items'));   // 「默认」模式：写放行
 });
 
-test('page secrets and markup never reach the output; a failed action stops the batch', { timeout: 180_000 }, async () => {
+test('page tokens never reach the output; a failed action stops the batch', { timeout: 180_000 }, async () => {
+  // 命令输出是页面文本的原样输出（给 agent 或终端看，不是 HTML 语境），只有长得像 token 的串会被脱敏；标签不会被转义。
+  // 末尾前的那条不符的 assert 让页面里的标签进入 result.json 和 report.html，close 之后在那边验证它们被转义。
   const ops = [{ op: 'goto', url: origin + '/tricky.html' }, { op: 'snapshot' }, { op: 'text' }, { op: 'console' },
+    { op: 'assert', kind: 'text', target: '#markup', cmp: 'eq', expected: 'x' },
     { op: 'eval', js: 'document.querySelector("#leak").textContent' }, { op: 'click', target: '#nope' }, { op: 'snapshot' }];
   const r = await e2kIn(JSON.stringify(ops), 'step', sid, '--stdin');
   assert.equal(r.code, 11);
   assert.match(r.out, /未执行 1/);
   for (const s of [server.fake.jwt, server.fake.bearer]) assert.ok(!r.out.includes(s) && !r.err.includes(s));
+  assert.ok(r.out.includes('[REDACTED]'), 'the page text carried tokens, so the output must show the redaction marker');
   // 内核自己的值没有被脱敏弄坏：会话 id 和失败截图的路径原样在
   assert.ok(r.out.includes(sid));
+  assert.ok((await e2k('status')).out.includes(NAME), 'the session name must survive redaction');
   assert.match(r.out, /shots\/\d+\.jpg/);
 });
 
@@ -127,17 +138,26 @@ test('close writes a report with evidence, writes, a replayable record, and no s
   // 填值：只有确认不是密码框的才留值，被拒绝的密码框那条记成 [REDACTED]
   assert.equal(result.actions[0].op.value, 'Gamma');
   assert.equal(result.actions.at(-1).op.value, '[REDACTED]');
+  assert.ok(post.body.includes('[REDACTED]'), 'the POST body had a password key, so it must show the marker');
   assert.equal(post.status, 200);
   assert.equal(post.decision, 'allowed');
   assert.deepEqual(result.hosts[0], { host: '127.0.0.1', mode: 'default' });
   assert.ok(readdirSync(join(close.runDir, 'shots')).some((f: string) => f.endsWith('.jpg')));
+  // 页面标签确实进了记录（不符的 assert 的 actual），是 JSON 字符串；result.json 以外的文件里不许有它的原样。
+  const markup = '<script>window.pwned=1</script>';
+  assert.ok(result.actions.some((a: any) => a.actual === markup), 'the mismatching assert must carry the page markup as data');
   for (const f of allFilesUnder(close.runDir).filter((p) => !p.endsWith('.jpg'))) {
     const text = readFileSync(f, 'utf8');
     for (const s of [server.fake.jwt, server.fake.bearer, server.fake.password, 'not-a-real-password']) assert.ok(!text.includes(s), `${f} leaks`);
-    assert.ok(!text.includes('<script>window.pwned=1</script>'), `${f} carries page markup verbatim`);
+    if (!f.endsWith('result.json')) assert.ok(!text.includes(markup), `${f} carries page markup verbatim`);
   }
+  // 内核自己的值没被脱敏弄坏：会话名（36 位十六进制）原样在命令输出、result.json、报告目录和 report.html 里
+  assert.equal(result.name, NAME);
+  assert.ok(close.runDir.includes(NAME));
   const html = readFileSync(close.reportPath, 'utf8');
+  assert.ok(html.includes(NAME), 'the session name must appear in report.html');
   assert.ok(!html.includes('<script'));
+  assert.ok(html.includes('&lt;script&gt;window.pwned=1&lt;/script&gt;'), 'page markup must be escaped in report.html');
   assert.ok(html.includes('这次动了什么'));
   assert.ok(html.includes('结论与记录不一致'));
 });
