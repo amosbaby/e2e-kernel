@@ -87,7 +87,8 @@ function stepRow(a: ActionRecord): string {
 function writeItem(w: WriteRecord): string {
   const status = w.failed ? '失败' : w.status === null ? '无状态码' : String(w.status);
   const flag = w.targetMode === 'default' ? '' : ` <strong class="flag">非默认模式域名（${own(w.targetMode)}）</strong>`;
-  const body = w.body === null ? '' : `<br>请求体 <code>${pageBody(w.body)}</code>`;
+  const body = w.bodyOmitted ? '<br>请求体未记录（发出它的页面有密码框，或判断不出）'
+    : w.body === null ? '' : `<br>请求体 <code>${pageBody(w.body)}</code>`;
   return `<li><code>${page(w.method)} ${pageUrl(w.url)}</code> 时间 ${own(w.at)} 状态码 ${own(status)}${flag}${body}</li>`;
 }
 

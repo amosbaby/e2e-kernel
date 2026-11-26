@@ -142,6 +142,16 @@ Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调�
 
 结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；README Known gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定），不在 M7 内。
 
+## 9.6 写请求时探测密码框
+
+内核要知道「发出写请求的页面有没有密码框」，好决定记不记请求体。驱动在路由回调里对发出请求的 frame 和它所在页面的顶层文档各做一次 `locator(...).count()`（跑在 Playwright 的隔离环境里，页面改写不了 `querySelector`，CSS 选择器穿透 open shadow root；只数有没有 `input[type=password]` 或 `autocomplete` 含 `current-password` / `new-password` / `one-time-code` 的元素），与 300 ms 定时器竞速；超时、抛错、或探测前后 frame 或顶层的地址变了，都给 `null`，内核按失败关闭不记体。
+
+实测（`test/browser/playwright-driver.test.ts`）：
+- 页面用同步 XHR 发写请求时，页面线程被占着，探测跑不起来：约 312 ms 后超时为 `null`，请求照常交给内核、到达服务，不被探测卡住。
+- 顶层 frame 的导航请求（原生表单提交）在路由回调里对它做探测会挂住：Playwright 等导航结束，导航又在等这个回调，回调之后才报「Execution context was destroyed」。iframe 里的导航请求实测不挂（4–6 ms 返回），但为简单起见，有请求体的导航请求一律不探测、给 `null`。后果：原生表单提交的请求体一律不记。
+- 页面发写请求后马上 `location.href` 跳走：路由回调里先看到的是跳转的导航请求，探测的 locator 可能已经落在新文档上，而 `frame.url()` 还是旧地址，只比地址会判成确切的 `false`（实测每次都是）。所以驱动登记「已发起、未提交」的导航（`framenavigated`、请求失败或结束时撤销，10 秒过期），探测开始前或结束后它为真、或地址变了，都给 `null`。
+- 子 frame 里发的写，顶层文档有密码框：判为有；`fetch` 在没有密码框的页面上判为没有。
+
 ## 10. 复测
 
 运行 `npm run m0`。Playwright 升级后必须重跑并更新本文件。

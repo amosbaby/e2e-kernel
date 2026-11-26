@@ -28,7 +28,7 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
   const kernelFields = [...KERNEL_SKIP_KEYS, 'v', 'ok', 'result', 'error', 'code', 'message', 'next', 'method', 'params', 'url', 'title', 'mode', 'snapshot',
     'results', 'tallies', 'exit', 'index', 'op', 'outcome', 'output', 'actual', 'expected', 'consistency', 'sessions', 'idleSec', 'version', 'pid',
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
-    'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text'];
+    'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
 

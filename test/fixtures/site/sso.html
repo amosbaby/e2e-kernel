@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture SSO</title>
+</head>
+<body>
+<form id="sso" method="post" action="/api/sso">
+  <input name="user" id="user">
+  <input type="password" name="pw" id="pw">
+  <input type="hidden" name="state" value="{{FAKE_FORM_TOKEN}}">
+  <button>Sign in</button>
+</form>
+<button id="send-ids">Send ids</button>
+<script>
+  document.getElementById('send-ids').addEventListener('click', () => {
+    fetch('/api/ids', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'ids=' + encodeURIComponent(JSON.stringify([{ email: '{{FAKE_EMAIL}}' }])),
+    }).catch(() => {});
+  });
+</script>
+</body>
+</html>

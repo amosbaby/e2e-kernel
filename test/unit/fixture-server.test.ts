@@ -32,6 +32,17 @@ test('serves pages with placeholders filled in', async () => {
   assert.ok((await get('/tricky.html')).includes(server.fake.jwt));
 });
 
+test('sso and profile pages carry runtime-generated fakes; only sso has a password field', async () => {
+  const { email, formToken } = server.fake;
+  assert.match(email, /^u[0-9a-f]{10}@example\.com$/);
+  assert.match(formToken, /^[A-Za-z0-9]{43}=$/);
+  const sso = await get('/sso.html');
+  const profile = await get('/profile.html');
+  for (const html of [sso, profile]) { assert.ok(!html.includes('{{')); assert.ok(html.includes(email)); }
+  assert.ok(sso.includes(formToken)); assert.ok(sso.includes('type="password"'));
+  assert.ok(!profile.includes('password'));
+});
+
 test('rejects path traversal sent as-is', async () => {
   for (const p of ['/../../package.json', '/..%2f..%2fpackage.json', '/%2e%2e/%2e%2e/package.json', '/a%00.html', '/controls.js/../../../package.json'])
     assert.equal((await rawGet(p)).status, 404, p);

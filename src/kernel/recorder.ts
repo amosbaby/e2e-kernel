@@ -8,7 +8,7 @@ import { REDACTED, redactBody, redactText, redactUrl } from '../shared/redact.ts
 export interface ActionRecord { seq: number; at: string; ms: number; op: Op; target?: { given: Target; stable: Stable | null };
   outcome: Outcome; actual?: string | number | boolean | null; expected?: string | number | boolean; error?: string; shot?: string }
 export interface WriteRecord { id: string; at: string; method: string; url: string; status: number | null; failed: boolean;
-  body: string | null; pageUrl: string | null; decision: 'allowed' | 'blocked'; targetMode: Mode }
+  body: string | null; bodyOmitted: boolean; pageUrl: string | null; decision: 'allowed' | 'blocked'; targetMode: Mode }
 
 const MAX_REQUESTS = 200;
 
@@ -30,6 +30,8 @@ export function safely(redact: () => string): string {
 
 export function toWriteRecord(req: RequestInfo, decision: Decision, targetMode: Mode, at: Date): WriteRecord {
   const { body, contentType, topUrl } = req;
+  // 失败关闭：只有明确判断出「没有密码框」（false）才记体；true 和判断不出（null）都不记。
+  const omit = body !== null && req.fromLoginForm !== false;
   return {
     id: req.id,
     at: at.toISOString(),
@@ -37,7 +39,8 @@ export function toWriteRecord(req: RequestInfo, decision: Decision, targetMode: 
     url: safely(() => redactUrl(req.url)),
     status: null,
     failed: false,
-    body: body === null ? null : safely(() => redactBody(body, contentType) ?? REDACTED),
+    body: body === null || omit ? null : safely(() => redactBody(body, contentType) ?? REDACTED),
+    bodyOmitted: omit,
     pageUrl: topUrl === null ? null : safely(() => redactUrl(topUrl)),
     decision: decision.action === 'continue' ? 'allowed' : 'blocked',
     targetMode,

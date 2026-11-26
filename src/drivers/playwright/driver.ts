@@ -76,6 +76,47 @@ export interface DriverOptions {
   actionTimeoutMs?: number;
 }
 
+// 密码类输入框的选择器：不要求可见，宁可多判成「有」，少记一条请求体。
+// 用 locator 数而不是在页面里 querySelector：locator 跑在 Playwright 自己的隔离环境里，页面改写不了
+// document.querySelector，CSS 选择器默认还会穿透 open shadow root（closed shadow root 看不见）。
+const PASSWORD_FIELD_SELECTOR =
+  'input[type="password" i], [autocomplete*="current-password" i], [autocomplete*="new-password" i], [autocomplete*="one-time-code" i]';
+
+const PROBE_TIMEOUT_MS = 300;
+const NAVIGATION_PENDING_MS = 10_000;
+
+// 发出请求的 frame 和它所在页面顶层 frame 当前的地址；探测前后各取一次，变了说明期间页面在换文档。
+function frameUrls(frame: Frame): string[] {
+  return [frame.url(), frame.page().mainFrame().url()];
+}
+
+// 发出请求的 frame，或它所在页面顶层文档里有没有密码类输入框。true / false 都是确切的判断；
+// 抛错、被页面卡住（比如同步 XHR 正占着页面线程）、超过 300 ms、探测期间 frame 或顶层的地址变了，一律 null，
+// 内核按失败关闭处理。`before` 是请求一到就（同步）取的 frameUrls，没有它探不出「期间换了文档」。
+// `navigating` 说这个 frame 或顶层 frame 有一次导航已经发起、还没提交（发请求之后马上 location.href 跳走的页面）：
+// 此时 locator 可能已经落在新文档上而 frame.url() 还是旧的，所以开始前、结束后它为真都给 null。
+// 这是在路由回调里等的，所以必须有时限：绝不让探测卡住请求。
+async function probePasswordField(frame: Frame, before: string[], navigating: () => boolean): Promise<boolean | null> {
+  if (navigating()) return null;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), PROBE_TIMEOUT_MS); });
+  const main = frame.page().mainFrame();
+  const frames = main === frame ? [frame] : [frame, main];
+  const probe = Promise.allSettled(frames.map((f) => f.locator(PASSWORD_FIELD_SELECTOR).count())).then((rs): boolean | null => {
+    if (rs.some((r) => r.status === 'fulfilled' && r.value > 0)) return true;
+    return rs.every((r) => r.status === 'fulfilled') ? false : null;
+  });
+  try {
+    const found = await Promise.race([probe, timeout]);
+    const after = frameUrls(frame);
+    return navigating() || !before.every((u, i) => u === after[i]) ? null : found;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // 统一写法 → Playwright 的 Locator：引用 → getByRef；role=…[name="…"] → getByRole（我们自己解析）；其余 → locator。
 function locate(page: PwPage, target: Target): Locator {
   if (isRef(target)) return page.getByRef(target);
@@ -407,6 +448,8 @@ class PlaywrightInstance implements Instance, Host {
   private readonly closing = new Set<PlaywrightPage>();   // 已关、onClosed 还没触发的页
   private readonly requestIds = new WeakMap<PwRequest, string>();
   private readonly requestsDone = new WeakSet<PwRequest>();
+  // 已经发起、还没提交（也没失败或结束）的导航：frame → 发起它的请求和时间。给密码框探测用，见 probePasswordField。
+  private readonly navigating = new WeakMap<Frame, { request: PwRequest; at: number }>();
   private readonly reportListenerError: (e: unknown) => void;
   private readonly closedListeners: (() => void)[] = [];
   private readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean }) => void)[] = [];
@@ -439,8 +482,8 @@ class PlaywrightInstance implements Instance, Host {
     // 响应头一到就算这个请求有了结果：只发出去不读响应体的请求（信标式的 fetch）不会触发 requestfinished，
     // 页面一跳转还会被报成 requestfailed。所以以 response 事件为准，requestfinished 和 requestfailed 只补没有响应的情形。
     this.context.on('response', (r) => { this.requestDone(r.request(), r.status(), false); });
-    this.context.on('requestfinished', (r) => { void this.requestFinished(r); });
-    this.context.on('requestfailed', (r) => { this.requestDone(r, null, true); });
+    this.context.on('requestfinished', (r) => { this.navigationEnded(r); void this.requestFinished(r); });
+    this.context.on('requestfailed', (r) => { this.navigationEnded(r); this.requestDone(r, null, true); });
     await this.context.route('**/*', (route) => this.handleRoute(route));
   }
 
@@ -545,6 +588,7 @@ class PlaywrightInstance implements Instance, Host {
     const w = new PlaywrightPage(this, `p${++this.counters.page}`, p, (gone) => { this.open.delete(gone); this.closing.add(gone); }, (done) => { this.closing.delete(done); });
     this.byPage.set(p, w);
     this.open.add(w);
+    p.on('framenavigated', (f) => { this.navigating.delete(f); });
     if (p.isClosed()) {
       w.markClosed();
     } else if (!own) {
@@ -565,6 +609,23 @@ class PlaywrightInstance implements Instance, Host {
     emit(this.reportListenerError, this.pageOpenedListeners, w, w.openerId);
   }
 
+  // 导航请求一到就登记，frame 提交了新文档（framenavigated）、这个请求失败或结束就撤掉；超过 10 秒的登记当作过期
+  // （下载、204 之类不提交文档的导航），免得一直把这个 frame 当成在导航。
+  private isNavigating(frame: Frame): boolean {
+    const now = Date.now();
+    return [frame, frame.page().mainFrame()].some((f) => {
+      const n = this.navigating.get(f);
+      return n !== undefined && now - n.at < NAVIGATION_PENDING_MS;
+    });
+  }
+
+  private navigationEnded(request: PwRequest): void {
+    try {
+      const f = request.frame();
+      if (this.navigating.get(f)?.request === request) this.navigating.delete(f);
+    } catch { /* 拿不到 frame：没有登记可撤 */ }
+  }
+
   // 请求 → RequestInfo。归属判断不出来（request.frame() 抛错）时 pageId、openerPageId、topUrl 都是 null。
   // topUrl（内核拿它的主机去定模式，空就退回请求自己的地址）：
   // - 顶层框架的导航请求：就是请求自己的地址，即正要打开的那份文档；
@@ -577,9 +638,14 @@ class PlaywrightInstance implements Instance, Host {
     let openerPageId: string | null = null;
     let topUrl: string | null = null;
     let topFrame = isNavigation;
+    let fromLoginForm: boolean | null = null;
+    let urlsAtStart: string[] = [];
+    const post = request.postDataBuffer();
     try {
       const frame: Frame = request.frame();
       const pwPage = frame.page();
+      urlsAtStart = frameUrls(frame);
+      if (isNavigation) this.navigating.set(frame, { request, at: Date.now() });
       topFrame = frame.parentFrame() === null;
       topUrl = isNavigation && topFrame ? request.url() : httpUrlOrNull(pwPage.mainFrame().url());
       const w = this.register(pwPage, false);
@@ -588,10 +654,12 @@ class PlaywrightInstance implements Instance, Host {
         pageId = w.id;
         openerPageId = w.openerId;
       }
+      // 导航请求（原生表单提交）不探测：实测顶层 frame 的导航请求在路由回调里对该 frame 做 evaluate 或 locator.count
+      // 都会一直挂着（Playwright 要等导航结束，导航又在等这个回调），白白拖满 300 ms 还是 null，所以直接 null，请求体不记。
+      if (post !== null && !isNavigation) fromLoginForm = await probePasswordField(frame, urlsAtStart, () => this.isNavigating(frame));
     } catch {
-      pageId = null; openerPageId = null; topUrl = null; topFrame = isNavigation;
+      pageId = null; openerPageId = null; topUrl = null; topFrame = isNavigation; fromLoginForm = null;
     }
-    const post = request.postDataBuffer();
     return {
       id: `r${++this.counters.request}`,
       pageId, openerPageId,
@@ -601,6 +669,7 @@ class PlaywrightInstance implements Instance, Host {
       isNavigation, topFrame, topUrl,
       contentType: request.headers()['content-type'] ?? null,
       body: post === null ? null : post.subarray(0, MAX_BODY_BYTES).toString('utf8'),
+      fromLoginForm,
     };
   }
 

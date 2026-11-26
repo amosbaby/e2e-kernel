@@ -133,6 +133,21 @@ test('the kernel refuses to type into a password field', { timeout: 180_000 }, a
   assert.equal(JSON.parse(typed.out).results[0].output, '0', 'nothing may have been typed into the password field');
 });
 
+test('requests from a page with a password field leave no body; other pages are recorded as before', { timeout: 180_000 }, async () => {
+  const { email, password, formToken } = server.fake;
+  // 跨主机的 sso 页：假账号密码经 stdin 填进去（不进 argv），再提交原生表单。这一步之后的退出码不是本测试要断言的，只看记录。
+  await e2kIn(JSON.stringify([{ op: 'goto', url: server.altOrigin + '/sso.html' }]), 'step', sid, '--stdin');
+  const fill = [{ op: 'click', target: '#send-ids' },
+    { op: 'eval', js: `document.querySelector('#user').value = ${JSON.stringify(email)}; document.querySelector('#pw').value = ${JSON.stringify(password)}; document.querySelector('#sso').requestSubmit(); 'submitted'` }];
+  await e2kIn(JSON.stringify(fill), 'step', sid, '--stdin');
+  for (let i = 0; i < 50 && !server.hits.some((h) => h.path === '/api/sso'); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(server.hits.some((h) => h.path === '/api/sso' && h.body.includes(encodeURIComponent(password))), 'the form really was submitted');
+  // 没有密码框的页面发同样的表单体：照旧记录（脱敏后）
+  await e2kIn(JSON.stringify([{ op: 'goto', url: origin + '/profile.html' }, { op: 'click', target: '#send-ids' }]), 'step', sid, '--stdin');
+  for (let i = 0; i < 50 && server.hits.filter((h) => h.path === '/api/ids').length < 2; i++) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(server.hits.filter((h) => h.path === '/api/ids').length, 2);
+});
+
 test('close writes a report with evidence, writes, a replayable record, and no secrets', { timeout: 180_000 }, async () => {
   const closed = await e2k('close', sid, '--verdict', 'pass', '--because', '列表多了一项', '--json');
   const close = JSON.parse(closed.out);
@@ -147,6 +162,17 @@ test('close writes a report with evidence, writes, a replayable record, and no s
   assert.deepEqual(refused.map((a: any) => a.op.target), ['#pw', '#lab', '#sp', 'text=Password']);
   for (const a of refused) assert.equal(a.op.value, '[REDACTED]');
   assert.ok(post.body.includes('[REDACTED]'), 'the POST body had a password key, so it must show the marker');
+  assert.equal(post.bodyOmitted, false);
+  // 登录页（有密码框）发出的写只记方法、URL、状态；没有密码框的页面发的写照旧记体（脱敏后）
+  const allowed: any[] = result.writes.allowed;
+  const sso = allowed.find((w) => w.url.endsWith('/api/sso'));
+  assert.ok(sso !== undefined && sso.body === null && sso.bodyOmitted === true, 'the native form post from the password page must have no body');
+  const ids = allowed.filter((w) => w.url.endsWith('/api/ids'));
+  assert.equal(ids.length, 2);
+  const fromSso = ids.find((w) => w.pageUrl.endsWith('/sso.html'));
+  const fromProfile = ids.find((w) => w.pageUrl.endsWith('/profile.html'));
+  assert.ok(fromSso.body === null && fromSso.bodyOmitted === true);
+  assert.ok(typeof fromProfile.body === 'string' && fromProfile.body.startsWith('ids=') && fromProfile.bodyOmitted === false);
   assert.equal(post.status, 200);
   assert.equal(post.decision, 'allowed');
   assert.deepEqual(result.hosts[0], { host: '127.0.0.1', mode: 'default' });
@@ -156,7 +182,7 @@ test('close writes a report with evidence, writes, a replayable record, and no s
   assert.ok(result.actions.some((a: any) => a.actual === markup), 'the mismatching assert must carry the page markup as data');
   for (const f of allFilesUnder(close.runDir).filter((p) => !p.endsWith('.jpg'))) {
     const text = readFileSync(f, 'utf8');
-    for (const s of [server.fake.jwt, server.fake.bearer, server.fake.password, 'not-a-real-password']) assert.ok(!text.includes(s), `${f} leaks`);
+    for (const s of [server.fake.jwt, server.fake.bearer, server.fake.password, server.fake.email, server.fake.formToken, 'not-a-real-password']) assert.ok(!text.includes(s), `${f} leaks`);
     if (!f.endsWith('result.json')) assert.ok(!text.includes(markup), `${f} carries page markup verbatim`);
   }
   // 内核自己的值没被脱敏弄坏：会话名（36 位十六进制）原样在命令输出、result.json、报告目录和 report.html 里

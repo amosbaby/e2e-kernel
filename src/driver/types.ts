@@ -46,6 +46,11 @@ export class DriverError extends Error {
 export interface RequestInfo {
   id: string; pageId: string | null; openerPageId: string | null; method: string; url: string; resourceType: string;
   isNavigation: boolean; topFrame: boolean; topUrl: string | null; contentType: string | null; body: string | null;
+  // 有请求体时：发出请求的 frame，或它所在页面的顶层文档里，有没有密码类输入框（type=password，或 autocomplete 含
+  // current-password / new-password / one-time-code；不要求可见）。没有请求体、导航请求（原生表单提交，路由回调里探测不了）、
+  // 探测失败或超时都是 null。
+  // 内核只在它严格等于 false 时才记请求体（失败关闭）。
+  fromLoginForm: boolean | null;
 }
 
 export type Decision =

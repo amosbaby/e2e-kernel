@@ -147,6 +147,85 @@ test('request handler sees writes with bodies and can block them', { timeout: 60
   assert.match(post.body!, /"name":"Delta"/); assert.equal(post.contentType, 'application/json');
 });
 
+test('fromLoginForm: true on a page with a password field, false without one, null without a body', { timeout: 60_000 }, async () => {
+  const post = (path: string): RequestInfo => seen.find(r => r.method === 'POST' && r.url.endsWith(path))!;
+  // index.html 没有密码框
+  await page.fill('#new-item', 'Delta'); await page.click('[data-testid="add"]'); await settle();
+  assert.equal(post('/api/items').fromLoginForm, false);
+  assert.equal(seen.find(r => r.method === 'GET' && r.url.endsWith('/index.html'))?.fromLoginForm, null);
+  // profile.html 没有密码框
+  await page.goto(server.origin + '/profile.html');
+  await page.click('#send-ids'); await settle();
+  assert.equal(post('/api/ids').fromLoginForm, false);
+  assert.match(post('/api/ids').body!, /^ids=/);
+  // sso.html 有：fetch 是 true；原生表单提交（导航请求）在路由回调里探测不了，是 null（内核照样不记体）
+  seen = [];
+  await page.goto(server.origin + '/sso.html');
+  await page.click('#send-ids'); await settle();
+  assert.equal(post('/api/ids').fromLoginForm, true);
+  await page.evaluate(`document.querySelector('#pw').value = 'x'; document.querySelector('#sso').requestSubmit()`); await settle();
+  const sso = post('/api/sso');
+  assert.equal(sso.fromLoginForm, null); assert.equal(sso.isNavigation, true);
+  assert.match(sso.body!, /state=/);
+});
+
+test('fromLoginForm also looks at the top document when the request comes from a child frame', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/sso.html');
+  seen = [];
+  // 子 frame（profile.html，自己没有密码框）里发写请求，顶层文档（sso.html）有密码框
+  await page.evaluate(`new Promise(res => { const f = document.createElement('iframe'); f.id = 'kid'; f.src = '/profile.html'; f.onload = () => res(1); document.body.append(f); })`);
+  await page.evaluate(`document.querySelector('#kid').contentWindow.fetch('/api/ids', { method: 'POST', body: 'a=1' }).then(() => 1, () => 0)`); await settle();
+  const r = seen.find(x => x.method === 'POST' && x.url.endsWith('/api/ids'))!;
+  assert.equal(r.topFrame, false); assert.equal(r.fromLoginForm, true);
+});
+
+test('fromLoginForm sees a password field inside an open shadow root, and a page cannot hide it by patching querySelector', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/profile.html');
+  seen = [];
+  await page.evaluate(`(() => { const host = document.createElement('div'); document.body.append(host); const root = host.attachShadow({ mode: 'open' });
+    const i = document.createElement('input'); i.type = 'password'; root.append(i); })()`);
+  await page.click('#send-ids'); await settle();
+  assert.equal(seen.find(r => r.method === 'POST' && r.url.endsWith('/api/ids'))?.fromLoginForm, true);
+  seen = [];
+  await page.goto(server.origin + '/sso.html');
+  await page.evaluate(`document.querySelector = () => null; Document.prototype.querySelector = () => null; Element.prototype.querySelector = () => null`);
+  await page.click('#send-ids'); await settle();
+  assert.equal(seen.find(r => r.method === 'POST' && r.url.endsWith('/api/ids'))?.fromLoginForm, true);
+});
+
+// 请求发出后页面立刻换掉文档：探测不能落到新文档上得出一个错的 false。窗口取决于时序，所以只断言「不是 false」。
+test('fromLoginForm is not false when the page navigates away right after sending', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/sso.html');
+  seen = [];
+  await page.evaluate(`fetch('/api/ids', { method: 'POST', body: 'a=1' }).catch(() => {}); location.href = '/profile.html'; 1`);
+  await settle();
+  const r = seen.find(x => x.method === 'POST' && x.url.endsWith('/api/ids'));
+  assert.ok(r !== undefined && r.fromLoginForm !== false);
+});
+
+test('fromLoginForm is not false when a page with an inserted password field reloads right after sending', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/profile.html');
+  await page.evaluate(`(() => { const i = document.createElement('input'); i.type = 'password'; document.body.append(i); })()`);
+  seen = [];
+  await page.evaluate(`fetch('/api/ids', { method: 'POST', body: 'a=1' }).catch(() => {}); location.reload(); 1`);
+  await settle();
+  const r = seen.find(x => x.method === 'POST' && x.url.endsWith('/api/ids'));
+  assert.ok(r !== undefined && r.fromLoginForm !== false);
+});
+
+// 【实测】页面线程被同步 XHR 占着时，页面里的探测跑不起来：300 ms 后 null，请求照常交给内核，不被探测卡住。
+test('a probe blocked by a synchronous XHR times out to null without stalling the request', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/profile.html');
+  seen = [];
+  const t0 = Date.now();
+  await page.evaluate(`(() => { const x = new XMLHttpRequest(); x.open('POST', '/api/sync', false); x.setRequestHeader('content-type', 'text/plain'); x.send('a=1'); return x.status; })()`);
+  const elapsed = Date.now() - t0;
+  const r = seen.find(x => x.method === 'POST' && x.url.endsWith('/api/sync'))!;
+  assert.equal(r.fromLoginForm, null);
+  assert.ok(elapsed < 5000, `the request was held for ${elapsed} ms`);
+  assert.ok(server.hits.some(h => h.path === '/api/sync'), 'the request still reached the server');
+});
+
 test('requests that arrive before a handler is set are aborted, then pass once it is', { timeout: 60_000 }, async () => {
   const fresh = await driver.launch({ name: 'fresh', userDataDir: makeTmp('e2k-pw-') });
   try {

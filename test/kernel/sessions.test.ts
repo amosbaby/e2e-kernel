@@ -232,6 +232,30 @@ test('login pages and their popups are continued and never recorded', async () =
   const w = readResult(runDir).writes; assert.deepEqual([w.allowed.length, w.unattributed.length], [0, 0]);
 });
 
+test('a write from a page with a password field (or an undetermined one) is recorded without its body', async () => {
+  const { sm, fake } = setup(); const { session, runDir, pageId } = await opened(sm, fake);
+  const secret = 'not-a-real-password-xyz';
+  await fake.emitRequest({ id: 'r1', pageId, method: 'POST', url: 'http://localhost:5173/api/sso', body: `note=${secret}`, contentType: 'application/x-www-form-urlencoded', fromLoginForm: true });
+  await fake.emitRequest({ id: 'r2', pageId, method: 'POST', url: 'http://localhost:5173/api/sso2', body: `note=${secret}`, contentType: 'application/x-www-form-urlencoded', fromLoginForm: null });
+  await fake.emitRequest({ id: 'r3', pageId, method: 'POST', url: 'http://localhost:5173/api/ok', body: 'note=plain', contentType: 'application/x-www-form-urlencoded' });
+  await sm.close({ session });
+  const result = readResult(runDir);
+  assert.ok(!JSON.stringify(result).includes(secret));
+  assert.deepEqual(result.writes.allowed.map((w: any) => [w.body, w.bodyOmitted]), [[null, true], [null, true], ['note=plain', false]]);
+  assert.ok(readFileSync(join(runDir, 'report.html'), 'utf8').includes('请求体未记录'));
+});
+
+test('an unattributed write from a password page is recorded without its body', async () => {
+  const { sm, fake } = setup(); const { session, runDir } = await opened(sm, fake);
+  const secret = 'not-a-real-password-xyz';
+  await fake.emitRequest({ id: 'u1', pageId: null, method: 'POST', url: 'http://localhost:5173/api/form-blank', body: `note=${secret}`, contentType: 'application/x-www-form-urlencoded', fromLoginForm: true });
+  await sm.close({ session });
+  const result = readResult(runDir);
+  assert.ok(!JSON.stringify(result).includes(secret));
+  assert.equal(result.writes.unattributed[0].bodyOmitted, true);
+  assert.equal(result.writes.unattributed[0].body, null);
+});
+
 test('writes from unknown pages are allowed in M1 but reported as unattributed', async () => {
   const { sm, fake } = setup(); const { session, runDir } = await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ id: 'u1', pageId: null, method: 'POST', url: 'http://localhost:5173/api/form-blank' }), { action: 'continue' });

@@ -13,7 +13,7 @@ export interface FixtureServer {
   altOrigin: string;   // http://localhost:<port>（同一个服务，另一个站点）
   port: number;
   hits: FixtureHit[];
-  fake: { bearer: string; jwt: string; password: string };   // 每次启动随机生成的假值
+  fake: { bearer: string; jwt: string; password: string; email: string; formToken: string };   // 每次启动随机生成的假值
   close(): Promise<void>;
 }
 
@@ -42,6 +42,8 @@ function makeFakes(): FixtureServer['fake'] {
     bearer: randomChars(40, HEX),
     jwt: ['eyJ' + randomChars(21, B64URL), randomChars(24, B64URL), randomChars(24, B64URL)].join('.'),
     password: randomChars(16, ALNUM),
+    email: `u${randomChars(10, HEX)}@example.com`,
+    formToken: randomChars(43, ALNUM) + '=',   // 44 位标准 base64 的样子
   };
 }
 
@@ -137,6 +139,8 @@ export async function startFixtureServer(): Promise<FixtureServer> {
         .replaceAll('{{FAKE_BEARER}}', fake.bearer)
         .replaceAll('{{FAKE_JWT}}', fake.jwt)
         .replaceAll('{{FAKE_PASSWORD}}', fake.password)
+        .replaceAll('{{FAKE_EMAIL}}', fake.email)
+        .replaceAll('{{FAKE_FORM_TOKEN}}', fake.formToken)
         .replaceAll('{{ALT_ORIGIN}}', altOrigin);
     }
     const headers: Record<string, string> = { 'content-type': CONTENT_TYPES[ext] ?? 'text/plain', 'cache-control': 'no-store' };

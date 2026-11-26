@@ -309,7 +309,7 @@ export class FakeDriver implements Driver {
     const page = r.pageId === null ? undefined : this.pages.find((p) => p.id === r.pageId);
     const info: RequestInfo = {
       id: `r${++this.requestSeq}`, openerPageId: page?.openerId ?? null, resourceType: 'fetch', isNavigation: false,
-      topFrame: true, topUrl: page?.url ?? null, contentType: null, body: null, ...r,
+      topFrame: true, topUrl: page?.url ?? null, contentType: null, body: null, fromLoginForm: false, ...r,
     };
     if (inst.requestHandler === undefined) return { action: 'abort' };
     try {

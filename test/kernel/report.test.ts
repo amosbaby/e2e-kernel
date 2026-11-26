@@ -21,7 +21,7 @@ function act(op: Op['op'], outcome: Outcome, extra: Partial<ActionRecord> = {}):
   return { seq: ++seq, at: '2026-11-26T15:30:05.000Z', ms: 3, op: { op } as Op, outcome, ...extra };
 }
 function write(method: string, url: string, status: number | null, extra: Partial<WriteRecord> = {}): WriteRecord {
-  return { id: `r${++seq}`, at: '2026-11-26T15:30:06.000Z', method, url, status, failed: false, body: null, pageUrl: null,
+  return { id: `r${++seq}`, at: '2026-11-26T15:30:06.000Z', method, url, status, failed: false, body: null, bodyOmitted: false, pageUrl: null,
     decision: 'allowed', targetMode: 'default', ...extra };
 }
 function driverWith(caps: Partial<Capabilities> = {}): RunInput['driver'] {
@@ -147,13 +147,19 @@ test('if redaction throws, a fixed marker is shown and the raw value never is', 
   assert.ok(!html.includes(secret)); assert.ok(html.includes(REDACTED));
 });
 
+test('a write whose body was omitted says so in the report', () => {
+  const html = renderReport(buildResult(input({ writes: [write('POST', 'http://localhost/api/sso', 200, { bodyOmitted: true })] })));
+  assert.ok(html.includes('请求体未记录'));
+  assert.ok(!renderReport(buildResult(input({ writes: [write('POST', 'http://localhost/api/ok', 200, { body: 'a=1' })] }))).includes('请求体未记录'));
+});
+
 test('no key anywhere in buildResult output is a sensitive key', () => {
   const r = buildResult(input({
     verdict: { value: 'pass', because: 'b' }, findings: [{ claim: 'c', basis: 'b' }], notDone: ['n'], webSockets: 1,
     driver: driverWith({ nativeFormSubmit: 'unknown' }),
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: '#a', via: 'id' } }, shot: 'shots/01.jpg' }),
       act('assert', 'match', { actual: 1, expected: 1, error: 'e' })],
-    writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' })],
+    writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true })],
     unattributedWrites: [write('PUT', 'http://localhost/b', null)],
   }));
   const bad: string[] = [];

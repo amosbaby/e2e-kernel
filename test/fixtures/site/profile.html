@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Profile</title>
+</head>
+<body>
+<h1>Profile</h1>
+<button id="send-ids">Send ids</button>
+<script>
+  document.getElementById('send-ids').addEventListener('click', () => {
+    fetch('/api/ids', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'ids=' + encodeURIComponent(JSON.stringify([{ email: '{{FAKE_EMAIL}}' }])),
+    }).catch(() => {});
+  });
+</script>
+</body>
+</html>
