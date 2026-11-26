@@ -11,7 +11,7 @@ import type { ClosedBy, RunResult, SupersededEntry } from './result.ts';
 // 内核自己的值（会话名、选择器、路径、操作名）不脱敏，只 escapeHtml。
 
 const CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'";
-const SHOT_PATH = /^shots\/\d{2,}\.jpg$/;
+const SHOT_PATH = /^shots\/\d{2,}(-[a-z0-9][a-z0-9-]{0,39})?\.(jpg|png)$/;
 const DISPLAY_MAX = 500;
 
 const VERDICT_TEXT: Record<VerdictValue, string> = {

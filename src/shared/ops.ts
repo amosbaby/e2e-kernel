@@ -6,12 +6,13 @@ import { bool, httpUrl, int, oneOf, plainObject, str } from './validate.ts';
 export type Target = string;   // 快照里的引用（/^(f\d+)?e\d+$/），或选择器字符串，长度 1..500
 export interface Viewport { width: number; height: number }   // 宽 320..3840，高 240..2160
 export type AssertKind = 'text' | 'count' | 'css' | 'url' | 'visible';
+export type ShotFormat = 'jpeg' | 'png';
 export type Cmp = 'eq' | 'ne' | 'contains' | 'gt' | 'gte' | 'lt' | 'lte';
 export type WaitCond = { text: string } | { target: Target; state: 'visible' | 'hidden' } | { urlContains: string } | { ms: number };
 export type Op =
   | { op: 'snapshot'; depth?: number }
   | { op: 'text'; target?: Target; max?: number }
-  | { op: 'screenshot'; fullPage?: boolean }
+  | { op: 'screenshot'; fullPage?: boolean; label?: string; target?: Target; format?: ShotFormat; mask?: Target[] }
   | { op: 'console' } | { op: 'network' }
   | { op: 'click'; target: Target } | { op: 'hover'; target: Target }
   | { op: 'fill'; target: Target; value: string }
@@ -39,6 +40,9 @@ export const READ_OPS: ReadonlySet<OpName> = new Set<OpName>(['snapshot', 'text'
 const REF = /^(f\d+)?e\d+$/;
 const KEY = /^[\x21-\x7E]{1,50}$/;
 const CSS_PROPERTY = /^[a-z-]{1,40}$/;
+// label 会进截图的文件名：只放小写字母、数字和连字符，首字符不能是连字符。
+const SHOT_LABEL = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const MAX_MASK = 10;
 const MAX_OPS = 50;
 const MAX_EXPECTED_TEXT = 2000;
 
@@ -49,7 +53,7 @@ export function isRef(t: Target): boolean {
 const KEYS_BY_OP: Record<OpName, readonly string[]> = {
   snapshot: ['op', 'depth'],
   text: ['op', 'target', 'max'],
-  screenshot: ['op', 'fullPage'],
+  screenshot: ['op', 'fullPage', 'label', 'target', 'format', 'mask'],
   console: ['op'],
   network: ['op'],
   click: ['op', 'target'],
@@ -71,6 +75,25 @@ const ALL_WAIT_KEYS = WAIT_VARIANTS.flat();
 
 function target(v: unknown, name: string): Target {
   return str(v, name, { min: 1, max: 500 });
+}
+
+function screenshotOp(o: Record<string, unknown>, name: string): Op {
+  const fullPage = o.fullPage === undefined ? undefined : bool(o.fullPage, `${name}.fullPage`);
+  const tgt = o.target === undefined ? undefined : target(o.target, `${name}.target`);
+  if (fullPage === true && tgt !== undefined) throw new E2kError('usage', `${name}: fullPage and target cannot be used together`);
+  let mask: Target[] | undefined;
+  if (o.mask !== undefined) {
+    if (!Array.isArray(o.mask) || o.mask.length < 1 || o.mask.length > MAX_MASK) throw new E2kError('usage', `${name}.mask must be an array of 1-${MAX_MASK} targets`);
+    mask = o.mask.map((t: unknown, i) => target(t, `${name}.mask[${i}]`));
+  }
+  return present({
+    op: 'screenshot',
+    fullPage,
+    label: o.label === undefined ? undefined : str(o.label, `${name}.label`, { min: 1, max: 40, pattern: SHOT_LABEL }),
+    target: tgt,
+    format: o.format === undefined ? undefined : oneOf(o.format, `${name}.format`, ['jpeg', 'png'] as const),
+    mask,
+  });
 }
 
 function waitCond(v: unknown, name: string): WaitCond {
@@ -138,7 +161,7 @@ function validateOp(v: unknown, name: string): Op {
     case 'text':
       return present({ op, target: optTarget(), max: optInt('max', 1, 20000) });
     case 'screenshot':
-      return present({ op, fullPage: o.fullPage === undefined ? undefined : bool(o.fullPage, `${name}.fullPage`) });
+      return screenshotOp(o, name);
     case 'console':
     case 'network':
       return { op };

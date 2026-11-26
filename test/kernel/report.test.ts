@@ -182,6 +182,24 @@ test('a valid screenshot path becomes an img, anything else does not', () => {
   assert.equal(html.match(/<img /g)?.length, 1); assert.ok(html.includes('<img src="shots/01.jpg"'));
 });
 
+test('labelled and png screenshot paths render as img; traversal and odd shapes do not', () => {
+  const good = ['shots/03-checkout-mobile.png', 'shots/12.png', 'shots/100-a.jpg', 'shots/01-0-9.jpg'];
+  const badPaths = ['shots/../x.png', 'shots/03-../x.png', '../shots/01.png', 'shots/01-.png', 'shots/01-A.png', 'shots/01-a/b.png', 'shots/1.png',
+    'shots/01.gif', 'shots/01-a.png.html', '/shots/01.png', 'shots/01-' + 'a'.repeat(41) + '.png', 'shots/01.png\n'];
+  const html = renderReport(buildResult(input({ actions: [...good, ...badPaths].map((shot) => act('screenshot', 'ok', { shot })) })));
+  assert.equal(html.match(/<img /g)?.length, good.length);
+  for (const g of good) assert.ok(html.includes(`<img src="${g}" alt="截图 ${g}">`), g);
+  assert.equal(html.match(/截图路径无效/g)?.length, badPaths.length);
+});
+
+test('the screenshot path rule holds up against long adversarial input', () => {
+  const t0 = Date.now();
+  const shots = ['shots/' + '1'.repeat(30000) + '.gif', 'shots/01-' + 'a-'.repeat(15000) + '.png', 'shots/' + '1'.repeat(30000) + '-' + '-'.repeat(30000)];
+  const html = renderReport(buildResult(input({ actions: shots.map((shot) => act('screenshot', 'ok', { shot })) })));
+  assert.equal(html.match(/<img /g)?.length ?? 0, 0);
+  assert.ok(Date.now() - t0 < 2000);
+});
+
 test('page content is redacted before it is truncated and escaped in the html', () => {
   // 脱敏必须在截断之前：token 跨过显示上限时，先截断会留下半截 token。
   const body = JSON.stringify({ note: 'x'.repeat(470) + ' ' + jwt + ' <img src=x onerror=1>' });
@@ -243,6 +261,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
       act('assert', 'match', { actual: 1, expected: 1, error: 'e' }),
       act('click', 'failed', { seq: 9001, target: { given: '#b', stable: null }, error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
       act('screenshot', 'ok', { seq: 9002 }),
+      act('screenshot', 'ok', { op: { op: 'screenshot', label: 'a', format: 'png', mask: ['#m'] }, shot: 'shots/04-a.png' }),
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true }),
       write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' })],
@@ -263,7 +282,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     else if (typeof v === 'object' && v !== null) for (const [k, val] of Object.entries(v)) { keys.add(k); collect(val); }
   };
   collect(r);
-  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked']) assert.ok(keys.has(k), k);
+  for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 

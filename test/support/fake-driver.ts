@@ -102,9 +102,15 @@ class FakePage implements Page {
     return [...this.elements.values()].flatMap((el) => (el.text === undefined ? [] : [el.text])).join('\n');
   }
 
-  async screenshot(o: { path: string; fullPage: boolean }): Promise<void> {
+  async screenshot(o: { path: string; fullPage: boolean; format?: 'jpeg' | 'png'; target?: Target; mask?: Target[]; maskColor?: string }): Promise<void> {
     this.enter('screenshot', [o]);
-    await writeFile(o.path, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    if (o.target !== undefined) this.element(o.target);
+    for (const [i, t] of (o.mask ?? []).entries()) {
+      if (!this.elements.has(t)) throw new DriverError('not-found', `mask[${i}] matched no element`);
+    }
+    // 按扩展名写最小的文件头：png 的魔数，或 jpeg 的起止标记。
+    const png = o.path.endsWith('.png');
+    await writeFile(o.path, Buffer.from(png ? [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] : [0xff, 0xd8, 0xff, 0xd9]));
   }
 
   async console(): Promise<{ level: string; text: string }[]> {

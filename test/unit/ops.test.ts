@@ -34,6 +34,36 @@ test('validateOps accepts every other operation shape', () => {
   assert.deepEqual(validateOps(ops), ops);
 });
 
+test('screenshot accepts label, target, format and mask in any valid combination', () => {
+  const ops = [
+    { op: 'screenshot' }, { op: 'screenshot', label: 'checkout-mobile' }, { op: 'screenshot', label: 'a', format: 'png' },
+    { op: 'screenshot', format: 'jpeg', fullPage: true }, { op: 'screenshot', target: '#card' }, { op: 'screenshot', target: 'e3', fullPage: false },
+    { op: 'screenshot', mask: ['#a'] }, { op: 'screenshot', target: '#card', mask: ['e1', '.x'], label: '0-9', format: 'png' },
+    { op: 'screenshot', label: 'x'.repeat(40) }, { op: 'screenshot', mask: Array.from({ length: 10 }, (_, i) => `#m${i}`) },
+  ];
+  assert.deepEqual(validateOps(ops), ops);
+});
+
+test('screenshot rejects unsafe labels, bad formats, fullPage with target and bad masks', () => {
+  const bad: unknown[] = [
+    ...['Shot', 'a/b', '../x', 'a.b', 'a_b', '-a', '', 'a b', 'x'.repeat(41), 'é', 'a\nb', 'a\n'].map((label) => [{ op: 'screenshot', label }]),
+    [{ op: 'screenshot', label: 1 }], [{ op: 'screenshot', format: 'gif' }], [{ op: 'screenshot', format: 'PNG' }], [{ op: 'screenshot', format: 1 }],
+    [{ op: 'screenshot', fullPage: true, target: '#a' }], [{ op: 'screenshot', target: '' }], [{ op: 'screenshot', target: 'x'.repeat(501) }],
+    [{ op: 'screenshot', mask: [] }], [{ op: 'screenshot', mask: Array.from({ length: 11 }, (_, i) => `#m${i}`) }],
+    [{ op: 'screenshot', mask: '#a' }], [{ op: 'screenshot', mask: [''] }], [{ op: 'screenshot', mask: [1] }], [{ op: 'screenshot', maskColor: '#fff' }],
+  ];
+  for (const b of bad) assert.throws(() => validateOps(b), isUsage, JSON.stringify(b).slice(0, 120));
+  assert.throws(() => validateOps([{ op: 'screenshot', fullPage: true, target: '#a' }]),
+    (e: E2kError) => e.code === 'usage' && e.message.includes('fullPage and target cannot be used together'));
+});
+
+test('the label rule holds up against long adversarial input', () => {
+  const t0 = Date.now();
+  for (const label of ['a'.repeat(30000), 'a-'.repeat(15000), '-'.repeat(30000) + '!'])
+    assert.throws(() => validateOps([{ op: 'screenshot', label }]), isUsage);
+  assert.ok(Date.now() - t0 < 2000);
+});
+
 test('validateOps rejects bad operations', () => {
   const bad: unknown[] = [
     [], Array(51).fill({ op: 'snapshot' }), 'x',

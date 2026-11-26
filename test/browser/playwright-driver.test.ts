@@ -1,7 +1,7 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -882,6 +882,75 @@ test('screenshot is a JPEG', { timeout: 60_000 }, async () => {
   const file = join(makeTmp('e2k-shot-'), 'shot.jpg');
   await page.screenshot({ path: file, fullPage: false });
   assert.deepEqual([...readFileSync(file).subarray(0, 2)], [0xff, 0xd8]);
+});
+
+// PNG 的宽高：IHDR 在固定位置。
+function pngSize(file: string): { width: number; height: number } {
+  const b = readFileSync(file);
+  return { width: b.readUInt32BE(16), height: b.readUInt32BE(20) };
+}
+
+// 把 png 文件画进页面里的 canvas，取 (x, y) 一点的 RGB。
+async function pngPixel(p: Page, file: string, x: number, y: number): Promise<[number, number, number]> {
+  const url = `data:image/png;base64,${readFileSync(file).toString('base64')}`;
+  const px = await p.evaluate(`new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+      const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+      resolve(Array.from(g.getImageData(${x}, ${y}, 1, 1).data).slice(0, 3));
+    };
+    img.onerror = () => reject(new Error('png did not decode'));
+    img.src = ${JSON.stringify(url)};
+  })`);
+  return px as [number, number, number];
+}
+
+const near = (got: number[], want: number[]): boolean => got.every((v, i) => Math.abs(v - want[i]!) <= 8);
+
+test('screenshot with format png writes a PNG', { timeout: 60_000 }, async () => {
+  const file = join(makeTmp('e2k-shot-'), 'shot.png');
+  await page.screenshot({ path: file, fullPage: false, format: 'png' });
+  assert.deepEqual([...readFileSync(file).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+});
+
+test('screenshot of a target is narrower than the viewport and uses strict matching with diagnostics', { timeout: 60_000 }, async () => {
+  const dir = makeTmp('e2k-shot-');
+  const whole = join(dir, 'whole.png');
+  await page.screenshot({ path: whole, fullPage: false, format: 'png' });
+  const part = join(dir, 'part.png');
+  await page.screenshot({ path: part, fullPage: false, format: 'png', target: '#styled' });
+  assert.ok(pngSize(part).width < pngSize(whole).width, `${pngSize(part).width} vs ${pngSize(whole).width}`);
+  assert.ok(pngSize(part).height < pngSize(whole).height);
+  const jpg = join(dir, 'part.jpg');
+  await page.screenshot({ path: jpg, fullPage: false, target: '#styled' });
+  assert.deepEqual([...readFileSync(jpg).subarray(0, 2)], [0xff, 0xd8]);
+  const gone = await failureOf(() => page.screenshot({ path: join(dir, 'gone.png'), fullPage: false, format: 'png', target: '#nope' }));
+  assert.equal(gone.kind, 'not-found');
+  await page.goto(server.origin + '/overlay.html');
+  const err = await failureOf(() => page.screenshot({ path: join(dir, 'dup.png'), fullPage: false, format: 'png', target: '.dup' }));
+  assert.equal(err.kind, 'other'); assert.ok(!err.message.includes('\n'));
+  assert.equal(err.hints[0], '共 2 个匹配');
+});
+
+test('a mask target that matches nothing fails the screenshot and writes no file', { timeout: 60_000 }, async () => {
+  const file = join(makeTmp('e2k-shot-'), 'masked.png');
+  const err = await failureOf(() => page.screenshot({ path: file, fullPage: false, format: 'png', mask: ['#styled', '#nope'] }));
+  assert.equal(err.kind, 'not-found'); assert.equal(err.message, 'mask[1] matched no element');
+  assert.ok(!existsSync(file));
+});
+
+test('screenshot mask paints the masked element in the mask colour', { timeout: 60_000 }, async () => {
+  const dir = makeTmp('e2k-shot-');
+  const box = await page.evaluate(`(() => { const r = document.getElementById('styled').getBoundingClientRect();
+    return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)]; })()`) as [number, number];
+  const plain = join(dir, 'plain.png');
+  await page.screenshot({ path: plain, fullPage: false, format: 'png' });
+  assert.ok(!near(await pngPixel(page, plain, box[0], box[1]), [255, 0, 255]), 'not magenta before masking');
+  const masked = join(dir, 'masked.png');
+  await page.screenshot({ path: masked, fullPage: false, format: 'png', mask: ['#styled'], maskColor: '#FF00FF' });
+  const got = await pngPixel(page, masked, box[0], box[1]);
+  assert.ok(near(got, [255, 0, 255]), `centre pixel ${got.join(',')}`);
 });
 
 test('screenshot is in CSS pixels and, without fullPage, no wider than the viewport', { timeout: 60_000 }, async () => {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DriverError } from '../../src/driver/types.ts';
@@ -331,6 +331,38 @@ test('seq and shot numbers continue across batches in one session', async () => 
   const [s] = await runOps(page, [{ op: 'screenshot' }], ctx);
   assert.equal(s.outcome, 'ok'); assert.equal(s.shot, 'shots/03.jpg'); assert.ok(existsSync(join(ctx.runDir, 'shots/03.jpg')));
   assert.equal(recorder.actions[2].shot, 'shots/03.jpg');
+});
+
+test('screenshot names carry the label and the extension, and the record keeps the op', async () => {
+  await runOps(page, [{ op: 'click', target: 'e2' }, { op: 'click', target: 'e2' }], ctx);
+  const r = await runOps(page, [
+    { op: 'screenshot', label: 'checkout-mobile', format: 'png' }, { op: 'screenshot', label: 'plain' }, { op: 'screenshot', format: 'png' },
+    { op: 'screenshot', target: 'e2', mask: ['#status'] },
+  ], ctx);
+  assert.deepEqual(r.map(x => x.shot), ['shots/03-checkout-mobile.png', 'shots/04-plain.jpg', 'shots/05.png', 'shots/06.jpg']);
+  for (const x of r) assert.ok(existsSync(join(ctx.runDir, x.shot!)));
+  assert.deepEqual(recorder.actions[2].op, { op: 'screenshot', label: 'checkout-mobile', format: 'png' });
+  assert.deepEqual(recorder.actions[5].target, { given: 'e2', stable: { selector: '[data-testid="add"]', via: 'testid' } });
+  const shot = fake.calls.filter(c => c.method === 'screenshot').map(c => c.args[0] as Record<string, unknown>);
+  assert.deepEqual(shot.map(o => [o.fullPage, o.format, o.target, o.mask]), [[false, 'png', undefined, undefined], [false, 'jpeg', undefined, undefined],
+    [false, 'png', undefined, undefined], [false, 'jpeg', 'e2', ['#status']]]);
+});
+
+test('a failed screenshot with a label and a png format still leaves a plain NN.jpg failure shot', async () => {
+  const [s] = await runOps(page, [{ op: 'screenshot', label: 'gone-thing', format: 'png', target: '#absent' }], ctx);
+  assert.equal(s.outcome, 'failed'); assert.equal(s.shot, 'shots/01.jpg');
+  assert.ok(existsSync(join(ctx.runDir, 'shots/01.jpg')) && !existsSync(join(ctx.runDir, 'shots/01-gone-thing.png')));
+});
+
+test('a mask that matches nothing fails the screenshot and leaves no failure shot, masked or not', async () => {
+  const r = await runOps(page, [{ op: 'screenshot', label: 'masked', mask: ['#status', '#absent'] }, { op: 'snapshot' }], ctx);
+  assert.deepEqual(r.map(x => x.outcome), ['failed', 'not-run']);
+  assert.equal(r[0].error, 'not-found: mask[1] matched no element');
+  assert.equal(r[0].shot, undefined); assert.equal(recorder.actions[0].shot, undefined);
+  assert.ok(!existsSync(join(ctx.runDir, 'shots')) || readdirSync(join(ctx.runDir, 'shots')).length === 0);
+  // 别的操作失败照旧留失败截图
+  const [c] = await runOps(page, [{ op: 'click', target: '#gone' }], ctx);
+  assert.equal(c.shot, 'shots/03.jpg');
 });
 
 test('a password refusal stops the batch and leaves the value out of the result too', async () => {

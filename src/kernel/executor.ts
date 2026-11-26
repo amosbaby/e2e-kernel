@@ -143,21 +143,28 @@ async function runEval(page: Page, op: Extract<Op, { op: 'eval' }>): Promise<Don
   return done;
 }
 
-function shotName(seq: number): string {
-  return `${String(seq).padStart(2, '0')}.jpg`;
+type ShotOp = Extract<Op, { op: 'screenshot' }>;
+
+// 文件名：NN[-label].jpg|png。label 在校验时已限定成小写字母、数字和连字符，所以进路径是安全的。
+function shotName(seq: number, op?: ShotOp): string {
+  const label = op?.label === undefined ? '' : `-${op.label}`;
+  return `${String(seq).padStart(2, '0')}${label}.${op?.format === 'png' ? 'png' : 'jpg'}`;
 }
 
-async function takeShot(page: Page, seq: number, ctx: ExecCtx, fullPage: boolean): Promise<string> {
+async function takeShot(page: Page, seq: number, ctx: ExecCtx, op?: ShotOp): Promise<string> {
   ensurePrivateDir(resolveInside(ctx.runDir, 'shots'));
-  const name = shotName(seq);
-  await page.screenshot({ path: resolveInside(ctx.runDir, 'shots', name), fullPage });
+  const name = shotName(seq, op);
+  await page.screenshot({
+    path: resolveInside(ctx.runDir, 'shots', name), fullPage: op?.fullPage ?? false, format: op?.format ?? 'jpeg',
+    ...defined({ target: op?.target, mask: op?.mask }),
+  });
   return `shots/${name}`;
 }
 
 // 失败时留一张截图；截不了（页面没了之类）就不留。
 async function failureShot(page: Page, seq: number, ctx: ExecCtx): Promise<string | undefined> {
   try {
-    return await takeShot(page, seq, ctx, false);
+    return await takeShot(page, seq, ctx);
   } catch (e) {
     rethrowUnlessDriverError(e);
     return undefined;
@@ -228,7 +235,7 @@ async function perform(page: Page, op: Exclude<Op, { op: 'fill' }>, seq: number,
     case 'text':
       return { outcome: 'ok', output: redactCap(await page.text(defined({ target: op.target })), Math.min(op.max ?? DEFAULT_TEXT, MAX_TEXT)) };
     case 'screenshot':
-      return { outcome: 'ok', shot: await takeShot(page, seq, ctx, op.fullPage ?? false) };
+      return { outcome: 'ok', shot: await takeShot(page, seq, ctx, op) };
     case 'console': {
       const all = await page.console();
       return { outcome: 'ok', output: all.slice(-MAX_CONSOLE_ENTRIES).map((m) => ({ level: m.level, text: redactCap(m.text, MAX_CONSOLE_TEXT) })) };
@@ -325,7 +332,8 @@ export async function runOps(page: Page, ops: Op[], ctx: ExecCtx, opts?: { keepG
       done = await runOne(page, op, seq, ctx);
       if (done.outcome === 'failed') {
         if (!keepGoing) stopped = true;
-        done.shot ??= await failureShot(page, seq, ctx);
+        // 带 mask 的截图失败时不留失败截图：那张是整页、没有遮罩，正好违背 mask 的用意。
+        if (!(op.op === 'screenshot' && op.mask !== undefined)) done.shot ??= await failureShot(page, seq, ctx);
       }
     }
     const ms = done.outcome === 'not-run' ? 0 : Math.max(0, ctx.now().getTime() - started.getTime());

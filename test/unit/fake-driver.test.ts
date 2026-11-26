@@ -184,6 +184,9 @@ test('fill, read, text, location, console, eval and screenshot', async () => {
     const path = join(dir, '01.jpg');
     await page.screenshot({ path, fullPage: false });
     assert.deepEqual([...readFileSync(path)], [0xff, 0xd8, 0xff, 0xd9]);
+    const png = join(dir, '02.png');
+    await page.screenshot({ path: png, fullPage: false, format: 'png' });
+    assert.deepEqual([...readFileSync(png).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

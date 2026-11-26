@@ -445,10 +445,21 @@ class PlaywrightPage implements Page {
     }, o.target);
   }
 
-  screenshot(o: { path: string; fullPage: boolean }): Promise<void> {
+  screenshot(o: { path: string; fullPage: boolean; format?: 'jpeg' | 'png'; target?: Target; mask?: Target[]; maskColor?: string }): Promise<void> {
     return this.run(async () => {
-      await this.page.screenshot({ path: o.path, fullPage: o.fullPage, scale: 'css', type: 'jpeg', quality: 60 });
-    });
+      // 失败关闭：每个遮罩目标至少要匹配一个元素，否则不截图（Playwright 对匹配不到的遮罩是悄悄跳过，图上就有没盖住的内容）。
+      for (const [i, t] of (o.mask ?? []).entries()) {
+        if ((await locate(this.page, t).count()) === 0) throw new DriverError('not-found', `mask[${i}] matched no element`);
+      }
+      const opts = {
+        path: o.path, scale: 'css' as const,
+        ...((o.format ?? 'jpeg') === 'png' ? { type: 'png' as const } : { type: 'jpeg' as const, quality: 60 }),
+        ...(o.mask === undefined ? {} : { mask: o.mask.map((t) => locate(this.page, t)) }),
+        ...(o.maskColor === undefined ? {} : { maskColor: o.maskColor }),
+      };
+      if (o.target !== undefined) await (await this.resolve(o.target, false)).screenshot(opts);
+      else await this.page.screenshot({ ...opts, fullPage: o.fullPage });
+    }, o.target);
   }
 
   console(): Promise<{ level: string; text: string }[]> {

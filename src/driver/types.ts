@@ -103,7 +103,8 @@ export interface Page {
   location(): Promise<PageLocation>;                                                 // 读数：当前位置、拦截覆盖情况
   snapshot(o: { depth?: number }): Promise<string>;
   text(o: { target?: Target }): Promise<string>;
-  screenshot(o: { path: string; fullPage: boolean }): Promise<void>;
+  // format 缺省是 jpeg；target 给了就只截这个元素（严格模式，匹配多个算错）；mask 里的元素盖上 maskColor（缺省是驱动自己的遮罩色）。
+  screenshot(o: { path: string; fullPage: boolean; format?: 'jpeg' | 'png'; target?: Target; mask?: Target[]; maskColor?: string }): Promise<void>;
   console(): Promise<{ level: string; text: string }[]>;
   click(target: Target): Promise<void>;
   hover(target: Target): Promise<void>;
