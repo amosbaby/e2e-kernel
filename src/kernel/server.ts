@@ -12,7 +12,7 @@ import { KERNEL_SKIP_KEYS, MAX_LINE_BYTES, PROTOCOL_VERSION, parseRequest, valid
 import type { Request, Response, SessionInfo } from '../shared/protocol.ts';
 import { redactDeep, redactText, safely } from '../shared/redact.ts';
 import { kernelVersion } from '../shared/version.ts';
-import { defaultOnlyResolver } from './mode.ts';
+import { createRulesResolver } from './rules.ts';
 import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
 import type { ProfileInfo } from './profiles.ts';
 import { SessionManager } from './sessions.ts';
@@ -255,8 +255,9 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   const stopDeadlineMs = o.stopDeadlineMs ?? DEFAULT_STOP_DEADLINE_MS;
   const instances = new Set<Instance>();
   // 唯一组装 SessionDeps 的地方：M2 换掉 modes 和 policy 就接上了。
+  const modes = createRulesResolver(home.rulesFile);
   const sessions = new SessionManager({
-    driver: trackInstances(driver, instances), home, modes: defaultOnlyResolver, policy: allowAllPolicy,
+    driver: trackInstances(driver, instances), home, modes, policy: allowAllPolicy,
     idleMs: o.idleMs ?? DEFAULT_IDLE_MS, keepRuns: o.keepRuns ?? DEFAULT_KEEP_RUNS, now: () => new Date(),
     kernelVersion: version, log: (line) => { log.write(line); },
   });

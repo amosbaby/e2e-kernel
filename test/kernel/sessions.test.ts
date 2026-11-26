@@ -225,7 +225,7 @@ test('idle sessions are closed with a report, but not while a step is running', 
 });
 
 test('fails closed when the resolver returns a non-default mode', async () => {
-  const { sm, fake } = setup({ modes: { resolve: () => 'readonly' } });
+  const { sm, fake } = setup({ modes: { ...defaultOnlyResolver, resolve: () => 'readonly' } });
   await assert.rejects(sm.open({ url: 'http://localhost:5173/' }), (e: E2kError) => e.code === 'internal');
   assert.deepEqual(fake.openPages(), []);
 });
@@ -233,7 +233,7 @@ test('fails closed when the resolver returns a non-default mode', async () => {
 test('a session request that touches a non-default host is aborted without asking the policy (fail closed)', async () => {
   const asked: string[] = [];
   const spy: WritePolicy = { decide: (r) => { asked.push(r.url); return { action: 'continue' }; }, decideUnattributed: () => ({ action: 'continue' }) };
-  const modes = { resolve: (host: string): Mode => (host === 'example.com' ? 'readonly' : 'default') };
+  const modes = { ...defaultOnlyResolver, resolve: (host: string): Mode => (host === 'example.com' ? 'readonly' : 'default') };
   const { sm, fake } = setup({ policy: spy, modes }); const { session, runDir, pageId } = await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api' }), { action: 'abort' });
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'POST', url: 'http://localhost:5173/api', topUrl: 'http://example.com/' }), { action: 'abort' });
@@ -441,7 +441,7 @@ test('session requests: the mode check uses the top URL and falls back to the re
 
 test('a request whose mode cannot be decided is aborted (fail closed)', async () => {
   let calls = 0;
-  const { sm, fake, logs } = setup({ modes: { resolve: () => { if (++calls > 1) throw new Error('rule error'); return 'default'; } } });
+  const { sm, fake, logs } = setup({ modes: { ...defaultOnlyResolver, resolve: () => { if (++calls > 1) throw new Error('rule error'); return 'default'; } } });
   const { pageId } = await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ pageId, method: 'GET', url: 'http://localhost:5173/x' }), { action: 'abort' });
   assert.ok(logs.some((l) => l.includes('rule error')));
