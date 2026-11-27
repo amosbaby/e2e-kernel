@@ -178,9 +178,34 @@ function identityBlock(r: RunResult): string {
 function frozenBlock(r: RunResult): string {
   const f = r.frozen;
   if (f === null || f === undefined || typeof f !== 'object' || Array.isArray(f)) return '';
-  const where = f.group === null || f.group === undefined ? '判断不出归属的域名' : `组 ${page(f.group)} 的域名`;
+  const where = f.denied === true ? '不允许的域名' : f.group === null || f.group === undefined ? '判断不出归属的域名' : `组 ${page(f.group)} 的域名`;
   const host = typeof f.host === 'string' && f.host !== '' ? ` ${page(f.host)}` : '';
   return `<div id="frozen"><h3>冻结</h3><p class="flag">页面经重定向进了${where}${host}，会话已冻结：此后所有请求一律被拦下，不再执行任何操作，需要关掉后重开</p></div>`;
+}
+
+const DENY_MODE_TEXT: Record<string, string> = { readonly: '只读', writable: '可写' };
+
+// 不允许的域名：open 时批准的授权（主机、只读还是可写、可写时的放行清单）、借用的含不允许域名的组、冻结在不允许的域名、被拒的跳转次数。
+// 四样都没有（或老版本的 result.json 没有这些字段、字段坏了）整块不出现。字段都按页面内容处理（脱敏、转义）；老记录里认不出的模式显示「未知」。
+function denyBlock(r: RunResult): string {
+  const start = r.start !== null && typeof r.start === 'object' ? r.start : null;
+  const grant = start?.deny;
+  const items: string[] = [];
+  if (grant !== null && grant !== undefined && typeof grant === 'object' && !Array.isArray(grant) && typeof grant.host === 'string') {
+    const allow = Array.isArray(grant.allow) ? grant.allow.filter((a) => a !== null && typeof a === 'object') : [];
+    const mode = Object.hasOwn(DENY_MODE_TEXT, grant.mode) ? DENY_MODE_TEXT[grant.mode] : '未知';
+    const list = allow.length === 0 ? '' : `<ul>${allow.map((a) => `<li><code>${page(a.method)} ${pageUrl(a.url)}</code> `
+      + `${typeof a.operation === 'string' ? `只放行 operation ${page(a.operation)}` : '这个地址上的所有写（GraphQL mutation 不在内）'}</li>`).join('')}</ul>`;
+    items.push(`<p>人批准打开不允许的域名 ${page(grant.host)}，模式：${escapeHtml(mode!)}${mode === '可写' ? `，放行 ${allow.length} 条写` : ''}</p>${list}`);
+  }
+  if (typeof start?.borrowDeny === 'string') items.push(`<p>借用了组 ${page(start.borrowDeny)} 的登录，这个组里有不允许的域名（人批准了借用）</p>`);
+  const f = r.frozen;
+  if (f !== null && f !== undefined && typeof f === 'object' && !Array.isArray(f) && f.denied === true) {
+    items.push(`<p class="flag">页面经重定向进了不允许的域名${typeof f.host === 'string' && f.host !== '' ? ` ${page(f.host)}` : ''}，会话已冻结</p>`);
+  }
+  const n = r.deniedNavigations;
+  if (typeof n === 'number' && Number.isInteger(n) && n > 0) items.push(`<p>有 ${own(n)} 次跳转进不允许的域名被拒绝（没有打开页面，会话仍可用）</p>`);
+  return items.length === 0 ? '' : `<div id="deny-hosts"><h3>不允许的域名</h3>${items.join('')}</div>`;
 }
 
 // 模式变更时间线：只有一条且是默认模式（或一条也没有）时写「全程默认模式」。host 是页面内容，脱敏后转义。
@@ -189,8 +214,8 @@ function modesSection(r: RunResult): string {
   const rules = r.rules !== null && typeof r.rules === 'object' ? r.rules : { hash: null, count: 0, pendingHash: null };
   const approvedLine = rules.hash === null ? '<p>没有已批准的规则</p>' : `<p>收尾时生效的已批准规则 ${own(rules.count)} 条，哈希 <code>${own(rules.hash)}</code></p>`;
   const rulesLine = rules.pendingHash == null ? approvedLine
-    : `${approvedLine}<p>另有未批准的规则文件，哈希 <code>${own(rules.pendingHash)}</code>（其中新增或改成只读的规则条目已按更严合并生效）</p>`;
-  const tail = profileBlock(r) + declarationsBlock(r) + identityBlock(r) + frozenBlock(r);
+    : `${approvedLine}<p>另有未批准的规则文件，哈希 <code>${own(rules.pendingHash)}</code>（其中新增或改严（只读、不允许）的规则条目已按更严合并生效）</p>`;
+  const tail = profileBlock(r) + declarationsBlock(r) + identityBlock(r) + frozenBlock(r) + denyBlock(r);
   let out = '<section id="modes"><h2>模式</h2>';
   if (modes.length === 0 || (modes.length === 1 && modes[0]!.mode === 'default')) return `${out}<p>全程默认模式</p>${rulesLine}${tail}</section>`;
   const rows = modes.map((m) => `<tr><td>${own(m.at)}</td><td>${page(m.host)}</td><td>${own(m.mode)}</td><td>${escapeHtml(MODE_REASON_TEXT[m.reason] ?? '未知')}</td></tr>`).join('');

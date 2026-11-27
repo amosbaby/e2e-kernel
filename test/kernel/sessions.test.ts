@@ -2176,7 +2176,7 @@ test('a hop of the session page into another group freezes it: every page and ev
   assert.ok(res.writes.blocked.some((w) => w.host === 'b.example.com' && w.method === 'GET'));                              // 那一跳
   assert.ok(res.writes.blocked.some((w) => w.host === 'a.example.com' && w.method === 'POST'));                             // 冻结后的写
   assert.ok(res.writes.blockedSummary.every((r) => r.reason === 'other-group'));
-  assert.deepEqual(res.frozen, { group: 'b', host: 'b.example.com' });   // 冻结写进报告：组和第一跳的主机
+  assert.deepEqual(res.frozen, { group: 'b', host: 'b.example.com', denied: false });   // 冻结写进报告：组和第一跳的主机
   assert.ok(readFileSync(closed.reportPath, 'utf8').includes('<h3>冻结</h3>'));
   assert.ok(!res.hosts.some((h) => h.host === 'b.example.com'));                                                            // 没算「到过」
   for (const s2 of [other, plain]) assert.equal(readResult((await sm.close({ session: s2.session })).runDir).frozen, null);   // 没冻结的会话是 null
@@ -2650,7 +2650,7 @@ test('declared writes: step --allow on a read-only session answers 21 and runs n
   assert.deepEqual(await dPost(c, pageId, D_URL), NO_REDIRECT);
   const res = readResult((await c.sm.close({ session })).runDir);
   assert.deepEqual(res.writes.allowed.map((w) => [w.url, w.allowedBy]), [[D_URL, 'declared'], [D_GQL, 'declared'], [D_URL, 'declared']]);
-  assert.deepEqual(res.declarations, [{ method: 'POST', url: D_GQL, operation: 'Save', approved: 'dialog' }, { method: 'POST', url: D_URL, operation: null, approved: 'dialog' }]);
+  assert.deepEqual(res.declarations, [{ method: 'POST', url: D_GQL, operation: 'Save', approved: 'dialog', seq: 1 }, { method: 'POST', url: D_URL, operation: null, approved: 'dialog', seq: 1 }]);
   assert.equal(dialog.requests.length, 1);
 });
 
@@ -4769,7 +4769,7 @@ test('step --allow on a granted deny host asks every time and is never remembere
   assert.deepEqual(store.get().writes, {}, 'never remembered');
   assert.deepEqual(denyAllowOf(sm, one.session), [{ host: '127.0.0.1', decl: { ...ALLOW_SAVE, operation: null } }]);
   const res = readResult((await sm.close({ session: one.session })).runDir);
-  assert.deepEqual(res.declarations, [{ method: 'POST', url: ALLOW_SAVE.url, operation: null, approved: 'dialog' }]);
+  assert.deepEqual(res.declarations, [{ method: 'POST', url: ALLOW_SAVE.url, operation: null, approved: 'dialog', seq: 1 }]);
   assert.deepEqual(res.writes.allowed.map((w) => w.allowedBy), ['declared']);
   const two = await openDenied(sm, fake, { url: DENY_URL, name: 'two' });
   await assert.rejects(sm.step({ session: two.session, ops: SNAP, allow }), isCode('wait-approval'));   // 另开会话：照样问
@@ -4940,4 +4940,91 @@ test('a step that cannot pass any more does not queue the other gate\'s box: a r
   await assert.rejects(b.sm.step({ session: rb.session, ops: SNAP, allow: [toG2, plain] }), isCode('usage'));
   await settleDialog();
   assert.equal(writesBoxes(b.dialog).length, 2, 'no box for toG2');
+});
+
+// ---- 报告和 result.json 记下 deny 的事实（M3 任务 7） ----
+
+test('a session opened on a deny host records start.deny (host, mode, each allow entry) and the report shows the grant; refused deny navigations are counted in deniedNavigations', async () => {
+  const { sm, fake } = setupDeny(everyBox('可写'), { rules: BORROW_RULES });
+  const r = await openDenied(sm, fake, { url: DENY_URL, allow: [ALLOW_SAVE, ALLOW_DROP] });
+  assert.deepEqual(await topNav(fake, r.pageId, G_DENY), { action: 'abort' });
+  assert.deepEqual(await topNav(fake, r.pageId, `${G_DENY}again`), { action: 'abort' });
+  const closed = await sm.close({ session: r.session });
+  const res = readResult(closed.runDir);
+  assert.deepEqual(res.start.deny, { host: '127.0.0.1', mode: 'writable', allow: [{ method: 'DELETE', url: ALLOW_DROP.url, operation: 'Drop' }, { method: 'POST', url: ALLOW_SAVE.url, operation: null }] });   // 规范化后按方法、地址排序
+  assert.equal(res.start.borrowDeny, null);
+  assert.equal(res.deniedNavigations, 2);
+  assert.equal(res.frozen, null);
+  const html = readFileSync(closed.reportPath, 'utf8');
+  assert.ok(html.includes('<h3>不允许的域名</h3>') && html.includes('127.0.0.1') && html.includes('可写') && html.includes(ALLOW_SAVE.url) && html.includes('Drop'));
+  assert.ok(html.includes('2 次'), 'the refused navigations are in the report');
+  // 只读授权：allow 是空的；没有被拒的跳转
+  const ro = setupDeny(answeringDeny('只读'));
+  const r2 = await openDenied(ro.sm, ro.fake, { url: DENY_URL });
+  const res2 = readResult((await ro.sm.close({ session: r2.session })).runDir);
+  assert.deepEqual(res2.start.deny, { host: '127.0.0.1', mode: 'readonly', allow: [] });
+  assert.equal(res2.deniedNavigations, 0);
+});
+
+test('a borrow grant records start.borrowDeny (the borrowed group) and, with a deny host open too, both; a session with neither has two nulls and no section', async () => {
+  const one = setupDeny(everyBox('只读'), { rules: BORROW_RULES });
+  const r = await openDenied(one.sm, one.fake, BORROW_OPEN);
+  const closed = await one.sm.close({ session: r.session });
+  const res = readResult(closed.runDir);
+  assert.deepEqual([res.start.deny, res.start.borrowDeny, res.start.borrowed], [null, 'g', true]);
+  assert.ok(readFileSync(closed.reportPath, 'utf8').includes('<h3>不允许的域名</h3>'));
+  const both = setupDeny(everyBox('只读'), { rules: BORROW_RULES });
+  const bothOpen = { url: DENY_URL, profile: 'g', name: 'both' };
+  await assert.rejects(both.sm.open(bothOpen), isCode('wait-approval'));   // deny 框
+  await settleDialog();
+  await assert.rejects(both.sm.open(bothOpen), isCode('wait-approval'));   // 借用框
+  await settleDialog();
+  const r2 = await both.sm.open(bothOpen);
+  const res2 = readResult((await both.sm.close({ session: r2.session })).runDir);
+  assert.deepEqual([res2.start.deny?.host, res2.start.deny?.mode, res2.start.borrowDeny], ['127.0.0.1', 'readonly', 'g']);
+  const plain = setupDeny(answeringDeny('只读'));
+  const p = await opened(plain.sm, plain.fake);
+  const closedPlain = await plain.sm.close({ session: p.session });
+  const res3 = readResult(closedPlain.runDir);
+  assert.deepEqual([res3.start.deny, res3.start.borrowDeny, res3.deniedNavigations], [null, null, 0]);
+  assert.ok(!readFileSync(closedPlain.reportPath, 'utf8').includes('不允许的域名</h3>'));
+});
+
+test('a redirect freeze into a deny host records frozen.denied true with the first hop host and the report says 不允许的域名; a freeze into another group records denied false', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const { session, pageId } = await opened(sm, fake);
+  fake.emitHop(pageId, DENY_URL + 'landing');
+  const closed = await sm.close({ session });
+  const res = readResult(closed.runDir);
+  assert.deepEqual(res.frozen, { group: null, host: '127.0.0.1', denied: true });
+  const html = readFileSync(closed.reportPath, 'utf8');
+  assert.ok(html.includes('<h3>不允许的域名</h3>') && html.includes('经重定向进了不允许的域名'), 'the freeze reason says deny');
+  const groups = await setupGroups();
+  const a = await groups.sm.open({ url: A_URL }); const pageA = groups.fake.openPages().at(-1)!;
+  groups.fake.emitHop(pageA, B_URL + 'landing');
+  const res2 = readResult((await groups.sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res2.frozen, { group: 'b', host: 'b.example.com', denied: false });
+});
+
+test('declarations carry the seq of the first operation of the step that declared them; a re-declaration in a later step keeps the first seq; a deny declaration gets one too', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const one = await openAt(c, 'one');
+  await c.sm.step({ session: one.session, ops: [{ op: 'snapshot' }, { op: 'snapshot' }, { op: 'snapshot' }] });   // 序号 1–3
+  await declare(c, one.session, [D_A]);                                  // 第一次（21）什么都没执行；重试那次的第一个操作是 4
+  await c.sm.step({ session: one.session, ops: [{ op: 'snapshot' }, { op: 'snapshot' }] });   // 5、6
+  await assert.rejects(c.sm.step({ session: one.session, ops: [{ op: 'snapshot' }, { op: 'snapshot' }], allow: [D_A, D_C] }), isCode('wait-approval'));
+  await settleDialog();
+  await c.sm.step({ session: one.session, ops: [{ op: 'snapshot' }, { op: 'snapshot' }], allow: [D_A, D_C] });   // 7、8：D_A 沿用 4，D_C 是 7
+  const res = readResult((await c.sm.close({ session: one.session })).runDir);
+  assert.deepEqual(res.declarations.map((d) => [d.method, d.url, d.seq]), [['POST', D_URL, 4], ['DELETE', D_API, 7]]);
+
+  const deny = setupDeny(everyBox('只读'));
+  const r = await openDenied(deny.sm, deny.fake, { url: DENY_URL });
+  await deny.sm.step({ session: r.session, ops: [{ op: 'snapshot' }, { op: 'snapshot' }] });   // 1、2
+  await assert.rejects(deny.sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  await deny.sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] });   // 3
+  const res2 = readResult((await deny.sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res2.declarations.map((d) => [d.url, d.seq]), [[ALLOW_SAVE.url, 3]]);
 });

@@ -56,7 +56,7 @@ afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 test('the mode section also names an unapproved rules file whose tightening is already in force', () => {
   const html = section(renderReport(buildResult(input({ modes: [], rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' } }))), 'modes');
   assert.ok(html.includes('sha256:0123456789abcdef') && html.includes('sha256:fedcba9876543210') && html.includes('未批准'));
-  assert.ok(html.includes('新增或改成只读的规则条目'), 'only those rules are in force before approval');
+  assert.ok(html.includes('新增或改严（只读、不允许）的规则条目'), 'only those rules are in force before approval');
   assert.ok(!html.includes('其中的收紧'));
   assert.ok(!section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('未批准'));
 });
@@ -332,8 +332,8 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     unattributedWrites: [{ ...write('PUT', 'http://localhost/b', null, { reason: 'unattributed', mode: 'readonly' }), decision: 'blocked' }],
     modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: 'sha256:fedcba9876543210' }],
     rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' }, blocked: 'login', forced: true,
-    declarations: [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' }, { method: 'PUT', url: 'http://localhost/b', operation: null, approved: 'remembered' }],
-    identity: { group: 'a', checks: 2, skipped: 1, mismatch: true }, frozen: { group: 'a', host: 'b.example.com' },
+    declarations: [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog', seq: 1 }, { method: 'PUT', url: 'http://localhost/b', operation: null, approved: 'remembered', seq: 2 }],
+    identity: { group: 'a', checks: 2, skipped: 1, mismatch: true }, frozen: { group: 'a', host: 'b.example.com', denied: false },
   }));
   const bad: string[] = [];
   const walk = (v: unknown): void => {
@@ -367,7 +367,7 @@ test('buildResult carries the read-only fields through as given', () => {
   assert.deepEqual(r.modes, modes);
   assert.deepEqual(r.rules, { hash: 'sha256:0123456789abcdef', count: 3, pendingHash: 'sha256:fedcba9876543210' });
   assert.equal(r.blocked, 'login');
-  assert.deepEqual(r.start, { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', borrowed: false, readonly: true });
+  assert.deepEqual(r.start, { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', borrowed: false, deny: null, borrowDeny: null, readonly: true });
   const plain = buildResult(input({}));
   assert.deepEqual([plain.modes, plain.rules, plain.blocked, plain.start.readonly], [[], { hash: null, count: 0, pendingHash: null }, null, false]);
 });
@@ -718,9 +718,9 @@ test('the M2 fields (declarations, identity, frozen, profile, write list) are re
   const email = 'someone' + '@' + 'example.com';
   const out = writeRun(join(tmp, 'r-m2'), buildResult(input({
     start: { url: 'http://localhost/', viewport: null, touch: false, profile: `g@${jwt}`, borrowed: true },
-    declarations: [{ method: 'POST', url: `http://localhost/a/${email}`, operation: jwt, approved: 'dialog' }],
+    declarations: [{ method: 'POST', url: `http://localhost/a/${email}`, operation: jwt, approved: 'dialog', seq: 1 }],
     identity: { group: `g ${jwt}`, checks: 1, skipped: 0, mismatch: true },
-    frozen: { group: `g ${jwt}`, host: `${email}.example.com` },
+    frozen: { group: `g ${jwt}`, host: `${email}.example.com`, denied: false },
     writes: [write('POST', `http://localhost/w/${email}`, 200, { allowedBy: 'declared' })],
   })));
   for (const f of [out.reportPath, out.resultPath]) {
@@ -855,7 +855,7 @@ test('an allowedBy value that is a key of Object.prototype is shown as unknown, 
 
 test('declarations: result.json carries them as given; with none it is an empty array', () => {
   assert.deepEqual(buildResult(input({})).declarations, []);
-  const given = [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' as const }, { method: 'DELETE', url: 'http://localhost/b', operation: null, approved: 'remembered' as const }];
+  const given = [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' as const, seq: 1 }, { method: 'DELETE', url: 'http://localhost/b', operation: null, approved: 'remembered' as const, seq: 2 }];
   const r = buildResult(input({ declarations: given }));
   assert.deepEqual(r.declarations, given);
   assert.notEqual(r.declarations[0], given[0], 'a copy, not the same object');
@@ -865,9 +865,9 @@ test('the report lists the declarations: method, address, operation or the whole
   const none = section(renderReport(buildResult(input({}))), 'declarations');
   assert.ok(none.includes('<p>无</p>'));
   const html = section(renderReport(buildResult(input({ declarations: [
-    { method: 'POST', url: 'http://localhost/graphql', operation: 'Save', approved: 'dialog' },
-    { method: 'DELETE', url: 'http://localhost/items/*', operation: null, approved: 'remembered' },
-    { method: 'POST', url: 'http://localhost/<b>x</b>', operation: '<i>' as never, approved: 'other' as never },
+    { method: 'POST', url: 'http://localhost/graphql', operation: 'Save', approved: 'dialog', seq: 1 },
+    { method: 'DELETE', url: 'http://localhost/items/*', operation: null, approved: 'remembered', seq: 1 },
+    { method: 'POST', url: 'http://localhost/<b>x</b>', operation: '<i>' as never, approved: 'other' as never, seq: 1 },
   ] }))), 'declarations');
   assert.ok(html.includes('POST') && html.includes('http://localhost/graphql') && html.includes('operation Save') && html.includes('弹框批准'));
   assert.ok(html.includes('DELETE') && html.includes('这个地址上的所有写') && html.includes('沿用之前的批准'));
@@ -898,19 +898,19 @@ test('identity: the report has a section only when the group has an identity; a 
 test('frozen: result.json carries it as given; a session that was not frozen has null', () => {
   assert.equal(buildResult(input({})).frozen, null);
   assert.equal(buildResult(input({ frozen: null })).frozen, null);
-  const given = { group: 'a', host: 'b.example.com' };
+  const given = { group: 'a', host: 'b.example.com', denied: false };
   const r = buildResult(input({ frozen: given }));
   assert.deepEqual(r.frozen, given);
   assert.notEqual(r.frozen, given, 'a copy, not the same object');
-  assert.deepEqual(buildResult(input({ frozen: { group: null, host: null } })).frozen, { group: null, host: null });
+  assert.deepEqual(buildResult(input({ frozen: { group: null, host: null, denied: true } })).frozen, { group: null, host: null, denied: true });
 });
 
 // 模式一节下集中显示：profile、放行声明、身份探针、冻结。每段只出现一次，不另起顶层小节。
 test('the mode section gathers profile, declarations, identity probe and freeze under their own headings, each once', () => {
   const html = renderReport(buildResult(input({
     start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'a', borrowed: true },
-    declarations: [{ method: 'POST', url: 'http://localhost/a', operation: null, approved: 'dialog' }],
-    identity: { group: 'a', checks: 2, skipped: 0, mismatch: true }, frozen: { group: 'b', host: 'b.example.com' },
+    declarations: [{ method: 'POST', url: 'http://localhost/a', operation: null, approved: 'dialog', seq: 1 }],
+    identity: { group: 'a', checks: 2, skipped: 0, mismatch: true }, frozen: { group: 'b', host: 'b.example.com', denied: false },
   })));
   const modes = section(html, 'modes');
   const headings = [...modes.matchAll(/<h3>([^<]*)<\/h3>/g)].map((m) => m[1]);
@@ -922,14 +922,14 @@ test('the mode section gathers profile, declarations, identity probe and freeze 
   assert.ok(section(modes, 'identity').includes('id="identity-mismatch"') && section(modes, 'identity').includes('核对 2 次'));
   assert.ok(section(modes, 'frozen').includes('组 b') && section(modes, 'frozen').includes('b.example.com'));
   // 全程默认模式的早返回路径也带这几段
-  const plain = section(renderReport(buildResult(input({ frozen: { group: null, host: null } }))), 'modes');
+  const plain = section(renderReport(buildResult(input({ frozen: { group: null, host: null, denied: false } }))), 'modes');
   assert.ok(plain.includes('全程默认模式') && plain.includes('<h3>profile</h3>') && plain.includes('<h3>放行声明</h3>') && plain.includes('<h3>冻结</h3>'));
 });
 
 test('freeze: the reason names the group and the redacted host; an unknown group is said so; no freeze means no freeze heading', () => {
-  const known = section(renderReport(buildResult(input({ frozen: { group: 'b', host: 'b.example.com' } }))), 'frozen');
+  const known = section(renderReport(buildResult(input({ frozen: { group: 'b', host: 'b.example.com', denied: false } }))), 'frozen');
   assert.ok(known.includes('组 b') && known.includes('b.example.com') && known.includes('冻结'), known);
-  const unknown = section(renderReport(buildResult(input({ frozen: { group: null, host: null } }))), 'frozen');
+  const unknown = section(renderReport(buildResult(input({ frozen: { group: null, host: null, denied: false } }))), 'frozen');
   assert.ok(unknown.includes('判断不出归属') && !unknown.includes('组 null'), unknown);
   const none = renderReport(buildResult(input({})));
   assert.ok(!none.includes('<h3>冻结</h3>') && section(none, 'frozen') === '');
@@ -938,8 +938,8 @@ test('freeze: the reason names the group and the redacted host; an unknown group
 test('freeze, declarations, profile: page-derived values are redacted and escaped', () => {
   const html = renderReport(buildResult(input({
     start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'p<i>q', borrowed: false },
-    declarations: [{ method: 'P<b>', url: 'http://localhost/a<script>x</script>', operation: 'O<u>' as never, approved: 'dialog' }],
-    frozen: { group: 'g<s>', host: `${jwt}.exa<em>mple.com` },
+    declarations: [{ method: 'P<b>', url: 'http://localhost/a<script>x</script>', operation: 'O<u>' as never, approved: 'dialog', seq: 1 }],
+    frozen: { group: 'g<s>', host: `${jwt}.exa<em>mple.com`, denied: false },
   })));
   const modes = section(html, 'modes');
   for (const raw of ['<script>', '<b>', '<i>', '<u>', '<s>', '<em>']) assert.ok(!modes.includes(raw), raw);
@@ -962,4 +962,84 @@ test('an older result.json without declarations, identity, frozen or start.borro
     const m = section(renderReport(r as never), 'modes');
     assert.ok(section(m, 'frozen') === '' && section(m, 'identity') === '', `a malformed value (${JSON.stringify(bad)}) shows no freeze or identity block`);
   }
+});
+
+// ---- deny 的事实：授权、借用、冻结、被拒的跳转（M3 任务 7） ----
+
+const DENY_START = { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', borrowed: false };
+const GRANT = { host: 'deny.example.com', mode: 'writable' as const, allow: [{ method: 'POST', url: 'http://deny.example.com/api/save', operation: null }, { method: 'DELETE', url: 'http://deny.example.com/api/x', operation: 'Drop' }] };
+
+test('start.deny and start.borrowDeny are carried as given (copies); without them both are null, deniedNavigations is 0, and the frozen record carries denied', () => {
+  const plain = buildResult(input({}));
+  assert.deepEqual([plain.start.deny, plain.start.borrowDeny, plain.deniedNavigations], [null, null, 0]);
+  const r = buildResult(input({ start: { ...DENY_START, deny: GRANT, borrowDeny: 'g' }, deniedNavigations: 2, frozen: { group: null, host: 'deny.example.com', denied: true } }));
+  assert.deepEqual(r.start.deny, GRANT);
+  assert.notEqual(r.start.deny, GRANT, 'a copy');
+  assert.notEqual(r.start.deny?.allow[0], GRANT.allow[0], 'the allow entries are copies too');
+  assert.deepEqual([r.start.borrowDeny, r.deniedNavigations, r.frozen?.denied], ['g', 2, true]);
+});
+
+test('the report shows a deny grant under the mode section: host, mode and each allow entry, nothing for a session without one', () => {
+  const html = renderReport(buildResult(input({ start: { ...DENY_START, deny: GRANT } })));
+  const modes = section(html, 'modes');
+  assert.ok(modes.includes('<h3>不允许的域名</h3>'));
+  const deny = section(modes, 'deny-hosts');
+  assert.ok(deny.includes('deny.example.com') && deny.includes('可写'), deny);
+  assert.ok(deny.includes('POST http://deny.example.com/api/save') && deny.includes('DELETE http://deny.example.com/api/x') && deny.includes('Drop'), deny);
+  assert.equal(html.split('>不允许的域名</h').length - 1, 1, 'one heading, once');
+  const ro = section(renderReport(buildResult(input({ start: { ...DENY_START, deny: { host: 'deny.example.com', mode: 'readonly', allow: [] } } }))), 'deny-hosts');
+  assert.ok(ro.includes('只读') && !ro.includes('POST'), ro);
+  const none = renderReport(buildResult(input({})));
+  assert.ok(!none.includes('不允许的域名</h3>') && section(none, 'deny-hosts') === '');
+});
+
+test('the report names a borrowed group that has a deny host, a deny freeze, and the number of refused navigations; each alone is enough to show the section', () => {
+  const borrow = section(renderReport(buildResult(input({ start: { ...DENY_START, borrowed: true, borrowDeny: 'g<x>' } }))), 'deny-hosts');
+  assert.ok(borrow.includes('借用') && borrow.includes('g&lt;x&gt;') && !borrow.includes('g<x>'), borrow);
+  const frozen = section(renderReport(buildResult(input({ frozen: { group: null, host: 'deny.example.com', denied: true } }))), 'deny-hosts');
+  assert.ok(frozen.includes('冻结') && frozen.includes('不允许的域名') && frozen.includes('deny.example.com'), frozen);
+  const other = renderReport(buildResult(input({ frozen: { group: 'b', host: 'b.example.com', denied: false } })));
+  assert.ok(section(other, 'deny-hosts') === '' && !other.includes('不允许的域名</h3>'), 'a freeze into another group is not a deny freeze');
+  assert.ok(section(other, 'frozen').includes('组 b'));
+  const denyFrozenBlock = section(renderReport(buildResult(input({ frozen: { group: null, host: 'deny.example.com', denied: true } }))), 'frozen');
+  assert.ok(denyFrozenBlock.includes('不允许的域名') && !denyFrozenBlock.includes('判断不出归属'), denyFrozenBlock);
+  const navs = section(renderReport(buildResult(input({ deniedNavigations: 3 }))), 'deny-hosts');
+  assert.ok(navs.includes('3 次') && navs.includes('跳转'), navs);
+  assert.equal(section(renderReport(buildResult(input({ deniedNavigations: 0 }))), 'deny-hosts'), '');
+});
+
+test('an old result.json without start.deny, start.borrowDeny, frozen.denied, deniedNavigations (or with malformed values) renders without the section and does not throw', () => {
+  const old = JSON.parse(JSON.stringify(buildResult(input({ frozen: { group: 'b', host: 'b.example.com', denied: false } })))) as { start: Record<string, unknown>; frozen: Record<string, unknown>; deniedNavigations?: unknown };
+  delete old.start.deny; delete old.start.borrowDeny; delete old.frozen.denied; delete old.deniedNavigations;
+  let html = '';
+  assert.doesNotThrow(() => { html = renderReport(old as never); });
+  assert.ok(section(html, 'deny-hosts') === '' && !html.includes('不允许的域名</h3>'));
+  assert.ok(section(html, 'frozen').includes('组 b'), 'the old freeze still shows as an other-group one');
+  for (const bad of [5, 'x', [], { host: 1 }, { host: 'h', mode: 'x', allow: 3 }, { host: 'h', mode: 'readonly', allow: [null, 5, { method: 1 }] }]) {
+    const r = { ...old, start: { ...old.start, deny: bad, borrowDeny: bad }, deniedNavigations: bad };
+    assert.doesNotThrow(() => renderReport(r as never), JSON.stringify(bad));
+  }
+});
+
+test('deny facts are redacted on disk and escaped in the report: the host, every allow url and operation, the borrowed group name', () => {
+  const email = 'someone' + '@' + 'example.com';
+  const out = writeRun(join(tmp, 'r-deny'), buildResult(input({
+    start: { ...DENY_START, deny: { host: `${email}.example.net`, mode: 'writable', allow: [{ method: 'POST', url: `http://deny.example.com/a/${email}`, operation: jwt }, { method: 'PUT', url: `http://x.example.com/<b>`, operation: null }] }, borrowDeny: `g ${jwt}` },
+    frozen: { group: null, host: `${email}.example.net`, denied: true },
+  })));
+  for (const f of [out.reportPath, out.resultPath]) {
+    const t = readFileSync(f, 'utf8');
+    for (const [what, needle] of [['jwt', jwt], ['email', email]] as const) assert.ok(!t.includes(needle), `${f}: ${what} leaks`);
+  }
+  const j = JSON.parse(readFileSync(out.resultPath, 'utf8'));
+  assert.ok(j.start.deny.host.includes(REDACTED) && j.start.deny.allow[0].url.includes(REDACTED) && j.start.deny.allow[0].operation.includes(REDACTED) && j.start.borrowDeny.includes(REDACTED));
+  assert.equal(j.start.deny.allow[1].method, 'PUT');
+  assert.ok(!readFileSync(out.reportPath, 'utf8').includes('<b>'), 'page-derived text is escaped');
+});
+
+test('declarations carry the seq they were given and it is copied into result.json', () => {
+  const r = buildResult(input({ declarations: [{ method: 'POST', url: 'http://localhost/a', operation: null, approved: 'dialog', seq: 4 }] }));
+  assert.deepEqual(r.declarations, [{ method: 'POST', url: 'http://localhost/a', operation: null, approved: 'dialog', seq: 4 }]);
+  const out = writeRun(join(tmp, 'r-seq'), r);
+  assert.equal(JSON.parse(readFileSync(out.resultPath, 'utf8')).declarations[0].seq, 4);
 });

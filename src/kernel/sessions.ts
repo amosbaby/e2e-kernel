@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DriverError } from '../driver/types.ts';
 import type { Decision, Driver, Instance, Page, RequestInfo } from '../driver/types.ts';
 import { buildResult, resolveSuperseded } from '../report/result.ts';
-import type { ClosedBy, DeclarationRecord, RunResult } from '../report/result.ts';
+import type { ClosedBy, DeclarationRecord, DenyGrantRecord, RunResult } from '../report/result.ts';
 import { pruneRuns, runDirName, writeRun } from '../report/store.ts';
 import { E2kError } from '../shared/errors.ts';
 import type { Viewport } from '../shared/ops.ts';
@@ -108,7 +108,7 @@ interface Session {
   readonly group: string;
   // 跨组导航被拦的次数，和还没在 step 的 notices 里提示过的提示句（去重）。
   crossCount: number;
-  deniedCount: number;                       // 被拦的不允许的域名的顶层导航次数（也进 crossNotices 的提示；step 的「只读模式」提示不算它们）
+  deniedCount: number;                       // 被拦的不允许的域名的顶层导航次数（也进 crossNotices 的提示；step 的「只读模式」提示不算它们）；收尾时写进报告的 deniedNavigations
   readonly crossNotices: Set<string>;
   readonly refused: Refused;                 // 每页上被拦下的跨组导航的地址（去掉 #），见 MAX_REFUSED
   frozen: Freeze | null;                     // 经重定向进了别的组的域名：整个会话冻结
@@ -148,7 +148,8 @@ export interface DenyGrant { host: string | null; mode: 'readonly' | 'writable' 
 const noGrant = (): DenyGrant => ({ host: null, mode: null, allow: [], borrowGroup: null });
 
 // scope：批准是在哪个组、哪个页面主机上给的（`组/主机`；主机名里不会有 `/`，也不会撞上 `constructor` 一类原型上的名字）。
-interface DeclaredEntry { readonly scope: string; readonly decl: Declaration; readonly approved: DeclarationRecord['approved'] }
+// seq：提出它的那次 step 的第一个操作的会话序号（报告和用例要把声明挂回那一批）。
+interface DeclaredEntry { readonly scope: string; readonly decl: Declaration; readonly approved: DeclarationRecord['approved']; readonly seq: number }
 
 // 放行声明的一道闸：error 为 null 才算过；commit 在所有闸都过了之后才做（记批准记录或记进会话）；remembered 是本来就记住了的条目。
 interface DeclGate { readonly error: E2kError | null; readonly commit: () => void; readonly remembered: Declaration[] }
@@ -545,7 +546,7 @@ export class SessionManager {
         throw frozenError(frozenNowOnProbe);
       }
       // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；探针之后到这里、再到开始执行之间没有 await。
-      if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow);
+      if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow, s.recorder.upcomingSeq());
       const loginOpenAtStart = this.loginActive();
       const token = await this.safeCapture();
       focus = { token, pagesBefore: s.pagesOpened, loginOpenAtStart };
@@ -674,7 +675,7 @@ export class SessionManager {
   // 被拒的集合不带会话名记（deniedWrites）：换个会话也不重新弹框。批准用掉之后，别的没用掉的 writes 答复一并作废（基线变了）。
   // deny 分支（R21）：条目的目标主机是不允许的域名、或会话页面主机是不允许的域名的，一律走 gateDenyDeclarations——每次都问、不进批准记录、只活在会话里。
   // 两类条目同一次 step 里都有时两个框都先问，都批准了才一起生效：全有或全无，没批准的这一批什么都不记、什么都不执行。
-  private gateDeclarations(s: Session, raw: readonly unknown[]): void {
+  private gateDeclarations(s: Session, raw: readonly unknown[], seq: number): void {
     const decls = normalizeDeclarations(raw);
     if (decls.length === 0) return;
     this.pruneAskedWrites();
@@ -698,7 +699,7 @@ export class SessionManager {
     const scope = `${s.group}/${host}`;
     for (const d of decls) {
       if (s.declared.some((e) => e.scope === scope && sameDeclaration(e.decl, d))) continue;
-      s.declared.push({ scope, decl: d, approved: plainGate.remembered.some((r) => sameDeclaration(r, d)) ? 'remembered' : 'dialog' });
+      s.declared.push({ scope, decl: d, approved: plainGate.remembered.some((r) => sameDeclaration(r, d)) ? 'remembered' : 'dialog', seq });
     }
   }
 
@@ -842,7 +843,7 @@ export class SessionManager {
     }
   }
 
-  // 报告里的放行声明：同一条（方法、地址、operation）只列一次，先提的在前。
+  // 报告里的放行声明：同一条（方法、地址、operation）只列一次，先提的在前，序号是第一次提出那次 step 的第一个操作。
   private declarationRecords(s: Session): DeclarationRecord[] {
     const seen = new Set<string>();
     const out: DeclarationRecord[] = [];
@@ -850,7 +851,7 @@ export class SessionManager {
       const k = declarationKey(e.decl);
       if (seen.has(k)) continue;
       seen.add(k);
-      out.push({ method: e.decl.method, url: e.decl.url, operation: e.decl.operation, approved: e.approved });
+      out.push({ method: e.decl.method, url: e.decl.url, operation: e.decl.operation, approved: e.approved, seq: e.seq });
     }
     return out;
   }
@@ -1385,12 +1386,13 @@ export class SessionManager {
     try {
       result = buildResult({
         kernelVersion: this.deps.kernelVersion, session: s.id, name: s.name, startedAt: s.startedAt, endedAt, closedBy,
-        start: s.start, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
+        start: { ...s.start, deny: this.denyRecord(s), borrowDeny: s.grant.borrowGroup },
+        deniedNavigations: s.deniedCount, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
         actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
         verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [], declarations: this.declarationRecords(s),
         modes: s.recorder.modes, rules: this.rulesInForce(), blocked: s.lastWall, forced: s.forced,
         identity: s.identityConfigured ? { group: s.group, checks: s.identityChecks, skipped: s.identitySkipped, mismatch: s.identityMismatch !== null } : null,
-        frozen: s.frozen === null ? null : { group: s.frozen.group, host: this.frozenHost(s.frozen) },
+        frozen: s.frozen === null ? null : { group: s.frozen.group, host: this.frozenHost(s.frozen), denied: s.frozen.denied },
       });
       paths = writeRun(s.runDir, result);
     } catch (e) {
@@ -1412,6 +1414,13 @@ export class SessionManager {
   private rulesInForce(): { hash: string | null; count: number; pendingHash: string | null } {
     const { hash, count, pendingHash } = this.deps.modes.state();
     return { hash, count, pendingHash };
+  }
+
+  // 报告里的 deny 授权：没有授权（没开不允许的域名）是 null。host 和地址在写盘时统一脱敏。
+  private denyRecord(s: Session): DenyGrantRecord | null {
+    const { host, mode, allow } = s.grant;
+    if (host === null || mode === null) return null;
+    return { host, mode, allow: allow.map((a) => ({ method: a.method, url: a.url, operation: a.operation })) };
   }
 
   // 清理旧报告时不能删的目录：所有还在进行中的会话（含正在开的），以及刚收尾、要交给调用方的这一份。

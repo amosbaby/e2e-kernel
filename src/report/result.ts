@@ -15,7 +15,9 @@ export type ClosedBy = 'agent' | 'idle-timeout' | 'kernel-shutdown' | 'browser-g
 
 export interface RunInput {
   kernelVersion: string; session: string; name: string; startedAt: Date; endedAt: Date; closedBy: ClosedBy;
-  start: { url: string; viewport: Viewport | null; touch: boolean; profile: string; borrowed?: boolean };   // borrowed：借用了别的组的登录（没给就是 false）
+  // borrowed：借用了别的组的登录（没给就是 false）；deny：open 时人批准的不允许的域名授权（没有或没给是 null）；
+  // borrowDeny：借用授权覆盖的组名（借的组里有不允许的域名、人批准了借用；没有或没给是 null）。
+  start: { url: string; viewport: Viewport | null; touch: boolean; profile: string; borrowed?: boolean; deny?: DenyGrantRecord | null; borrowDeny?: string | null };
   driver: { name: string; capabilities: Capabilities };
   actions: ActionRecord[]; writes: WriteRecord[]; unattributedWrites: WriteRecord[];
   hosts: { host: string; mode: Mode }[]; webSockets: number;
@@ -28,16 +30,23 @@ export interface RunInput {
   forced: boolean;           // open --readonly
   identity?: IdentityRecord | null;   // 身份探针的计数；组没配身份为 null（没给也是 null）
   frozen?: FrozenRecord | null;       // 会话被冻结时的记录；没冻结为 null（没给也是 null）
+  deniedNavigations?: number;         // 被拒（abort）的不允许的域名的顶层导航次数（没给是 0）
 }
 
 // 身份探针的计数，不含任何页面文字。checks：真正做了比较的探测次数（含不符，不含跳过）；skipped：前提不满足而跳过的次数。
 export interface IdentityRecord { group: string; checks: number; skipped: number; mismatch: boolean }
 
-// 会话经重定向进了别的组的域名而被冻结：group 是第一次跨进去的那个组，判断不出归属时是 null；host 是第一跳的主机（已脱敏），没有是 null。
-export interface FrozenRecord { group: string | null; host: string | null }
+// 会话经重定向进了别的组的域名（或不允许的域名）而被冻结：group 是第一次跨进去的那个组，判断不出归属时是 null；host 是第一跳的主机（已脱敏），没有是 null；
+// denied：第一次冻结的原因是进了不允许的域名（这时 group 是 null，也不清 cookie）。
+export interface FrozenRecord { group: string | null; host: string | null; denied: boolean }
+
+// open 时人批准的不允许的域名授权（R2）：host 只有打开的那个主机；mode 是人选的「只读」或「可写」；allow 是选「可写」时 open --allow 的放行清单（其余为空）。
+// 主机和地址在 result.json 里同其他地址一样脱敏。
+export interface DenyGrantRecord { host: string; mode: 'readonly' | 'writable'; allow: { method: string; url: string; operation: string | null }[] }
 
 // 本会话提过、人批准了的放行声明（url 是规范化后的地址，不带查询串）。approved：本次在弹框里批准的 / 之前批准过、这次沿用的。
-export interface DeclarationRecord { method: string; url: string; operation: string | null; approved: 'dialog' | 'remembered' }
+// seq：提出这条声明的那次 step 的第一个操作的会话序号（同一条在之后的 step 里再提，沿用第一次的序号）；用例的 allow 靠它挂回那一批。
+export interface DeclarationRecord { method: string; url: string; operation: string | null; approved: 'dialog' | 'remembered'; seq: number }
 
 // 一条已恢复的失败：序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代。op 和 target 来自记录，不来自 agent。
 // target 是已脱敏的选择器或引用，没有就是 null。byReadOnly：取代者是只读操作（含 wait），而被取代的是动作（读一下页面或等一会儿不能证明动作做成了）。
@@ -54,18 +63,19 @@ export interface BlockedSummaryRow { host: string; method: string; reason: Block
 
 export interface RunResult {
   schema: 1; kernelVersion: string; session: string; name: string; startedAt: string; endedAt: string; closedBy: ClosedBy;
-  start: Omit<RunInput['start'], 'borrowed'> & { borrowed: boolean; readonly: boolean }; driver: RunInput['driver']; hosts: RunInput['hosts'];
+  start: Omit<RunInput['start'], 'borrowed' | 'deny' | 'borrowDeny'> & { borrowed: boolean; deny: DenyGrantRecord | null; borrowDeny: string | null; readonly: boolean }; driver: RunInput['driver']; hosts: RunInput['hosts'];
   modes: ModeChange[]; rules: RunInput['rules'];
   verdict: Verdict | null; findings: Finding[]; notDone: string[]; superseded: SupersededEntry[];
   declarations: DeclarationRecord[];
   identity: IdentityRecord | null;
   frozen: FrozenRecord | null;
+  deniedNavigations: number;
   tallies: Tallies; consistency: 'ok' | 'conflict'; conflicts: ConflictReason[];
   actions: ActionRecord[];
   writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[]; summary: WriteSummaryRow[]; blockedSummary: BlockedSummaryRow[] };
   approvals: never[];                 // M2 才有内容
   coverage: { serviceWorkers: 'blocked'; webSockets: number; notes: string[] };
-  blocked: 'login' | null;            // 会话最后一次登录墙检查的结果；等批准、身份不符、跳到不允许的域名要到 M3
+  blocked: 'login' | null;            // 会话最后一次登录墙检查的结果（R8：仍只有这两个值）；跳到不允许的域名被拦、冻结的事实记在 start.deny、start.borrowDeny、writes.blocked 和 frozen.denied
   next: string | null;
 }
 
@@ -192,7 +202,11 @@ export function buildResult(input: RunInput): RunResult {
     startedAt: input.startedAt.toISOString(),
     endedAt: input.endedAt.toISOString(),
     closedBy: input.closedBy,
-    start: { ...input.start, borrowed: input.start.borrowed === true, readonly: input.forced },
+    start: {
+      ...input.start, borrowed: input.start.borrowed === true, readonly: input.forced,
+      deny: input.start.deny === undefined || input.start.deny === null ? null : { ...input.start.deny, allow: input.start.deny.allow.map((a) => ({ ...a })) },
+      borrowDeny: input.start.borrowDeny ?? null,
+    },
     driver: { name: input.driver.name, capabilities: { ...input.driver.capabilities } },
     hosts: input.hosts.map((h) => ({ ...h })),
     modes: input.modes.map((m) => ({ ...m })),
@@ -204,6 +218,7 @@ export function buildResult(input: RunInput): RunResult {
     declarations: input.declarations.map((d) => ({ ...d })),
     identity: input.identity === undefined || input.identity === null ? null : { ...input.identity },
     frozen: input.frozen === undefined || input.frozen === null ? null : { ...input.frozen },
+    deniedNavigations: input.deniedNavigations ?? 0,
     tallies,
     consistency: conflicts.length > 0 ? 'conflict' : 'ok',
     conflicts,
