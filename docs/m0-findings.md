@@ -110,7 +110,7 @@ changed: false
 
 4 次里有 2 次 `changed: true`：有头启动拿走了前台。这 2 次前台都是运行脚本的那个应用；另外 2 次前台是别的应用，没有变。这几次测的时候机器上有人在用，前台应用不是由脚本控制的，只能作参考。
 
-用户自己跑的 `node scripts/m0/focus-probe.ts` 是权威结果，它取代上面这几次不受控的运行。原样输出（`<应用 A>` 是用户自己的桌面应用，名字按上文约定替换）：
+作者自己跑的 `node scripts/m0/focus-probe.ts` 是权威结果，它取代上面这几次不受控的运行。原样输出（`<应用 A>` 是作者自己的桌面应用，名字按上文约定替换）：
 
 ```text
 front-app-before: <应用 A>
@@ -122,7 +122,7 @@ changed: true
 
 ## 8. 人关窗口后
 
-用户自己跑的 `node scripts/m0/window-close.ts`，原样输出：
+作者自己跑的 `node scripts/m0/window-close.ts`，原样输出：
 
 ```text
 请在 20 秒内手动关闭这个浏览器窗口
@@ -134,7 +134,7 @@ context-close: not-fired
 
 ## 9. 人工登录
 
-由用户在自己的环境上实测，结果不进仓库。
+由作者在自己的环境上实测，结果不进仓库。
 
 ## 9.5 重定向的后续跳不经路由 handler
 
