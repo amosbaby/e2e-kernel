@@ -603,7 +603,7 @@ export interface RulesInspection {
   fileDeleted: boolean;            // 待批的改动是「文件被删了」
   hash: string | null;             // 待批文件的短哈希（显示用）；删文件为 null
   summary: string[];               // 完整差异；没有待批为空
-  hostModes: Record<string, 'default' | 'readonly'>;   // 批准记录里登录时选的模式（读不了为空）
+  hostModes: Record<string, 'default' | 'readonly' | 'deny'>;   // 批准记录里登录时选的模式（读不了为空）
   writes: Record<string, Declaration[]>;               // 批准记录里记住的放行声明（读不了为空）
 }
 

@@ -81,12 +81,14 @@ after(async () => {
   }
 });
 
-// 没列明的主机上第一次登录要问模式（三键框）：用自己的内核和 home，不占共用内核的弹框额度（10 分钟 6 个，已被规则测试用满）。
-// 21 → 假对话框回「默认」→ 原样重试；这条路和线上一样，测试从不直接写批准记录。
-async function loginAfterChoice(h: typeof home, url: string): Promise<{ loginId: string }> {
-  const first = await call(h, 'login.begin', { url });
-  assert.ok(!first.ok && first.error.code === 'wait-approval', 'the first login on an unlisted host asks for a mode');
-  await settle();
+// 没列明的主机上第一次登录要问模式（两步框）：用自己的内核和 home，不占共用内核的弹框额度（10 分钟 6 个，已被规则测试用满）。
+// 21 → 假对话框回答 → 原样重试（「默认」一步，「只读」要两步）；这条路和线上一样，测试从不直接写批准记录。
+async function loginAfterChoice(h: typeof home, url: string, steps = 1): Promise<{ loginId: string }> {
+  for (let i = 0; i < steps; i++) {   // 模式框每一步答完都要重试一次：「默认」一步，「只读」「不允许」两步
+    const asked = await call(h, 'login.begin', { url });
+    assert.ok(!asked.ok && asked.error.code === 'wait-approval', 'the first login on an unlisted host asks for a mode');
+    await settle();
+  }
   const again = await call(h, 'login.begin', { url });
   assert.ok(again.ok);
   return (again as { result: { loginId: string } }).result;
@@ -531,7 +533,7 @@ test('login on an unlisted host answered read-only: the window\'s own writes are
   const k = await startKernel({ focus: noFocus, home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('只读')) });
   try {
     const from = server.hits.length;
-    const begin = await loginAfterChoice(own.home, server.altOrigin + '/login-writes.html');
+    const begin = await loginAfterChoice(own.home, server.altOrigin + '/login-writes.html', 2);   // 只读：两步
     await settle(1500);
     const end = await call(own.home, 'login.end', begin);
     assert.ok(end.ok);

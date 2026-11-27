@@ -2,7 +2,7 @@ import type { Mode } from '../shared/protocol.ts';
 import type { ApprovalsStatus } from './approval-store.ts';
 import type { Endpoint, Group } from './rules.ts';
 
-// 域名规则里能写的模式。'deny'（不允许）解析成会话模式 'denied'；登录时选的模式（hostModes）只有 default / readonly，不会有 deny。
+// 域名规则里能写的模式。'deny'（不允许）解析成会话模式 'denied'；登录时选的模式（hostModes，两步框的结果）也可以是 deny：同样解析成 'denied'。
 export type RuleMode = 'readonly' | 'default' | 'deny';
 
 // 规则的当前状态。count、hash：当前**生效**的那份（人批准过的快照）；没有批准过为 0 条、hash 为 null。

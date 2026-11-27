@@ -31,13 +31,22 @@ const titled = (r: DialogRequest, ...titles: string[]): boolean => titles.some((
 const LOGIN_MODE_TITLE = 'e2k：在新域名上登录';
 const DENY_TITLES = ['e2k：打开不允许的域名', 'e2k：借用登录', 'e2k：在不允许的域名上登录'];
 
-// 登录前「问模式」的三键框（不登录 / 默认 / 只读）：见到就按 button；别的框照 approving。只在测试里用。
-export const choosingMode = (button: '不登录' | '默认' | '只读') => (r: DialogRequest): DialogResult =>
-  titled(r, LOGIN_MODE_TITLE) ? { kind: 'button', button } : approving(r);
+// 登录前「问模式」是两步框：第一步 不登录 / 默认 / 更严…，第二步（标题带「（更严的模式）」）不登录 / 只读 / 不允许。
+// 按标题认：第一步的标题后面直接是「（请求 id）」，第二步的是「（更严的模式）」开头。
+const LOGIN_STRICT_TITLE = 'e2k：在新域名上登录（更严的模式）';
+type LoginChoice = '不登录' | '默认' | '只读' | '不允许';
+function loginAnswer(r: DialogRequest, choice: LoginChoice): DialogResult | null {
+  if (!titled(r, LOGIN_MODE_TITLE)) return null;
+  if (titled(r, LOGIN_STRICT_TITLE)) return { kind: 'button', button: choice === '只读' || choice === '不允许' ? choice : '不登录' };
+  return { kind: 'button', button: choice === '只读' || choice === '不允许' ? '更严…' : choice };
+}
+
+// 登录前「问模式」的两步框：'默认' / '不登录' 一步答完，'只读' / '不允许' 先点第一步的「更严…」再点第二步；别的框照 approving。只在测试里用。
+export const choosingMode = (choice: LoginChoice) => (r: DialogRequest): DialogResult => loginAnswer(r, choice) ?? approving(r);
 
 // 只答登录前「问模式」的框，别的框照 fakeDialog() 缺省回 unavailable：给共用内核的老测试用（不改变它们对别的框的行为）。
-export const choosingModeOnly = (button: '不登录' | '默认' | '只读') => (r: DialogRequest): DialogResult =>
-  titled(r, LOGIN_MODE_TITLE) ? { kind: 'button', button } : { kind: 'unavailable', why: '测试里没有编排这个对话框' };
+export const choosingModeOnly = (choice: LoginChoice) => (r: DialogRequest): DialogResult =>
+  loginAnswer(r, choice) ?? { kind: 'unavailable', why: '测试里没有编排这个对话框' };
 
 // deny 类的三种框（打开不允许的域名、借用登录、在不允许的域名上登录）：按 button，框里没有这个按钮就按「拒绝」；别的框照 approving。只在测试里用。
 export const answeringDeny = (button: '拒绝' | '只读' | '可写' | '允许' | '登录') => (r: DialogRequest): DialogResult =>

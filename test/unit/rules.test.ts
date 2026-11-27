@@ -793,7 +793,7 @@ test('resolver: group() and groupOf() hand out frozen objects of the approved sn
 const LISTED_FILE = { version: 1, rules: [{ match: 'ruled.example.com', mode: 'default' }, { match: '*.wild.example.com', mode: 'readonly' }], loginHosts: ['top-sso.example.com'],
   groups: [{ name: 'g', hosts: ['grouped.example.com'], loginHosts: ['group-sso.example.com'] }] };
 
-function chooseNow(store: ApprovalStore, host: string, mode: 'default' | 'readonly'): void {
+function chooseNow(store: ApprovalStore, host: string, mode: 'default' | 'readonly' | 'deny'): void {
   store.update((r) => { r.hostModes[host] = mode; return r; });
 }
 
@@ -956,17 +956,27 @@ test('a pending deny is in force at once; a pending relax from deny waits', () =
   assert.equal(q.resolve('app.example.com'), 'default');
 });
 
-test('hostModes never yield deny: a stored login choice is only ever default or readonly', () => {
-  const { io } = fakeIo(null);
+test('hostModes can hold deny (the two-step login box): it resolves to denied with reason host-choice, never touches groups, and an approved rule still wins over it', () => {
+  const { io } = fakeIo(JSON.stringify({ version: 1, rules: [{ match: 'ruled.example.com', mode: 'default' }, { match: 'ro.example.com', mode: 'readonly' }],
+    groups: [{ name: 'g', hosts: ['grouped.example.com'] }] }));
   const store = newStore();
   const m = resolverOf(io, store);
-  chooseNow(store, 'picked.example.com', 'readonly');
+  approveNow(m);
+  chooseNow(store, 'picked.example.com', 'deny');
   chooseNow(store, 'free.example.com', 'default');
-  for (const h of ['picked.example.com', 'free.example.com', 'none.example.com']) {
-    assert.notEqual(m.resolve(h), 'denied', h);
-    assert.notEqual(m.ruleFor(h), 'deny', h);
-    assert.notEqual(m.hostChoice(h), 'deny', h);
-  }
+  chooseNow(store, 'ruled.example.com', 'deny');
+  chooseNow(store, 'ro.example.com', 'deny');
+  assert.equal(m.resolve('picked.example.com'), 'denied');
+  assert.equal(m.resolve('PICKED.example.com.'), 'denied');
+  assert.equal(m.ruleFor('picked.example.com'), 'deny');
+  assert.equal(m.hostChoice('picked.example.com'), 'deny');
+  assert.equal(m.isListed('picked.example.com'), true, 'a stored choice counts as listed, so it is never asked about again');
+  assert.equal(m.resolve('www.picked.example.com'), 'default', 'exact host only');
+  assert.equal(m.resolve('free.example.com'), 'default');
+  assert.equal(m.resolve('ruled.example.com'), 'default', 'the approved default rule beats the stored deny');
+  assert.equal(m.hostChoice('ruled.example.com'), null);
+  assert.equal(m.resolve('ro.example.com'), 'readonly');
+  assert.equal(m.groupHasDeny('g'), false, 'hostModes hosts are by definition not in any group, and groupHasDeny only looks at rules');
 });
 
 describe('deny in the pending summary', () => {

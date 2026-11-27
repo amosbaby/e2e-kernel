@@ -274,21 +274,23 @@ function clockOf(ctx: Ctx): NonNullable<Io['clock']> {
 const LOGIN_WAIT_MS = 120_000;
 const LOGIN_RETRY_MS = 2000;
 
-// login.begin 收到 21（等人在弹框里批准或选模式）就每 2 秒原样重试，最多等 120 秒；其他错误原样往上抛。
-// 提示只打印一次。等到时间了返回 null。
+// login.begin 收到 21（等人在弹框里批准或选模式）就每 2 秒原样重试；其他错误原样往上抛。
+// 模式框是两步，每一步是一个新的请求 id：每换一个请求 id 重新计 120 秒（和 run 同一口径；取不到 id 的算 null），提示每换一个 id 打印一次。
+// 同一个 id 等满 120 秒返回 null。
 async function beginLogin(ctx: Ctx, home: Home, params: unknown): Promise<unknown> {
   const clock = clockOf(ctx);
-  const deadline = clock.now() + LOGIN_WAIT_MS;
-  let told = false;
+  let current: string | null | undefined;
+  let deadline = 0;
   for (;;) {
     try {
       return await send(ctx, home, 'login.begin', params);
     } catch (e) {
       if (!(e instanceof E2kError) || e.code !== 'wait-approval') throw e;
-      if (!told) {
-        told = true;
-        const id = /请求 (a-[0-9a-f]{6})/.exec(e.message)?.[1];
-        ctx.io.out(id === undefined ? '请在弹出的对话框里选择' : `请在弹出的对话框里选择（请求 ${id}）`);
+      const id = /请求 (a-[0-9a-f]{6})/.exec(e.message)?.[1] ?? null;
+      if (current === undefined || id !== current) {
+        current = id;
+        deadline = clock.now() + LOGIN_WAIT_MS;
+        ctx.io.out(id === null ? '请在弹出的对话框里选择' : `请在弹出的对话框里选择（请求 ${id}）`);
       }
       if (clock.now() >= deadline) return null;
       await clock.sleep(LOGIN_RETRY_MS);

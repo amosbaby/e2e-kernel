@@ -16,9 +16,9 @@ import type { CloseParams, CloseResult, LoginBeginParams, Mode, OpenParams, Open
 import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
 import { checkDialogText, pendingError } from './approval.ts';
-import type { Approvals, DialogRequest } from './approval.ts';
+import type { ApprovalState, Approvals, DialogRequest } from './approval.ts';
 import type { FocusKeeper } from './focus.ts';
-import type { ApprovalStore, Declaration } from './approval-store.ts';
+import type { ApprovalStore, Declaration, HostMode } from './approval-store.ts';
 import { declarationKey, normalizeDeclarations, sameDeclaration } from './declarations.ts';
 import type { ModeResolver } from './mode.ts';
 import { checkProfileKey, parseProfileArg, prepareProfileDir, profileKey, recordLogin } from './profiles.ts';
@@ -937,18 +937,25 @@ export class SessionManager {
     return this.track(() => this.beginLogin(p));
   }
 
-  // 登录前的弹框确认（设计 5.2「第一次登录问模式」）：主机没列明（已批准的规则、登录时选过、组、任何 loginHosts 都没有）就先问人：
-  // 不登录 / 默认 / 只读（按钮不叫「取消」：避免被 osascript 当成系统取消键，见 approval.ts 的 isUserCancel），选择记进批准记录的 hostModes（不改 rules.json）。要在规则闸门之后、算 login.mode 之前，窗口也还没开。
-  // 答复（待批表的键 `login:` + 规范化主机）绑定框里显示的全部内容：框里只有这个主机和三个选项，所以键已经绑定了。
-  // 各主机的键彼此独立，没有「基线」会变，所以用掉之后只 forget 自己，不作废别的 login: 答复。被拒的保留到内核重启，同类 60 秒冷却。
+  // 登录前的弹框确认（设计 5.2「第一次登录问模式」），两步：主机没列明（已批准的规则、登录时选过、组、任何 loginHosts 都没有）就先问人。
+  // 第一步（键 `login:` + 规范化主机）：不登录 / 默认 / 更严…。「默认」写 hostModes 就完；「更严…」什么都不写，进第二步。
+  // 第二步（键 `login-strict:` + 规范化主机，kind 仍是 login）：不登录 / 只读 / 不允许，选择记进批准记录的 hostModes（不改 rules.json）。
+  // 按钮不叫「取消」：避免被 osascript 当成系统取消键，见 approval.ts 的 isUserCancel（对话框最多 3 个按钮，所以要两步）。
+  // 要在规则闸门之后、算 login.mode 之前，窗口也还没开；两步都在同一个同步段里（第一个 await 之前）。
+  // 答复绑定框里显示的全部内容：框里只有这个主机和选项，所以键已经绑定了。第一步答了「更严…」的答复留着，直到第二步答完才和第二步的一起 forget。
+  // 各主机的键彼此独立，没有「基线」会变，所以用掉之后只 forget 自己，不作废别的 login: 答复。被拒的（任一步）保留到内核重启，同类 60 秒冷却。
+  // 选「不允许」的这次登录本身就是 R5 的那次批准：gateLoginDeny 在它之前跑过了（那时主机还不是 deny），所以这次不再弹「在不允许的域名上登录」；
+  // 窗口里 denied 照旧按只读算，下一次 login 这个主机就照 R5 每次弹框。
   // 规范化不了的主机（含取不到主机）不弹框，直接 usage：失败关闭。写盘失败时 needs-human 原样往上走，答复还留着，重试会再写一次。
   private gateLoginHost(rawHost: string): void {
     const { modes, approvals, store } = this.deps;
     if (modes.isListed(rawHost)) {
       // 已列明（比如规则后来批准了）：之前没用掉的答复不能留着，免得以后又没列明时直接生效。
       try {
-        const stale = `login:${normalizeHost(rawHost)}`;
-        if (approvals.stateOf(stale) === 'approved') approvals.forget(stale);
+        const h = normalizeHost(rawHost);
+        for (const stale of [`login:${h}`, `login-strict:${h}`]) {
+          if (approvals.stateOf(stale) === 'approved') approvals.forget(stale);
+        }
       } catch {
         // 规范化不了的主机谈不上有旧答复
       }
@@ -962,30 +969,43 @@ export class SessionManager {
     }
     // `__proto__` 作键写不进批准记录（读回来会被当成坏文件）。
     if (host === '__proto__') throw new E2kError('usage', '这个主机名不能用', '换成别的地址');
-    const key = `login:${host}`;
-    const request: DialogRequest = {
-      title: 'e2k：在新域名上登录',
-      lines: [`要在 ${host} 上打开登录窗口。`, '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '不登录：不打开'],
-      buttons: ['不登录', '默认', '只读'], defaultButton: '不登录', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    const refused = (asked: Extract<ApprovalState, { status: 'denied' | 'unavailable' }>): never => {
+      if (asked.status === 'unavailable') throw new E2kError('needs-human', `要在新域名上登录但弹不出确认框：${asked.why}`, '在有桌面的终端里起内核');
+      if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试，或换一个已列进规则的域名');
+      throw new E2kError('usage', '人取消了这次登录', '内核重启前同一个域名不会再问；要登录请重启内核再试，或把它列进 rules.json');
     };
-    const asked = approvals.ask(key, 'login', request, ['默认', '只读']);
-    switch (asked.status) {
-      case 'pending':
-        throw pendingError(asked.id, '在新域名上登录，选模式');
-      case 'denied':
-        if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试，或换一个已列进规则的域名');
-        throw new E2kError('usage', '人取消了这次登录', '内核重启前同一个域名不会再问；要登录请重启内核再试，或把它列进 rules.json');
-      case 'unavailable':
-        throw new E2kError('needs-human', `要在新域名上登录但弹不出确认框：${asked.why}`, '在有桌面的终端里起内核');
-      case 'approved': {
-        const mode = asked.button === '只读' ? 'readonly' : asked.button === '默认' ? 'default' : null;
-        if (mode === null) throw new E2kError('internal', '登录的答复对不上');   // 不放行
-        // 写盘失败时 update 抛 needs-human，原样往上走；答复还留着，重试会再写一次。
-        store.update((r) => { r.hostModes[host] = mode; return r; });
-        approvals.forget(key);
-        break;
-      }
+    // 写盘失败时 update 抛 needs-human，原样往上走；答复还留着，重试会再写一次。
+    const record = (mode: HostMode): void => {
+      store.update((r) => { r.hostModes[host] = mode; return r; });
+    };
+    const key = `login:${host}`;
+    const first: DialogRequest = {
+      title: 'e2k：在新域名上登录',
+      lines: [`要在 ${host} 上打开登录窗口。`, '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '更严…：下一步在「只读」和「不允许」里选', '不登录：不打开'],
+      buttons: ['不登录', '默认', '更严…'], defaultButton: '不登录', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
+    const asked = approvals.ask(key, 'login', first, ['默认', '更严…']);
+    if (asked.status === 'pending') throw pendingError(asked.id, '在新域名上登录，选模式');
+    if (asked.status !== 'approved') return refused(asked);
+    if (asked.button === '默认') {
+      record('default');
+      approvals.forget(key);
+      return;
     }
+    if (asked.button !== '更严…') throw new E2kError('internal', '登录的答复对不上');   // 不放行
+    const strictKey = `login-strict:${host}`;
+    const second: DialogRequest = {
+      title: 'e2k：在新域名上登录（更严的模式）',
+      lines: [`要在 ${host} 上打开登录窗口。`, '只读：写请求会被拦下', '不允许：以后每次打开这个域名（open、login、借用）都要人点框批准；这次登录窗口里按只读拦写', '不登录：不打开'],
+      buttons: ['不登录', '只读', '不允许'], defaultButton: '不登录', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
+    const strict = approvals.ask(strictKey, 'login', second, ['只读', '不允许']);
+    if (strict.status === 'pending') throw pendingError(strict.id, '在新域名上登录，选更严的模式');
+    if (strict.status !== 'approved') return refused(strict);
+    if (strict.button !== '只读' && strict.button !== '不允许') throw new E2kError('internal', '登录的答复对不上');   // 不放行
+    record(strict.button === '只读' ? 'readonly' : 'deny');
+    approvals.forget(strictKey);
+    approvals.forget(key);
   }
 
   // 在不允许的域名上登录（设计 5.4、R5）：agent 也能发 login.begin，所以每次都要人点框（不记住，批准后 5 分钟没用掉作废，R20）。

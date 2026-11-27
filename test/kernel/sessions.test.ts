@@ -25,7 +25,7 @@ import { Approvals, noDialog } from '../../src/kernel/approval.ts';
 import type { Dialog, DialogRequest, DialogResult } from '../../src/kernel/approval.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
-import { answeringDeny, approving, choosingMode, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { answeringDeny, approving, choosingMode, choosingModeOnly, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 import { approveRulesFile } from '../support/approve-rules.ts';
 import { noFocus } from '../../src/kernel/focus.ts';
 import type { FocusKeeper } from '../../src/kernel/focus.ts';
@@ -3268,23 +3268,110 @@ function setupChoice(script: (r: DialogRequest) => DialogResult | Promise<Dialog
   return { dialog, ...setupGate(dialog, null, undefined, true) };
 }
 
-test('login on a host nobody listed: 21, one three-button box that shows the host and the options, and no page is opened', async () => {
+// 两步框：每一步答完都要重试一次（21 → 人点 → 重试）。steps 是要过几步；之后的 loginBegin 由调用方发。
+async function answerSteps(sm: SessionManager, url: string, steps: number): Promise<void> {
+  for (let i = 0; i < steps; i++) {
+    await assert.rejects(sm.loginBegin({ url }), isCode('wait-approval'));
+    await settleDialog();
+  }
+}
+const STRICT_TITLE = 'e2k：在新域名上登录（更严的模式）';
+const strictBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter((r) => r.title.startsWith(STRICT_TITLE));
+
+test('login on a host nobody listed: 21, one three-button box (step one) that shows the host and the options, and no page is opened', async () => {
   const { sm, fake, dialog, store } = setupChoice(() => new Promise<DialogResult>(() => {}));   // 人一直没点
   await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
-  await assert.rejects(sm.loginBegin({ url: NEW_URL }), (e: E2kError) => e.code === 'wait-approval' && /等人在弹框里批准：在新域名上登录/.test(e.message));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), (e: E2kError) => e.code === 'wait-approval' && /等人在弹框里批准：在新域名上登录，选模式/.test(e.message));
   assert.equal(dialog.requests.length, 1, 'the retry meets the same box');
   const req = dialog.requests[0]!;
   assert.match(req.title, /^e2k：在新域名上登录（请求 a-[0-9a-f]{6}）$/);
-  assert.deepEqual(req.lines, ['要在 app.example.com 上打开登录窗口。', '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '不登录：不打开']);
-  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['不登录', '默认', '只读'], '不登录', 120]);
+  assert.deepEqual(req.lines, ['要在 app.example.com 上打开登录窗口。', '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '更严…：下一步在「只读」和「不允许」里选', '不登录：不打开']);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['不登录', '默认', '更严…'], '不登录', 120]);
+  assert.equal(openedPages(fake), 0);
+  assert.deepEqual(store.get().hostModes, {});
+});
+
+test('login answered "更严…": nothing is written, the retry gets 21 again with the second box (own title, key and buttons), and the first answer is kept', async () => {
+  const { sm, fake, dialog, store } = setupChoice((r) => (r.title.startsWith(STRICT_TITLE) ? new Promise<DialogResult>(() => {}) : { kind: 'button', button: '更严…' }));
+  await answerSteps(sm, NEW_URL, 1);
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), (e: E2kError) => e.code === 'wait-approval' && /等人在弹框里批准：在新域名上登录，选更严的模式/.test(e.message));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  assert.equal(dialog.requests.length, 2, 'one box per step, the retry meets the same second box');
+  const req = dialog.requests[1]!;
+  assert.match(req.title, /^e2k：在新域名上登录（更严的模式）（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual(req.lines, ['要在 app.example.com 上打开登录窗口。', '只读：写请求会被拦下', '不允许：以后每次打开这个域名（open、login、借用）都要人点框批准；这次登录窗口里按只读拦写', '不登录：不打开']);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['不登录', '只读', '不允许'], '不登录', 120]);
+  assert.deepEqual(store.get().hostModes, {});
+  const approvals = approvalsOf(sm);
+  assert.equal(approvals.stateOf('login:app.example.com'), 'approved', 'the first answer stays until both steps are done');
+  assert.equal(approvals.stateOf('login-strict:app.example.com'), 'showing');
+  assert.equal(openedPages(fake), 0);
+});
+
+test('login answered "只读" in step two: stored as readonly, both keys are forgotten, and the window opens', async () => {
+  const { sm, fake, dialog, store } = setupChoice(choosingMode('只读'));
+  await answerSteps(sm, NEW_URL, 2);
+  const { loginId } = await sm.loginBegin({ url: NEW_URL });
+  assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly' });
+  const approvals = approvalsOf(sm);
+  assert.deepEqual([approvals.stateOf('login:app.example.com'), approvals.stateOf('login-strict:app.example.com')], [undefined, undefined]);
+  assert.equal(openedPages(fake), 1);
+  await sm.loginEnd({ loginId });
+  assert.equal(dialog.requests.length, 2);
+});
+
+test('login answered "不允许" in step two: stored as deny, both keys forgotten; this login is the approval (no deny-login box), its window treats the host as read-only', async () => {
+  const { sm, fake, dialog, store } = setupChoice(choosingMode('不允许'));
+  await answerSteps(sm, NEW_URL, 2);
+  const { loginId } = await sm.loginBegin({ url: NEW_URL });
+  assert.deepEqual(store.get().hostModes, { 'app.example.com': 'deny' });
+  const approvals = approvalsOf(sm);
+  assert.deepEqual([approvals.stateOf('login:app.example.com'), approvals.stateOf('login-strict:app.example.com')], [undefined, undefined]);
+  const page = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId: page, method: 'POST', url: NEW_API, topUrl: NEW_URL })).action, 'fulfill', 'a write in the window is blocked as read-only');
+  assert.equal((await fake.emitRequest({ pageId: page, method: 'GET', url: NEW_URL, topUrl: NEW_URL })).action, 'continue');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+  assert.equal(dialog.requests.filter((r) => r.title.startsWith('e2k：在不允许的域名上登录')).length, 0, 'no extra box for this login');
+  assert.equal(dialog.requests.length, 2);
+});
+
+test('after choosing "不允许": the next login on that host asks the deny-login box, and an open of it asks the deny box', async () => {
+  const choose = choosingModeOnly('不允许');
+  const { sm, fake, dialog } = setupChoice((r) => (isLoginBox(r) ? choose(r) : answeringDeny('登录')(r)));   // deny 类的框：只看它们被问了
+  await answerSteps(sm, NEW_URL, 2);
+  await sm.loginEnd(await sm.loginBegin({ url: NEW_URL }));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.filter((r) => r.title.startsWith('e2k：在不允许的域名上登录')).length, 1);
+  await assert.rejects(sm.open({ url: 'http://app.example.com/' }), (e: E2kError) => e.code === 'wait-approval' && /打开不允许的域名/.test(e.message));
+  await settleDialog();
+  assert.equal(dialog.requests.filter((r) => r.title.startsWith('e2k：打开不允许的域名')).length, 1);
+  assert.equal(fake.openPages().length, 0);
+});
+
+test('step two answered "不登录": usage like a refusal in step one, nothing stored, no window; the same host stays refused after the retry (no new box); the first answer is kept', async () => {
+  const two = setupChoice((r) => ({ kind: 'button', button: r.title.startsWith(STRICT_TITLE) ? '不登录' : '更严…' }));
+  await answerSteps(two.sm, NEW_URL, 2);
+  for (let i = 0; i < 2; i++) await assert.rejects(two.sm.loginBegin({ url: NEW_URL }), usageMatch(/人取消了这次登录/));
+  assert.equal(openedPages(two.fake), 0);
+  assert.deepEqual(two.store.get().hostModes, {});
+  assert.equal(two.dialog.requests.length, 2);
+  assert.equal(strictBoxes(two.dialog).length, 1);
+  assert.equal(approvalsOf(two.sm).stateOf('login:app.example.com'), 'approved');
+  await assert.rejects(two.sm.loginBegin({ url: 'http://other.example.org/login' }), usageMatch(/刚被人拒过/));   // 同类冷却
+});
+
+test('step two with no way to show the box is needs-human (22) with the same text as step one', async () => {
+  const { sm, fake, store } = setupChoice((r) => (r.title.startsWith(STRICT_TITLE) ? { kind: 'unavailable', why: '测试里弹不出' } : { kind: 'button', button: '更严…' }));
+  await answerSteps(sm, NEW_URL, 2);
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), (e: E2kError) => e.code === 'needs-human' && /弹不出确认框：测试里弹不出/.test(e.message) && e.next === '在有桌面的终端里起内核');
   assert.equal(openedPages(fake), 0);
   assert.deepEqual(store.get().hostModes, {});
 });
 
 test('login answered "只读": the retry opens the window, the choice is stored, the login window\'s own POST is blocked, and later opens of that host are read-only', async () => {
   const { sm, fake, dialog, store } = setupChoice(choosingMode('只读'));
-  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
-  await settleDialog();
+  await answerSteps(sm, NEW_URL, 2);
   const { loginId } = await sm.loginBegin({ url: NEW_URL });
   const loginPage = fake.openPages().at(-1)!;
   assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly' });
@@ -3296,7 +3383,7 @@ test('login answered "只读": the retry opens the window, the choice is stored,
   const page = fake.openPages().at(-1)!;
   assert.equal((await fake.emitRequest({ pageId: page, method: 'POST', url: NEW_API, topUrl: 'http://app.example.com/' })).action, 'fulfill');
   assert.equal(readResult((await sm.close({ session: o.session })).runDir).modes[0]?.reason, 'host-choice');
-  assert.equal(loginBoxes(dialog).length, 1, 'asked once');
+  assert.equal(loginBoxes(dialog).length, 2, 'asked once: the two steps');
 });
 
 test('login answered "默认": the window opens, the choice is stored, writes pass as before, and the host is not asked about again', async () => {
@@ -3356,26 +3443,27 @@ test('a login on an unlisted host with no dialog available is needs-human (22): 
 
 test('the answer is bound to the host: answering for one host does not let another one in, and each box shows only its own host', async () => {
   const asked: string[] = [];
-  const { sm, dialog, store } = setupChoice((r) => { asked.push(r.lines[0]!); return { kind: 'button', button: r.lines[0]!.includes('a.example.com') ? '只读' : '默认' }; });
-  await assert.rejects(sm.loginBegin({ url: 'http://a.example.com/login' }), isCode('wait-approval'));
-  await settleDialog();
-  await assert.rejects(sm.loginBegin({ url: 'http://b.example.com/login' }), isCode('wait-approval'));   // a 的答复不算 b 的
-  await settleDialog();
+  const { sm, dialog, store } = setupChoice((r) => {
+    asked.push(r.lines[0]!);
+    const strict = r.title.startsWith(STRICT_TITLE);
+    return { kind: 'button', button: r.lines[0]!.includes('a.example.com') ? (strict ? '只读' : '更严…') : '默认' };
+  });
+  await answerSteps(sm, 'http://a.example.com/login', 2);
+  await answerSteps(sm, 'http://b.example.com/login', 1);   // a 的答复不算 b 的
   await sm.loginEnd(await sm.loginBegin({ url: 'http://a.example.com/login' }));
   await sm.loginEnd(await sm.loginBegin({ url: 'http://b.example.com/login' }));
-  assert.deepEqual(asked, ['要在 a.example.com 上打开登录窗口。', '要在 b.example.com 上打开登录窗口。']);
+  assert.deepEqual(asked, ['要在 a.example.com 上打开登录窗口。', '要在 a.example.com 上打开登录窗口。', '要在 b.example.com 上打开登录窗口。']);
   assert.deepEqual(store.get().hostModes, { 'a.example.com': 'readonly', 'b.example.com': 'default' });
-  assert.equal(dialog.requests.length, 2);
+  assert.equal(dialog.requests.length, 3);
 });
 
 test('the box and the stored key use the normalized host (lower case, no port, no trailing dot, IPv6 in brackets)', async () => {
   const { sm, dialog, store } = setupChoice(choosingMode('只读'));
   for (const url of ['http://App.Example.COM.:8080/login.html', 'http://[::1]:5173/login.html']) {
-    await assert.rejects(sm.loginBegin({ url }), isCode('wait-approval'));
-    await settleDialog();
+    await answerSteps(sm, url, 2);
     await sm.loginEnd(await sm.loginBegin({ url }));
   }
-  assert.deepEqual(dialog.requests.map((r) => r.lines[0]), ['要在 app.example.com 上打开登录窗口。', '要在 [::1] 上打开登录窗口。']);
+  assert.deepEqual(dialog.requests.map((r) => r.lines[0]), ['要在 app.example.com 上打开登录窗口。', '要在 app.example.com 上打开登录窗口。', '要在 [::1] 上打开登录窗口。', '要在 [::1] 上打开登录窗口。']);
   assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly', '[::1]': 'readonly' });
   assert.equal((await sm.open({ url: 'http://app.example.com/' })).mode, 'readonly');
   assert.equal((await sm.open({ url: 'http://[::1]:5173/' })).mode, 'readonly');
@@ -3394,15 +3482,14 @@ test('a login that cannot be recorded (the approval file does not take it) is ne
   const { sm, dialog, store } = setupChoice(choosingMode('只读'));
   const update = store.update.bind(store);
   store.update = () => { throw new E2kError('needs-human', '批准记录写不进磁盘'); };
-  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
-  await settleDialog();
+  await answerSteps(sm, NEW_URL, 2);
   await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('needs-human'));
   await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('needs-human'));
   assert.deepEqual(store.get().hostModes, {});
   store.update = update;
   await sm.loginEnd(await sm.loginBegin({ url: NEW_URL }));
   assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly' });
-  assert.equal(dialog.requests.length, 1);
+  assert.equal(dialog.requests.length, 2, 'one box per step, none for the retries');
 });
 
 test('changed rules come first: the rules box is answered before the login box, and both are needed', async () => {
@@ -3433,10 +3520,9 @@ test('an answer that was never used is dropped once the host is listed, so a lat
 });
 
 test('the stored host choice reaches all four request paths: session page, session popup, login window, unattributed request (the mode follows the page, as with rules)', async () => {
-  const { sm, fake } = setupChoice((r) => ({ kind: 'button', button: r.lines[0]!.includes('app.example.com') ? '只读' : '默认' }));
+  const { sm, fake } = setupChoice((r) => ({ kind: 'button', button: r.lines[0]!.includes('app.example.com') ? (r.title.startsWith(STRICT_TITLE) ? '只读' : '更严…') : '默认' }));
   const login = async (url: string): Promise<{ loginId: string }> => {
-    await assert.rejects(sm.loginBegin({ url }), isCode('wait-approval'));
-    await settleDialog();
+    await answerSteps(sm, url, url.includes('app.example.com') ? 2 : 1);
     return sm.loginBegin({ url });
   };
   await sm.loginEnd(await login(NEW_URL));   // app.example.com 选了「只读」

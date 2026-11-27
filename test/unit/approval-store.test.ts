@@ -96,6 +96,19 @@ test('store: an update that serialises past 2 MB throws needs-human and changes 
   } finally { t.done(); }
 });
 
+test('store: a "deny" host mode is written and read back (and a record with it reads fine)', () => {
+  const t = dir();
+  try {
+    const s = ApprovalStore.open(t.file, quiet);
+    s.update((r) => { r.hostModes['a.example.com'] = 'deny'; return r; });
+    assert.equal(s.hostModeFor('a.example.com'), 'deny');
+    const back = readApprovals(t.file);
+    assert.equal(back.status, 'ok');
+    assert.deepEqual(back.record.hostModes, { 'a.example.com': 'deny' });
+    assert.equal(ApprovalStore.open(t.file, quiet).hostModeFor('a.example.com'), 'deny');
+  } finally { t.done(); }
+});
+
 test('store: an update whose result has the wrong shape is refused before anything is written', () => {
   const t = dir();
   try {

@@ -9,7 +9,7 @@ import { E2kError } from '../shared/errors.ts';
 
 // 规范化后的放行声明；url 是规范化字符串（不带查询串）。
 export interface Declaration { method: string; url: string; operation: string | null }
-export type HostMode = 'default' | 'readonly';
+export type HostMode = 'default' | 'readonly' | 'deny';
 export interface ApprovalRecord {
   rules: { hash: string; text: string } | null;
   writes: Record<string, Declaration[]>;
@@ -67,7 +67,7 @@ function parseRecord(text: string): ApprovalRecord | null {
   }
   const hostModes: Record<string, HostMode> = {};
   for (const [k, m] of Object.entries(v.hostModes)) {
-    if (m !== 'default' && m !== 'readonly') return null;
+    if (m !== 'default' && m !== 'readonly' && m !== 'deny') return null;
     hostModes[k] = m;
   }
   return { rules, writes, hostModes };

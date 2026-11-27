@@ -1280,6 +1280,38 @@ test('login on an unlisted host and nobody answers: it retries every 2 seconds f
   });
 });
 
+test('login on an unlisted host picked "只读" in two steps: the prompt is printed once per request id and the 120 seconds start again for each id', async () => {
+  // 第一步马上答「更严…」，第二步一直没人点：第一个 id 等了 2 秒，换成第二个 id 后重新计满 120 秒，才退出 21。
+  const dialog = fakeDialog((r) => (r.title.startsWith('e2k：在新域名上登录（更严的模式）') ? new Promise<never>(() => {}) : { kind: 'button', button: '更严…' }));
+  await withChoiceKernel(dialog, async (h, f) => {
+    const t = io({ env: h.env, isTTY: true });
+    assert.equal(await main(['login', NEW_LOGIN], t), 21);
+    assert.equal(t.clockLog.slept.length, 61, 'one wait for the first request, then 60 for the second');
+    assert.equal(t.clockLog.elapsed(), 122_000);
+    const ids = t.outText().match(PROMPT_RE) ?? [];
+    assert.equal(ids.length, 2, t.outText());
+    assert.notEqual(ids[0], ids[1]);
+    assert.match(t.outText(), /^对话框超时，请重新运行 login$/m);
+    assert.equal(dialog.requests.length, 2);
+    assert.equal(f.calls.filter((c) => c.method === 'openPage').length, 0);
+  });
+});
+
+test('login on an unlisted host picked "不允许" in two steps: the window opens, rule list shows the stored deny, and --json says mode deny', async () => {
+  const dialog = fakeDialog(choosingMode('不允许'));
+  await withChoiceKernel(dialog, async (h, f) => {
+    const t = io({ env: h.env, isTTY: true, stdinText: '\n' });
+    assert.equal(await main(['login', NEW_LOGIN], t), 0);
+    assert.equal((t.outText().match(PROMPT_RE) ?? []).length, 2, 'one prompt per step');
+    assert.equal(dialog.requests.length, 2);
+    assert.equal(f.openPages().length, 0, 'the login page was closed again');
+    const list = io({ env: h.env }); assert.equal(await main(['rule', 'list'], list), 0);
+    assert.match(list.outText(), /^登录时选的模式 {2}app\.example\.com {2}不允许$/m);
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    assert.deepEqual((JSON.parse(j.outText()) as { hostModes: unknown }).hostModes, [{ host: 'app.example.com', mode: 'deny' }]);
+  });
+});
+
 test('login on an unlisted host: cancel is exit 2 and a kernel without dialogs is exit 22, both on the first retry; neither opens a window', async () => {
   for (const [dialog, want, text] of [[fakeDialog(choosingMode('不登录')), 2, /人取消了这次登录/], [noDialog, 22, /弹不出确认框/]] as const) {
     await withChoiceKernel(dialog, async (h, f) => {
@@ -1300,7 +1332,7 @@ test('login picks the host mode once: the first login asks, the second one does 
     const again = io({ env: h.env, isTTY: true, stdinText: '\n' });
     assert.equal(await main(['login', NEW_LOGIN], again), 0);
     assert.deepEqual(again.clockLog.slept, [], 'no 21 the second time');
-    assert.equal(dialog.requests.length, 1);
+    assert.equal(dialog.requests.length, 2, 'one box per step, none the second time');
     const list = io({ env: h.env }); assert.equal(await main(['rule', 'list'], list), 0);
     assert.match(list.outText(), /^登录时选的模式 {2}app\.example\.com {2}只读$/m);
   });
