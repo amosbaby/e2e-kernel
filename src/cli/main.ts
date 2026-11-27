@@ -17,12 +17,13 @@ import type { CloseResult, Method, OpenResult, StepResult } from '../shared/prot
 import { redactText, safely } from '../shared/redact.ts';
 import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
+import { saveCase } from './commands.ts';
 import { runDoctor } from './doctor.ts';
-import { formatChecks, formatClose, formatError, formatOpen, formatRuleDiff, formatRuleList, formatStatus, formatStep } from './format.ts';
-import type { RuleDiffResult, RuleListResult } from './format.ts';
+import { formatChecks, formatClose, formatError, formatOpen, formatRuleDiff, formatRuleList, formatSaveCase, formatStatus, formatStep } from './format.ts';
+import type { RuleDiffResult, RuleListResult, SaveCaseResult } from './format.ts';
 
 // e2k 命令行（设计 5.9）。只做校验和转发：参数先用和内核同一套 validateParams 校验，再经 socket 发给内核。
-// 这一版没有 run、save-case，rule 只有只读的 list 和 diff，也没有任何批准类的命令。
+// 这一版没有 run，rule 只有只读的 list 和 diff，也没有任何批准类的命令。
 // 报错不回显调用方给的值：参数解析、JSON 解析的原始错误消息都不打印。
 
 export interface Io {
@@ -72,6 +73,9 @@ function helpText(selfCmd: string): string {
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
     '               [--findings <JSON>] [--not-done <JSON>] [--superseded <JSON>] [--json]',
     '                                          --findings 每条可带 "verdict"；--superseded 如 [{"failed":3,"by":5}]：序号 3 的失败由之后的序号 5 取代',
+    '  save-case <会话> --out <文件> [--steps <JSON>] [--json]    从已 close 的会话记录导出可重放的用例（不需要内核）',
+    '                                          --out 必填、.json 结尾、文件已存在就拒绝（不覆盖）、不能放在状态目录里；--steps 如 [3,4,7]：只导出这些序号（可含 eval，写成跳过项），',
+    '                                          不给就留成功的动作和执行了的断言；不能重放的步骤（eval、没有稳定选择器的引用、含脱敏内容）写成跳过项',
     '  login <url> [--profile <组>[/<槽>]]    在专用 profile 里登录（要在终端里由人按回车确认）；--profile 同 open',
     '  --version',
     '  help',
@@ -361,6 +365,20 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   return ExitCode.OK;
 }
 
+async function saveCaseCmd(ctx: Ctx, args: string[]): Promise<number> {
+  const p = parse(ctx, args, { ...JSON_OPTION, out: { type: 'string' }, steps: { type: 'string' } });
+  const [session] = positionals(ctx, p, 1, '<会话>');
+  const out = optString(p, 'out');
+  if (out === undefined) throw usage('缺少 --out <文件>');
+  const steps = optString(p, 'steps');
+  const outcome = saveCase(resolveHome(ctx.io.env), {
+    session, out, ...(steps === undefined ? {} : { steps: parseJson(steps, '--steps 必须是 JSON 数组，如 [3,4,7]') as number[] }),
+  });
+  if ('error' in outcome) throw new E2kError(outcome.error.code, outcome.error.message, outcome.error.next);
+  print(ctx, outcome.result as SaveCaseResult, formatSaveCase);
+  return outcome.exit;
+}
+
 async function run(ctx: Ctx, argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   switch (command) {
@@ -377,6 +395,7 @@ async function run(ctx: Ctx, argv: string[]): Promise<number> {
     case 'step': return step(ctx, rest);
     case 'close': return close(ctx, rest);
     case 'login': return login(ctx, rest);
+    case 'save-case': return saveCaseCmd(ctx, rest);
     default:
       // 不回显命令名：它可能是调用方误贴的任何东西。
       throw usage(command === undefined ? '缺少命令' : '没有这个命令', `${ctx.io.selfCmd} help 查看可用命令`);

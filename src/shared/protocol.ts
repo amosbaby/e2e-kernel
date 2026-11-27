@@ -108,12 +108,12 @@ export interface CloseResult {
 export const METHODS: readonly Method[] = ['status', 'open', 'step', 'close', 'login.begin', 'login.end'];
 const VERDICT_VALUES: readonly VerdictValue[] = ['pass', 'fail', 'exists', 'absent', 'undetermined'];
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/;
-const SESSION_ID = /^s-[0-9a-f]{6}$/;
-const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
+export const SESSION_ID = /^s-[0-9a-f]{6}$/;
+export const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const LOGIN_ID = /^l-[0-9a-f]{6}$/;
 const MAX_LIST = 20;
 const MAX_SUPERSEDED = 50;
-const MAX_ALLOW = 12;
+export const MAX_ALLOW = 12;
 const ALLOW_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'] as const;
 const MAX_PROFILE_ARG = 65;   // 组 32 + "/" + 槽 32
 
@@ -179,7 +179,7 @@ function supersede(v: unknown, name: string): Supersede {
   return { failed, by };
 }
 
-function allowItem(v: unknown, name: string): AllowItem {
+export function allowItem(v: unknown, name: string): AllowItem {
   const o = plainObject(v, name, ['method', 'url', 'operation']);
   const out: AllowItem = { method: oneOf(o.method, `${name}.method`, ALLOW_METHODS), url: str(o.url, `${name}.url`, { min: 1, max: 2048 }) };
   if (o.operation !== undefined) out.operation = str(o.operation, `${name}.operation`, { min: 1, max: 100 });

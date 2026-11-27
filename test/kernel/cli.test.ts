@@ -1,7 +1,7 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -135,7 +135,7 @@ test('kernel not running: exit 22 and the command that starts the kernel', async
 test('--version and help', async () => {
   const v = io(); assert.equal(await main(['--version'], v), 0); assert.equal(v.outText(), '0.1.0');
   const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url>/); assert.match(h.outText(), /step .*--keep-going/); assert.match(h.outText(), /--allow/);
-  assert.ok(!/approve|save-case/.test(h.outText()));
+  assert.ok(!/approve/.test(h.outText()));
   assert.match(h.outText(), /退出码：.*10 .*11 .*20 .*22/);   // 退出码一行要列到 20 和 22
   assert.equal(await main([], io()), 2);
 });
@@ -392,8 +392,9 @@ test('formatClose prints a fixed text for a reason it does not know, never the r
   assert.ok(!formatClose({ ...base }).includes('原因'));
 });
 
-test('this build has no approve, rule, run or save-case command', async () => {
-  for (const c of ['approve', 'rule', 'run', 'save-case']) assert.equal(await main([c], io()), 2, c);
+test('this build has no approve, rule or run command, and save-case without arguments is a usage error', async () => {
+  for (const c of ['approve', 'rule', 'run']) assert.equal(await main([c], io()), 2, c);
+  assert.equal(await main(['save-case'], io()), 2);
 });
 
 test('start without a terminal runs until the stop signal', async () => {
@@ -1377,4 +1378,173 @@ test('open --allow with bad JSON, a wrong shape, or a missing value is a usage e
     assert.ok(!all.includes(secret) && t.errText().length > 0, bad);
   }
   assert.equal(await main(['open', 'http://localhost:5173/', '--allow'], io()), 2);   // 缺值
+});
+
+// ---- save-case：在客户端读已脱敏的 result.json 导出用例，不需要内核 ----
+
+describe('save-case', () => {
+  const sc = makeTmpHome();
+  after(() => { sc.cleanup(); });
+  const scEnv = sc.env;
+  const outDir = realpathSync(mkdtempSync(join(tmpdir(), 'e2k-out-')));
+  after(() => { rmSync(outDir, { recursive: true, force: true }); });
+
+  function resultFor(session: string, over: Record<string, unknown> = {}): Record<string, unknown> {
+    const act = (seq: number, op: Record<string, unknown>, outcome: string): Record<string, unknown> => ({ seq, at: '2026-01-01T00:00:00.000Z', ms: 3, op, outcome });
+    return {
+      schema: 1, kernelVersion: '0.1.0', session, name: 'demo',
+      start: { url: 'http://localhost:5173/', viewport: null, touch: false, profile: 'default', borrowed: false, deny: null, borrowDeny: null, readonly: false },
+      actions: [act(1, { op: 'snapshot' }, 'ok'), act(2, { op: 'click', target: '#go' }, 'ok'), act(3, { op: 'eval', js: '1' }, 'ok')],
+      writes: { allowed: [], blocked: [], unattributed: [] }, declarations: [], findings: [],
+      ...over,
+    };
+  }
+
+  // 在状态目录里放一份记录：result 是 null 时只建目录，不写 result.json（会话还没 close）。
+  function putRun(session: string, stamp: string, result: Record<string, unknown> | null): string {
+    const dir = join(sc.home.runsDir, `${stamp}-${session}`);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (result !== null) writeFileSync(join(dir, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
+    return dir;
+  }
+
+  let n = 0;
+  const outPath = (): string => join(outDir, `case-${++n}.json`);
+  const jsonOf = (t: TestIo): Record<string, unknown> => JSON.parse(t.outText()) as Record<string, unknown>;
+
+  test('save-case writes the case file 0600 and refuses to overwrite', async () => {
+    putRun('s-a00001', '20260101-000000', resultFor('s-a00001'));
+    const out = outPath();
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00001', '--out', out, '--json'], t), 0, t.errText());
+    assert.deepEqual(jsonOf(t), { path: out, steps: 1, skipped: 0, containsWrites: false });
+    assert.equal(statSync(out).mode & 0o777, 0o600);
+    const written = readFileSync(out, 'utf8');
+    assert.ok(written.endsWith('}\n') && written.includes('\n  "e2kCase": 1'), 'two-space indent');
+    const c = JSON.parse(written) as { steps: { seq: number }[]; name: string };
+    assert.deepEqual(c.steps.map((s) => s.seq), [2]);
+    assert.equal(c.name, 'demo');
+    // 文件已存在：拒绝，原文件不变
+    const again = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00001', '--out', out], again), 2);
+    assert.equal(readFileSync(out, 'utf8'), written);
+    // 人读的输出
+    const human = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00001', '--out', outPath()], human), 0);
+    assert.match(human.outText(), /共 1 步，其中 0 步不能重放/);
+  });
+
+  test('save-case --steps picks exactly those steps, and a missing sequence number is a usage error', async () => {
+    putRun('s-a00002', '20260101-000000', resultFor('s-a00002'));
+    const out = outPath();
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00002', '--out', out, '--steps', '[1,3]', '--json'], t), 0, t.errText());
+    assert.deepEqual(jsonOf(t), { path: out, steps: 2, skipped: 1, containsWrites: false });
+    const bad = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00002', '--out', outPath(), '--steps', '[9]'], bad), 2);
+    for (const steps of ['not json', '{"a":1}', '[1,"2"]']) assert.equal(await main(['save-case', 's-a00002', '--out', outPath(), '--steps', steps], io({ env: scEnv })), 2, steps);
+  });
+
+  test('save-case before close is a usage error', async () => {
+    putRun('s-a00003', '20260101-000000', null);
+    const out = outPath();
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00003', '--out', out], t), 2);
+    assert.match(t.errText(), /close/);
+    assert.ok(!existsSync(out));
+    const none = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00004', '--out', out], none), 2);
+    assert.match(none.errText(), /没有这个会话的记录/);
+    assert.equal(await main(['save-case', 'nope', '--out', out], io({ env: scEnv })), 2);
+  });
+
+  test('save-case --out without .json is a usage error', async () => {
+    putRun('s-a00005', '20260101-000000', resultFor('s-a00005'));
+    for (const bad of [join(outDir, 'case'), join(outDir, 'case.txt'), join(outDir, 'case.json.bak'), '']) {
+      assert.equal(await main(['save-case', 's-a00005', '--out', bad], io({ env: scEnv })), 2, bad);
+    }
+    assert.equal(await main(['save-case', 's-a00005'], io({ env: scEnv })), 2, 'no --out');
+    assert.equal(await main(['save-case', '--out', outPath()], io({ env: scEnv })), 2, 'no session');
+    assert.equal(await main(['save-case', 's-a00005', '--out', join(outDir, 'nodir', 'x.json')], io({ env: scEnv })), 2, 'missing parent directory');
+    assert.deepEqual(readdirSync(outDir).filter((f) => !f.startsWith('case-')), []);
+  });
+
+  test('save-case --out through a symlink is refused', async () => {
+    putRun('s-a00006', '20260101-000000', resultFor('s-a00006'));
+    const target = join(outDir, 'link-target.json');
+    const link = join(outDir, 'link-out.json');
+    symlinkSync(target, link);
+    assert.equal(await main(['save-case', 's-a00006', '--out', link], io({ env: scEnv })), 2);
+    assert.ok(!existsSync(target), 'nothing written through the link');
+    // 父目录是符号链接、指向别处：写到真实目录里，这是允许的；指向状态目录才拒绝（下一条）
+    const realSub = join(outDir, 'real-sub');
+    mkdirSync(realSub);
+    const subLink = join(outDir, 'sub-link');
+    symlinkSync(realSub, subLink);
+    assert.equal(await main(['save-case', 's-a00006', '--out', join(subLink, 'c.json')], io({ env: scEnv })), 0);
+    assert.ok(existsSync(join(realSub, 'c.json')));
+  });
+
+  test('save-case --out inside the state directory is refused, also through a symlinked parent', async () => {
+    putRun('s-a00007', '20260101-000000', resultFor('s-a00007'));
+    mkdirSync(join(sc.home.root, 'sub'), { recursive: true });
+    const viaLink = join(outDir, 'to-home');
+    symlinkSync(sc.home.root, viaLink);
+    for (const bad of [join(sc.home.root, 'case.json'), join(sc.home.runsDir, 'case.json'), join(sc.home.root, 'sub', 'case.json'), join(viaLink, 'case.json'), join(viaLink, 'sub', 'case.json')]) {
+      const t = io({ env: scEnv });
+      assert.equal(await main(['save-case', 's-a00007', '--out', bad], t), 2, bad);
+      assert.match(t.errText(), /状态目录/);
+      assert.ok(!existsSync(bad), bad);
+    }
+  });
+
+  test('save-case picks the newest run directory of a reused session id, and says close first when that one has no result.json', async () => {
+    putRun('s-a00008', '20260101-000000', resultFor('s-a00008', { name: 'old-run' }));
+    putRun('s-a00008', '20260202-000000', resultFor('s-a00008', { name: 'new-run' }));
+    const out = outPath();
+    assert.equal(await main(['save-case', 's-a00008', '--out', out], io({ env: scEnv })), 0);
+    assert.equal((JSON.parse(readFileSync(out, 'utf8')) as { name: string }).name, 'new-run');
+    putRun('s-a00008', '20260303-000000', null);   // 更新的一次会话还没 close
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00008', '--out', outPath()], t), 2);
+    assert.match(t.errText(), /close/);
+  });
+
+  test('save-case refuses a record whose session id does not match, a result.json that is a symlink, and one that is not JSON', async () => {
+    putRun('s-a00009', '20260101-000000', resultFor('s-a0000f'));
+    assert.equal(await main(['save-case', 's-a00009', '--out', outPath()], io({ env: scEnv })), 2);
+    const dir = putRun('s-a0000a', '20260101-000000', null);
+    const real = join(outDir, 'real-result.json');
+    writeFileSync(real, JSON.stringify(resultFor('s-a0000a')));
+    symlinkSync(real, join(dir, 'result.json'));
+    assert.equal(await main(['save-case', 's-a0000a', '--out', outPath()], io({ env: scEnv })), 2);
+    const dir2 = putRun('s-a0000b', '20260101-000000', null);
+    writeFileSync(join(dir2, 'result.json'), `{ "${secret}": `);
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a0000b', '--out', outPath()], t), 2);
+    assert.ok(!t.errText().includes(secret));
+  });
+
+  test('save-case reports a refusal to export (declarations without seq) as usage, and reports containsWrites', async () => {
+    putRun('s-a0000c', '20260101-000000', resultFor('s-a0000c', { declarations: [{ method: 'POST', url: 'http://localhost:5173/a', operation: null, approved: 'dialog' }] }));
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a0000c', '--out', outPath()], t), 2);
+    assert.match(t.errText(), /旧版内核/);
+    putRun('s-a0000d', '20260101-000000', resultFor('s-a0000d', { declarations: [{ method: 'POST', url: 'http://localhost:5173/a', operation: null, approved: 'dialog', seq: 2 }] }));
+    const ok = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a0000d', '--out', outPath(), '--json'], ok), 0, ok.errText());
+    assert.equal(jsonOf(ok).containsWrites, true);
+    const human = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a0000d', '--out', outPath()], human), 0);
+    assert.match(human.outText(), /写/);
+  });
+
+  test('save-case --help text lists the command, and save-case with --json prints one error object on failure', async () => {
+    const h = io(); assert.equal(await main(['help'], h), 0);
+    assert.match(h.outText(), /save-case <会话> --out <文件> \[--steps <JSON>\]/);
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-ffffff', '--out', outPath(), '--json'], t), 2);
+    const e = jsonOf(t).error as { code: string; message: string };
+    assert.equal(e.code, 'usage');
+  });
 });

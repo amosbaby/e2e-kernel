@@ -121,6 +121,14 @@ export function formatClose(r: CloseResult): string {
   return out.join('\n');
 }
 
+export interface SaveCaseResult { path: string; steps: number; skipped: number; containsWrites: boolean }
+
+export function formatSaveCase(r: SaveCaseResult): string {
+  const out = [`已导出用例 ${inline(r.path)}`, `共 ${r.steps} 步，其中 ${r.skipped} 步不能重放，写成了跳过项`];
+  if (r.containsWrites) out.push('注意：原会话放行过写请求或提过放行声明；重放时写仍受只读规则管，放行声明要重新由人批准');
+  return out.join('\n');
+}
+
 // doctor 和 status 共用的措辞；枚举值只出现在 --json 里。
 export const PROFILE_STATE_TEXT: Record<ProfileInfo['state'], string> = { missing: '目录还不存在', 'never-launched': '没启动过', launched: '用过' };
 
