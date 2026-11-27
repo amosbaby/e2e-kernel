@@ -111,6 +111,24 @@ test('unattributed requests are only blocked when some session is read-only, and
   assert.deepEqual(policy.decideUnattributed(req({ method: 'purge' }), { anyReadonly: true, logout: [] }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
 });
 
+test('unattributed requests get the same read-only check as session requests: a safe method with a mutation-like URL or with a body is blocked', () => {
+  const un = (r: RequestInfo) => policy.decideUnattributed(r, { anyReadonly: true, logout: [] });
+  const mutationUrl = 'https://api.example.com/graphql?query=mutation%7BdeleteAll%7D';
+  assert.deepEqual(un(req({ method: 'GET', url: mutationUrl })), { decision: BLOCK_JSON, reason: 'graphql-mutation', allowedBy: null });
+  assert.deepEqual(un(req({ method: 'HEAD', url: mutationUrl })), { decision: BLOCK_JSON, reason: 'graphql-mutation', allowedBy: null });
+  // 同一个请求在会话路径上也是这个原因：两条路径口径一致
+  assert.equal(ro(req({ method: 'GET', url: mutationUrl })).reason, 'graphql-mutation');
+  assert.deepEqual(un(req({ method: 'OPTIONS', url: 'http://localhost/api', contentType: JSON_CT, body: '{"a":1}' })), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
+  assert.deepEqual(un(req({ method: 'GET', url: 'http://localhost/api', contentType: JSON_CT, body: '{"query":"query{a}"}' })), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
+  // 导航也回 JSON（不给未归属的页面画 403 页）
+  assert.deepEqual(un(req({ method: 'GET', url: mutationUrl, isNavigation: true, topFrame: true })), { decision: BLOCK_JSON, reason: 'graphql-mutation', allowedBy: null });
+  // 普通 GET/HEAD/OPTIONS、带普通查询串的 GET 仍放行；没有只读会话时什么都不拦
+  for (const r of [req({ method: 'GET' }), req({ method: 'HEAD' }), req({ method: 'OPTIONS' }), req({ method: 'GET', url: 'http://localhost/api?page=2&q=hello' })]) {
+    assert.deepEqual(un(r), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  }
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET', url: mutationUrl }), { anyReadonly: false, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+});
+
 test('allowAllPolicy allows everything and is frozen', () => {
   assert.deepEqual(allowAllPolicy.decide(req({ method: 'POST' }), { ...DEFAULT_CTX, mode: 'readonly' }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   assert.deepEqual(allowAllPolicy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });

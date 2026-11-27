@@ -1118,6 +1118,16 @@ test('read-only by rule: writes from the session page get a 403, a strict GraphQ
   assert.deepEqual(blocked.map((w) => [w.id, w.decision, w.reason, w.mode]), [['w1', 'blocked', 'method', 'readonly']]);
 });
 
+test('an unattributed GET with a mutation-like URL (a popup before it is attributed) is blocked while a read-only session lives; a plain GET still passes', async () => {
+  const { sm, fake } = setupRo(); const r = await sm.open({ url: RO });
+  const hit = await fake.emitRequest({ id: 'u1', pageId: null, method: 'GET', url: 'https://api.example.org/graphql?query=mutation%7BdeleteAll%7D' });
+  assert.equal(hit.action, 'fulfill'); assert.equal((hit as { status: number }).status, 403);
+  assert.deepEqual(await fake.emitRequest({ id: 'u2', pageId: null, method: 'GET', url: 'https://api.example.org/items?page=2' }), { action: 'continue' });
+  const withBody = await fake.emitRequest({ id: 'u3', pageId: null, method: 'OPTIONS', url: 'https://api.example.org/items', body: '{"a":1}', contentType: 'application/json' });
+  assert.equal(withBody.action, 'fulfill');
+  await sm.close({ session: r.session });
+});
+
 test('open --readonly forces read-only on a host without rules, also after navigating to another default host', async () => {
   const { sm, fake } = setupRo(); const r = await sm.open({ url: 'http://localhost:5173/', readonly: true }); const pageId = fake.openPages().at(-1)!;
   assert.equal(r.mode, 'readonly');

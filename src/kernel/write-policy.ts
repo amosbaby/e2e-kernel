@@ -140,7 +140,12 @@ export const policy: WritePolicy = Object.freeze({
   decideUnattributed(req: RequestInfo, ctx: { anyReadonly: boolean; logout: readonly Endpoint[] }): PolicyVerdict {
     if (!ctx.anyReadonly) return PASS;
     if (logoutHit(ctx.logout, req)) return block(req, 'logout');
-    if (isSafeMethod(req.method)) return PASS;
+    // 与会话路径的只读判定同口径（decideReadonly ②③）：安全方法也要无体、URL 不像 mutation 才放行，否则弹窗里的 GET ?query=mutation{…} 会带着 cookie 写。
+    // 命中 mutation 样的 URL 记 graphql-mutation（与会话路径同一原因）；带体的安全方法记 unattributed。白名单里的写仍一概不放行。
+    if (isSafeMethod(req.method)) {
+      if (req.body !== null) return block({ ...req, isNavigation: false }, 'unattributed');
+      return isMutationLikeUrl(req.url) ? block({ ...req, isNavigation: false }, 'graphql-mutation') : PASS;
+    }
     return block({ ...req, isNavigation: false }, 'unattributed');
   },
 });
