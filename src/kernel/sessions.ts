@@ -55,9 +55,8 @@ interface Session {
   readonly startedAt: Date;
   readonly instance: Instance;               // 会话的页所在的实例
   readonly start: { url: string; viewport: Viewport | null; touch: boolean; profile: string; borrowed: boolean };   // profile 存 key（`组` 或 `组@槽`）
-  // profile 的组名（只存名字，不存 modes.group() 返回的缓存对象：规则刷新、被批准的改动都不会改写它），和是否借用了别的组的登录。
+  // profile 的组名（只存名字，不存 modes.group() 返回的缓存对象：规则刷新、被批准的改动都不会改写它）。
   readonly group: string;
-  readonly borrowed: boolean;
   // 跨组导航被拦的次数，和还没在 step 的 notices 里提示过的提示句（去重）。
   crossCount: number;
   readonly crossNotices: Set<string>;
@@ -85,12 +84,12 @@ interface Login {
   readonly instance: Instance;
   readonly profile: string;                  // 登录用的 profile（key）：人按回车结束时，登录记录记到它名下
   readonly group: string;                    // profile 的组名（只存名字）：loginHosts 按它查，跨组导航拦的也是它
-  readonly borrowed: boolean;                // 借用了别的组的登录
   readonly host: string;                     // 起始地址的主机（URL.hostname），人按回车结束时记进登录记录
   readonly mode: Mode;                       // resolve(起始主机)：起点只读，登录里的写就都按只读
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
   readonly places: Map<string, LoginPlace>;  // 每个登录页现在在哪个主机上（照会话的 topHost / pendingHosts 那套）
-  blocked: number;                           // 登录期间被拦下的写（含放行后发现重定向被拒的）
+  blocked: number;                           // 登录期间被拦下的写（含放行后发现重定向被拒的），其中含跨组导航
+  crossBlocked: number;                      // 其中跨组导航被拦的次数（不是只读规则拦的）
   // 放行时带 followRedirects: false 的请求 id → 日志行，onRequestDone 发现重定向被拒时用它补记一条拦截。
   readonly requestIds: Map<string, string>;
 }
@@ -380,18 +379,18 @@ export class SessionManager {
     } catch {
       // 取不到主机：host 留空
     }
-    const { ref, borrowed } = this.pickProfile(host, arg);
+    const { ref } = this.pickProfile(host, arg);
     const profile = profileKey(ref);
     const slot = this.pin(profile);
     try {
-      return await this.loginOn(await this.acquireInstance(profile, slot), p, { profile, group: ref.group, borrowed });
+      return await this.loginOn(await this.acquireInstance(profile, slot), p, { profile, group: ref.group });
     } finally {
       this.unpin(slot);
     }
   }
 
-  private async loginOn(instance: Instance, p: LoginBeginParams, o: { profile: string; group: string; borrowed: boolean }): Promise<{ loginId: string }> {
-    const { profile, group, borrowed } = o;
+  private async loginOn(instance: Instance, p: LoginBeginParams, o: { profile: string; group: string }): Promise<{ loginId: string }> {
+    const { profile, group } = o;
     if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;
     while (this.logins.has(id)) id = `l-${randomHex()}`;
@@ -407,7 +406,7 @@ export class SessionManager {
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, profile, group, borrowed, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, requestIds: new Map() };
+      login = { id, instance, profile, group, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, crossBlocked: 0, requestIds: new Map() };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -422,7 +421,8 @@ export class SessionManager {
   }
 
   // 关掉登录页和它弹出的窗口；登录态留在 user data 目录里。
-  async loginEnd(p: { loginId: string }): Promise<{ writesBlocked: number }> {
+  // writesBlocked 含跨组导航；crossGroupBlocked（只在有跨组拦截时才有）是其中跨组的次数。
+  async loginEnd(p: { loginId: string }): Promise<{ writesBlocked: number; crossGroupBlocked?: number }> {
     if (this.stopping) throw stopping();
     const login = this.logins.get(p.loginId);
     if (login === undefined) throw new E2kError('not-found', '没有这个登录');
@@ -433,7 +433,7 @@ export class SessionManager {
     } catch (e) {
       this.logFailure(null, `写登录记录`, e);
     }
-    return { writesBlocked: login.blocked };
+    return { writesBlocked: login.blocked, ...(login.crossBlocked > 0 ? { crossGroupBlocked: login.crossBlocked } : {}) };
   }
 
   // 任一实例在跑就是 running。
@@ -629,7 +629,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
-        group: o.group, borrowed: o.borrowed, crossCount: 0, crossNotices: new Set(),
+        group: o.group, crossCount: 0, crossNotices: new Set(),
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
@@ -871,6 +871,7 @@ export class SessionManager {
       const cross = this.crossGroup(req, login.group);
       if (cross !== null) {
         login.blocked++;
+        login.crossBlocked++;
         this.logLine(`登录 ${login.id}：拦下跨组导航 ${safely(() => redactText(hostOf(req.url)))}`);
         return cross.verdict.decision;
       }
@@ -886,9 +887,7 @@ export class SessionManager {
     let decision: Decision;
     if (exempt) decision = { action: 'continue' };
     else {
-      // 借用的登录：发往被借组的请求，也按目标主机自己的模式算进去。
-      const target = login.borrowed && modes.groupOf(hostOf(req.url)).name === login.group ? [hostOf(req.url)] : [];
-      const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...target].map((h) => modes.resolve(h))];
+      const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...this.groupTargets(login.group, hostOf(req.url), topHost)].map((h) => modes.resolve(h))];
       const mode: Mode = all.includes('readonly') ? 'readonly' : all.includes('denied') ? 'denied' : 'default';
       const verdict = this.deps.policy.decide(req, { mode });
       decision = verdict.decision;
@@ -923,6 +922,15 @@ export class SessionManager {
   }
 
   // 顶层导航的目标主机属于别的组（不是 default 组、也不是 ownGroup）：给出 403 的判定；否则 null。组只认已批准的快照。
+  // 「事实上的借用」：用的是某个组（不是 default）的登录态，请求发往这个组的主机，而发出请求的页面当前的顶层主机不在这个组里
+  // （含没编组的主机）。这时要把目标主机自己的模式也算进有效模式（那边只读就按只读判），所以返回 [目标主机]；否则 []。
+  // 按事实判，不按 open 时有没有借用：先开本组、再跳到没编组主机的会话也一样受约束。
+  private groupTargets(group: string, targetHost: string, topHost: string): string[] {
+    if (group === DEFAULT_GROUP_NAME) return [];
+    const { modes } = this.deps;
+    return modes.groupOf(targetHost).name === group && modes.groupOf(topHost).name !== group ? [targetHost] : [];
+  }
+
   // message 是给 step 的提示句（和 403 页面上的是同一句）。
   private crossGroup(req: RequestInfo, ownGroup: string): { verdict: PolicyVerdict; message: string } | null {
     const target = this.deps.modes.groupOf(hostOf(req.url)).name;
@@ -954,9 +962,8 @@ export class SessionManager {
     }
     // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
     if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
-    // 借用的会话：发往被借组的请求，有效模式里再并上目标主机自己的模式（那边只读就按只读判）。
-    const borrowedTarget = s.borrowed && this.deps.modes.groupOf(host).name === s.group ? [host] : [];
-    const mode = this.sessionMode(s, [topHost, ...borrowedTarget]);
+    // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
+    const mode = this.sessionMode(s, [topHost, ...this.groupTargets(s.group, host, topHost)]);
     const verdict: PolicyVerdict = this.deps.policy.decide(req, { mode });
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);

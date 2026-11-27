@@ -757,3 +757,25 @@ describe('pending summary', () => {
     assert.equal(inspectRules('/x/rules.json', file, fakeIo('nope').io).pending, false);   // 文件有错：不算待批
   });
 });
+
+test('resolver: group() and groupOf() hand out frozen objects of the approved snapshot; writing to them throws and changes nothing, also for the default and the empty snapshot', () => {
+  const { io } = fakeIo(JSON.stringify(GROUP_FILE));
+  const m = resolverOf(io);
+  const empty = m.group('default')!;                                    // 还没有批准：空快照
+  assert.throws(() => { empty.loginHosts.push('x.example.org'); }, TypeError);
+  assert.throws(() => { empty.hosts.push('x.example.org'); }, TypeError);
+  approveNow(m);
+  const admin = m.group('admin')!;
+  assert.deepEqual(admin.hosts, ['admin.example.com', 'api.example.com']);
+  assert.throws(() => { admin.hosts.push('evil.example.com'); }, TypeError);
+  assert.throws(() => { admin.hosts.length = 0; }, TypeError);
+  assert.throws(() => { admin.loginHosts[0] = 'evil.example.org'; }, TypeError);
+  assert.throws(() => { (admin as { name: string }).name = 'other'; }, TypeError);
+  assert.throws(() => { admin.readPosts.pop(); }, TypeError);
+  assert.throws(() => { if (admin.identity !== null) admin.identity.expect = 'Other'; }, TypeError);
+  assert.throws(() => { m.groupOf('admin.example.com').hosts.push('evil.example.com'); }, TypeError);
+  assert.throws(() => { m.group('default')!.loginHosts.push('evil.example.org'); }, TypeError);
+  assert.throws(() => { m.groupOf('nothing.example.net').loginHosts.push('evil.example.org'); }, TypeError);
+  assert.deepEqual([m.group('admin')?.hosts, m.isLoginHost('evil.example.org', 'admin'), m.isLoginHost('evil.example.org', 'default'), m.groupOf('evil.example.com').name],
+    [['admin.example.com', 'api.example.com'], false, false, 'default']);
+});

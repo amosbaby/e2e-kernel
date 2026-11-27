@@ -308,8 +308,13 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   ctx.io.out('登录页已关闭，登录状态留在专用 profile 里');
   // 老内核不返回 writesBlocked：当作 0。
   const blocked = isObject(ended) && typeof ended.writesBlocked === 'number' ? ended.writesBlocked : 0;
-  if (blocked > 0) {
-    ctx.io.out(`登录过程中有 ${blocked} 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules.json 的 loginHosts`);
+  // 跨组导航被拦的次数（writesBlocked 里含它们）：不是只读规则拦的，另给一句；老内核没有这个字段。
+  const cross = isObject(ended) && typeof ended.crossGroupBlocked === 'number' ? ended.crossGroupBlocked : 0;
+  if (blocked - cross > 0) {
+    ctx.io.out(`登录过程中有 ${blocked - cross} 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules.json 的 loginHosts`);
+  }
+  if (cross > 0) {
+    ctx.io.out(`登录过程中有 ${cross} 次跳到别的组的导航被拦：这个登录窗口只能用本组的域名和 loginHosts 里的主机`);
   }
   return ExitCode.OK;
 }

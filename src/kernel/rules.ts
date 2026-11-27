@@ -348,7 +348,7 @@ export function hostListed(patterns: readonly string[], host: string): boolean {
 }
 
 function defaultGroup(rules: Rules): Group {
-  return { name: DEFAULT_GROUP_NAME, hosts: [], loginHosts: rules.loginHosts, readPosts: [], persistedQueries: [], logout: [], identity: null };
+  return Object.freeze({ name: DEFAULT_GROUP_NAME, hosts: Object.freeze([]), loginHosts: rules.loginHosts, readPosts: Object.freeze([]), persistedQueries: Object.freeze([]), logout: Object.freeze([]), identity: null }) as unknown as Group;
 }
 
 // 主机所在的组：在所有组的 hosts 里取最具体的；没有、或主机不合格，是合成的 default 组。
@@ -433,17 +433,26 @@ function toRulesFile(loaded: Loaded): RulesFile {
 
 // ---- 批准快照 ----
 
-const EMPTY_RULES: Rules = { rules: [], loginHosts: [], groups: [] };
+const EMPTY_RULES: Rules = Object.freeze({ rules: Object.freeze([]), loginHosts: Object.freeze([]), groups: Object.freeze([]) }) as unknown as Rules;
 export const MAX_SUMMARY_LINES = 12;
 
 // 批准记录里的规则：哈希对得上原文、原文解析得了才算数；对不上或解析不了（被改过，或解析器收紧了）当没批准过。
 interface Snapshot { rules: Rules; hash: string | null; text: string | null; valid: boolean }
 
+// 批准快照里的规则整个冻住：groupOf / group 返回的组对象和它的数组，调用方改写不了快照（严格模式下改写会抛错）。
+function deepFreeze<T>(v: T): T {
+  if (typeof v === 'object' && v !== null && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    for (const x of Object.values(v)) deepFreeze(x);
+  }
+  return v;
+}
+
 function snapshotOf(approved: ApprovalRecord['rules']): Snapshot {
   if (approved === null) return { rules: EMPTY_RULES, hash: null, text: null, valid: true };
   try {
     if (contentHash(approved.text) !== approved.hash) throw new Error('hash');
-    return { rules: parseRules(approved.text), hash: approved.hash, text: approved.text, valid: true };
+    return { rules: deepFreeze(parseRules(approved.text)), hash: approved.hash, text: approved.text, valid: true };
   } catch {
     return { rules: EMPTY_RULES, hash: null, text: null, valid: false };
   }

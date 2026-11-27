@@ -1039,3 +1039,30 @@ test('formatOpen: the borrowed line is only printed for borrowed:true; an older 
   assert.ok(!formatOpen(base as never).includes('借用'));
   assert.ok(formatOpen({ ...base, profile: 'a@t1', borrowed: true }).includes('借用组 a 的登录'));
 });
+
+test('login end: cross-group navigations that were blocked get their own sentence and are not blamed on the read-only rules; read-only blocks keep theirs', async () => {
+  await withGroupKernel(async (h, f) => {
+    const run = async (profile: string[], act: (pageId: string) => Promise<void>): Promise<string> => {
+      const t = io({ env: h.env, isTTY: true });
+      t.stdin.readLine = async () => { await act(f.openPages().at(-1)!); return ''; };
+      assert.equal(await main(['login', 'http://localhost:5173/login.html', ...profile], t), 0);
+      return t.outText();
+    };
+    const navTo = (pageId: string, url: string) => f.emitRequest({ pageId, method: 'GET', url, topUrl: url, isNavigation: true, topFrame: true });
+    const postTo = (pageId: string, url: string) => f.emitRequest({ pageId, method: 'POST', url, topUrl: 'http://localhost:5173/login.html', body: '{}', contentType: 'application/json' });
+    // 只有跨组导航被拦：没有「只读规则」那句
+    const onlyCross = await run([], async (p) => { assert.equal((await navTo(p, 'http://b.example.com/')).action, 'fulfill'); });
+    assert.match(onlyCross, /1 次跳到别的组的导航被拦：这个登录窗口只能用本组的域名和 loginHosts 里的主机/);
+    assert.ok(!onlyCross.includes('只读规则拦下'));
+    // 两样都有：借用 a 的登录，本地页面写只读的 a 主机（拦），再跳去 b（拦）
+    const both = await run(['--profile', 'a'], async (p) => {
+      assert.equal((await postTo(p, 'http://a.example.com/api')).action, 'fulfill');
+      assert.equal((await navTo(p, 'http://b.example.com/')).action, 'fulfill');
+      assert.equal((await navTo(p, 'http://b.example.com/2')).action, 'fulfill');
+    });
+    assert.match(both, /1 条写被只读规则拦下/); assert.match(both, /2 次跳到别的组的导航被拦/);
+    // 什么都没拦：两句都没有
+    const none = await run([], async () => {});
+    assert.ok(!none.includes('只读规则拦下') && !none.includes('跳到别的组'));
+  });
+});

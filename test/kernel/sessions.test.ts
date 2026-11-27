@@ -1948,7 +1948,7 @@ test('a login window: navigation to another group is refused even from a login h
   const popup = fake.emitPopup(loginPageId, 'about:blank');
   assert.equal((await topNav(fake, popup.id, B_URL, 'GET', null)).action, 'fulfill');            // 弹窗一样
   assert.deepEqual(logs.filter((l) => l.includes(loginId)), [`登录 ${loginId}：拦下跨组导航 b.example.com`, `登录 ${loginId}：拦下跨组导航 b.example.com`]);
-  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 2 });
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 2, crossGroupBlocked: 2 });   // writesBlocked 含跨组的；crossGroupBlocked 是其中的次数
   assert.equal(profileInfo(home, 'a').lastLogin?.host, 'a.example.com');
 });
 
@@ -1956,7 +1956,7 @@ test('a default-group login window cannot enter a group either, and a borrowed l
   const { sm, fake } = await setupGroups();
   const plain = await sm.loginBegin({ url: LOGIN_URL }); const plainPage = fake.openPages().at(-1)!;
   assert.equal((await topNav(fake, plainPage, A_URL, 'GET', LOGIN_URL)).action, 'fulfill');
-  assert.deepEqual(await sm.loginEnd({ loginId: plain.loginId }), { writesBlocked: 1 });
+  assert.deepEqual(await sm.loginEnd({ loginId: plain.loginId }), { writesBlocked: 1, crossGroupBlocked: 1 });
   const borrowed = await sm.loginBegin({ url: LOGIN_URL, profile: 'a' }); const page = fake.openPages().at(-1)!;
   assert.deepEqual(await topNav(fake, page, 'http://sso.example.org/', 'GET', LOGIN_URL), { action: 'continue' });   // a 的 loginHost：借用的登录按 a 查
   assert.equal((await fake.emitRequest({ id: `e${++navSeq}`, pageId: page, method: 'POST', url: 'http://a.example.com/api', topUrl: LOGIN_URL, body: '{}', contentType: 'application/json' })).action, 'fulfill');   // 发往 a 的写按 a 的只读
@@ -1997,6 +1997,57 @@ test('the session keeps its group by name: rules that move the group\'s hosts (a
   const blocked = await topNav(fake, pageId, B_URL);
   assert.equal(blocked.action, 'fulfill');
   assert.ok((blocked as { body: string }).body.includes(OTHER_GROUP_SENTENCE));
-  const group = modes.group('b')!; group.hosts.length = 0;                                       // 调用方改写拿到的对象……
-  assert.equal(sessionGroup(sm, a.session), 'a');                                                // ……不影响会话绑定的组名
+  // 调用方改写 modes.group() / groupOf() 拿到的对象：快照是冻住的，改不动（严格模式下抛错），之后跳到 b 仍被拦。
+  const group = modes.group('b')!;
+  assert.throws(() => { group.hosts.length = 0; }, TypeError);
+  assert.throws(() => { group.hosts.push('c.example.com'); }, TypeError);
+  assert.throws(() => { (group as { name: string }).name = 'a'; }, TypeError);
+  assert.throws(() => { modes.groupOf('b.example.com').loginHosts.push('x.example.org'); }, TypeError);
+  assert.throws(() => { modes.group('default')!.loginHosts.push('x.example.org'); }, TypeError);
+  assert.deepEqual([modes.group('b')?.hosts, modes.isLoginHost('x.example.org', 'b')], [['b.example.com'], false]);
+  assert.equal(sessionGroup(sm, a.session), 'a');
+  assert.equal((await topNav(fake, pageId, B_URL + 'again')).action, 'fulfill');
+});
+
+// 本组登录态下、顶层不在本组的页面发往本组的写，按目标主机的模式判：不论 open 时是不是借用（M2b 任务 6 修复轮 1）。
+const BYPASS_RULES = { ...GROUP_RULES, groups: [{ name: 'a', hosts: ['a.example.com', 'w.example.com'], loginHosts: ['sso.example.org'] }, { name: 'b', hosts: ['b.example.com'] }] };
+const W_URL = 'http://w.example.com/';
+const apiPost = (fake: FakeDriver, pageId: string, url: string, topUrl: string) =>
+  fake.emitRequest({ id: `w${++navSeq}`, pageId, method: 'POST', url, topUrl, body: '{}', contentType: 'application/json' });
+
+test('a group session that left the group for an unlisted host cannot write to the read-only group host from there; on a group host it is judged as before', async () => {
+  const { sm, fake } = await setupGroups();
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  assert.equal(a.borrowed, false);
+  assert.equal((await apiPost(fake, pageId, A_URL + 'api', A_URL)).action, 'fulfill');            // 在本组的只读主机上：组 a 自己的模式
+  assert.deepEqual(await topNav(fake, pageId, HOME_URL), { action: 'continue' });                 // 跳到没编组的主机
+  await fake.emitRequest({ id: `c${++navSeq}`, pageId, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL });   // 页面提交在那里
+  assert.equal(inner(sm, a.session).topHost, 'localhost');
+  const bypass = await apiPost(fake, pageId, 'http://a.example.com/api', HOME_URL);
+  assert.deepEqual([bypass.action, (bypass as { status: number }).status], ['fulfill', 403]);     // 绕过路径被拦
+  assert.equal((await apiPost(fake, pageId, HOME_URL + 'api', HOME_URL)).action, 'continue');     // 本地主机自己的写：默认模式，不受影响
+  const w = readResult((await sm.close({ session: a.session })).runDir).writes;
+  assert.ok(w.blocked.some((x) => x.host === 'a.example.com' && x.reason === 'method' && x.mode === 'readonly' && x.targetMode === 'readonly'));
+});
+
+test('a group session on a default-mode group host still writes to the read-only host of its own group (as before); after leaving the group it cannot, and an unrelated host or group is unaffected', async () => {
+  const { sm, fake } = await setupGroups(BYPASS_RULES);
+  const s = await sm.open({ url: W_URL }); const pageId = fake.openPages().at(-1)!;
+  assert.equal((await apiPost(fake, pageId, 'http://a.example.com/api', W_URL)).action, 'continue');   // 页面在本组的默认模式主机上：不被误伤
+  await topNav(fake, pageId, HOME_URL);
+  await fake.emitRequest({ id: `c${++navSeq}`, pageId, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL });
+  assert.equal((await apiPost(fake, pageId, 'http://a.example.com/api', HOME_URL)).action, 'fulfill');   // 离开本组之后：按 a.example.com 的只读判
+  assert.equal((await apiPost(fake, pageId, 'http://w.example.com/api', HOME_URL)).action, 'continue');   // 本组但默认模式的主机
+  assert.equal((await apiPost(fake, pageId, 'http://b.example.com/api', HOME_URL)).action, 'continue');   // 别的组的主机：不归这个 profile 管
+  await sm.close({ session: s.session });
+});
+
+test('a login window of a group is bound the same way: from a default-mode group page a write to the read-only group host passes, from a page outside the group it does not', async () => {
+  const { sm, fake } = await setupGroups(BYPASS_RULES);
+  const { loginId } = await sm.loginBegin({ url: W_URL + 'login' }); const pageId = fake.openPages().at(-1)!;
+  assert.equal((await apiPost(fake, pageId, 'http://a.example.com/api', W_URL)).action, 'continue');
+  await topNav(fake, pageId, HOME_URL + 'login', 'GET', W_URL);
+  await fake.emitRequest({ id: `c${++navSeq}`, pageId, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL + 'login' });
+  assert.equal((await apiPost(fake, pageId, 'http://a.example.com/api', HOME_URL + 'login')).action, 'fulfill');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
 });

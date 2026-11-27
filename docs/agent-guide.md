@@ -171,7 +171,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 - 验证需要真的写、又被拦了：停下告诉人，由人决定改规则或另开会话；不要换主机、换会话或用 `eval` 去绕。
 - `rules.json` 有错时新的 `open` 会被拒（退出码 2），已开的会话照旧、`step` 的 `notices` 会提示。运行 `node bin/e2k.js rule list` 看错误，让人修。永远不要自己改 `rules.json`。
 - 规则被人改过后，新的 `open`、`login` 先得 21：等人点弹框再原样重试；人拒绝是 2，弹不出框是 22。批准前收紧已生效，放宽要等批准。
-- `open --profile <组>`：域名在某组里默认就用它；本地页面要借那组的登录才写。会话跳到别组的域名会 403（`notices` 有提示），请另开会话，不要绕。
+- 域名在某组里，`open` 默认用那组的 profile；本地页面要用某组的登录：`--profile <组>`（借用）。会话跳到别组的域名会 403（`notices` 有提示），请另开会话，不要绕。
 
 ## 报告在哪
 
