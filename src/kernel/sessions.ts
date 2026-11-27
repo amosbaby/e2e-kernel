@@ -362,6 +362,7 @@ export class SessionManager {
     const { store, approvals } = this.deps;
     const decls = normalizeDeclarations(raw);
     if (decls.length === 0) return;
+    this.pruneAskedWrites();
     const host = s.topHost;
     const scope = `${s.group}/${host}`;
     const have = store.writesFor(scope);
@@ -371,10 +372,9 @@ export class SessionManager {
       const denyKey = sha256(JSON.stringify([s.group, host, pending.map(declarationKey)]));
       const refused = new E2kError('usage', '人拒绝了这些放行声明', '内核重启前同一组声明不会再问；要放行请换成别的声明');
       const key = `writes:${sha256(JSON.stringify([s.name, s.group, host, pending.map(declarationKey)]))}`;
-      const earlier = this.askedWrites.get(denyKey) ?? new Set<string>();
-      if ([...earlier].some((k) => approvals.stateOf(k) === 'denied')) { this.deniedWrites.add(denyKey); this.askedWrites.delete(denyKey); }
+      const earlier = this.askedWrites.get(denyKey);
+      if (earlier !== undefined && [...earlier].some((k) => approvals.stateOf(k) === 'denied')) { this.deniedWrites.add(denyKey); this.askedWrites.delete(denyKey); }
       if (this.deniedWrites.has(denyKey)) throw refused;
-      this.askedWrites.set(denyKey, earlier.add(key));
       const request: DialogRequest = {
         title: 'e2k：放行写请求',
         lines: [`会话：${s.name}（组 ${s.group}）`, `页面所在主机：${host}`, '要放行这些写请求（批准后，只读主机上也能发出）：',
@@ -385,6 +385,8 @@ export class SessionManager {
       const asked = approvals.ask(key, 'writes', request, ['放行']);
       switch (asked.status) {
         case 'pending':
+          // 真有框在等人才登记（弹不出、冷却里拒绝的，待批表里没有这个键）。
+          this.askedWrites.set(denyKey, (this.askedWrites.get(denyKey) ?? new Set<string>()).add(key));
           throw pendingError(asked.id, '放行写请求的声明');
         case 'denied':
           if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '换成别的声明，或等一分钟再试；内核重启前被拒的同一组声明不会再问');
@@ -408,6 +410,14 @@ export class SessionManager {
     for (const d of decls) {
       if (s.declared.some((e) => e.scope === scope && sameDeclaration(e.decl, d))) continue;
       s.declared.push({ scope, decl: d, approved: remembered.includes(d) ? 'remembered' : 'dialog' });
+    }
+  }
+
+  // 待批表里已经没有的键（超时、被丢弃、弹不出框）是死项，剪掉；集合空了就删这个集合。被拒的键在待批表里一直是 denied，不会被剪。
+  private pruneAskedWrites(): void {
+    for (const [denyKey, keys] of this.askedWrites) {
+      for (const k of keys) if (this.deps.approvals.stateOf(k) === undefined) keys.delete(k);
+      if (keys.size === 0) this.askedWrites.delete(denyKey);
     }
   }
 

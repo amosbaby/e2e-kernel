@@ -2826,3 +2826,27 @@ test('declared writes: the operation is part of a declaration\'s identity: appro
   assert.equal(dialog.requests.length, 3);
   assert.ok(dialog.requests[2]!.lines.includes(lineOf(other)));
 });
+
+const askedSizes = (sm: SessionManager): number[] => [...(sm as unknown as { askedWrites: Map<string, Set<string>> }).askedWrites.values()].map((x) => x.size);
+
+test('declared writes: the record of asked sets stays bounded: a dialog that cannot be shown leaves nothing behind, however many different sets are tried', async () => {
+  const c = setupDecl(noDialog);
+  const { session } = await openAt(c, 'many');
+  const attempt = (i: number) => c.sm.step({ session, ops: SNAP, allow: [{ method: 'POST', url: `${D_URL}/${i}` }] });
+  await assert.rejects(attempt(0), isCode('wait-approval'));    // 第一次有框在排队（真的 pending）
+  await settleDialog();                                          // 框弹不出：待批表删了它
+  for (let i = 1; i <= 50; i++) await assert.rejects(attempt(i), isCode('needs-human'));
+  assert.deepEqual(askedSizes(c.sm), []);
+});
+
+test('declared writes: an asked box whose dialog timed out is a dead entry and is dropped; the live one stays', async () => {
+  const dialog = fakeDialog(() => ({ kind: 'timeout' }));
+  const c = setupDecl(dialog);
+  const one = await openAt(c, 'one');
+  const two = await openAt(c, 'two');
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  assert.deepEqual(askedSizes(c.sm), [1]);
+  await settleDialog();                                           // 没人理：待批表删了这个键
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  assert.deepEqual(askedSizes(c.sm), [1], 'the dead key of the first session was dropped');
+});
