@@ -58,6 +58,12 @@ const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 const JSON_PAIR_NAME = /"([^"\\\r\n]{1,100})"\s*:\s*"/g;
 const JSON_PAIR_NAME_ESC = /\\"([^"\\\r\n]{1,100})\\"\s*:\s*\\"/g;
 // 行首的 `头名: 值`。头名是敏感键（cookie、authorization、x-api-key……）就换值。
+// 行中间的 `名字: 值`（名字后可带一个引号，接住 `"password": 123`、`'token': '…'`）。名字前不能是名字字符，名字最长 64，不回溯。
+const COLON_PAIR_NAME = /(?<![A-Za-z0-9_-])([A-Za-z0-9_-]{1,64})["']?[ \t]*:([ \t]*)/g;
+const COLON_VALUE_END = /[\s,;})\]"'<>]/;
+// 参数值外面的实体引号、转义引号：只换两者之间的内容。
+const URL_NAME_DELIM = /[?&#\s;,({\[]/;               // URL_PARAM_NAME 里名字前的分隔符
+const ENTITY_QUOTES = ['&quot;', '&#34;', '&#x22;', '&#X22;', '&apos;', '&#39;', '&#x27;', '&#X27;', '\\"', "\\'"];
 const HEADER_LINE = /^([ \t]*)([A-Za-z0-9_-]{1,64}):[ \t]*([^\r\n]*)$/gm;
 const COOKIE_PAIR = /^[^\s=;]+=[^;]*$/;
 
@@ -102,45 +108,79 @@ function redactCookieLine(line: string): string {
 // 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
 // 给了 selectorRe 时（只用于选择器，SELECTOR_PARAM_NAMES 之一）：名字前的分隔符另外认引号和 `=`（窄的还认 `]`）；
 // 名字紧跟 `[`（中间可有空白）、本身不含 `]` 的，值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
-function redactParamsInText(s: string, selectorRe?: RegExp): string {
+// decode 为真时（自由文本的顶层调用）：名字不敏感、值里有 `%` 的，解码后露出秘密就整个值换掉（见 decodedRevealsSecret；嵌套的值另查自己那一段）。
+// 值以实体引号或转义引号开头（`&quot;…&quot;`、`\"…\"`）时，只换两者之间的内容；找不到结尾就换到串尾。
+function redactParamsInText(s: string, selectorRe?: RegExp, decode = false): string {
   const selector = selectorRe !== undefined;
   const re = new RegExp((selectorRe ?? URL_PARAM_NAME).source, 'g');
   let out = '';
   let copied = 0;
+  // 把 [from, to) 换成 [REDACTED]。解码命中后会回到被换的值里接着扫（里面可能嵌着原样的敏感参数，它带引号的值可能伸到外面），
+  // 所以可能和已换的部分重叠：只补没换到的那段。
+  const emit = (from: number, to: number): void => {
+    if (to <= copied) return;
+    if (from >= copied) out += s.slice(copied, from);
+    out += REDACTED;
+    copied = to;
+  };
+  let checkedEnd = -1;                                     // 上一个整段做过解码检查的值的结尾
+  // 从 at 起到第一个 PARAM_VALUE_END 字符（不含）：上次找到的结尾记下来，起点不超过它的，结尾也是它（中间没有这类字符），不重扫。
+  // 回扫（解码命中后、引号尾巴之后）时起点只会落在已扫过的范围里，所以总量线性。
+  let scanEnd = -1;
+  const valueEnd = (at: number): number => {
+    let e = at <= scanEnd ? scanEnd : at;
+    while (e < s.length && !PARAM_VALUE_END.test(s[e]!)) e++;
+    scanEnd = e;
+    return e;
+  };
   for (let m = re.exec(s); m !== null; m = re.exec(s)) {
     // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值（选择器模式下在后顾里）。选择器模式下名字另按 selectorNameSensitive 判（`/cb/pw=`、`data-pw=`）。
-    if (!isSensitiveKey(safeDecode(m[2]!)) && !(selector && selectorNameSensitive(m[2]!))) continue;
+    if (!isSensitiveKey(safeDecode(m[2]!)) && !(selector && selectorNameSensitive(m[2]!))) {
+      if (!decode) continue;
+      const vStart = m.index + m[0].length;
+      const vEnd = valueEnd(vStart);
+      // 同一结尾的值嵌在前一个值里（`next=/cb?ret=token%3D…`）：整段已查过，但上下文不同（整段里它前面是 `=`），
+      // 所以只查它自己这一段（到下一个名字分隔符为止）。各段互不重叠，整段每个结尾只查一次，总量线性。
+      let checkTo = vEnd;
+      if (vEnd === checkedEnd) {
+        checkTo = vStart;
+        while (checkTo < vEnd && !URL_NAME_DELIM.test(s[checkTo]!)) checkTo++;
+      } else checkedEnd = vEnd;
+      const value = s.slice(vStart, checkTo);
+      if (!value.includes('%') || !decodedRevealsSecret(value)) continue;
+      emit(vStart, vEnd);
+      re.lastIndex = vStart;                               // 回到值里接着找原样的嵌套名字（`a=%2F…?token="x"`）
+      continue;
+    }
     let start = m.index + m[0].length;
     if (selector) {
       // 名字紧跟 `[`（中间可有空白）：属性值，到配对的 `]` 为止。别的位置不知道值在哪结束，换到串尾（失败关闭，再过一遍也不变）。
       while (start < s.length && /\s/.test(s[start]!)) start++;   // `=` 后的空白保留（和 redactSelectorAttrs 一致）
       const attrLike = bracketBefore(s, m.index - 1) || nameStartsInBracketComment(s, m.index, m[2]!);
       const end = attrLike && !m[2]!.includes(']') ? selectorValueEnd(s, start) : s.length;
-      out += s.slice(copied, start) + REDACTED;
-      copied = end;
+      emit(start, end);
       re.lastIndex = end;
       continue;
     }
-    const quote = s[start];
-    if (quote === '"' || quote === "'") {
-      // 值以引号开头：只换两个引号之间的内容（引号里的反斜杠跳过下一个字符），再从结束引号之后接着找。
-      // 找不到结束引号就从值开头换到串尾（失败关闭）。
-      start++;
-      let close = -1;
-      for (let i = start; i < s.length; i++) {
-        if (s[i] === '\\') i++;
-        else if (s[i] === quote) { close = i; break; }
+    const qv = quotedValue(s, start);
+    if (qv !== null) {
+      // 值以引号开头（含实体、转义引号）：只换两个引号之间的内容，再从结束引号之后接着找；结束引号后面紧跟着别的字符
+      // （`token='a'x`）时，那一段也换到值的结尾。找不到结束引号就从值开头换到串尾（失败关闭）。
+      if (qv.close < 0) {
+        emit(qv.from, s.length);
+        return out;
       }
-      out += s.slice(copied, start) + REDACTED;
-      if (close < 0) return out;
-      copied = close;
-      re.lastIndex = close + 1;
+      emit(qv.from, qv.close);
+      const after = qv.close + qv.closeLen;
+      const tail = valueEnd(after);
+      if (tail > after) emit(after, tail);
+      // 尾巴里可能嵌着原样的敏感参数（`token="a",password="x"`），回去接着找；从结束引号的最后一个字符起，
+      // 实体引号结尾的 `;` 也能当后面名字的分隔符（`token=&quot;&quot;token="x"`）。
+      re.lastIndex = after - 1;
       continue;
     }
-    let end = start;
-    while (end < s.length && !PARAM_VALUE_END.test(s[end]!)) end++;
-    out += s.slice(copied, start) + REDACTED;
-    copied = end;
+    const end = valueEnd(start);
+    emit(start, end);
     re.lastIndex = end;
   }
   return out + s.slice(copied);
@@ -373,6 +413,91 @@ function redactJsonPairsInText(s: string, nameRe: RegExp, escaped: boolean): str
   return out + s.slice(copied);
 }
 
+// 值以引号开头（普通引号，或 ENTITY_QUOTES 里的实体、转义引号）：返回引号内容的起点、结束引号的位置（没闭合是 -1）和它的长度。
+// 普通引号里的反斜杠跳过下一个字符。
+function quotedValue(s: string, start: number): { from: number; close: number; closeLen: number } | null {
+  const opener = ENTITY_QUOTES.find((q) => s.startsWith(q, start));
+  if (opener !== undefined) {
+    const from = start + opener.length;
+    return { from, close: s.indexOf(opener, from), closeLen: opener.length };
+  }
+  const quote = s[start];
+  if (quote !== '"' && quote !== "'") return null;
+  for (let i = start + 1; i < s.length; i++) {
+    if (s[i] === '\\') i++;
+    else if (s[i] === quote) return { from: start + 1, close: i, closeLen: 1 };
+  }
+  return { from: start + 1, close: -1, closeLen: 1 };
+}
+
+// 行中间的 `名字: 值`（行首的由 redactHeaderLines 整行换）：名字敏感时，值换掉。值以引号开头就换到结束引号（找不到就到串尾），
+// 否则换到空白、`,`、`;`、括号、引号或尖括号为止；`Bearer`、`Basic` 方案名留下；已是 [REDACTED] 的不再换（幂等）。
+// 引号包括实体、转义引号；结束引号后紧跟的内容（`password: "a"x`）也换。引号没闭合时，多半是外面一段引号文本的结束引号
+// （`label:has-text("Password: ")`）：选择器里不换，自由文本里只换到下一个空白或分隔符（`password: "x` 里的 `x`）。
+// 不换的还有：`名字:=`（交给参数规则）、冒号后紧跟 1–5 位、不超过 65535 的数字再接 `/` 或 `:` 的端口（`auth:8080/`、`auth-service:50051:`），
+// 以及冒号后没有空白、名字前是 `.` 或 `#`、值是小写字母和 `-` 并接着 `{`、`,`、`(` 的 CSS 伪类（`.password:focus {`）。
+// selector 为真时冒号后必须有空白：选择器里 `#auth:hover`、`.password:focus` 是伪类，不是键值对。
+function redactColonPairs(s: string, selector: boolean): string {
+  const re = new RegExp(COLON_PAIR_NAME.source, 'g');
+  let out = '';
+  let copied = 0;
+  for (let m = re.exec(s); m !== null; m = re.exec(s)) {
+    if (!isSensitiveKey(m[1]!) || (selector && m[2] === '')) continue;
+    const before = s[m.index - 1];
+    let start = m.index + m[0].length;
+    if (m[2] === '' && (before === '.' || before === '#') && /^[a-z-]+\s*[{,(]/.test(s.slice(start, start + 64))) continue;
+    if (s[start] === '=') continue;
+    start += /^(?:bearer|basic)[ \t]+/i.exec(s.slice(start, start + 16))?.[0].length ?? 0;
+    if (s.startsWith(REDACTED, start)) {
+      re.lastIndex = start + REDACTED.length;
+      continue;
+    }
+    const qv = quotedValue(s, start);
+    if (qv !== null && qv.close >= 0) {
+      out += s.slice(copied, qv.from) + REDACTED;
+      const after = qv.close + qv.closeLen;
+      let tail = after;
+      if (!s.startsWith(REDACTED, after)) while (tail < s.length && !COLON_VALUE_END.test(s[tail]!)) tail++;
+      if (tail > after) out += s.slice(qv.close, after) + REDACTED;
+      copied = tail > after ? tail : qv.close;
+      re.lastIndex = tail;
+      continue;
+    }
+    if (qv !== null) {
+      if (selector || s.startsWith(REDACTED, qv.from)) continue;
+      start = qv.from;
+    }
+    let digits = start;
+    while (digits < s.length && digits - start < 6 && s[digits]! >= '0' && s[digits]! <= '9') digits++;
+    const port = digits - start <= 5 && Number(s.slice(start, digits)) <= 65535;
+    if (m[2] === '' && digits > start && port && (s[digits] === '/' || s[digits] === ':')) continue;
+    let end = start;
+    while (end < s.length && !COLON_VALUE_END.test(s[end]!)) end++;
+    if (end === start) continue;
+    out += s.slice(copied, start) + REDACTED;
+    copied = end;
+    re.lastIndex = end;
+  }
+  return out + s.slice(copied);
+}
+
+// 只解合法的 `%XX`（逐字节，不管 UTF-8），`+` 当空白；不会失败，所以整段解码后一定含着它任一后缀的解码。
+function lenientDecode(s: string): string {
+  return s.replace(/\+/g, ' ').replace(/%([0-9A-Fa-f]{2})/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16)));
+}
+
+// 参数值编码过（可能不止一层）时，最多解三层；任一层不带解码地过 redactText 有变化、或按 `=` 切开后有一段是 token 形态，就算露出了秘密。
+function decodedRevealsSecret(value: string): boolean {
+  let cur = value;
+  for (let n = 0; n < 3; n++) {
+    const next = lenientDecode(cur);
+    if (next === cur) return false;
+    if (redactTextWith(next, false, false) !== next || next.split(/=+/).some(tokenValue)) return true;
+    cur = next;
+  }
+  return false;
+}
+
 // 行首 `头名: 值`：头名是敏感键就整个值换掉（空值、非 ASCII、纯符号都换）。`Bearer`、`Basic` 方案名留下。
 function redactHeaderLines(s: string): string {
   return s.replace(HEADER_LINE, (m, lead: string, name: string, value: string) => {
@@ -400,7 +525,7 @@ export function redactSelector(s: string): string {
   return REDACTED;
 }
 
-function redactTextWith(s: string, selector: boolean): string {
+function redactTextWith(s: string, selector: boolean, decode = true): string {
   let out = s.replace(JWT, REDACTED);
   out = out.replace(AUTH_SCHEME, (_m, scheme: string, gap: string) => `${scheme}${gap}${REDACTED}`);
   out = out.replace(USERINFO, `://${REDACTED}@`);     // 先于邮箱：`://用户名:密码@主机` 要整段换掉
@@ -408,15 +533,17 @@ function redactTextWith(s: string, selector: boolean): string {
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
   if (selector) out = redactSelectorAttrs(redactSelectorAttrs(out, false), true);
-  out = selector ? SELECTOR_PARAM_NAMES.reduce((acc, re) => redactParamsInText(acc, re), out) : redactParamsInText(out);
+  out = selector ? SELECTOR_PARAM_NAMES.reduce((acc, re) => redactParamsInText(acc, re), out) : redactParamsInText(out, undefined, decode);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);
   out = redactHeaderLines(out);
+  out = redactColonPairs(out, selector);
   return out.split('\n').map(redactCookieLine).join('\n');
 }
 
-// `a=1&b=2` 形式：名字是敏感键的，值换掉；名字不敏感时，值先解码再判（接住 URL 编码的 JSON 里的邮箱），
-// 解码后过 redactText 有变化、或整个值是 token 形态，就整个值换掉。名字照旧保留，解码后的内容不会写回去。
+// `a=1&b=2` 形式：名字是敏感键的，值换掉；名字不敏感时，值本身或解码后（最多三层，见 decodedRevealsSecret）过 redactText 有变化、
+// 或按 `=` 切开后有一段是 token 形态（`a=b=<token>`），就整个值换掉（接住 URL 编码的 JSON 里的邮箱）。这里的值是 `&` 之间的全部、
+// 名字可以是任意字符，和自由文本的参数规则（值到 `&#`、空白、引号、尖括号为止）不等价，所以两边都查。名字照旧保留，解码后的内容不会写回去。
 function redactParams(s: string): string {
   return s.split('&').map((part) => {
     const eq = part.indexOf('=');
@@ -424,8 +551,8 @@ function redactParams(s: string): string {
     const name = part.slice(0, eq);
     const value = part.slice(eq + 1);
     if (isSensitiveKey(safeDecode(name))) return `${name}=${REDACTED}`;
-    const decoded = safeDecode(value);
-    return redactText(decoded) !== decoded || tokenValue(value) ? `${name}=${REDACTED}` : part;
+    const hit = value.split(/=+/).some(tokenValue) || redactTextWith(value, false, false) !== value || decodedRevealsSecret(value);
+    return hit ? `${name}=${REDACTED}` : part;
   }).join('&');
 }
 

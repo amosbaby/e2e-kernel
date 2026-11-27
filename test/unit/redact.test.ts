@@ -88,6 +88,130 @@ test('redactText: more token and url shapes', () => {
   assert.equal(redactText('note: a=1; b=2'), 'note: a=1; b=2');      // 不是整行 cookie 形态（第一段名字里有空白）
 });
 
+test('redactText: `name: value` mid-line, quoted names, numbers, entity quotes and encoded values', () => {
+  const S = 'Zq9xK';
+  const leaks = [
+    `login failed, password: ${S}, retry`,
+    `note password:${S}`,
+    `{"password": 12345678, "pin": 1}`,
+    `{"pin": 1, "token": 98765}`,
+    `{'password': '${S}'}`,
+    `{'token':'${S}'}`,
+    `token=&quot;${S}&quot;`,
+    `password=&#34;${S}&#34; x`,
+    `token=\\"${S}\\"`,
+    `?next=%252Ftoken%253D${S}`,
+    `q=%2526token%253D${S}`,
+    `?next=%2Ftoken%3D${S}`,
+    `a?b=1&next=%2Fcb%3Fpassword%3D${S}#x`,
+    `msg Authorization: Bearer ${S}`,
+  ];
+  for (const s of leaks) {
+    const out = redactText(s);
+    assert.ok(!out.includes(S) && !out.includes('12345678') && !out.includes('98765'), `${s} -> ${out}`);
+    assert.equal(redactText(out), out, `idempotent: ${s}`);
+  }
+  assert.equal(redactText('login failed, password: hunter, retry'), `login failed, password: ${REDACTED}, retry`);
+  assert.equal(redactText(`{"pin": 1, "token": 98765}`), `{"pin": 1, "token": ${REDACTED}}`);
+  assert.equal(redactText(`token=&quot;${S}&quot; next`), `token=&quot;${REDACTED}&quot; next`);
+  assert.equal(redactText('msg Authorization: Bearer abc'), `msg Authorization: Bearer ${REDACTED}`);
+  // 不敏感的不动：时间、端口、普通的 `名字: 值`、没编码秘密的编码值。
+  for (const s of ['at 12:30 ok', 'localhost:8080', 'note: a=1; b=2', 'status: done, user: x', '?next=%2Fhome%3Fa%3D1', 'a=%41%42']) {
+    assert.equal(redactText(s), s, s);
+  }
+  // 选择器里 `名字:伪类` 不是键值对；冒号后有空白才算。
+  for (const s of ['#auth:hover', 'input.password:focus', '[name=token]:visible']) assert.equal(redactSelector(s), s, s);
+  assert.equal(redactSelector('text=password: abc'), `text=password: ${REDACTED}`);
+});
+
+test('redactText: review follow-ups for `name: value`, quotes and encoded values', () => {
+  const S = 'Zq9xK';
+  const leaks = [
+    `x token: &quot;${S}&quot;`,
+    `x password: \\"${S}\\"`,
+    `token=\\'\\'${S}`,
+    `token=\\'a\\'${S}`,
+    `token='a'${S}`,
+    `xa=${S}; token:=y`,
+    `next=/cb?ret=token%3D${S}`,
+    `a=x%20y?n=c%3D1%3B%20b%3D${S}`,
+    `a=x?n=cookie%3A%20%2C${S}`,
+    `?next=%25252Ftoken%25253D${S}`,
+    `token=&#x22;${S}&#x22;`,
+    `?next=%ZZ%2Ftoken%3D${S}`,
+    `?n=a%3D${S}AbCdEf0123456789AbCdEf012345`,
+    `a=%2Fcb%3Ftoken%3Dx?token="${S}"`,
+    `d=%22?pw="${S}"`,
+    `a=%2Fx%3Fk%3D1?password="${S}" tail`,
+    `a=%2Fcb%3Ftoken%3Dx,token="${S}"`,
+    `a=%2Fcb%3Ftoken%3D?token=&quot;${S}&quot;`,
+    `a=%2Fcb%3Ftoken%3D?token=\\"${S}\\"`,
+    `a=%2F?token='${S} x'`,
+    `x token:123456789:AAEhBP0av28${S}`,
+    `x password:654321/${S}`,
+    `x config.password:${S}`,
+    `x #password:${S}`,
+    `x password: "${S}`,
+    `x token: &quot;${S}`,
+    `x password: "pa"${S}`,
+    `token='a';password="${S}"`,
+    `token="a",password="${S}"`,
+    `cfg(token="a",password="${S}")`,
+    `token="a";sid="${S}"`,
+    `token=&quot;&quot;token="${S}"`,
+    `token=&quot;a&quot;password=&quot;${S}&quot;`,
+  ];
+  for (const s of leaks) {
+    const out = redactText(s);
+    assert.ok(!out.includes(S), `${s} -> ${out}`);
+    assert.equal(redactText(out), out, `idempotent: ${s}`);
+  }
+  assert.equal(redactText(`x token: &quot;${S}&quot; y`), `x token: &quot;${REDACTED}&quot; y`);
+  assert.equal(redactText('a token: x"y'), `a token: ${REDACTED}"y`);
+  assert.equal(redactText('a token: x;y'), `a token: ${REDACTED};y`);
+  for (const q of ['&quot;', '&#34;', '&#x22;', '&#X22;', '&apos;', '&#39;', '&#x27;', '&#X27;', '\\"', "\\'"]) {
+    assert.equal(redactText(`token=${q}${S}${q} x`), `token=${q}${REDACTED}${q} x`, q);
+  }
+  assert.equal(redactSelector('form pw:checked'), 'form pw:checked');
+  assert.ok(!redactUrl(`https://h.example.com/p?next=/cb?ret=token%3D${S}`).includes(S));
+  for (const ct of ['text/plain', 'application/x-www-form-urlencoded']) {
+    assert.ok(!redactBody(`redirect=%2Fcb%3Ftoken%3D"${S}"`, ct)!.includes(S), ct);
+    assert.ok(!redactBody(`x=token%3D#${S}`, ct)!.includes(S), ct);
+  }
+  assert.ok(!redactUrl(`https://h.example.com/p?#t=TOKEN%3D#${S}`).includes(S));
+  assert.equal(redactText(`x token:99999:${S}`), `x token:${REDACTED}`);   // 超过 65535 不是端口
+  // 明显不该换的：没闭合的引号（多半是外面一段引号文本的结束引号）、host:port、自由文本里的 CSS 伪类。
+  for (const s of ['label "Password: " then x', 'dial tcp auth-service:50051: refused', '.password:focus {', 'a.token:hover{color:red}']) {
+    assert.equal(redactText(s), s, s);
+  }
+  assert.equal(redactText('connect auth:8080/health ok'), 'connect auth:8080/health ok');
+  for (const s of ['label:has-text("Password: ") >> input', 'internal:label="Password: "i', 'role=textbox[name="Password: "]']) {
+    assert.equal(redactSelector(s), s, s);
+  }
+});
+
+test('redactUrl: a token after another `=`, and values encoded more than once', () => {
+  const tok = 'Zq9xKAbCdEf0123456789AbCdEf0123456789xY';
+  assert.equal(redactUrl(`https://h.example.com/a?a=b=${tok}`), `https://h.example.com/a?a=${REDACTED}`);
+  assert.equal(redactUrl('https://h.example.com/a?next=%252Fcb%253Ftoken%253DZq9xK'), `https://h.example.com/a?next=${REDACTED}`);
+  assert.equal(redactUrl('https://h.example.com/a?next=%2Fhome'), 'https://h.example.com/a?next=%2Fhome');
+});
+
+test('redactText new rules stay fast on adversarial input', () => {
+  const inputs = ['password: '.repeat(30000), 'password:'.repeat(30000), 'a: '.repeat(30000), 'a' + ' '.repeat(1e5) + ':',
+    '"password": "'.repeat(30000), "password: '" + 'a'.repeat(1e5), 'token=&quot;'.repeat(30000), 'token=&quot;' + 'a'.repeat(1e5),
+    'token=\\"'.repeat(30000), '?a=%41'.repeat(30000), 'x;a=%41'.repeat(30000), '?a=%41?a=%41'.repeat(15000), 'a=' + '%2525'.repeat(30000),
+    '?a=' + '%41'.repeat(50000), '-'.repeat(1e5) + ': x', ('a'.repeat(70) + ':').repeat(2000),
+    "token='';pw='';".repeat(20000), 'token="a",'.repeat(30000), 'a=%2Ftoken%3Dx?token="a"'.repeat(10000)];
+  // 每个输入单独限时：平方级退化在这些长度下要十几秒以上，机器忙时正常输入也可能接近 1 秒。
+  for (const s of inputs) {
+    const start = performance.now();
+    redactText(s);
+    const ms = performance.now() - start;
+    assert.ok(ms < 3000, `${JSON.stringify(s.slice(0, 20))}… took ${ms.toFixed(0)}ms`);
+  }
+});
+
 test('redactText stays fast on adversarial input', () => {
   const inputs = ['eyJ'.repeat(20000), 'a'.repeat(60000) + '!', '?'.repeat(30000) + '=', '&a'.repeat(30000),
     '://'.repeat(20000), '://a:' + 'b:'.repeat(30000), 'Bearer '.repeat(10000), ('A1b-'.repeat(10) + '.').repeat(5000),
@@ -120,7 +244,7 @@ test('redactUrl: fragment-only, encoded names, unparseable, user name only', () 
 test('redactBody: sniffing, invalid json, quotes, truncation size', () => {
   assert.equal(redactBody('{"password":"p3"}', 'text/plain;charset=UTF-8'), '{"password":"[REDACTED]"}');
   assert.ok(!redactBody('password=p4&x=1', null)!.includes('p4'));
-  assert.equal(redactBody('{"password": broken', 'application/json'), '{"password": broken');
+  assert.equal(redactBody('{"password": broken', 'application/json'), '{"password": [REDACTED]');   // 无效 JSON 走自由文本，`名字: 值` 也换
   assert.equal(redactBody('[1,"ok"]', 'application/vnd.api+json'), '[1,"ok"]');
   assert.equal(redactBody('abc', 'text/plain', 2), 'ab…[truncated 3]');
   assert.equal(redactBody('', 'text/plain'), '');
