@@ -22,7 +22,7 @@ export interface RunInput {
   verdict: Verdict | null; findings: Finding[]; notDone: string[];
   superseded: Supersede[];   // agent 声明的；buildResult 对着 actions 校验，再补上两边的操作名和目标
   modes: ModeChange[];       // 模式变更时间线
-  rules: { hash: string | null; count: number };   // 收尾时生效的那份规则
+  rules: { hash: string | null; count: number; pendingHash: string | null };   // hash、count：收尾时已批准的规则；pendingHash：同时生效（取更严）的待批文件
   blocked: 'login' | null;   // 会话最后一次登录墙检查的结果
   forced: boolean;           // open --readonly
 }

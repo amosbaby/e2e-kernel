@@ -512,10 +512,10 @@ export class SessionManager {
     };
   }
 
-  // 收尾时生效的规则（规则文件有错时是最后一份好的）。
-  private rulesInForce(): { hash: string | null; count: number } {
-    const { hash, count } = this.deps.modes.state();
-    return { hash, count };
+  // 收尾时生效的规则：hash、count 是已批准的快照（规则文件有错时也不变）；pendingHash 是同时按「更严合并」生效的待批文件。
+  private rulesInForce(): { hash: string | null; count: number; pendingHash: string | null } {
+    const { hash, count, pendingHash } = this.deps.modes.state();
+    return { hash, count, pendingHash };
   }
 
   // 清理旧报告时不能删的目录：所有还在进行中的会话（含正在开的），以及刚收尾、要交给调用方的这一份。
@@ -727,9 +727,10 @@ export class SessionManager {
   // 记一条模式变更（和上一条同模式的由 Recorder 去重）：reason 看这个主机有没有命中规则。
   private recordMode(s: Session): void {
     const { modes } = this.deps;
+    const { hash, pendingHash } = modes.state();
     s.recorder.noteMode({
       at: this.deps.now().toISOString(), host: s.topHost, mode: this.sessionMode(s, []),
-      reason: s.forced ? 'forced' : modes.ruleFor(s.topHost) === null ? 'no-rule' : 'rule', rulesHash: modes.state().hash,
+      reason: s.forced ? 'forced' : modes.ruleFor(s.topHost) === null ? 'no-rule' : 'rule', rulesHash: hash, pendingRulesHash: pendingHash,
     });
   }
 

@@ -667,14 +667,14 @@ test('redirectRefused on a request that is not a write changes nothing', () => {
 test('noteMode records mode changes, skips a repeat of the same mode and redacts the host', () => {
   assert.equal(recorder.modes.length, 0);
   const at = now.toISOString();
-  recorder.noteMode({ at, host: 'Example.COM', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:abc' });
-  recorder.noteMode({ at, host: 'example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:abc' });
+  recorder.noteMode({ at, host: 'Example.COM', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:abc', pendingRulesHash: null });
+  recorder.noteMode({ at, host: 'example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:abc', pendingRulesHash: null });
   assert.equal(recorder.modes.length, 1, 'same mode as the previous entry is not recorded again');
-  recorder.noteMode({ at, host: 'example.com', mode: 'default', reason: 'no-rule', rulesHash: null });
-  recorder.noteMode({ at, host: 'example.com', mode: 'readonly', reason: 'forced', rulesHash: null });
+  recorder.noteMode({ at, host: 'example.com', mode: 'default', reason: 'no-rule', rulesHash: null, pendingRulesHash: null });
+  recorder.noteMode({ at, host: 'example.com', mode: 'readonly', reason: 'forced', rulesHash: null, pendingRulesHash: null });
   assert.deepEqual(recorder.modes.map(m => m.mode), ['readonly', 'default', 'readonly']);
   const longLabel = 'Ab1'.repeat(14);
-  recorder.noteMode({ at, host: `${longLabel}.example.com`, mode: 'denied', reason: 'rule', rulesHash: null });
+  recorder.noteMode({ at, host: `${longLabel}.example.com`, mode: 'denied', reason: 'rule', rulesHash: null, pendingRulesHash: null });
   assert.equal(recorder.modes[3].host, '[REDACTED].example.com');
 });
 

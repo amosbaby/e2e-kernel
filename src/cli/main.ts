@@ -223,7 +223,7 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
       approved: approvedGroup(g),
     })),
     hash: f.hash, error: redactError(f.error),
-    approved: f.error === null && !r.pending, pending: r.pending, approvals: r.approvals,
+    approved: f.error === null && !r.pending && r.approvals !== 'unreadable', pending: r.pending, approvals: r.approvals,
   };
   print(ctx, result, formatRuleList);
   return f.error === null ? ExitCode.OK : ExitCode.USAGE;

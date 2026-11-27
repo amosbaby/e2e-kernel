@@ -23,6 +23,7 @@ import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 import { Approvals } from '../../src/kernel/approval.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
+import { createRulesResolver } from '../../src/kernel/rules.ts';
 import { fakeDialog } from '../support/fake-dialog.ts';
 
 const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null };
@@ -715,7 +716,7 @@ function mutableRules(readonlyHosts: string[], loginHosts: string[] = []) {
     group: defaultOnlyResolver.group,
     isLoginHost: (h) => loginHosts.includes(h),
     refresh: () => { st.refreshes++; const p = st.pending; st.pending = null; p?.(); },
-    state: () => ({ count: st.ro.size, hash: st.hash, error: st.error, pending: null, approvals: 'absent', approvalsChanged: false }),
+    state: () => ({ count: st.ro.size, hash: st.hash, error: st.error, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false }),
     pending: () => null,
     approvePending: () => false,
   };
@@ -731,6 +732,24 @@ function setupRo(readonlyHosts: string[] = ['example.com'], overrides: Partial<S
 function inner(sm: SessionManager, id: string): { topHost: string; pendingHosts: Set<string>; recorder: { modes: { mode: string; reason: string; rulesHash: string | null; host: string }[] } } {
   return (sm as unknown as { sessions: Map<string, never> }).sessions.get(id) as never;
 }
+
+test('a readonly rule in an unapproved rules.json is already in force: the timeline says rule and carries the pending hash, result.json.rules carries it too', async () => {
+  const tmp = makeTmpHome();
+  writeFileSync(tmp.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'example.com', mode: 'readonly' }] }));
+  const modes = createRulesResolver(tmp.home.rulesFile, ApprovalStore.open(tmp.home.approvalsFile, () => {}));
+  const pendingHash = modes.state().pendingHash;
+  assert.match(pendingHash ?? '', /^sha256:[0-9a-f]{16}$/);
+  const { sm, fake } = setup({ modes, policy, home: tmp.home });
+  cleanups.push(async () => { tmp.cleanup(); });
+  const r = await sm.open({ url: RO });
+  assert.equal(r.mode, 'readonly');
+  const [change] = inner(sm, r.session).recorder.modes as unknown as { reason: string; rulesHash: string | null; pendingRulesHash: string | null }[];
+  assert.deepEqual([change?.reason, change?.rulesHash, change?.pendingRulesHash], ['rule', null, pendingHash]);
+  assert.equal((await fake.emitRequest({ pageId: fake.openPages().at(-1)!, method: 'POST', url: 'http://example.com/api', body: '{}', contentType: 'application/json' })).action, 'fulfill');
+  const result = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(result.rules, { hash: null, count: 0, pendingHash });
+  assert.equal(result.modes[0]?.pendingRulesHash, pendingHash);
+});
 
 test('read-only by rule: writes from the session page get a 403, a strict GraphQL query goes through without following redirects', async () => {
   const { sm, fake } = setupRo(); const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
@@ -768,7 +787,7 @@ test('close writes the mode timeline, the rules in force, start.readonly and the
   st.hash = 'sha256:0000000000000002';
   const res = readResult((await sm.close({ session: r.session })).runDir);
   assert.deepEqual(res.modes.map((m) => [m.host, m.mode, m.reason, m.rulesHash]), [['example.com', 'readonly', 'rule', 'sha256:0000000000000001']]);
-  assert.deepEqual(res.rules, { hash: 'sha256:0000000000000002', count: 1 });   // 收尾时生效的那份
+  assert.deepEqual(res.rules, { hash: 'sha256:0000000000000002', count: 1, pendingHash: null });   // 收尾时生效的那份
   assert.equal(res.start.readonly, false);
   assert.deepEqual(res.writes.blockedSummary, [
     { host: 'example.com', method: 'POST', reason: 'method', count: 1, unattributed: false },

@@ -281,6 +281,13 @@ function parseGroup(item: unknown, i: number): Group {
     });
     return { endpoint, hashes };
   });
+  // 同一个接口在一组里只能写一条：写两条的话，差异按接口合并时会漏掉其中一条的新哈希。
+  const seenEndpoints = new Set<string>();
+  persistedQueries.forEach((p, k) => {
+    const key = endpointKey(p.endpoint);
+    if (seenEndpoints.has(key)) throw usage(`${at}.persistedQueries[${k}].url repeats an earlier persistedQueries entry`);
+    seenEndpoints.add(key);
+  });
   const identity = o.identity === undefined ? null : parseIdentity(o.identity, `${at}.identity`);
   return { name, hosts, loginHosts, readPosts, persistedQueries, logout, identity };
 }
@@ -375,8 +382,14 @@ const defaultIo: RulesIo = {
   read: (p) => readFileSync(p, 'utf8'),
 };
 
+// 报告和状态里显示用的短哈希（16 位十六进制）。
 export function contentHash(text: string): string {
   return 'sha256:' + createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16);
+}
+
+// 待批改动的身份：完整的 sha256（64 位十六进制）。approvePending 比的是它，不是短哈希。
+function fullHash(text: string): string {
+  return 'sha256:' + createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
 type Loaded = { kind: 'absent' } | { kind: 'bad'; error: string } | { kind: 'text'; text: string; hash: string };
@@ -546,11 +559,11 @@ export function summarizeChange(approved: Rules, pending: Rules | null): string[
 type Comparison =
   | { kind: 'same' }
   | { kind: 'error'; error: string }
-  | { kind: 'changed'; hash: string | null; text: string | null; rules: Rules | null; summary: string[] };
+  | { kind: 'changed'; hash: string | null; shortHash: string | null; text: string | null; rules: Rules | null; summary: string[] };   // hash：完整 sha256（待批的身份）；shortHash：显示用；删文件都是 null
 
 function compareWithApproved(loaded: Loaded, snap: Snapshot): Comparison {
   if (loaded.kind === 'absent') {
-    return snap.text === null ? { kind: 'same' } : { kind: 'changed', hash: null, text: null, rules: null, summary: summarizeChange(snap.rules, null) };
+    return snap.text === null ? { kind: 'same' } : { kind: 'changed', hash: null, shortHash: null, text: null, rules: null, summary: summarizeChange(snap.rules, null) };
   }
   if (loaded.kind === 'bad') return { kind: 'error', error: loaded.error };
   if (loaded.text === snap.text) return { kind: 'same' };   // 比原文，不只比 64 位的哈希
@@ -560,7 +573,7 @@ function compareWithApproved(loaded: Loaded, snap: Snapshot): Comparison {
   } catch (e) {
     return { kind: 'error', error: parseError(e) };
   }
-  return { kind: 'changed', hash: loaded.hash, text: loaded.text, rules, summary: summarizeChange(snap.rules, rules) };
+  return { kind: 'changed', hash: fullHash(loaded.text), shortHash: loaded.hash, text: loaded.text, rules, summary: summarizeChange(snap.rules, rules) };
 }
 
 // 给 CLI（rule list、rule diff、doctor）：自己读规则文件和批准记录，不经内核。批准记录读不了或没有，快照就是空的。
@@ -571,7 +584,7 @@ export interface RulesInspection {
   approvedCount: number;
   pending: boolean;                // 文件和快照不一致且解析得了（文件有错不算）；文件被删而快照里有规则也算
   fileDeleted: boolean;            // 待批的改动是「文件被删了」
-  hash: string | null;             // 待批文件的内容哈希
+  hash: string | null;             // 待批文件的短哈希（显示用）；删文件为 null
   summary: string[];               // 完整差异；没有待批为空
 }
 
@@ -583,7 +596,7 @@ export function inspectRules(rulesFile: string, approvalsFile: string, io: Rules
   const approvals: ApprovalsStatus = snap.valid ? status : 'unreadable';
   const base = { file: toRulesFile(loaded), approvals, approvedRules: snap.rules, approvedCount: snap.rules.rules.length };
   if (c.kind !== 'changed') return { ...base, pending: false, fileDeleted: false, hash: null, summary: [] };
-  return { ...base, pending: true, fileDeleted: c.text === null, hash: c.hash, summary: c.summary };
+  return { ...base, pending: true, fileDeleted: c.text === null, hash: c.shortHash, summary: c.summary };
 }
 
 // 规则解析器。生效的是批准快照（ApprovalStore 里最后一次批准的那份规则）；规则文件只产生「待批」。
@@ -592,14 +605,14 @@ export function inspectRules(rulesFile: string, approvalsFile: string, io: Rules
 // 组、白名单、loginHosts 只认已批准的。批准只认内存里留着的原文和哈希，不重读磁盘。
 export function createRulesResolver(file: string, store: ApprovalStore, io: RulesIo = defaultIo): ModeResolver {
   let snap = snapshotOf(store.get().rules);
-  const approvals: ApprovalsStatus = snap.valid ? store.startupStatus : 'unreadable';
-  let pending: { hash: string | null; text: string | null; rules: Rules | null; summary: string[] } | null = null;
+  let approvals: ApprovalsStatus = snap.valid ? store.startupStatus : 'unreadable';
+  let pending: { hash: string | null; shortHash: string | null; text: string | null; rules: Rules | null; summary: string[] } | null = null;
   let error: string | null = null;
   let approvalsChanged = false;
 
   const refresh = (): void => {
     const c = compareWithApproved(loadFile(file, io), snap);
-    if (c.kind === 'changed') { pending = { hash: c.hash, text: c.text, rules: c.rules, summary: c.summary }; error = null; }
+    if (c.kind === 'changed') { pending = { hash: c.hash, shortHash: c.shortHash, text: c.text, rules: c.rules, summary: c.summary }; error = null; }
     else if (c.kind === 'error') { pending = null; error = c.error; }
     else { pending = null; error = null; }
     approvalsChanged = store.externallyChanged();
@@ -646,15 +659,17 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     refresh,
     state: (): RulesState => ({
       count: snap.rules.rules.length, hash: snap.hash, error,
-      pending: pending === null ? null : { hash: pending.hash, tooLong: pending.summary.length > MAX_SUMMARY_LINES },
+      pending: pending === null ? null : { hash: pending.shortHash, tooLong: pending.summary.length > MAX_SUMMARY_LINES },
+      pendingHash: pending?.shortHash ?? null,   // 报告用的短哈希；删文件没有哈希，是 null
       approvals, approvalsChanged,
     }),
     pending: pendingView,
     approvePending(hash): boolean {
       if (pending === null || pending.hash !== hash) return false;
       const { text } = pending;
-      store.update((r) => ({ ...r, rules: text === null || hash === null ? null : { hash, text } }));
+      store.update((r) => ({ ...r, rules: text === null ? null : { hash: contentHash(text), text } }));
       snap = snapshotOf(store.get().rules);
+      approvals = 'ok';   // 批准记录刚写成功，现在读得了
       pending = null;
       error = null;
       approvalsChanged = store.externallyChanged();

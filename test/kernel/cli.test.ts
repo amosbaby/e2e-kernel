@@ -600,6 +600,14 @@ test('rule list when the approvals file is unreadable: every rule is unapproved 
     const r = JSON.parse(j.outText()) as { approved: boolean; approvals: string };
     assert.deepEqual([r.approved, r.approvals], [false, 'unreadable']);
   });
+  await withRules(null, async (h) => {   // 没有 rules.json、批准记录读不了：顶层 approved 仍是 false
+    writeFileSync(h.home.approvalsFile, '{broken');
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    const r = JSON.parse(j.outText()) as { approved: boolean; pending: boolean; approvals: string };
+    assert.deepEqual([r.approved, r.pending, r.approvals], [false, false, 'unreadable']);
+    const t = io({ env: h.env }); await main(['rule', 'list'], t);
+    assert.match(t.outText(), /^批准记录读不了：现有规则全部要重新批准$/m);
+  });
   await withRules(GOOD_RULES, async (h) => {
     approveRulesFile(h.home);
     rmSync(h.home.rulesFile);

@@ -22,8 +22,9 @@ export interface WriteRecord { id: string; at: string; method: string; url: stri
   host: string; graphql: GraphqlKind | null;
   // reason：被拦的原因，放行是 null；mode：判定当时的有效模式（targetMode 是请求目标主机自己的模式，两者可以不同）。
   reason: BlockReason | null; mode: Mode }
-// 模式变更时间线（设计 5.2）：host 已脱敏；rulesHash 是规则文件的摘要，没有规则文件是 null。
-export interface ModeChange { at: string; host: string; mode: Mode; reason: 'rule' | 'forced' | 'no-rule'; rulesHash: string | null }
+// 模式变更时间线（设计 5.2）：host 已脱敏；rulesHash 是已批准规则（快照）的摘要，没有是 null；
+// pendingRulesHash 是变化当时待批规则文件的摘要（它里面的收紧已经生效），没有待批是 null。
+export interface ModeChange { at: string; host: string; mode: Mode; reason: 'rule' | 'forced' | 'no-rule'; rulesHash: string | null; pendingRulesHash: string | null }
 
 const MAX_REQUESTS = 200;
 

@@ -34,7 +34,7 @@ function input(o: Partial<RunInput> = {}): RunInput {
     endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'default' },
     driver: driverWith(), actions: [], writes: [], unattributedWrites: [], hosts: [{ host: 'localhost', mode: 'default' }], webSockets: 0,
     verdict: null, findings: [], notDone: [], superseded: [],
-    modes: [], rules: { hash: null, count: 0 }, blocked: null, forced: false, ...o };
+    modes: [], rules: { hash: null, count: 0, pendingHash: null }, blocked: null, forced: false, ...o };
 }
 function textOf(html: string, id: string): string {
   const m = new RegExp(`<p id="${id}">([^<]*)</p>`).exec(html);
@@ -51,6 +51,12 @@ function section(html: string, id: string): string {
 let tmp: string;
 beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'e2k-report-')); });
 afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+test('the mode section also names an unapproved rules file whose tightening is already in force', () => {
+  const html = section(renderReport(buildResult(input({ modes: [], rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' } }))), 'modes');
+  assert.ok(html.includes('sha256:0123456789abcdef') && html.includes('sha256:fedcba9876543210') && html.includes('未批准'));
+  assert.ok(!section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('未批准'));
+});
 
 test('tallies line and per-step outcome wording', () => {
   const r = buildResult(input({ actions: [act('assert', 'match'), act('assert', 'mismatch'), act('click', 'ok'), act('click', 'failed'), act('click', 'not-run')] }));
@@ -286,8 +292,8 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true }),
       write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' })],
     unattributedWrites: [{ ...write('PUT', 'http://localhost/b', null, { reason: 'unattributed', mode: 'readonly' }), decision: 'blocked' }],
-    modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef' }],
-    rules: { hash: 'sha256:0123456789abcdef', count: 2 }, blocked: 'login', forced: true,
+    modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: 'sha256:fedcba9876543210' }],
+    rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' }, blocked: 'login', forced: true,
   }));
   const bad: string[] = [];
   const walk = (v: unknown): void => {
@@ -305,7 +311,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   collect(r);
   for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
-    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'readonly', 'blockedSummary', 'unattributed']) assert.ok(keys.has(k), k);
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 
@@ -314,16 +320,16 @@ const blockedWrite = (m: string, u: string, reason: NonNullable<WriteRecord['rea
 
 test('buildResult carries the read-only fields through as given', () => {
   const modes: ModeChange[] = [
-    { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: null },
-    { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef' },
+    { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: null, pendingRulesHash: null },
+    { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: null },
   ];
-  const r = buildResult(input({ modes, rules: { hash: 'sha256:0123456789abcdef', count: 3 }, forced: true, blocked: 'login' }));
+  const r = buildResult(input({ modes, rules: { hash: 'sha256:0123456789abcdef', count: 3, pendingHash: 'sha256:fedcba9876543210' }, forced: true, blocked: 'login' }));
   assert.deepEqual(r.modes, modes);
-  assert.deepEqual(r.rules, { hash: 'sha256:0123456789abcdef', count: 3 });
+  assert.deepEqual(r.rules, { hash: 'sha256:0123456789abcdef', count: 3, pendingHash: 'sha256:fedcba9876543210' });
   assert.equal(r.blocked, 'login');
   assert.deepEqual(r.start, { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', readonly: true });
   const plain = buildResult(input({}));
-  assert.deepEqual([plain.modes, plain.rules, plain.blocked, plain.start.readonly], [[], { hash: null, count: 0 }, null, false]);
+  assert.deepEqual([plain.modes, plain.rules, plain.blocked, plain.start.readonly], [[], { hash: null, count: 0, pendingHash: null }, null, false]);
 });
 
 test('blocked writes carry reason and mode in result.json', () => {
@@ -393,17 +399,17 @@ test('the environment section says the session ended on a login page only when b
 test('the mode section says default all along when there is nothing but the default mode', () => {
   const only = (modes: ModeChange[]): string => section(renderReport(buildResult(input({ modes }))), 'modes');
   assert.ok(only([]).includes('全程默认模式'));
-  assert.ok(only([{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: null }]).includes('全程默认模式'));
+  assert.ok(only([{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: null, pendingRulesHash: null }]).includes('全程默认模式'));
 });
 
 test('the mode section lists time, host, mode and reason, and the rules in force', () => {
   const r = buildResult(input({
     modes: [
-      { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: 'sha256:0123456789abcdef' },
-      { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef' },
-      { at: '2026-11-26T15:30:20.000Z', host: 'x.example.com', mode: 'readonly', reason: 'forced', rulesHash: null },
+      { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: null },
+      { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: null },
+      { at: '2026-11-26T15:30:20.000Z', host: 'x.example.com', mode: 'readonly', reason: 'forced', rulesHash: null, pendingRulesHash: null },
     ],
-    rules: { hash: 'sha256:0123456789abcdef', count: 2 },
+    rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: null },
   }));
   const sec = section(renderReport(r), 'modes');
   assert.ok(!sec.includes('全程默认模式'));
@@ -414,7 +420,7 @@ test('the mode section lists time, host, mode and reason, and the rules in force
     ['2026-11-26T15:30:20.000Z', 'x.example.com', 'readonly', '--readonly 强制'],
   ]);
   assert.ok(sec.includes('规则 2 条') && sec.includes('sha256:0123456789abcdef'), sec);
-  assert.ok(section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('没有规则文件'));
+  assert.ok(section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('没有已批准的规则'));
 });
 
 test('the blocked-writes section shows the summary table, or says none', () => {
@@ -435,7 +441,7 @@ test('the blocked-writes section shows the summary table, or says none', () => {
 
 test('hosts in the mode and blocked-writes sections are escaped', () => {
   const r = buildResult(input({
-    modes: [{ at: '2026-11-26T15:30:09.000Z', host: '<img src=x onerror=alert(1)>', mode: 'readonly', reason: 'rule', rulesHash: null }],
+    modes: [{ at: '2026-11-26T15:30:09.000Z', host: '<img src=x onerror=alert(1)>', mode: 'readonly', reason: 'rule', rulesHash: null, pendingRulesHash: null }],
     writes: [blockedWrite('POST', 'http://x.example.com/a', 'method', { host: '<script>alert(1)</script>.example.com' })],
   }));
   const html = renderReport(r);

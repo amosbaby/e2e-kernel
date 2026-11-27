@@ -7,16 +7,18 @@ export type RuleMode = 'readonly' | 'default';
 
 // 规则的当前状态。count、hash：当前**生效**的那份（人批准过的快照）；没有批准过为 0 条、hash 为 null。
 // error：规则文件现在改坏了（生效的仍是批准快照）。
-// pending：规则文件和批准快照不一致，等人批准（hash 为 null 表示文件被删了）；没有为 null。
+// pending：规则文件和批准快照不一致，等人批准（hash 是显示用的短哈希，null 表示文件被删了）；没有为 null。
+// 待批文件里的收紧同时已按「更严合并」生效，所以报告要同时记 hash（已批准的）和 pendingHash（待批的）。
 // approvals：启动时批准记录的状态（读不了 = 现有规则全部重新批准）；approvalsChanged：运行中磁盘上的批准记录被外部改过
 // （只是提示，生效的仍是内存里最后一次批准）。
 export interface RulesState {
   count: number; hash: string | null; error: string | null;
   pending: { hash: string | null; tooLong: boolean } | null;
+  pendingHash: string | null;   // 待批文件的短哈希（和 hash 同一写法，给报告用）；没有待批、或待批是删文件时为 null
   approvals: ApprovalsStatus; approvalsChanged: boolean;
 }
 
-// 待批的规则改动。text 是内存里留着的原文（批准时写的就是它，不重读磁盘），hash 是它的内容哈希；文件被删时两者都是 null。
+// 待批的规则改动。text 是内存里留着的原文（批准时写的就是它，不重读磁盘），hash 是它的完整 sha256（64 位十六进制，待批的身份，approvePending 比的就是它；状态和报告里只露短哈希，64 位十六进制会被脱敏）；文件被删时两者都是 null。
 // summary 是和已批准内容逐字段比较的完整差异，放宽的排前面；超过 12 行 tooLong 为 true。
 export interface PendingRules { hash: string | null; text: string | null; summary: string[]; tooLong: boolean }
 
@@ -54,7 +56,7 @@ export const defaultOnlyResolver: ModeResolver = Object.freeze({
   group: (name: string): Group | null => (name === 'default' ? emptyDefaultGroup() : null),
   isLoginHost: (): boolean => false,
   refresh: (): void => {},
-  state: (): RulesState => ({ count: 0, hash: null, error: null, pending: null, approvals: 'absent', approvalsChanged: false }),
+  state: (): RulesState => ({ count: 0, hash: null, error: null, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false }),
   pending: (): PendingRules | null => null,
   approvePending: (): boolean => false,
 });

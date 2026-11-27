@@ -171,11 +171,12 @@ test('status reports the rules state, rereads the file first, and its keys are n
   const rules = async (): Promise<StatusResult['rules']> => {
     const r = await call(h, 'status', {}); assert.ok(r.ok); return (r.result as StatusResult).rules;
   };
-  assert.deepEqual(await rules(), { count: 0, hash: null, error: null, pending: null, approvals: 'absent', approvalsChanged: false });
+  assert.deepEqual(await rules(), { count: 0, hash: null, error: null, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false });
   writeFileSync(h.rulesFile, '{"version":1,"rules":[{"match":"*.example.com","mode":"readonly"}]}');
   const pending = await rules();   // 没有批准过：文件是待批的，生效的还是「没有规则」
   assert.equal(pending.count, 0); assert.equal(pending.hash, null); assert.equal(pending.error, null);
   assert.match(pending.pending?.hash ?? '', /^sha256:[0-9a-f]{16}$/); assert.equal(pending.pending?.tooLong, false);
+  assert.match(pending.pendingHash ?? '', /^sha256:[0-9a-f]{16}$/);
   writeFileSync(h.rulesFile, '{"version":1,"rules":null}');
   const bad = await rules();
   assert.equal(bad.count, 0); assert.equal(bad.pending, null); assert.match(bad.error ?? '', /rules must be an array/);

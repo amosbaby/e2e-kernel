@@ -128,7 +128,7 @@ function approveNow(m: ModeResolver): void {
   assert.ok(p !== null, 'there is something pending');
   assert.equal(m.approvePending(p.hash), true);
 }
-const NO_STATE = { count: 0, hash: null, error: null, pending: null, approvals: 'absent', approvalsChanged: false };
+const NO_STATE = { count: 0, hash: null, error: null, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false };
 
 test('resolver: no file and nothing approved means no rules and nothing pending', () => {
   const { io } = fakeIo(null);
@@ -150,7 +150,9 @@ test('resolver: a good file is pending until approved; only the stricter of appr
   const s0 = m.state();
   assert.equal(s0.count, 0); assert.equal(s0.hash, null); assert.equal(s0.error, null);
   assert.deepEqual(s0.pending, { hash: s0.pending?.hash, tooLong: false });
-  assert.match(s0.pending?.hash ?? '', /^sha256:[0-9a-f]{16}$/);
+  assert.match(s0.pending?.hash ?? '', /^sha256:[0-9a-f]{16}$/);   // 状态里只露短哈希
+  assert.equal(s0.pendingHash, contentHash(good));
+  assert.match(m.pending()?.hash ?? '', /^sha256:[0-9a-f]{64}$/);  // 待批的身份是完整 sha256
   // 待批文件里 *.example.com 只读：收紧立刻生效；app.example.com 的「默认」是放宽，要等批准（还不存在已批准的规则，所以也是 default）
   assert.equal(m.resolve('x.example.com'), 'readonly');
   assert.equal(m.resolve('X.example.com.'), 'readonly');
@@ -252,11 +254,44 @@ test('resolver: a broken file leaves the approved rules in force, is an error an
   assert.equal(m.state().pending?.hash, m.pending()?.hash);
   f.text = '{"version":1,"rules":null}';
   m.refresh();
-  assert.deepEqual({ ...m.state(), error: m.state().error === null ? null : 'set' }, { ...NO_STATE, count: 2, hash: h1, error: 'set', approvals: 'absent' });
+  assert.deepEqual({ ...m.state(), error: m.state().error === null ? null : 'set' }, { ...NO_STATE, count: 2, hash: h1, error: 'set', approvals: 'ok' });
   assert.equal(m.pending(), null);
   f.text = good;   // 改回原内容：错误清掉
   m.refresh();
-  assert.deepEqual(m.state(), { ...NO_STATE, count: 2, hash: h1 });
+  assert.deepEqual(m.state(), { ...NO_STATE, count: 2, hash: h1, approvals: 'ok' });
+});
+
+test('resolver: state carries the short hash of the pending file; deleting the file leaves it null; approving clears it', () => {
+  const { f, io } = fakeIo(good);
+  const m = resolverOf(io);
+  assert.equal(m.state().pendingHash, contentHash(good));
+  approveNow(m);
+  assert.equal(m.state().pendingHash, null);
+  f.text = null; m.refresh();
+  assert.deepEqual([m.pending()?.hash, m.state().pending?.hash, m.state().pendingHash], [null, null, null]);
+});
+
+test('resolver: a pending change is identified by the full sha256; the short hash of the same text is refused', () => {
+  const { io } = fakeIo(good);
+  const m = resolverOf(io);
+  const full = m.pending()?.hash ?? null;
+  assert.match(full ?? '', /^sha256:[0-9a-f]{64}$/);
+  assert.equal(full?.startsWith(contentHash(good)), true);        // 短哈希只是它的前 16 位
+  assert.equal(m.approvePending(contentHash(good)), false);       // 前 16 位相同、但不是完整值：不批
+  assert.equal(m.approvePending(`${full?.slice(0, -1)}${full?.endsWith('0') ? '1' : '0'}`), false);   // 末位不同也不批
+  assert.equal(m.state().count, 0);
+  assert.equal(m.approvePending(full), true);
+  assert.equal(m.state().hash, contentHash(good));                // 批准记录里存的仍是短哈希
+});
+
+test('resolver: approving writes the approvals file, so state no longer says it was unreadable', () => {
+  const file = storeFile();
+  writeFileSync(file, '{broken');
+  const m = createRulesResolver('/x/rules.json', ApprovalStore.open(file, () => {}), fakeIo(good).io);
+  assert.equal(m.state().approvals, 'unreadable');
+  approveNow(m);
+  assert.equal(m.state().approvals, 'ok');
+  assert.equal(inspectRules('/x/rules.json', file, fakeIo(good).io).approvals, 'ok');
 });
 
 test('resolver: a file broken from the start means an error, no rules and nothing pending', () => {
@@ -279,7 +314,7 @@ test('resolver: deleting the file is a pending change (hash null); the approved 
   assert.equal(m.isLoginHost('sso.example.com', 'default'), true);
   assert.equal(m.approvePending('sha256:0000000000000000'), false);
   assert.equal(m.approvePending(null), true);
-  assert.deepEqual(m.state(), NO_STATE);
+  assert.deepEqual(m.state(), { ...NO_STATE, approvals: 'ok' });
   assert.equal(m.resolve('x.example.com'), 'default');
   assert.equal(m.isLoginHost('sso.example.com', 'default'), false);
   m.refresh();
@@ -560,6 +595,28 @@ describe('groups', () => {
     assert.throws(() => parseRules(sel('#t', 'a\nb')), { code: 'usage' });
     assert.throws(() => parseRules(withGroups(grp({ identity: { selector: '#t', expect: 'x', script: '1' } }))), { code: 'usage' });
     parseRules(sel('#t', 'x'.repeat(200)));
+  });
+
+  test('two persistedQueries entries for the same endpoint in one group are a parse error that names the entry', () => {
+    const pq = (...urls: string[]): string => withGroups(grp({ persistedQueries: urls.map((url, i) => ({ url, hashes: [String(i).repeat(64)] })) }));
+    assert.throws(() => parseRules(pq('https://a.example.com/graphql', 'https://a.example.com/graphql')), (e: Error) => e.message.includes('persistedQueries[1].url repeats'));
+    assert.throws(() => parseRules(pq('https://a.example.com/g/*', 'https://a.example.com/g/*')), { code: 'usage' });
+    parseRules(pq('https://a.example.com/graphql', 'https://a.example.com/other'));   // 不同接口照常
+  });
+
+  test('the duplicate-endpoint reproduction: the pending file cannot be parsed, so only the approved rules apply and nothing says "no difference"', () => {
+    const X = 'https://admin.example.com/graphql';
+    const file = (...sets: Obj[]): string => JSON.stringify({ version: 1, rules: [], loginHosts: [], groups: [grp({ name: 'admin', hosts: ['admin.example.com'], persistedQueries: sets })] });
+    const { f, io } = fakeIo(file({ url: X, hashes: ['1'.repeat(64)] }));
+    const m = resolverOf(io);
+    approveNow(m);
+    f.text = file({ url: X, hashes: ['9'.repeat(64)] }, { url: X, hashes: ['1'.repeat(64)] });
+    m.refresh();
+    assert.equal(m.pending(), null);
+    assert.match(m.state().error ?? '', /persistedQueries\[1\]\.url repeats/);
+    assert.equal(m.group('admin')?.persistedQueries[0]?.hashes[0], '1'.repeat(64));
+    assert.deepEqual(m.group('admin')?.persistedQueries.map((p) => p.hashes), [['1'.repeat(64)]]);
+    assert.equal(inspectRules('/x/rules.json', storeFile(), io).summary.includes('规则文件内容变了，解析出来的规则没有差别'), false);
   });
 
   test('resolver: groups and isLoginHost are per group', () => {
