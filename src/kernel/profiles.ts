@@ -44,6 +44,11 @@ export function parseProfileArg(s: string): ProfileRef {
   return { group, slot: slot ?? null };
 }
 
+// key 不合规就 usage（上限判断、建目录之前先过这一关）。
+export function checkProfileKey(key: string): void {
+  if (!NAME_RE.test(key)) throw usageProfile();
+}
+
 function checkName(name: string): void {
   if (!NAME_RE.test(name)) throw new Error('invalid profile name');
 }
@@ -114,7 +119,7 @@ export function profileInfo(home: Home, name: string): ProfileInfo {
 // 属于当前用户、没有组和其他人的权限）；profile 目录是符号链接或不是目录，一律 needs-human，不启动。
 // 路径严格在 profiles 之内（resolveInside 再按真实路径查一遍）。
 export function prepareProfileDir(home: Home, key: string): string {
-  if (!NAME_RE.test(key)) throw usageProfile();
+  checkProfileKey(key);
   ensurePrivateDir(home.profilesDir);
   const raw = join(home.profilesDir, key);
   let bad = false;

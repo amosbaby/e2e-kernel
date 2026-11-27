@@ -19,7 +19,7 @@ import { pendingError } from './approval.ts';
 import type { Approvals, DialogRequest } from './approval.ts';
 import type { ApprovalStore } from './approval-store.ts';
 import type { ModeResolver } from './mode.ts';
-import { DEFAULT_PROFILE, prepareProfileDir, recordLogin } from './profiles.ts';
+import { DEFAULT_PROFILE, checkProfileKey, prepareProfileDir, recordLogin } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
@@ -88,7 +88,12 @@ interface Login {
 interface LoginPlace { committed: string; readonly pending: Set<string> }
 
 // 一个 profile 的实例槽：已在跑的实例，和正在启动（或正在检查健康）的那一次。两者都没有的槽要摘掉。
-interface InstanceSlot { instance?: Instance; acquiring?: Promise<Instance> }
+// pins：正在开会话、开登录页的调用（从抢实例到登记完或失败），期间这个实例不算空闲；lastUsed：最近一次有人用完它的序号（单调增）。
+// reclaiming：空闲实例正在被停掉（还占着名额，直到停完）；after：这个槽要等它落定才能启动（新 key 等被回收的实例停完）。
+interface InstanceSlot {
+  instance?: Instance; acquiring?: Promise<Instance>; reclaiming?: Promise<void>; after?: Promise<void>;
+  pins: number; lastUsed: number;
+}
 
 const KNOWN_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 
@@ -162,6 +167,7 @@ export class SessionManager {
   private readonly unattributed: WriteRecord[] = [];
   // 每个 profile（key）一个浏览器实例，懒启动。
   private readonly slots = new Map<string, InstanceSlot>();
+  private useClock = 0;   // 给 lastUsed 用的单调序号：比时间戳稳，同一毫秒里的先后也分得清
   // 关停是终态：一旦开始，不再接受任何调用，也不再启动浏览器。
   private stopping = false;
   private stopped: Promise<void> | undefined;
@@ -191,7 +197,16 @@ export class SessionManager {
     if (mode === 'readonly' && !this.deps.driver.capabilities.networkInterception) {
       throw new E2kError('internal', '这个驱动不能拦网络请求，不能以只读方式打开');
     }
-    const instance = await this.acquireInstance(profile);
+    const slot = this.pin(profile);
+    try {
+      return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile });
+    } finally {
+      this.unpin(slot);
+    }
+  }
+
+  private async openOn(instance: Instance, p: OpenParams, o: { host: string; mode: Mode; forced: boolean; profile: string }): Promise<OpenResult> {
+    const { host, mode, forced, profile } = o;
     if (this.stopping) throw stopping();
 
     const name = p.name ?? DEFAULT_NAME;
@@ -322,7 +337,15 @@ export class SessionManager {
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
     this.gateRules();
-    const instance = await this.acquireInstance(profile);
+    const slot = this.pin(profile);
+    try {
+      return await this.loginOn(await this.acquireInstance(profile, slot), p, profile);
+    } finally {
+      this.unpin(slot);
+    }
+  }
+
+  private async loginOn(instance: Instance, p: { url: string }, profile: string): Promise<{ loginId: string }> {
     if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;
     while (this.logins.has(id)) id = `l-${randomHex()}`;
@@ -394,6 +417,8 @@ export class SessionManager {
     for (const login of [...this.logins.values()]) await this.endLogin(login);
     // 还在启动的实例等它落定，再把所有实例一起停。
     for (const x of [...this.slots.values()]) if (x.acquiring !== undefined) await x.acquiring.catch(() => undefined);
+    // 正在被回收的实例也等它停完。
+    await Promise.all([...this.slots.values()].flatMap((x) => (x.reclaiming === undefined ? [] : [x.reclaiming])));
     const live = [...this.slots.values()].flatMap((x) => (x.instance === undefined ? [] : [x.instance]));
     // 先摘掉再停：stop() 触发的 onClosed 是自己引起的，不算浏览器没了。
     this.slots.clear();
@@ -411,33 +436,95 @@ export class SessionManager {
 
   // ---- 实例 ----
 
-  // 每个 profile 一个实例，按 key 懒启动。冷启动串行化：同一个 key 正在启动（或正在检查健康）时再来的调用等同一个结果，
-  // 不 launch 第二次。同时在跑（含正在启动）的实例最多 MAX_INSTANCES 个，要启动第 5 个就 busy。上限在这里同步判断，
-  // 所以并发的几个新 key 不会一起越过它。
-  private acquireInstance(key: string): Promise<Instance> {
-    const slot = this.slots.get(key) ?? {};
-    if (slot.acquiring !== undefined) return slot.acquiring;
-    if (slot.instance === undefined) {
-      let others = 0;
-      for (const [k, x] of this.slots) if (k !== key && (x.instance !== undefined || x.acquiring !== undefined)) others++;
-      if (others >= MAX_INSTANCES) {
-        return Promise.reject(new E2kError('busy', '同时开着的 profile 太多，先关掉一些会话', '关掉一些会话，等它们的浏览器停了再开新的 profile'));
+  // 每个 profile 一个实例，按 key 懒启动。同时在跑（含正在启动、正在被回收）的实例最多 MAX_INSTANCES 个。
+  // pin 在 open、login 的入口同步做：先校验 key（非法 key 不占槽、不影响别的 key），再判断上限，最后把槽钉住。
+  // 要启动的 key 已满员时先回收空闲实例：没有会话、没有登录页、没有正在开会话的调用、也不在启动中；有空闲的就停最久没用的那个
+  // （登录态在 profile 目录里，不会丢），一个空闲的都没有才 busy。回收和占位在同一个同步段里完成，所以第三个请求越不过上限；
+  // 被回收的实例停完之前新 key 不启动（slot.after），它占着的名额也要到停完才放。回收期间又来了这个实例自己的 key：等它停完再重启。
+  private pin(key: string): InstanceSlot {
+    checkProfileKey(key);
+    const slot = this.slots.get(key) ?? { pins: 0, lastUsed: ++this.useClock };
+    if (slot.instance === undefined && slot.acquiring === undefined) {
+      // 要等的：这个 key 自己正在被回收的旧实例，和为它腾名额而被回收的空闲实例。名额都要等它们停完才放。
+      const waits: Promise<void>[] = slot.reclaiming === undefined ? [] : [slot.reclaiming];
+      if (this.runningOthers(key) >= MAX_INSTANCES) {
+        const victim = this.idleVictim(key);
+        if (victim === undefined) {
+          throw new E2kError('busy', '同时开着的 profile 太多，先关掉一些会话', '关掉一些会话；没有会话的 profile 浏览器到上限时会被自动停掉，登录态不会丢');
+        }
+        waits.push(this.reclaim(victim[0], victim[1]));
       }
+      if (waits.length > 0) slot.after = Promise.all(waits).then(() => undefined);
     }
     this.slots.set(key, slot);
-    slot.acquiring = this.ensureInstance(key, slot).finally(() => {
+    slot.pins++;
+    return slot;
+  }
+
+  private unpin(slot: InstanceSlot): void {
+    slot.pins--;
+    slot.lastUsed = ++this.useClock;
+  }
+
+  private isRunning(x: InstanceSlot): boolean {
+    return x.instance !== undefined || x.acquiring !== undefined || x.reclaiming !== undefined;
+  }
+
+  private runningOthers(key: string): number {
+    let n = 0;
+    for (const [k, x] of this.slots) if (k !== key && this.isRunning(x)) n++;
+    return n;
+  }
+
+  // 空闲的实例里最久没用的（不含 exceptKey）：已经启动完、没有钉住它的调用、上面没有会话（含正在开的、正在收尾的）也没有登录页。
+  private idleVictim(exceptKey: string): [string, InstanceSlot] | undefined {
+    let best: [string, InstanceSlot] | undefined;
+    for (const [k, x] of this.slots) {
+      const inst = x.instance;
+      if (k === exceptKey || inst === undefined || x.acquiring !== undefined || x.reclaiming !== undefined || x.pins > 0) continue;
+      if ([...this.sessions.values()].some((s) => s.instance === inst) || [...this.logins.values()].some((l) => l.instance === inst)) continue;
+      if (best === undefined || x.lastUsed < best[1].lastUsed) best = [k, x];
+    }
+    return best;
+  }
+
+  // 同步摘掉实例（之后没人能拿到它），再异步停；槽留着、算在名额里，直到停完。
+  private reclaim(key: string, slot: InstanceSlot): Promise<void> {
+    const inst = slot.instance as Instance;
+    slot.instance = undefined;
+    this.logLine(`profile ${key}：空闲，浏览器已回收（腾出名额）`);
+    const done = this.stopQuietly(inst).finally(() => {
+      slot.reclaiming = undefined;
+      this.dropIfEmpty(key, slot);
+    });
+    slot.reclaiming = done;
+    return done;
+  }
+
+  // 有人用完这个实例（会话收尾、登录页关掉）：记下序号，回收时最久没用的先停。
+  private touch(inst: Instance): void {
+    for (const x of this.slots.values()) if (x.instance === inst) x.lastUsed = ++this.useClock;
+  }
+
+  // 冷启动串行化：同一个 key 正在启动（或正在检查健康）时再来的调用等同一个结果，不 launch 第二次。
+  private acquireInstance(key: string, slot: InstanceSlot): Promise<Instance> {
+    if (slot.acquiring !== undefined) return slot.acquiring;
+    const after = slot.after;
+    slot.after = undefined;
+    slot.acquiring = this.ensureInstance(key, slot, after).finally(() => {
       slot.acquiring = undefined;
       this.dropIfEmpty(key, slot);
     });
     return slot.acquiring;
   }
 
-  // 槽里没有实例也没有正在启动的：摘掉，不让空槽占着表（上限只数有实例或正在启动的，这里是清理）。
+  // 槽里没有实例、没有正在启动的、也没有正在回收的：摘掉，不让空槽占着表。
   private dropIfEmpty(key: string, slot: InstanceSlot): void {
-    if (slot.instance === undefined && slot.acquiring === undefined && this.slots.get(key) === slot) this.slots.delete(key);
+    if (!this.isRunning(slot) && this.slots.get(key) === slot) this.slots.delete(key);
   }
 
-  private async ensureInstance(key: string, slot: InstanceSlot): Promise<Instance> {
+  private async ensureInstance(key: string, slot: InstanceSlot, after: Promise<void> | undefined): Promise<Instance> {
+    if (after !== undefined) await after;   // 被回收的实例（可能就是这个 key 自己的）停完才启动
     const current = slot.instance;
     if (current !== undefined) {
       if (await this.healthy(current)) return current;
@@ -566,6 +653,7 @@ export class SessionManager {
     }
     const endedAt = this.deps.now();
     this.sessions.delete(s.id);
+    this.touch(s.instance);
 
     let result: RunResult | undefined;
     let paths: { reportPath: string; resultPath: string } | undefined;
@@ -659,6 +747,7 @@ export class SessionManager {
 
   private async endLogin(login: Login): Promise<void> {
     this.logins.delete(login.id);
+    this.touch(login.instance);
     for (const page of login.pages.values()) {
       if (page === null) continue;
       try {

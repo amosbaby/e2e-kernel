@@ -1695,3 +1695,108 @@ test('requests from each instance land in their own session record, and a popup 
   assert.deepEqual([ra.writes.unattributed, rb.writes.unattributed], [[], []]);
   assert.deepEqual(fake.openPages(), []);
 });
+
+// ---- 到上限时回收空闲实例（M2b 任务 5 修复轮 1） ----
+
+// 给假驱动的每个实例装上：停止要多花 stopMs；同时「活着」的实例数峰值（启动完成算活，停完才算死）。
+function trackLive(fake: FakeDriver, stopMs = 0): { health(i: number): Promise<boolean>; peak(): number } {
+  const insts: Awaited<ReturnType<FakeDriver['launch']>>[] = [];
+  let live = 0; let peak = 0;
+  const orig = fake.launch.bind(fake);
+  fake.launch = async (p) => {
+    const inst = await orig(p);
+    insts.push(inst); live++; peak = Math.max(peak, live);
+    const stop = inst.stop.bind(inst);
+    inst.stop = async () => { await sleep(stopMs); await stop(); live--; };
+    return inst;
+  };
+  return { health: async (i) => (await insts[i]!.health()).ok, peak: () => peak };
+}
+
+async function closeAllOn(sm: SessionManager, sessions: { session: string }[]): Promise<void> {
+  for (const s of sessions) await sm.close({ session: s.session });
+}
+
+test('at the limit the instance with no sessions is reclaimed for a new profile; the others are untouched; with none idle it is busy', async () => {
+  const { sm, fake, logs } = setup();
+  const seen = trackLive(fake); const p = onProfile(sm);
+  const s: Record<string, { session: string; runDir: string }[]> = {};
+  for (const k of ['k1', 'k2', 'k3', 'k4']) s[k] = [await p.open(k, { url: HOME_URL })];
+  s.k2!.push(await p.open('k2', { url: HOME_URL }));
+  await assert.rejects(p.open('k5', { url: HOME_URL }), isBusyProfiles);                  // 四个都有会话：busy，没停任何一个
+  for (let i = 0; i < 4; i++) assert.equal(await seen.health(i), true);
+  await sm.close({ session: s.k2![0]!.session });                                         // k2 还剩一个会话：不算空闲
+  await assert.rejects(p.open('k5', { url: HOME_URL }), isBusyProfiles);
+  await sm.close({ session: s.k2![1]!.session });                                         // k2 上没有会话了，但浏览器还开着
+  assert.equal(await seen.health(1), true); assert.equal(sm.instanceState(), 'running');  // 不在关最后一个会话时立刻停
+  const five = await p.open('k5', { url: HOME_URL });
+  assert.equal(fake.launches, 5); assert.equal(fake.launched[4]?.name, 'k5');
+  assert.deepEqual(await Promise.all([0, 1, 2, 3].map((i) => seen.health(i))), [true, false, true, true]);   // 被停的是 k2
+  assert.ok(logs.some((l) => l.includes('profile k2') && l.includes('回收')));
+  for (const k of ['k1', 'k3', 'k4']) assert.equal((await sm.step({ session: s[k]![0]!.session, ops: [{ op: 'snapshot' }] })).results[0]?.outcome, 'ok');
+  assert.equal((await sm.step({ session: five.session, ops: [{ op: 'snapshot' }] })).results[0]?.outcome, 'ok');
+  assert.deepEqual(sm.list().length, 4);
+  await assert.rejects(p.open('k6', { url: HOME_URL }), isBusyProfiles);                  // 又满了、都有会话
+  assert.equal(seen.peak(), 4);                                                           // 回收在启动之前，同时活着的从没超过 4 个
+});
+
+test('with several idle instances the one that was last used longest ago is reclaimed', async () => {
+  const { sm, fake } = setup();
+  const seen = trackLive(fake); const p = onProfile(sm);
+  const s: Record<string, { session: string }> = {};
+  for (const k of ['k1', 'k2', 'k3', 'k4']) s[k] = await p.open(k, { url: HOME_URL });
+  await closeAllOn(sm, [s.k3!, s.k1!, s.k4!]);                                            // 结束顺序：k3、k1、k4；k2 还有会话
+  const k5 = await p.open('k5', { url: HOME_URL });
+  assert.deepEqual(await Promise.all([0, 1, 2, 3].map((i) => seen.health(i))), [true, true, false, true]);   // 停的是 k3
+  await sm.close({ session: s.k2!.session });                                             // 现在 k1、k4、k2 空闲，k1 最久
+  await p.open('k6', { url: HOME_URL });
+  assert.deepEqual(await Promise.all([0, 1, 2, 3, 4, 5].map((i) => seen.health(i))), [false, true, false, true, true, true]);
+  assert.ok(k5.session);
+  assert.equal(seen.peak(), 4);
+});
+
+test('an instance with a login page open is not idle; a login page that was closed makes it idle again', async () => {
+  const { sm, fake } = setup();
+  const seen = trackLive(fake); const p = onProfile(sm);
+  const s: { session: string }[] = [];
+  for (const k of ['k1', 'k2', 'k3', 'k4']) s.push(await p.open(k, { url: HOME_URL }));
+  await closeAllOn(sm, s);                                                                // 四个都没有会话了
+  const logins = [await p.loginBegin('k1', { url: LOGIN_URL }), await p.loginBegin('k2', { url: LOGIN_URL }), await p.loginBegin('k3', { url: LOGIN_URL })];
+  await p.open('k5', { url: HOME_URL });                                                  // 只有 k4 空闲
+  assert.deepEqual(await Promise.all([0, 1, 2, 3].map((i) => seen.health(i))), [true, true, true, false]);
+  const l5 = await p.loginBegin('k5', { url: LOGIN_URL });
+  assert.ok(l5.loginId);                                                                  // k5 有会话也有登录页
+  await assert.rejects(p.open('k6', { url: HOME_URL }), isBusyProfiles);                  // k1 到 k3 有登录页、k5 有会话：没有空闲的
+  await sm.loginEnd({ loginId: logins[1]!.loginId });                                     // k2 的登录页关了：它空闲
+  await p.open('k6', { url: HOME_URL });
+  assert.deepEqual(await Promise.all([0, 1, 2, 3, 4, 5].map((i) => seen.health(i))), [true, false, true, false, true, true]);
+});
+
+test('reclaiming waits for the stop: the limit is never exceeded, a third new profile cannot slip past, and the reclaimed key itself can be reopened', async () => {
+  const { sm, fake } = setup();
+  const seen = trackLive(fake, 60); const p = onProfile(sm);
+  const s: { session: string }[] = [];
+  for (const k of ['k1', 'k2', 'k3', 'k4']) s.push(await p.open(k, { url: HOME_URL }));
+  await closeAllOn(sm, s);
+  // k5、k6 各回收一个空闲实例，k7 回收第三个；k1 在被回收时又来了自己的 key。同时活着的实例始终不超过 4 个。
+  const r = await Promise.allSettled([p.open('k5', { url: HOME_URL }), p.open('k6', { url: HOME_URL }), p.open('k1', { url: HOME_URL }), p.open('k7', { url: HOME_URL })]);
+  const ok = r.filter((x) => x.status === 'fulfilled').length;
+  assert.ok(seen.peak() <= 4, `peak ${seen.peak()}`);
+  assert.equal(ok + r.filter((x) => x.status === 'rejected' && isBusyProfiles(x.reason)).length, 4);   // 成功或 busy，没有别的错
+  assert.equal(r[0]?.status, 'fulfilled');
+  assert.ok(sm.list().length === ok && ok >= 2);
+  for (const x of sm.list()) assert.equal((await sm.step({ session: x.session, ops: [{ op: 'snapshot' }] })).results[0]?.outcome, 'ok');
+});
+
+test('an invalid profile key is a usage error even when four profiles are running, and it takes no slot', async () => {
+  const { sm, fake } = setup();
+  const p = onProfile(sm);
+  for (const k of ['k1', 'k2', 'k3', 'k4']) await p.open(k, { url: HOME_URL });
+  for (const bad of ['../x', 'Admin', 'a/b', '', 'a@b@c']) {
+    await assert.rejects(p.open(bad, { url: HOME_URL }), (e: E2kError) => e.code === 'usage', JSON.stringify(bad));
+    await assert.rejects(p.loginBegin(bad, { url: LOGIN_URL }), (e: E2kError) => e.code === 'usage', JSON.stringify(bad));
+  }
+  assert.equal(fake.launches, 4);
+  assert.equal(sm.list().length, 4);
+  await p.open('k1', { url: HOME_URL });                                                  // 已在跑的 key 照常
+});
