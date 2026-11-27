@@ -25,6 +25,7 @@ let inst: Instance;
 let page: Page;
 let seen: RequestInfo[] = [];
 let opened: [Page, string | null][] = [];
+let hops: { pageId: string; url: string }[] = [];
 let decide: (r: RequestInfo) => Decision = () => ({ action: 'continue' });
 
 function makeTmp(prefix: string): string {
@@ -88,6 +89,7 @@ before(async () => {
   inst = await driver.launch({ name: 'default', userDataDir: makeTmp('e2k-pw-') });
   inst.setRequestHandler(r => { seen.push(r); return decide(r); });
   inst.onPageOpened((p, openerId) => { opened.push([p, openerId]); });
+  inst.onNavigationHop((e) => { hops.push(e); });
 });
 
 after(async () => {
@@ -100,6 +102,7 @@ beforeEach(async () => {
   decide = () => ({ action: 'continue' });
   seen = [];
   opened = [];
+  hops = [];
   page = await inst.openPage({});
   await page.goto(server.origin + '/index.html');
 });
@@ -1601,4 +1604,49 @@ test('two persistent instances run side by side: requests are attributed to thei
   } finally {
     await a.stop().catch(() => {}); await b.stop().catch(() => {});
   }
+});
+
+test('onNavigationHop reports each hop after the first of a main-frame redirect, with the page id and the hop url; the first request, plain navigations, sub-resources and iframes report nothing', { timeout: 60_000 }, async () => {
+  hops = [];
+  await page.goto(server.origin + '/index.html');
+  await page.evaluate(`fetch('/redir').then((r) => r.status)`);                                                    // 子资源的重定向
+  await page.evaluate(`(() => { const f = document.createElement('iframe'); f.src = '/redir'; document.body.append(f); return true; })()`);   // 子 frame 的重定向
+  await settle();
+  assert.deepEqual(hops, [], 'nothing so far: no main-frame redirect happened');
+  // 一跳：127.0.0.1/hop → localhost/index.html（路由回调只见第一个地址，第二跳只能从这里知道）
+  await page.goto(`${server.origin}/hop?to=${server.altOrigin}/index.html`);
+  await until(() => hops.length >= 1);
+  assert.deepEqual(hops, [{ pageId: page.id, url: server.altOrigin + '/index.html' }]);
+  assert.deepEqual(seen.filter((r) => r.isNavigation && r.topFrame).map((r) => r.url).slice(-1), [`${server.origin}/hop?to=${server.altOrigin}/index.html`], 'the handler saw only the first request of the chain');
+  // 两跳：每一跳都报，按顺序
+  hops = [];
+  await page.goto(`${server.origin}/hop?to=${server.altOrigin}/hop?to=${server.origin}/index.html`);
+  await until(() => hops.length >= 2);
+  assert.deepEqual(hops.map((h) => h.url), [`${server.altOrigin}/hop?to=${server.origin}/index.html`, `${server.origin}/index.html`]);
+  assert.ok(hops.every((h) => h.pageId === page.id));
+});
+
+test('onNavigationHop reports a redirect that a click starts in the page', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/cross-hop.html');
+  hops = [];
+  await page.click('#go');
+  await until(() => hops.length >= 1);
+  assert.deepEqual(hops, [{ pageId: page.id, url: server.altOrigin + '/index.html' }]);
+});
+
+test('clearCookies removes the cookies of that host only: the other host name keeps its own', { timeout: 60_000 }, async () => {
+  const cookieOf = async (origin: string): Promise<string> => {
+    await page.goto(origin + '/index.html');
+    return String(await page.evaluate('document.cookie'));
+  };
+  await page.goto(server.altOrigin + '/set-strict');                                                                 // localhost 上设一个 cookie
+  await page.goto(server.origin + '/set-strict');                                                                    // 127.0.0.1 上设一个
+  assert.ok((await cookieOf(server.altOrigin)).includes('strict_c=1'));
+  assert.ok((await cookieOf(server.origin)).includes('strict_c=1'));
+  await inst.clearCookies('localhost');
+  assert.equal(await cookieOf(server.altOrigin), '', 'the host that was cleared has no cookie left');
+  assert.ok((await cookieOf(server.origin)).includes('strict_c=1'), 'the other host name keeps its cookie');
+  await inst.clearCookies('127.0.0.1');
+  assert.equal(await cookieOf(server.origin), '');
+  await inst.clearCookies('no-such-host.example.com');                                                               // 没有 cookie 的主机：不报错
 });

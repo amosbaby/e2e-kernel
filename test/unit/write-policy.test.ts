@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { RequestInfo } from '../../src/driver/types.ts';
-import { BLOCK_MESSAGE, allowAllPolicy, blockOtherGroup, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
+import { BLOCK_MESSAGE, allowAllPolicy, blockFrozen, blockOtherGroup, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
 import type { BlockReason } from '../../src/kernel/write-policy.ts';
 
 const JSON_CT = 'application/json';
@@ -175,4 +175,18 @@ test('a cross-group navigation gets a fixed 403 page with the group names and th
     body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${sentence}</p><p>目标主机：b.example.com</p>` });
   const odd = blockOtherGroup('<b>"x"&\'y\'', 'b', 'a');
   assert.ok(odd.decision.action === 'fulfill' && !odd.decision.body.includes('<b>') && odd.decision.body.includes('&#60;b&#62;'));
+});
+
+test('a frozen session answers every request with a fixed 403 (HTML for navigations, JSON otherwise) and reason other-group, GET included', () => {
+  const sentence = '会话已冻结：页面经重定向进了组 b 的域名。请关掉这个会话，用 --profile b 另开。';
+  assert.equal(frozenMessage('b'), sentence);
+  const nav = blockFrozen(req({ method: 'GET', isNavigation: true, topFrame: true }), 'b');
+  assert.equal(nav.reason, 'other-group');
+  assert.deepEqual(nav.decision, { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${sentence}</p>` });
+  for (const method of ['GET', 'HEAD', 'POST']) {
+    const v = blockFrozen(req({ method }), 'b');
+    assert.equal(v.reason, 'other-group');
+    assert.ok(v.decision.action === 'fulfill' && v.decision.status === 403 && v.decision.contentType === 'application/json' && v.decision.body.includes('session frozen'));
+  }
+  assert.ok(frozenMessage(null).includes('判断不出归属'));
 });

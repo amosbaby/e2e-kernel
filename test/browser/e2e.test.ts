@@ -30,11 +30,11 @@ let ref = '';
 
 interface Run { code: number | null; out: string; err: string }
 
-// 参数固定、不经 shell；input 给了就作为标准输入。
-function e2kIn(input: string | undefined, ...args: string[]): Promise<Run> {
+// 参数固定、不经 shell；input 给了就作为标准输入；h 是内核的 home（默认是本文件共用的那个）。
+function e2kAt(h: typeof home, input: string | undefined, ...args: string[]): Promise<Run> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BIN, ...args], {
-      cwd: REPO, env: { ...process.env, E2K_HOME: home.root }, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: REPO, env: { ...process.env, E2K_HOME: h.root }, stdio: ['pipe', 'pipe', 'pipe'],
     });
     let out = '';
     let err = '';
@@ -45,6 +45,10 @@ function e2kIn(input: string | undefined, ...args: string[]): Promise<Run> {
     child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
   });
+}
+
+function e2kIn(input: string | undefined, ...args: string[]): Promise<Run> {
+  return e2kAt(home, input, ...args);
 }
 
 function e2k(...args: string[]): Promise<Run> {
@@ -462,6 +466,40 @@ test('a popup opened with noopener by a read-only session page is still read-onl
     assert.equal(popup.reason, 'method');
     assert.equal(popup.mode, 'readonly');
     assert.deepEqual(result.writes.unattributed, []);
+  }
+});
+
+// 跨组的重定向：用自己的内核和 home（共用内核的弹框额度——10 分钟 6 个——已被前面的规则测试用满）。
+// 组 a 是 127.0.0.1，组 b 是 localhost：点链接经 302 从 a 落到 b。
+test('a click that is redirected into another group freezes the session: step exits 22, the session refuses everything afterwards, and result.json records other-group', { timeout: 180_000 }, async () => {
+  const own = makeTmpHome();
+  writeFileSync(own.home.rulesFile, JSON.stringify({ version: 1, rules: [], loginHosts: [], groups: [{ name: 'a', hosts: ['127.0.0.1'] }, { name: 'b', hosts: ['localhost'] }] }));
+  const k = await startKernel({ home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(approving) });
+  const run = (input: string | undefined, ...args: string[]): Promise<Run> => e2kAt(own.home, input, ...args);
+  try {
+    const gate = await run(undefined, 'open', origin + '/cross-hop.html', '--json');
+    assert.equal(gate.code, 21, 'the first rules need an approval');
+    const open = JSON.parse((await run(undefined, 'open', origin + '/cross-hop.html', '--json')).out);
+    assert.equal(open.profile, 'a');
+    const from = server.hits.length;
+    const ok = await run(JSON.stringify([{ op: 'assert', kind: 'count', target: '#go', cmp: 'eq', expected: 1 }]), 'step', open.session, '--stdin');
+    assert.equal(ok.code, 0, 'a step that stays in the group is fine');
+    const click = await run(JSON.stringify([{ op: 'click', target: '#go' }, { op: 'snapshot' }]), 'step', open.session, '--stdin');
+    assert.equal(click.code, 22, click.out + click.err);
+    assert.ok((click.out + click.err).includes('页面经重定向进了组 b 的域名，会话已冻结'), click.out + click.err);
+    assert.ok((click.out + click.err).includes('--profile b'), 'the next step names the profile to use');
+    const again = await run(JSON.stringify([{ op: 'snapshot' }]), 'step', open.session, '--stdin');
+    assert.equal(again.code, 22, 'a frozen session does nothing');
+    assert.equal(server.hits.slice(from).length, 0);
+    const close = JSON.parse((await run(undefined, 'close', open.session, '--verdict', 'undetermined', '--because', 'e2e probe', '--json')).out);
+    const result = JSON.parse(readFileSync(close.resultPath, 'utf8'));
+    assert.ok(result.writes.blocked.some((w: any) => w.reason === 'other-group' && w.host === 'localhost'), JSON.stringify(result.writes.blocked));
+    assert.ok(result.writes.blocked.every((w: any) => w.reason === 'other-group' && w.decision === 'blocked'));
+    assert.deepEqual(result.actions.map((a: any) => [a.op.op, a.outcome]), [['assert', 'match'], ['click', 'ok'], ['snapshot', 'not-run']]);
+    assert.ok(!result.hosts.some((h: any) => h.host === 'localhost'), 'the landing host does not count as visited');
+  } finally {
+    await k.stop();
+    own.cleanup();
   }
 });
 

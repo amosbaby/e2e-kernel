@@ -24,7 +24,7 @@ import type { ProfileRef } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import { DEFAULT_GROUP_NAME } from './rules.ts';
-import { blockOtherGroup, otherGroupMessage } from './write-policy.ts';
+import { blockFrozen, blockOtherGroup, otherGroupMessage } from './write-policy.ts';
 import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
 
 // 会话管理（设计 5.2、5.5、5.6）：实例的懒启动和复用、会话的开、执行、收尾、闲置超时、关停。
@@ -43,6 +43,20 @@ const MAX_UNATTRIBUTED = 200;
 // 同时在跑（含正在启动）的浏览器实例上限：每个 profile 一个实例，每个实例是一整个有头浏览器。
 const MAX_INSTANCES = 4;
 
+// 冻结（设计 5.2）：会话（或登录页）经重定向进了别的组的域名之后，它所有页的所有请求（含 GET）一律 403，step 不再执行。
+// group 是第一次跨进去的那个组，判断不出归属时是 null（失败关闭：判断出错也冻结）；hosts 是跨进去的各跳主机（收尾时再清一次 cookie）；
+// clearing 是还没完成的 clearCookies，step 抛错和收尾前等它们落定。
+interface Freeze { readonly group: string | null; readonly hosts: Set<string>; readonly clearing: Set<Promise<void>> }
+
+// 被拦下的跨组导航的地址（去掉 #）：这些页面停在内核自己回的 403 页上，页面地址在别的组的域名上，但不是重定向带进去的，
+// 不能因为它冻结会话。只留最近 MAX_REFUSED 个。
+const MAX_REFUSED = 100;
+
+function withoutHash(url: string): string {
+  const i = url.indexOf('#');
+  return i < 0 ? url : url.slice(0, i);
+}
+
 // opening：页面已登记、首屏还没读完，对外当作不存在；closing：收尾中，再来的 step、close 都是 busy。
 type State = 'opening' | 'idle' | 'stepping' | 'closing';
 
@@ -60,6 +74,8 @@ interface Session {
   // 跨组导航被拦的次数，和还没在 step 的 notices 里提示过的提示句（去重）。
   crossCount: number;
   readonly crossNotices: Set<string>;
+  readonly refused: Set<string>;             // 被拦下的跨组导航的地址（去掉 #），见 MAX_REFUSED
+  frozen: Freeze | null;                     // 经重定向进了别的组的域名：整个会话冻结
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
   readonly recorder: Recorder;
@@ -89,7 +105,8 @@ interface Login {
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
   readonly places: Map<string, LoginPlace>;  // 每个登录页现在在哪个主机上（照会话的 topHost / pendingHosts 那套）
   blocked: number;                           // 登录期间被拦下的写（含放行后发现重定向被拒的），其中含跨组导航
-  crossBlocked: number;                      // 其中跨组导航被拦的次数（不是只读规则拦的）
+  crossBlocked: number;                      // 其中跨组导航被拦的次数（不是只读规则拦的）；冻结之后拦下的请求也计在这里
+  frozen: Freeze | null;                     // 经重定向进了别的组的域名：此后登录页的所有请求都拦
   // 放行时带 followRedirects: false 的请求 id → 日志行，onRequestDone 发现重定向被拒时用它补记一条拦截。
   readonly requestIds: Map<string, string>;
 }
@@ -109,6 +126,17 @@ const KNOWN_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 
 
 function busy(): E2kError {
   return new E2kError('busy', '会话正忙', '稍后重试');
+}
+
+// 冻结的会话 step 不执行：要人关掉它，用目标组的 profile 另开。group 为 null 是判断不出归属（失败关闭）。
+function frozenError(f: Freeze): E2kError {
+  return f.group === null
+    ? new E2kError('needs-human', '页面经重定向去了判断不出归属的域名，会话已冻结', '关掉这个会话，重新开')
+    : new E2kError('needs-human', `页面经重定向进了组 ${f.group} 的域名，会话已冻结`, `关掉这个会话，用 --profile ${f.group} 另开`);
+}
+
+function frozenNow(s: Session): Freeze | null {
+  return s.frozen;
 }
 
 // 关停开始以后，所有入口一律拒绝。
@@ -177,6 +205,7 @@ export class SessionManager {
   private readonly unattributed: WriteRecord[] = [];
   // 每个 profile（key）一个浏览器实例，懒启动。
   private readonly slots = new Map<string, InstanceSlot>();
+  private hopSeq = 0;   // 冻结时造的导航记录的编号
   private useClock = 0;   // 给 lastUsed 用的单调序号：比时间戳稳，同一毫秒里的先后也分得清
   // 关停是终态：一旦开始，不再接受任何调用，也不再启动浏览器。
   private stopping = false;
@@ -244,18 +273,25 @@ export class SessionManager {
     // 检查和置位之间没有 await：同一会话的两次 step 不会交错。
     const s = this.live(p.session);
     if (s.state !== 'idle') throw busy();
+    if (s.frozen !== null) throw frozenError(s.frozen);   // 冻结的会话不执行任何操作
     s.state = 'stepping';
     this.pauseIdle(s);
     try {
       const blockedBefore = s.recorder.blockedEvents();
       const crossBefore = s.crossCount;
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
-        { keepGoing: p.keepGoing === true, aborted: () => s.gone });
+        { keepGoing: p.keepGoing === true, aborted: () => s.gone || s.frozen !== null });
       // 口径：本批执行期间被拦下的本会话请求。执行结束之后才到的「重定向被拒」算进下一批；未归属的请求不算（它们不属于任何会话的记录）。
       const writesBlocked = s.recorder.blockedEvents() - blockedBefore;
       const crossBlocked = s.crossCount - crossBefore;   // 其中跨组导航被拦的：不是只读模式拦的，提示另说
       const tallies = tally(results);
       await this.syncTopHost(s);
+      // 本批执行期间冻结了（点链接被重定向到别的组）：后面的操作已记未执行，这一批的结果在报告里，这里报错让人处理。
+      const frozen = frozenNow(s);   // 不直接读 s.frozen：上面的检查让 TS 认定它是 null，而它在执行期间被回调改过
+      if (frozen !== null) {
+        await Promise.all([...frozen.clearing]);
+        throw frozenError(frozen);
+      }
       const wall = await loginWall(s.page, s.start.url);
       s.lastWall = wall.blocked;
       const notices: string[] = [];
@@ -406,7 +442,7 @@ export class SessionManager {
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, profile, group, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, crossBlocked: 0, requestIds: new Map() };
+      login = { id, instance, profile, group, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, crossBlocked: 0, frozen: null, requestIds: new Map() };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -585,6 +621,7 @@ export class SessionManager {
     inst.setRequestHandler((r) => this.onRequest(r));
     inst.onRequestDone((e) => { this.onRequestDone(e); });
     inst.onPageOpened((page, openerId) => { this.onPageOpened(page, openerId); });
+    inst.onNavigationHop((e) => { this.onNavigationHop(e); });
     inst.onClosed(() => { this.browserGone(inst); });
     slot.instance = inst;
     return inst;
@@ -629,7 +666,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
-        group: o.group, crossCount: 0, crossNotices: new Set(),
+        group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null,
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
@@ -698,6 +735,7 @@ export class SessionManager {
     for (const page of s.pages.values()) {
       if (page !== null) await this.closePageQuietly(s.id, page);
     }
+    await this.clearFrozenCookies(s);   // 页都关了，这时再清一遍：跳转那一刻的清理可能赶在那一跳的 Set-Cookie 之前
     const endedAt = this.deps.now();
     this.sessions.delete(s.id);
     this.touch(s.instance);
@@ -804,6 +842,7 @@ export class SessionManager {
         if (!(e instanceof DriverError)) this.logFailure(null, `登录 ${login.id} 关页面`, e);
       }
     }
+    await this.clearFrozenCookies(login);
   }
 
   // ---- 请求和新页面 ----
@@ -864,6 +903,12 @@ export class SessionManager {
   private decideForLogin(login: Login, req: RequestInfo): Decision {
     const { modes } = this.deps;
     const topHost = hostOf(req.topUrl ?? req.url);
+    // 已冻结（登录页经重定向进了别的组的域名）：所有请求，含 GET，一律拦，计入 writesBlocked 和 crossGroupBlocked。
+    if (login.frozen !== null) {
+      login.blocked++;
+      login.crossBlocked++;
+      return blockFrozen(req, login.frozen.group).decision;
+    }
     const place = this.loginPlace(login, req.pageId, req.openerPageId);
     const isNav = req.isNavigation && req.topFrame;
     // 跨组导航先于 loginHosts 的豁免和写策略：去别的组的域名，登录窗口里也不放行（含弹窗）。
@@ -938,9 +983,122 @@ export class SessionManager {
     return { verdict: blockOtherGroup(safely(() => redactText(hostOf(req.url))), target, ownGroup), message: otherGroupMessage(target, ownGroup) };
   }
 
+  // ---- 冻结（重定向进了别的组的域名） ----
+
+  // 驱动报来的重定向的跳（主 frame 导航被重定向之后的每一跳，首跳不在这里，走 decideRequest）：每一跳都查。
+  // 跳到的域名属于别的组（规则同首跳：不是 default 组、不是自己的组）就冻结；认不出是会话或登录页的页不管。
+  // 跳已经发出，拦不住，所以只能事后冻结，让这个会话此后的请求都 403。判断出错也冻结（失败关闭）。
+  private onNavigationHop(e: { pageId: string; url: string }): void {
+    const s = this.sessionOfPage(e.pageId);
+    const login = s === undefined ? this.loginOfPage(e.pageId) : undefined;
+    const owner = s ?? login;
+    if (owner === undefined) return;
+    let group: string | null = null;
+    let host: string | null = null;
+    try {
+      const u = new URL(e.url);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return;   // 重定向到别的协议进不了任何组的域名
+      host = u.hostname;
+      const target = this.deps.modes.groupOf(host).name;
+      if (target === DEFAULT_GROUP_NAME || target === owner.group) return;
+      group = target;
+    } catch (err) {
+      this.logFailure(null, '判断重定向的跳', err);
+    }
+    if (s !== undefined) this.freezeSession(s, e.url, group, host);
+    else if (login !== undefined) this.freezeLogin(login, group, host);
+  }
+
+  // 兜底：已提交的页面地址在别的组的域名上，说明重定向的跳事件漏掉了，同样冻结（已冻结的不再重复）。
+  // 被内核自己拦下的跨组导航停下的 403 页不算（s.refused）。判断出错也冻结。
+  private freezeIfOtherGroup(s: Session, url: string): void {
+    if (s.frozen !== null) return;
+    let group: string;
+    let host: string;
+    try {
+      host = hostOf(url);
+      group = this.deps.modes.groupOf(host).name;
+    } catch (err) {
+      this.logFailure(s.id, '判断页面地址', err);
+      this.freezeSession(s, url, null, null);
+      return;
+    }
+    if (group === DEFAULT_GROUP_NAME || group === s.group || s.refused.has(withoutHash(url))) return;
+    this.freezeSession(s, url, group, host);
+  }
+
+  // 冻结的共同部分：记下第一次跨进去的组，对这一跳的主机清 cookie（只在这个会话所在的实例上）。
+  private markFrozen(owner: Session | Login, group: string | null, host: string | null): Freeze {
+    const frozen: Freeze = owner.frozen ?? { group, hosts: new Set(), clearing: new Set() };
+    owner.frozen = frozen;
+    if (host !== null && host !== '') {
+      frozen.hosts.add(host);
+      this.clearCookies(owner, frozen, host);
+    }
+    return frozen;
+  }
+
+  // 日志里谁在清 cookie：会话记在会话名下，登录页写进文字里。
+  private who(owner: Session | Login): { sessionId: string | null; prefix: string } {
+    return 'page' in owner ? { sessionId: owner.id, prefix: '' } : { sessionId: null, prefix: `登录 ${owner.id} ` };
+  }
+
+  // 清这个主机的 cookie 不等结果（跳转回调是同步的）：失败只记日志。
+  private clearCookies(owner: Session | Login, frozen: Freeze, host: string): void {
+    const { sessionId, prefix } = this.who(owner);
+    const p = owner.instance.clearCookies(host).catch((e: unknown) => { this.logFailure(sessionId, `${prefix}清 ${safely(() => redactText(host))} 的 cookie`, e); });
+    frozen.clearing.add(p);
+    void p.finally(() => { frozen.clearing.delete(p); });
+  }
+
+  // 收尾时（页都关了）再清一遍：跳转那一刻清掉的 cookie，可能赶在那一跳的响应带来的 Set-Cookie 之前。实例已经没了就不清。
+  private async clearFrozenCookies(owner: Session | Login): Promise<void> {
+    const f = owner.frozen;
+    if (f === null) return;
+    await Promise.all([...f.clearing]);
+    if (!(await this.healthy(owner.instance))) return;
+    const { sessionId, prefix } = this.who(owner);
+    for (const host of f.hosts) {
+      try {
+        await owner.instance.clearCookies(host);
+      } catch (e) {
+        this.logFailure(sessionId, `${prefix}收尾清 ${safely(() => redactText(host))} 的 cookie`, e);
+      }
+    }
+  }
+
+  // 会话冻结：记一条被拦的 other-group（没有真请求，造一条导航的记录），日志一行。组、主机判断不出时 group、host 为 null。
+  private freezeSession(s: Session, url: string, group: string | null, host: string | null): void {
+    this.markFrozen(s, group, host);
+    const req: RequestInfo = {
+      id: `hop${++this.hopSeq}`, pageId: null, openerPageId: null, method: 'GET', url, resourceType: 'document',
+      isNavigation: true, topFrame: true, topUrl: url, initiatorUrl: null, contentType: null, body: null, fromLoginForm: null,
+    };
+    const verdict: PolicyVerdict = { decision: { action: 'abort' }, reason: 'other-group' };
+    s.recorder.addRequest(req, verdict, { mode: this.sessionMode(s, []), targetMode: this.deps.modes.resolve(host ?? '') }, this.deps.now());
+    this.logLine(`会话 ${s.id}：页面经重定向进了${group === null ? '判断不出归属的' : `组 ${group} 的`}域名 ${safely(() => redactText(host ?? ''))}，已冻结`);
+  }
+
+  // 登录页冻结：这一跳按一次被拦的跨组导航算（writesBlocked、crossGroupBlocked 各加一），日志一行。
+  private freezeLogin(login: Login, group: string | null, host: string | null): void {
+    this.markFrozen(login, group, host);
+    login.blocked++;
+    login.crossBlocked++;
+    this.logLine(`登录 ${login.id}：页面经重定向进了${group === null ? '判断不出归属的' : `组 ${group} 的`}域名 ${safely(() => redactText(host ?? ''))}，已冻结`);
+  }
+
+  // 冻结之后的请求：一律 403，记进会话的记录（每个请求都进 requests，被拦的进 writes）。
+  private blockFrozenRequest(s: Session, frozen: Freeze, req: RequestInfo): Decision {
+    const verdict = blockFrozen(req, frozen.group);
+    s.recorder.addRequest(req, verdict, { mode: this.sessionMode(s, []), targetMode: this.deps.modes.resolve(hostOf(req.url)) }, this.deps.now());
+    return verdict.decision;
+  }
+
   // 会话页（主页面、弹窗）的请求。模式跟着页面走（设计 5.2）：有效模式 = 会话主页面的顶层主机和请求所在页的顶层主机取并，
   // 任何一边只读就按只读；默认模式的页面发往只读主机的写照旧放行，只记录（targetMode）。
   private decideForSession(s: Session, req: RequestInfo): Decision {
+    // 已冻结：这个会话所有页的所有请求，含 GET，一律 403（记 other-group）。
+    if (s.frozen !== null) return this.blockFrozenRequest(s, s.frozen, req);
     // topUrl 可能是 null（判断不出顶层页面），这时退回请求自己的地址。
     const topHost = hostOf(req.topUrl ?? req.url);
     const isMain = req.pageId === s.page.id;
@@ -957,9 +1115,16 @@ export class SessionManager {
         s.recorder.addRequest(req, cross.verdict, { mode: this.sessionMode(s, []), targetMode }, this.deps.now());
         s.crossCount++;
         s.crossNotices.add(cross.message);
+        s.refused.add(withoutHash(req.url));   // 页面会停在这张 403 页上：之后看到页面在这个地址，不算被重定向带进去的
+        if (s.refused.size > MAX_REFUSED) s.refused.delete(s.refused.values().next().value as string);
         return cross.verdict.decision;
       }
     }
+    // 兜底（重定向的跳事件漏掉时，比如弹窗的第一个导航认不出归属）：会话的页已提交的地址（顶层导航：发起页的地址；其他请求：请求所在的
+    // 顶层地址）在别的组的域名上，就冻结，这个请求也不放行。
+    const evidence = req.isNavigation && req.topFrame ? req.initiatorUrl : req.topUrl;
+    if (evidence !== null) this.freezeIfOtherGroup(s, evidence);
+    if (s.frozen !== null) return this.blockFrozenRequest(s, s.frozen, req);
     // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
     if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
     // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
@@ -1005,7 +1170,10 @@ export class SessionManager {
   private followTopHost(s: Session, url: string): void {
     try {
       const u = new URL(url);
-      if (u.protocol === 'http:' || u.protocol === 'https:') this.converge(s, u.hostname);
+      if (u.protocol === 'http:' || u.protocol === 'https:') {
+        this.freezeIfOtherGroup(s, url);
+        this.converge(s, u.hostname);
+      }
     } catch {
       // 地址解析不了：沿用上一个主机。
     }

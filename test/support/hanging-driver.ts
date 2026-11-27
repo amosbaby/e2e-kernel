@@ -24,6 +24,8 @@ export function hangingDriver(pages: Record<string, FakePageSpec>, o: { hangStop
         onRequestDone: (l) => { inst.onRequestDone(l); },
         addInitScript: (s) => inst.addInitScript(s),
         onPageOpened: (l) => { inst.onPageOpened(l); },
+        onNavigationHop: (l) => { inst.onNavigationHop(l); },
+        clearCookies: (host) => inst.clearCookies(host),
         openPage: () => { opened = true; return new Promise<Page>(() => {}); },
       };
       return wrapped;

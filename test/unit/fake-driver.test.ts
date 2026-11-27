@@ -301,3 +301,21 @@ test('two instances run side by side: requests, popups and request-done stay wit
   d.closeBrowser();                                    // 最近启动的是第二个
   assert.equal((await b.health()).ok, false);
 });
+
+test('emitHop reaches only the listeners of the instance that owns the page; clearCookies is recorded per instance and refuses on a closed one', async () => {
+  const d = new FakeDriver();
+  const a = await d.launch({ name: 'a', userDataDir: '/tmp/e2k-fake-a' });
+  const b = await d.launch({ name: 'b', userDataDir: '/tmp/e2k-fake-b' });
+  const pageA = await a.openPage({});
+  const seenA: { pageId: string; url: string }[] = [];
+  const seenB: { pageId: string; url: string }[] = [];
+  a.onNavigationHop((e) => { seenA.push(e); });
+  b.onNavigationHop((e) => { seenB.push(e); });
+  d.emitHop(pageA.id, 'http://localhost/landed');
+  assert.deepEqual(seenA, [{ pageId: pageA.id, url: 'http://localhost/landed' }]);
+  assert.deepEqual(seenB, []);
+  await a.clearCookies('localhost');
+  assert.deepEqual([d.clearedHosts(0), d.clearedHosts(1)], [['localhost'], []]);
+  d.closeInstance(1);
+  await assert.rejects(b.clearCookies('localhost'), DriverError);
+});

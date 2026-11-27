@@ -238,6 +238,8 @@ class FakeInstance implements Instance {
   readonly closedListeners: (() => void)[] = [];
   readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void)[] = [];
   readonly pageOpenedListeners: ((page: Page, openerId: string | null) => void)[] = [];
+  readonly hopListeners: ((e: { pageId: string; url: string }) => void)[] = [];
+  readonly clearedHosts: string[] = [];   // clearCookies 收到的主机，按调用顺序
   private readonly openPageImpl: (o: { viewport?: Viewport }) => Promise<Page>;
 
   constructor(openPageImpl: (inst: FakeInstance, o: { viewport?: Viewport }) => Promise<Page>) {
@@ -284,6 +286,15 @@ class FakeInstance implements Instance {
     this.pageOpenedListeners.push(listener);
   }
 
+  onNavigationHop(listener: (e: { pageId: string; url: string }) => void): void {
+    this.hopListeners.push(listener);
+  }
+
+  async clearCookies(host: string): Promise<void> {
+    if (this.closed) throw new DriverError('other', 'browser is closed');
+    this.clearedHosts.push(host);
+  }
+
   openPage(o: { viewport?: Viewport }): Promise<Page> {
     return this.openPageImpl(o);
   }
@@ -326,6 +337,11 @@ export class FakeDriver implements Driver {
 
   async selfCheck(): Promise<Check[]> {
     return this.checks.map((c) => ({ ...c }));
+  }
+
+  // 测试里临时给一个 URL 加页面规格（比如让某个地址 goto 之后落到别处）。
+  definePage(url: string, spec: FakePageSpec): void {
+    this.pageSpecs[url] = spec;
   }
 
   get launches(): number {
@@ -371,6 +387,17 @@ export class FakeDriver implements Driver {
   emitRequestDone(id: string, status: number | null, opts: { failed?: boolean; redirectRefused?: true } = {}): void {
     const e = { id, status, failed: opts.failed ?? opts.redirectRefused === true, ...(opts.redirectRefused === true ? { redirectRefused: true as const } : {}) };
     for (const l of (this.requestOwners.get(id) ?? this.running()).requestDoneListeners) l(e);
+  }
+
+  // 模拟页面的主 frame 导航被重定向之后的一跳：发给这一页所属的实例。
+  emitHop(pageId: string, url: string): void {
+    const inst = this.pages.find((p) => p.id === pageId)?.owner ?? this.running();
+    for (const l of inst.hopListeners) l({ pageId, url });
+  }
+
+  // 第 index 个启动的实例上 clearCookies 收到的主机（见 launched），按调用顺序。
+  clearedHosts(index: number): string[] {
+    return [...(this.instances[index]?.clearedHosts ?? [])];
   }
 
   emitPopup(openerId: string, url: string): Page {

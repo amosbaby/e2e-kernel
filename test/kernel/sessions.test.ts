@@ -2051,3 +2051,185 @@ test('a login window of a group is bound the same way: from a default-mode group
   assert.equal((await apiPost(fake, pageId, 'http://a.example.com/api', HOME_URL + 'login')).action, 'fulfill');
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
 });
+
+// ---- 重定向进了别的组的域名：冻结（M2b 任务 7） ----
+
+const FROZEN_STEP_ERROR = (e: unknown): boolean => e instanceof E2kError && e.code === 'needs-human'
+  && e.message === '页面经重定向进了组 b 的域名，会话已冻结' && e.next === '关掉这个会话，用 --profile b 另开';
+const instanceOf = (fake: FakeDriver, name: string): number => fake.launched.findIndex((l) => l.name === name);
+const pageCalls = (fake: FakeDriver, pageId: string): number => fake.calls.filter((c) => c.pageId === pageId).length;
+
+test('a hop of the session page into another group freezes it: every page and every request (GET too) gets 403, step does nothing and says needs-human, cookies of that hop host are cleared on that instance only', async () => {
+  const { sm, fake } = await setupGroups();
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  const other = await sm.open({ url: A_URL, name: 'same-instance' }); const otherPage = fake.openPages().at(-1)!;   // 同一个实例（组 a）上的另一个会话
+  const plain = await sm.open({ url: HOME_URL, name: 'plain' }); const plainPage = fake.openPages().at(-1)!;      // 另一个实例（default）
+  const popup = fake.emitPopup(pageId, 'about:blank');
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL })).action, 'continue');   // 冻结之前照常
+  const calls = pageCalls(fake, pageId);
+  fake.emitHop(pageId, B_URL + 'landing');
+  const blocked = [
+    await fake.emitRequest({ pageId, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL }),                              // 子资源
+    await topNav(fake, pageId, A_URL + 'next'),                                                                           // 本组自己的导航也不行
+    await topNav(fake, pageId, 'http://sso.example.org/'),                                                                // 没编组的主机也不行
+    await fake.emitRequest({ pageId: popup.id, method: 'GET', url: A_URL + 'x', topUrl: A_URL }),                         // 弹窗
+    await fake.emitRequest({ pageId, method: 'POST', url: A_URL + 'api', topUrl: A_URL, body: '{}', contentType: 'application/json' }),
+  ];
+  for (const d of blocked) assert.deepEqual([d.action, (d as { status: number }).status], ['fulfill', 403]);
+  assert.equal((blocked[1] as { contentType: string }).contentType, 'text/html; charset=utf-8');
+  assert.ok((blocked[1] as { body: string }).body.includes('会话已冻结：页面经重定向进了组 b 的域名'));
+  assert.equal((blocked[0] as { contentType: string }).contentType, 'application/json');
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'snapshot' }, { op: 'click', target: 'e2' }] }), FROZEN_STEP_ERROR);
+  assert.equal(pageCalls(fake, pageId), calls);                                                                           // 一个操作都没执行，连读数都没有
+  // 别的会话不受影响：同实例的、别的实例的
+  assert.equal((await fake.emitRequest({ pageId: otherPage, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL })).action, 'continue');
+  assert.equal((await sm.step({ session: other.session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  assert.equal((await fake.emitRequest({ pageId: plainPage, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL })).action, 'continue');
+  assert.equal((await sm.step({ session: plain.session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  // clearCookies 只对 b 这一跳的主机、只在 a 的实例上调
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com']);
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'default')), []);
+  // 收尾：会话可以关；页都关了以后再清一遍；记录里有 other-group（跳那一下和冻结后被拦的请求）
+  const closed = await sm.close({ session: a.session });
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com', 'b.example.com']);
+  const res = readResult(closed.runDir);
+  assert.ok(res.writes.blocked.length >= 1 && res.writes.blocked.every((w) => w.reason === 'other-group' && w.decision === 'blocked'));
+  assert.ok(res.writes.blocked.some((w) => w.host === 'b.example.com' && w.method === 'GET'));                              // 那一跳
+  assert.ok(res.writes.blocked.some((w) => w.host === 'a.example.com' && w.method === 'POST'));                             // 冻结后的写
+  assert.ok(res.writes.blockedSummary.every((r) => r.reason === 'other-group'));
+  assert.ok(!res.hosts.some((h) => h.host === 'b.example.com'));                                                            // 没算「到过」
+  await sm.close({ session: other.session }); await sm.close({ session: plain.session });
+});
+
+test('every hop of the chain is checked: unlisted hosts and the own group pass, a later hop into another group freezes; a default-group session is frozen by a hop into a group', async () => {
+  const { sm, fake } = await setupGroups();
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  fake.emitHop(pageId, 'http://sso.example.org/'); fake.emitHop(pageId, A_URL + 'back'); fake.emitHop(pageId, 'about:blank');   // 没编组、本组、不是 http(s)
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL })).action, 'continue');
+  assert.equal((await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), []);
+  fake.emitHop(pageId, B_URL + 'hop2');                                                                                       // 链上的第三跳进了 b
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  fake.emitHop(pageId, 'http://b.example.com:8080/other');                                                                   // 冻结之后的跳：不换组，主机相同（带端口不影响 cookie 的主机）
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com', 'b.example.com']);
+  await sm.close({ session: a.session });
+  const d = await sm.open({ url: HOME_URL, name: 'dflt' }); const dPage = fake.openPages().at(-1)!;
+  fake.emitHop(dPage, A_URL + 'x');                                                                                           // default 组的会话被带进组 a
+  await assert.rejects(sm.step({ session: d.session, ops: [{ op: 'snapshot' }] }),
+    (e: unknown) => e instanceof E2kError && e.code === 'needs-human' && e.message === '页面经重定向进了组 a 的域名，会话已冻结' && e.next === '关掉这个会话，用 --profile a 另开');
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'default')), ['a.example.com']);
+  await sm.close({ session: d.session });
+});
+
+test('a hop that arrives while step is running stops the rest of the batch (not-run), step answers needs-human, and the report keeps what ran', async () => {
+  const { sm, fake } = await setupGroups();
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  const during = sm.step({ session: a.session, ops: [{ op: 'wait', for: { ms: 80 } }, { op: 'snapshot' }, { op: 'snapshot' }] });
+  await sleep(10);
+  fake.emitHop(pageId, B_URL);
+  await assert.rejects(during, FROZEN_STEP_ERROR);
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.actions.map((x) => [x.op.op, x.outcome]), [['wait', 'ok'], ['snapshot', 'not-run'], ['snapshot', 'not-run']]);
+  assert.ok(res.writes.blocked.some((w) => w.reason === 'other-group' && w.host === 'b.example.com'));
+});
+
+test('fallback: page evidence in another group freezes too (followTopHost after open and after step, and a request of the main page whose top page is there); a refused first-hop navigation does not', async () => {
+  const { sm, fake } = await setupGroups();
+  fake.definePage(A_URL + 'bounce', { redirectTo: B_URL + 'landed' });
+  fake.definePage(A_URL + 'bounce2', { redirectTo: B_URL });                                                                  // 和下面被拦的地址一样
+  // open 时页面落在 b：开成了，但已冻结
+  const o = await sm.open({ url: A_URL + 'bounce', name: 'on-open' });
+  await assert.rejects(sm.step({ session: o.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com']);
+  await sm.close({ session: o.session });
+  // step 里的 goto 落在 b：这一批的操作做完了，step 报 needs-human
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'goto', url: A_URL + 'bounce' }] }), FROZEN_STEP_ERROR);
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL })).action, 'fulfill');
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.actions.map((x) => [x.op.op, x.outcome]), [['goto', 'ok']]);
+  // 主页面的非导航请求带着的顶层地址在 b：冻结，这个请求也不放行
+  const c = await sm.open({ url: A_URL, name: 'by-request' }); const cPage = fake.openPages().at(-1)!;
+  const r = await fake.emitRequest({ pageId: cPage, method: 'GET', url: B_URL + 'app.js', topUrl: B_URL });
+  assert.deepEqual([r.action, (r as { status: number }).status], ['fulfill', 403]);
+  await assert.rejects(sm.step({ session: c.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  await sm.close({ session: c.session });
+  // 弹窗里的重定向驱动认不出归属（没有跳事件）：弹窗之后的请求带着的顶层地址在 b，同样冻结
+  const p = await sm.open({ url: A_URL, name: 'by-popup' }); const pPage = fake.openPages().at(-1)!;
+  const pop = fake.emitPopup(pPage, 'about:blank');
+  const popReq = await fake.emitRequest({ pageId: pop.id, method: 'GET', url: B_URL + 'app.js', topUrl: B_URL });
+  assert.deepEqual([popReq.action, (popReq as { status: number }).status], ['fulfill', 403]);
+  await assert.rejects(sm.step({ session: p.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  await sm.close({ session: p.session });
+  // 发起页（已提交的页面）的地址在 b 的主页面导航：冻结
+  const d = await sm.open({ url: A_URL, name: 'by-initiator' }); const dPage = fake.openPages().at(-1)!;
+  assert.equal((await topNav(fake, dPage, A_URL + 'x', 'GET', B_URL + 'was-here')).action, 'fulfill');
+  await assert.rejects(sm.step({ session: d.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  await sm.close({ session: d.session });
+  // 对照：内核自己拦下的跨组导航，页面停在那张 403 页上（地址在 b）：不算被重定向带进去的，不冻结，会话照常（# 不影响比较）
+  const e = await sm.open({ url: A_URL, name: 'refused' }); const ePage = fake.openPages().at(-1)!;
+  assert.equal((await topNav(fake, ePage, B_URL)).action, 'fulfill');
+  assert.equal((await topNav(fake, ePage, A_URL + 'x', 'GET', B_URL + '#frag')).action, 'continue');                          // 发起页停在被拦的 b 页上
+  assert.equal((await sm.step({ session: e.session, ops: [{ op: 'goto', url: A_URL + 'bounce2' }] })).exit, 0);               // 页面地址落在被拦过的 b 地址
+  assert.equal((await fake.emitRequest({ pageId: ePage, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL })).action, 'continue');
+  await assert.rejects(sm.step({ session: e.session, ops: [{ op: 'goto', url: A_URL + 'bounce' }] }), FROZEN_STEP_ERROR);     // 没被拦过的 b 地址：冻结
+  await sm.close({ session: e.session });
+});
+
+test('a hop whose group cannot be judged freezes the session too (fail closed): step says needs-human, nothing is cleared', async () => {
+  const { sm, fake, modes } = await setupGroups();
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  const real = modes.groupOf.bind(modes);
+  modes.groupOf = () => { throw new Error('boom'); };
+  fake.emitHop(pageId, B_URL);
+  modes.groupOf = real;
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'snapshot' }] }),
+    (e: unknown) => e instanceof E2kError && e.code === 'needs-human' && e.message.includes('判断不出归属') && e.next === '关掉这个会话，重新开');
+  const d = await fake.emitRequest({ pageId, method: 'GET', url: A_URL + 'app.js', topUrl: A_URL });
+  assert.equal((d as { status: number }).status, 403);
+  assert.ok(((await topNav(fake, pageId, A_URL)) as { body: string }).body.includes('判断不出归属'));
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com']);                                              // 主机认得出，只是组判断不出
+  await sm.close({ session: a.session });
+});
+
+test('a hop of an unknown page is ignored; a failing clearCookies is logged and does not stop the freeze', async () => {
+  const { sm, fake, logs } = await setupGroups();
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  fake.emitHop('p-unknown', B_URL);                                                                                           // 没有会话认领这一页
+  assert.equal((await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), []);
+  const inst = (fake as unknown as { instances: { clearCookies(h: string): Promise<void> }[] }).instances[instanceOf(fake, 'a')]!;
+  inst.clearCookies = () => Promise.reject(new DriverError('other', 'cookie store is gone'));
+  fake.emitHop(pageId, B_URL);
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  assert.ok(logs.some((l) => l.includes(`会话 ${a.session}：清 b.example.com 的 cookie失败：other: cookie store is gone`)));
+  await sm.close({ session: a.session });
+});
+
+test('a login window frozen by a hop into another group: all its requests are refused and counted in writesBlocked and crossGroupBlocked, cookies are cleared on its instance', async () => {
+  const { sm, fake, logs } = await setupGroups();
+  const { loginId } = await sm.loginBegin({ url: A_URL + 'login' }); const pageId = fake.openPages().at(-1)!;
+  fake.emitHop(pageId, 'http://sso.example.org/');                                                                            // a 的 loginHost：不冻结
+  assert.equal((await fake.emitRequest({ id: `e${++navSeq}`, pageId, method: 'GET', url: 'http://sso.example.org/app.js', topUrl: 'http://sso.example.org/' })).action, 'continue');
+  fake.emitHop(pageId, B_URL + 'acs');
+  const popup = fake.emitPopup(pageId, 'about:blank');
+  const refused = [
+    await fake.emitRequest({ id: `e${++navSeq}`, pageId, method: 'GET', url: 'http://sso.example.org/app.js', topUrl: 'http://sso.example.org/' }),   // loginHost 的豁免也不管用
+    await fake.emitRequest({ id: `e${++navSeq}`, pageId: popup.id, method: 'GET', url: A_URL + 'x', topUrl: A_URL }),
+    await topNav(fake, pageId, A_URL + 'acs', 'POST', 'http://sso.example.org/'),
+  ];
+  for (const d of refused) assert.deepEqual([d.action, (d as { status: number }).status], ['fulfill', 403]);
+  assert.deepEqual(logs.filter((l) => l.includes(loginId)), [`登录 ${loginId}：页面经重定向进了组 b 的域名 b.example.com，已冻结`]);
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 4, crossGroupBlocked: 4 });                                // 跳 1 + 被拦的 3
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com', 'b.example.com']);                              // 跳的时候一次，结束时一次
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'default')), []);
+});
+
+test('a login window that only hops through unlisted hosts or its own group is not frozen', async () => {
+  const { sm, fake } = await setupGroups();
+  const { loginId } = await sm.loginBegin({ url: A_URL + 'login' }); const pageId = fake.openPages().at(-1)!;
+  fake.emitHop(pageId, 'http://sso.example.org/'); fake.emitHop(pageId, A_URL + 'acs');
+  assert.equal((await topNav(fake, pageId, A_URL + 'acs', 'POST', 'http://sso.example.org/')).action, 'continue');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 0 });
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), []);
+});

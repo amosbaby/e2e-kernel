@@ -105,6 +105,7 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   const cookieSeen: (string | null)[] = [];
   const upgraded = new Set<Duplex>();
   let altOrigin = '';
+  let origin = '';
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const raw = req.url ?? '/';
@@ -126,6 +127,15 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     if (url.pathname === '/set-strict') {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'set-cookie': 'strict_c=1; Path=/; SameSite=Strict' });
       res.end('ok');
+      return;
+    }
+
+    // /hop?to=<地址>：302 到 to（只认本 fixture 的两个站点，别的一律 404）。用来造「经重定向进了另一个主机名」。
+    if (url.pathname === '/hop') {
+      const to = url.searchParams.get('to') ?? '';
+      if (!to.startsWith(origin + '/') && !to.startsWith(altOrigin + '/')) return notFound(res);
+      res.writeHead(302, { location: to, 'cache-control': 'no-store' });
+      res.end();
       return;
     }
 
@@ -264,7 +274,7 @@ export async function startFixtureServer(): Promise<FixtureServer> {
   });
   const servers = v6Up ? [v4, v6] : [v4];
 
-  const origin = `http://127.0.0.1:${port}`;
+  origin = `http://127.0.0.1:${port}`;
   altOrigin = `http://localhost:${port}`;
 
   return {

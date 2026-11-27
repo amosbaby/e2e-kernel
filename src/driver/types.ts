@@ -21,6 +21,11 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../shared/ops.ts';
 //   导航提交之前读到的 mainFrame().url()，只认 http: 和 https:，其他是 null），也就是「即将被这次导航替换掉的那份文档」；
 //   这和 topUrl（导航目标）不同。它通常就是发起导航的页，但不总是：iframe 的 target=_top、别的窗口的 target=<窗口名>
 //   发起的导航，报的是被替换的那一页，不是真正的发送者。其他请求和 topUrl 取同一个值。内核用它判断导航前页面在哪个主机上。
+// - onNavigationHop：主 frame 的导航被重定向之后的每一跳（request.redirectedFrom() 不为空的导航请求；首跳走 setRequestHandler，
+//   不在这里）都通知一次，url 是这一跳的地址。后续跳不进路由回调，内核只能从这里知道页面被带去了哪里；通知时这一跳已经发出，
+//   拦不住，内核只能事后冻结会话。子 frame、子资源的重定向不通知；认不出是哪一页的跳不通知（pageId 必须是驱动登记过的页）。
+// - clearCookies(host)：只清这个主机自己的 cookie（域名恰好是 host 或 .host）；上级域的 cookie 是同站点其他主机共用的，不动。
+//   只依赖 BrowserContext 的公开接口，不依赖持久化 context 才有的行为。
 // - 驱动不得往页面里暴露任何能调回驱动或内核的函数。
 
 export const ACTION_TIMEOUT_MS = 10_000;
@@ -101,6 +106,8 @@ export interface Instance {
   onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void): void;
   addInitScript(source: string): Promise<void>;                                      // 拦截：页面脚本之前的注入脚本
   onPageOpened(listener: (page: Page, openerId: string | null) => void): void;       // 弹窗和新标签页
+  onNavigationHop(listener: (e: { pageId: string; url: string }) => void): void;     // 拦截：主 frame 导航被重定向之后的每一跳
+  clearCookies(host: string): Promise<void>;                                         // 清掉这个主机自己的 cookie（见上面的约定）
   openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page>;              // 页面：打开一个空白页，由内核再 goto；touch 只对这一页模拟触屏（不能模拟就抛错，不留页）
 }
 

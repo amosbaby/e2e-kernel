@@ -39,6 +39,21 @@ export function blockOtherGroup(host: string, targetGroup: string, ownGroup: str
   return { decision: { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body }, reason: 'other-group' };
 }
 
+// 会话已冻结（页面经重定向进了别的组的域名）：它所有页的所有请求，含 GET，一律 403，原因记 other-group。
+// 组名只含小写字母、数字、_、-，不用转义。
+// group 为 null 是判断不出归属（失败关闭）。
+export function frozenMessage(group: string | null): string {
+  return group === null ? '会话已冻结：页面经重定向去了判断不出归属的域名。请关掉这个会话，重新开。'
+    : `会话已冻结：页面经重定向进了组 ${group} 的域名。请关掉这个会话，用 --profile ${group} 另开。`;
+}
+
+export function blockFrozen(req: RequestInfo, group: string | null): PolicyVerdict {
+  const decision: Decision = req.isNavigation
+    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${frozenMessage(group)}</p>` }
+    : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'blocked by e2k: session frozen after a cross-group redirect' }) };
+  return { decision, reason: 'other-group' };
+}
+
 function decideReadonly(req: RequestInfo): PolicyVerdict {
   // 带体的 GET/HEAD/OPTIONS 不算读（浏览器不会发，没有误伤）：和其他方法一样走下面的写检查，过不了 isStrictQuery，最后落到 method。
   if (isSafeMethod(req.method) && req.body === null) {

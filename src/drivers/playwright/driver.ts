@@ -715,6 +715,7 @@ class PlaywrightInstance implements Instance, Host {
   private readonly closedListeners: (() => void)[] = [];
   private readonly requestDoneListeners: ((e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void)[] = [];
   private readonly pageOpenedListeners: ((page: Page, openerId: string | null) => void)[] = [];
+  private readonly navigationHopListeners: ((e: { pageId: string; url: string }) => void)[] = [];
   private handler: ((r: RequestInfo) => Decision | Promise<Decision>) | undefined;
   private closed = false;
   private stopping: Promise<void> | undefined;
@@ -744,7 +745,7 @@ class PlaywrightInstance implements Instance, Host {
     // 页面一跳转还会被报成 requestfailed。所以以 response 事件为准，requestfinished 和 requestfailed 只补没有响应的情形。
     this.context.on('response', (r) => { this.requestDone(r.request(), r.status(), false); });
     // idle 的「请求结束」同样以响应头为准（理由同上：不读响应体的 fetch 不会触发 requestfinished），先到的事件为准。
-    this.context.on('request', (r) => { this.flightStarted(r); });
+    this.context.on('request', (r) => { this.flightStarted(r); void this.navigationHop(r); });
     this.context.on('response', (r) => { this.flightEnded(r.request()); });
     this.context.on('requestfinished', (r) => { this.flightEnded(r); this.navigationEnded(r); void this.requestFinished(r); });
     this.context.on('requestfailed', (r) => { this.flightEnded(r); this.navigationEnded(r); this.requestDone(r, null, true); });
@@ -786,6 +787,22 @@ class PlaywrightInstance implements Instance, Host {
 
   onRequestDone(listener: (e: { id: string; status: number | null; failed: boolean; redirectRefused?: true }) => void): void {
     this.requestDoneListeners.push(listener);
+  }
+
+  onNavigationHop(listener: (e: { pageId: string; url: string }) => void): void {
+    this.navigationHopListeners.push(listener);
+  }
+
+  // 只清这个主机自己的 cookie：域名恰好是 host 或 .host（带 Domain 属性设下的）。Playwright 的字符串过滤是全等比较，
+  // 认不出 .host，所以用正则；上级域的 cookie 是同站点别的主机共用的，不碰。
+  async clearCookies(host: string): Promise<void> {
+    if (this.closed) throw new DriverError('other', 'browser is closed');
+    const escaped = host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    try {
+      await this.context.clearCookies({ domain: new RegExp(`^\\.?${escaped}$`, 'i') });
+    } catch (e) {
+      throw mapError(e);
+    }
   }
 
   async addInitScript(source: string): Promise<void> {
@@ -905,6 +922,23 @@ class PlaywrightInstance implements Instance, Host {
       w.ready = this.announce(w);
     }
     return w;
+  }
+
+  // 主 frame 导航被重定向之后的每一跳（redirectedFrom 不为空的导航请求；首跳走路由）：通知 onNavigationHop。
+  // 认不出是哪一页（拿不到 frame：弹窗的第一个导航，Playwright 说「frame 还没创建」；是启动时的锚页）、不是主 frame 的，不通知；
+  // 弹窗里的重定向落到别的组，靠弹窗之后的请求带着的顶层地址兜底（decideForSession）。先等页面登记完（别处开出来的页要查开启者），
+  // 这样内核收到时已经认得这一页。
+  private async navigationHop(request: PwRequest): Promise<void> {
+    try {
+      if (request.redirectedFrom() === null || !request.isNavigationRequest()) return;
+      const frame = request.frame();
+      if (frame.parentFrame() !== null) return;
+      const w = this.register(frame.page(), false);
+      if (w === null) return;
+      await w.ready;
+      if (this.closed) return;
+      emit(this.reportListenerError, this.navigationHopListeners, { pageId: w.id, url: request.url() });
+    } catch { /* 拿不到 frame（弹窗的第一个导航还没有 frame）或页面已经没了：认不出归属，不通知 */ }
   }
 
   // 查开启者，再通知 onPageOpened。开启者自己也是没见过的页时，先把它也登记上。
