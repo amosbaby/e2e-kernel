@@ -196,6 +196,10 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
     path: home.rulesFile,
     rules: f.rules.map((x) => ({ match: redactText(x.match), mode: x.mode })),
     loginHosts: f.loginHosts.map((x) => redactText(x)),
+    groups: f.groups.map((g) => ({
+      name: g.name, hosts: g.hosts.map((x) => redactText(x)), loginHosts: g.loginHosts.map((x) => redactText(x)),
+      readPosts: g.readPosts.length, persistedQueries: g.persistedQueries.length, logout: g.logout.length, identity: g.identity !== null,
+    })),
     hash: f.hash, error: redactError(f.error),
   };
   print(ctx, result, formatRuleList);

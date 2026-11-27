@@ -706,6 +706,8 @@ function mutableRules(readonlyHosts: string[], loginHosts: string[] = []) {
   const resolver: ModeResolver = {
     resolve: (h) => (isRo(h) ? 'readonly' : 'default'),
     ruleFor: (h) => (isRo(h) ? 'readonly' : null),
+    groupOf: defaultOnlyResolver.groupOf,
+    group: defaultOnlyResolver.group,
     isLoginHost: (h) => loginHosts.includes(h),
     refresh: () => { st.refreshes++; const p = st.pending; st.pending = null; p?.(); },
     state: () => ({ count: st.ro.size, hash: st.hash, error: st.error }),

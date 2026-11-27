@@ -647,8 +647,8 @@ export class SessionManager {
       place.committed = hostOf(req.initiatorUrl);
       place.pending.clear();
     }
-    const exempt = modes.isLoginHost(hostOf(req.url))
-      || (isNav && [place.committed, ...place.pending].some((h) => modes.isLoginHost(h)));
+    const exempt = modes.isLoginHost(hostOf(req.url), 'default')
+      || (isNav && [place.committed, ...place.pending].some((h) => modes.isLoginHost(h, 'default')));
     let decision: Decision;
     if (exempt) decision = { action: 'continue' };
     else {

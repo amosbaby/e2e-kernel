@@ -132,7 +132,12 @@ export function formatStatus(r: StatusResult): string {
 }
 
 // `rule list` 的结果：规则文件现在的样子，由 CLI 自己读，不经内核。
-export interface RuleListResult extends RulesFile { path: string }
+// 组只列名字、主机和各清单的条数：接口路径和身份探针留在文件里，不进输出。
+export interface RuleGroupSummary {
+  name: string; hosts: string[]; loginHosts: string[];
+  readPosts: number; persistedQueries: number; logout: number; identity: boolean;
+}
+export interface RuleListResult extends Omit<RulesFile, 'groups'> { path: string; groups: RuleGroupSummary[] }
 
 export function formatRuleList(r: RuleListResult): string {
   if (r.error !== null) return [`规则文件 ${inline(r.path)}`, inline(r.error)].join('\n');
@@ -141,6 +146,8 @@ export function formatRuleList(r: RuleListResult): string {
     `规则文件 ${inline(r.path)}`,
     ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode)}`)),
     `loginHosts  ${r.loginHosts.length === 0 ? '（无）' : r.loginHosts.map(inline).join(', ')}`,
+    ...r.groups.map((g) => `组 ${inline(g.name)}  hosts ${g.hosts.map(inline).join(', ')}  loginHosts ${g.loginHosts.length === 0 ? '（无）' : g.loginHosts.map(inline).join(', ')}`
+      + `  readPosts ${g.readPosts}  persistedQueries ${g.persistedQueries}  logout ${g.logout}  identity ${g.identity ? '有' : '无'}`),
     `hash  ${inline(r.hash)}`,
   ].join('\n');
 }

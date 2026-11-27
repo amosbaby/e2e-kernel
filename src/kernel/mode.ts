@@ -1,4 +1,5 @@
 import type { Mode } from '../shared/protocol.ts';
+import type { Group } from './rules.ts';
 
 // 域名规则里能写的模式。'denied' 是 M3 的事，规则文件现在不收。
 export type RuleMode = 'readonly' | 'default';
@@ -13,17 +14,25 @@ export interface ModeResolver {
   resolve(host: string): Mode;
   // 命中的规则模式，没命中（或主机不合格）为 null。给 ModeChange.reason 用。
   ruleFor(host: string): RuleMode | null;
-  // 入口先规范化主机；失败为 false。
-  isLoginHost(host: string): boolean;
+  // 主机所在的域名组；没编组、或主机不合格，是合成的 'default' 组。
+  groupOf(host: string): Group;
+  // 按名字取组；'default' 总有，没有这个名字为 null。
+  group(name: string): Group | null;
+  // 入口先规范化主机；失败为 false。只看 group 那个组的 loginHosts（'default' 组 = 顶层 loginHosts）；没有这个组为 false。
+  isLoginHost(host: string, group: string): boolean;
   // 读文件比内容哈希，变了才重新解析。解析失败：保留上一份好的，error 置为说明。
   refresh(): void;
   state(): RulesState;
 }
 
-// 测试用：永远「默认」、没有登录主机。
+const emptyDefaultGroup = (): Group => ({ name: 'default', hosts: [], loginHosts: [], readPosts: [], persistedQueries: [], logout: [], identity: null });
+
+// 测试用：永远「默认」、没有登录主机、没有组。
 export const defaultOnlyResolver: ModeResolver = Object.freeze({
   resolve: (): Mode => 'default',
   ruleFor: (): RuleMode | null => null,
+  groupOf: emptyDefaultGroup,
+  group: (name: string): Group | null => (name === 'default' ? emptyDefaultGroup() : null),
   isLoginHost: (): boolean => false,
   refresh: (): void => {},
   state: (): RulesState => ({ count: 0, hash: null, error: null }),

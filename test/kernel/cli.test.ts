@@ -510,7 +510,23 @@ test('rule list without a rules file: says every host is default, exit 0, and cr
     assert.equal(t.outText(), '没有 rules.json，所有域名都是默认模式');
     assert.ok(!existsSync(h.home.root));
     const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
-    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], hash: null, error: null });
+    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], groups: [], hash: null, error: null });
+  });
+});
+
+test('rule list shows groups with host lists and counts only, not endpoint paths or the identity probe', async () => {
+  const withGroup = JSON.stringify({ version: 1, rules: [], loginHosts: ['sso.example.org'], groups: [{
+    name: 'admin', hosts: ['admin.example.com'], loginHosts: ['sso.example.org'],
+    readPosts: [{ method: 'POST', url: 'https://admin.example.com/v1/secret-path' }], logout: [{ url: 'https://admin.example.com/logout' }],
+    identity: { selector: '#tenant', expect: 'Test Tenant' } }] });
+  await withRules(withGroup, async (h) => {
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    assert.match(t.outText(), /^组 admin {2}hosts admin\.example\.com {2}loginHosts sso\.example\.org {2}readPosts 1 {2}persistedQueries 0 {2}logout 1 {2}identity 有$/m);
+    assert.ok(!t.outText().includes('secret-path') && !t.outText().includes('Test Tenant'));
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    const r = JSON.parse(j.outText()) as { groups: unknown[] };
+    assert.deepEqual(r.groups, [{ name: 'admin', hosts: ['admin.example.com'], loginHosts: ['sso.example.org'], readPosts: 1, persistedQueries: 0, logout: 1, identity: true }]);
+    assert.ok(!j.outText().includes('secret-path') && !j.outText().includes('Test Tenant'));
   });
 });
 
