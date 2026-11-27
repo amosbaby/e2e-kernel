@@ -33,6 +33,8 @@ function shapeProblem(r: DialogRequest): string | null {
   if (r.buttons.length < 1 || r.buttons.length > 3) return '按钮数不对';
   if (new Set(r.buttons).size !== r.buttons.length) return '按钮重名';
   if (r.buttons.some((b) => b === '' || /[\r\n]/.test(b))) return '按钮名不合法';
+  // 英文 Cancel：点它 osascript 以 -128 退出，会被当成弹不出，整个内核的弹框就此失效。
+  if (r.buttons.some((b) => /^cancel$/i.test(b))) return '按钮名不能叫 Cancel';
   if (!r.buttons.includes(r.defaultButton)) return '默认按钮不在按钮里';
   if (!Number.isInteger(r.timeoutSec) || r.timeoutSec < 1 || r.timeoutSec > MAX_TIMEOUT_SEC) return '超时秒数不合法';
   return null;
@@ -109,7 +111,7 @@ export type ApprovalState =
 interface Entry {
   id: string; kind: ApprovalKind; req: DialogRequest; approveButtons: string[];
   state: 'queued' | 'showing' | 'approved' | 'denied';
-  button?: string; deniedAt?: number;
+  button?: string;
 }
 
 export function pendingError(id: string, what: string): E2kError {
@@ -139,13 +141,18 @@ export class Approvals {
 
   ask(key: string, kind: ApprovalKind, req: DialogRequest, approveButtons: string[]): ApprovalState {
     checkDialogText(req);
+    const problem = shapeProblem(req);
+    if (problem !== null) throw new E2kError('internal', `对话框请求不合法：${problem}`);
+    // 批准键必须是这个框里的按钮，且不能是默认按钮（回车就批准了）。
+    if (approveButtons.includes(req.defaultButton) || !approveButtons.every((b) => req.buttons.includes(b))) {
+      throw new E2kError('internal', '对话框请求不合法：批准按钮不对');
+    }
     const t = this.now();
     const have = this.entries.get(key);
     if (have !== undefined) {
       if (have.state === 'approved') return { status: 'approved', button: have.button ?? '' };
       if (have.state === 'denied') {
-        if (t - (have.deniedAt ?? 0) < COOLING_MS) return { status: 'denied', cooling: false };
-        this.entries.delete(key);   // 拒绝只管冷却的这 60 秒，之后同一件事可以再问
+        return { status: 'denied', cooling: false };   // 被拒的请求一直记到 forget 或内核重启，不再问
       } else {
         return { status: 'pending', id: have.id };
       }
@@ -188,6 +195,11 @@ export class Approvals {
       const entry = this.entries.get(key);
       if (entry === undefined || entry.state !== 'queued') continue;
       const t = this.now();
+      const denied = this.lastDenied.get(entry.kind);
+      if (denied !== undefined && t - denied < COOLING_MS) {
+        this.entries.delete(key);   // 排队期间同类被拒了：不弹，调用方重试时 ask 走冷却分支
+        continue;
+      }
       if (this.shownRecently(t) >= RATE_MAX_SHOWN) {
         this.entries.delete(key);   // 排队期间额度用完了：不弹，调用方重试时会得到 unavailable
         this.log('待批请求因弹框太频繁被丢弃');
@@ -215,7 +227,6 @@ export class Approvals {
         entry.button = result.button;
       } else {
         entry.state = 'denied';
-        entry.deniedAt = t;
         this.lastDenied.set(entry.kind, t);
       }
     } else if (result.kind === 'timeout') {

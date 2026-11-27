@@ -93,7 +93,7 @@ export interface CloseResult {
   conflicts?: ConflictReason[];   // consistency 为 conflict 时的原因，和 result.json 的 conflicts 一致
 }
 
-const METHODS: readonly Method[] = ['status', 'open', 'step', 'close', 'login.begin', 'login.end'];
+export const METHODS: readonly Method[] = ['status', 'open', 'step', 'close', 'login.begin', 'login.end'];
 const VERDICT_VALUES: readonly VerdictValue[] = ['pass', 'fail', 'exists', 'absent', 'undetermined'];
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/;
 const SESSION_ID = /^s-[0-9a-f]{6}$/;

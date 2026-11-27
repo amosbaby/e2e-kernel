@@ -1,10 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { Approvals, checkDialogText, noDialog, osascriptDialog, pendingError } from '../../src/kernel/approval.ts';
 import type { DialogRequest, DialogResult, ExecFn } from '../../src/kernel/approval.ts';
 import type { E2kError } from '../../src/shared/errors.ts';
-import { exitCodeFor, parseRequest } from '../../src/shared/protocol.ts';
+import { METHODS, exitCodeFor, parseRequest } from '../../src/shared/protocol.ts';
 import { fakeDialog } from '../support/fake-dialog.ts';
 
 const isUsage = (e: E2kError): boolean => e.code === 'usage';
@@ -216,7 +215,12 @@ test('Approvals: a click on another button is a denial; the same kind is then re
   assert.equal(a.ask('k2', 'rules', req(), APPROVE).status, 'pending');
   assert.equal(m.seen.length, 3);
   await m.release({ kind: 'button', button: '允许' });
-  assert.deepEqual(a.ask('k1', 'rules', req(), APPROVE).status, 'pending');   // k1 自己的拒绝也过了冷却，是新的一件事
+  // k1 自己的拒绝一直记着：过了冷却也不再问，直到 forget（或内核重启）。
+  assert.deepEqual(a.ask('k1', 'rules', req(), APPROVE), { status: 'denied', cooling: false });
+  c.advance(60 * 60_000);
+  assert.deepEqual(a.ask('k1', 'rules', req(), APPROVE), { status: 'denied', cooling: false });
+  a.forget('k1');
+  assert.equal(a.ask('k1', 'rules', req(), APPROVE).status, 'pending');
 });
 
 test('Approvals: the seventh dialog within 10 minutes is unavailable; the window slides', async () => {
@@ -252,9 +256,10 @@ test('Approvals: an approval stays until forget, then the same key is a new ques
 test('Approvals: only the buttons the caller listed approve', async () => {
   const m = manualDialog();
   const a = new Approvals(m.dialog, () => {}, { now: clock().now });
-  a.ask('k', 'login', req({ buttons: ['取消', '默认', '只读'], defaultButton: '取消' }), ['默认', '只读']);
+  const three = req({ buttons: ['取消', '默认', '只读'], defaultButton: '取消' });
+  a.ask('k', 'login', three, ['默认', '只读']);
   await m.release({ kind: 'button', button: '只读' });
-  assert.deepEqual(a.ask('k', 'login', req(), ['默认', '只读']), { status: 'approved', button: '只读' });
+  assert.deepEqual(a.ask('k', 'login', three, ['默认', '只读']), { status: 'approved', button: '只读' });
 });
 
 test('Approvals: a timeout forgets the key, so asking again shows a new dialog', async () => {
@@ -313,6 +318,56 @@ test('Approvals: a request dropped from the queue by the rate limit is unavailab
   assert.equal(a.ask('seven', 'login', req(), APPROVE).status, 'unavailable');
 });
 
+test('Approvals: a queued request of a kind denied in the meantime is not shown; asking again gets cooling', async () => {
+  const c = clock();
+  const m = manualDialog();
+  const a = new Approvals(m.dialog, () => {}, { now: c.now });
+  assert.equal(a.ask('k1', 'rules', req(), APPROVE).status, 'pending');
+  assert.equal(a.ask('k2', 'rules', req(), APPROVE).status, 'pending');   // 同类，排在后面
+  await m.release({ kind: 'button', button: '不允许' });
+  assert.equal(m.seen.length, 1, 'k2 is not shown after k1 was denied');
+  assert.deepEqual(a.ask('k2', 'rules', req(), APPROVE), { status: 'denied', cooling: true });
+  assert.equal(m.seen.length, 1);
+  c.advance(61_000);
+  assert.equal(a.ask('k2', 'rules', req(), APPROVE).status, 'pending');
+  assert.equal(m.seen.length, 2);
+});
+
+test('Approvals: a different kind queued behind a denial is still shown', async () => {
+  const m = manualDialog();
+  const a = new Approvals(m.dialog, () => {}, { now: clock().now });
+  a.ask('k1', 'rules', req(), APPROVE);
+  a.ask('k2', 'writes', req(), APPROVE);
+  await m.release({ kind: 'button', button: '不允许' });
+  assert.equal(m.seen.length, 2);
+});
+
+test('a button named Cancel is refused: by the request check, and by Approvals before anything is shown', async () => {
+  for (const name of ['Cancel', 'cancel', 'CANCEL']) {
+    const r = req({ buttons: [name, '允许'], defaultButton: name });
+    const d = dialogWith(() => 'button returned:允许, gave up:false\n');
+    assert.equal((await d.dialog.show(r)).kind, 'unavailable');
+    assert.equal(d.calls.length, 0);
+    const dialog = fakeDialog();
+    const a = new Approvals(dialog, () => {}, { now: clock().now });
+    assert.throws(() => a.ask('k', 'rules', r, APPROVE), (e: E2kError) => e.code === 'internal');
+    assert.equal(dialog.requests.length, 0);
+  }
+  const ok = dialogWith(() => 'button returned:取消, gave up:false\n');
+  assert.equal((await ok.dialog.show(req({ buttons: ['取消', '允许'], defaultButton: '取消' }))).kind, 'button');
+});
+
+test('Approvals.ask: the default button cannot approve, and the approve buttons must be buttons of the dialog', () => {
+  const dialog = fakeDialog();
+  const a = new Approvals(dialog, () => {}, { now: clock().now });
+  const isInternal = (e: E2kError): boolean => e.code === 'internal';
+  assert.throws(() => a.ask('k', 'rules', req(), ['不允许']), isInternal);          // 默认按钮就是批准键
+  assert.throws(() => a.ask('k', 'rules', req(), ['允许', '不存在']), isInternal);   // 不在按钮里
+  assert.throws(() => a.ask('k', 'rules', req({ buttons: [], defaultButton: 'x' }), []), isInternal);
+  assert.equal(dialog.requests.length, 0);
+  assert.equal(a.ask('k', 'rules', req(), ['允许']).status, 'pending');   // 没留下半截状态
+});
+
 test('pendingError is exit 21 with a retry hint', () => {
   const e = pendingError('a-1b2c3d', '改规则');
   assert.equal(e.code, 'wait-approval');
@@ -324,10 +379,8 @@ test('pendingError is exit 21 with a retry hint', () => {
 // ---- 没有经协议批准的路 ----
 
 test('the protocol has no approval method', () => {
-  const src = readFileSync(new URL('../../src/shared/protocol.ts', import.meta.url), 'utf8');
-  const methods = [...src.matchAll(/^(?:export type Method =|const METHODS[^=]*=)(.*)$/gm)].map((m) => m[1]!);
-  assert.equal(methods.length, 2);
-  for (const line of methods) assert.ok(!/approv/i.test(line), line);
+  assert.ok(METHODS.length >= 6);
+  for (const m of METHODS) assert.ok(!/approv/i.test(m), m);
   for (const name of ['approve', 'approvals', 'approval.grant', 'approvals.approve', 'approve.begin']) {
     assert.throws(() => parseRequest(JSON.stringify({ v: 1, id: 'a1', method: name, params: {} })), isUsage, name);
   }
