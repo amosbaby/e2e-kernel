@@ -2,7 +2,7 @@ import { afterEach, beforeEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -19,7 +19,7 @@ import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { fakeDialog } from '../support/fake-dialog.ts';
+import { approving, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 
 // 长得像 token 的串在运行时拼出来，不写成字面量。
 const jwt = ['eyJ' + 'hbGciOiJIUzI1NiJ9', 'eyJ' + 'zdWIiOiIxMjM0NSJ9', 'c2lnbmF0dXJl' + 'LXZhbHVlLWZvci10ZXN0'].join('.');
@@ -183,6 +183,41 @@ test('status reports the rules state, rereads the file first, and its keys are n
   const raw = await call(h, 'status', {});
   assert.deepEqual(keysOf(raw).filter(isSensitiveKey), []);
   assert.ok(keysOf(raw).includes('approvalsChanged') && keysOf(raw).includes('approvals') && keysOf(raw).includes('pending'));
+});
+
+test('over the socket: a changed rules.json makes open and login.begin answer wait-approval (21) until the person clicks, status shows it pending, and the retry then goes through', async () => {
+  const h = tmpHome();
+  const { dialog, release } = holdingDialog();
+  await started({ home: h, driver: new FakeDriver({ pages: pages() }), dialog });
+  writeFileSync(h.rulesFile, '{"version":1,"rules":[{"match":"example.com","mode":"readonly"}]}');
+  for (const [method, params] of [['open', { url: 'http://localhost:5173/' }], ['login.begin', { url: 'http://localhost:5173/' }]] as const) {
+    const r = await call(h, method, params);
+    assert.ok(!r.ok && r.error.code === 'wait-approval', method);
+    assert.match(r.ok ? '' : r.error.message, /等人在弹框里批准：域名规则的改动（请求 a-[0-9a-f]{6}）/);
+  }
+  assert.equal(dialog.requests.length, 1);
+  const st = await call(h, 'status', {}); assert.ok(st.ok);
+  assert.equal((st.result as StatusResult).rules.count, 0, 'the approved rules are still none');
+  release();
+  await sleep(5);
+  const ok = await call(h, 'open', { url: 'http://localhost:5173/' });   // 人在弹框里点了批准（假对话框）：原样重试
+  assert.ok(ok.ok);
+  const after = await call(h, 'status', {}); assert.ok(after.ok);
+  assert.deepEqual([(after.result as StatusResult).rules.count, (after.result as StatusResult).rules.pending], [1, null]);
+  assert.equal(dialog.requests.length, 1);
+});
+
+test('over the socket: an approvals record that cannot be read at start puts rules.json up for approval again and status says so', async () => {
+  const h = tmpHome();
+  writeFileSync(h.rulesFile, '{"version":1,"rules":[{"match":"example.com","mode":"readonly"}]}');
+  mkdirSync(h.approvalsFile);   // 读不了；不是在写批准
+  await started({ home: h, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(approving) });
+  const st = await call(h, 'status', {}); assert.ok(st.ok);
+  const rules = (st.result as StatusResult).rules;
+  assert.deepEqual([rules.count, rules.approvals], [0, 'unreadable']);
+  assert.ok(rules.pending !== null);
+  const r = await call(h, 'open', { url: 'http://localhost:5173/' });
+  assert.ok(!r.ok && r.error.code === 'wait-approval');
 });
 
 test('a second start on the same home is refused while the first is alive', async () => {

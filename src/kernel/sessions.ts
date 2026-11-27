@@ -15,7 +15,8 @@ import type { CloseParams, CloseResult, Mode, OpenParams, OpenResult, SessionInf
   from '../shared/protocol.ts';
 import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
-import type { Approvals } from './approval.ts';
+import { pendingError } from './approval.ts';
+import type { Approvals, DialogRequest } from './approval.ts';
 import type { ApprovalStore } from './approval-store.ts';
 import type { ModeResolver } from './mode.ts';
 import { DEFAULT_PROFILE, recordLogin } from './profiles.ts';
@@ -34,6 +35,7 @@ export interface SessionDeps {
 }
 
 const DEFAULT_NAME = 'session';
+const APPROVAL_TIMEOUT_SEC = 120;
 const MAX_UNATTRIBUTED = 200;
 
 // opening：页面已登记、首屏还没读完，对外当作不存在；closing：收尾中，再来的 step、close 都是 busy。
@@ -173,6 +175,7 @@ export class SessionManager {
     // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
+    this.gateRules();
     const forced = p.readonly === true;
     const mode: Mode = forced ? 'readonly' : this.deps.modes.resolve(host);
     // 「denied」是 M3 的事，规则文件现在不收；到了这里也宁可拒绝，不开任何页面。
@@ -220,7 +223,10 @@ export class SessionManager {
       s.lastWall = wall.blocked;
       const notices: string[] = [];
       if (writesBlocked > 0) notices.push(`本批被拦 ${writesBlocked} 条写（只读模式），详见报告`);
-      if (this.deps.modes.state().error !== null) notices.push('规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝');
+      const rules = this.deps.modes.state();
+      if (rules.error !== null) notices.push('规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝');
+      if (rules.pending !== null) notices.push('规则文件有未批准的改动（收紧的部分已生效）');
+      if (rules.approvalsChanged) notices.push('批准记录被内核以外的进程改过，已忽略');
       // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。退出码不受 notices 影响。
       return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
     } finally {
@@ -254,6 +260,47 @@ export class SessionManager {
       }));
   }
 
+  // 入口闸门（设计 5.4）：规则文件有待批的改动时，新的 open 和 login 先过人工批准，含收紧、含删文件。
+  // 收紧的部分在批准前已经按「更严合并」生效；这里只管放宽要不要放。批准的是内存里待批的那份（完整哈希），不重读磁盘。
+  // 弹框在后台，这里同步返回：没批准就抛错，调用方等人点完再原样重试（重试靠内容键对上同一个框）。
+  private gateRules(): void {
+    const { modes, approvals } = this.deps;
+    let refreshed = false;
+    for (;;) {
+      const pending = modes.pending();
+      if (pending === null) return;
+      const short = modes.state().pendingHash ?? '文件被删了';   // 对外只露短哈希
+      const key = `rules:${pending.hash ?? 'deleted'}`;
+      // 改动太多框里放不下：只给「拒绝」一个按钮，必然 denied，让人先看完整差异、拆开再改。
+      const request: DialogRequest = pending.tooLong
+        ? { title: 'e2k：域名规则改了', lines: [`规则文件改动太多，框里放不下（${short}）：`, '先运行 e2k rule diff 看完整差异，再拆成几次改。', '', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）'],
+          buttons: ['拒绝'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC }
+        : { title: 'e2k：域名规则改了', lines: [`规则文件有改动（${short}），批准后才生效：`, ...pending.summary, '', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）'],
+          buttons: ['拒绝', '批准'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC };
+      const asked = approvals.ask(key, 'rules', request, pending.tooLong ? [] : ['批准']);
+      switch (asked.status) {
+        case 'pending':
+          throw pendingError(asked.id, '域名规则的改动');
+        case 'denied':
+          throw new E2kError('usage',
+            asked.cooling ? '刚被人拒过，过一会儿再试' : '人拒绝了这次规则改动；按上一次批准的规则，新的 open 和 login 也不开',
+            '把 rules.json 改回去或改成别的再试；内核重启前同一份改动不会再问');
+        case 'unavailable':
+          throw new E2kError('needs-human', `规则改了但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
+        case 'approved': {
+          // 写盘失败时 approvePending 抛 needs-human，原样往上走；这里不接。
+          const done = modes.approvePending(pending.hash);
+          approvals.forget(key);
+          if (done) break;   // 回到循环顶：待批已清，返回
+          // 内存里待批的已经不是被批准的那份：重读一次再走一遍，还不行就当没批准。
+          if (refreshed) throw new E2kError('wait-approval', '规则文件又变了，要重新批准', '人点完以后，原样重试这条命令');
+          refreshed = true;
+          modes.refresh();
+        }
+      }
+    }
+  }
+
   // 在 default profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录窗口里 loginHosts 之外的写照只读规则拦。
   loginBegin(p: { url: string }): Promise<{ loginId: string }> {
     return this.track(() => this.beginLogin(p));
@@ -263,6 +310,7 @@ export class SessionManager {
     // 规则先刷新一遍：文件有错就不开登录页（和 open 一致）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
+    this.gateRules();
     const instance = await this.acquireInstance();
     if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;

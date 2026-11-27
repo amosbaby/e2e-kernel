@@ -11,7 +11,7 @@ import { call } from '../../src/shared/client.ts';
 import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { fakeDialog } from '../support/fake-dialog.ts';
+import { approving, fakeDialog } from '../support/fake-dialog.ts';
 
 // 端到端验收：真浏览器（有头 Chromium）、真 fixture 服务、测试进程内的内核，CLI 走 bin/e2k.js 子进程。
 // 这份文件里的测试按书写顺序执行，共用模块级的 sid 和 ref。
@@ -61,7 +61,7 @@ function allFilesUnder(dir: string): string[] {
 before(async () => {
   server = await startFixtureServer();
   origin = server.origin;
-  kernel = await startKernel({ home, driver: createPlaywrightDriver(), dialog: fakeDialog() });
+  kernel = await startKernel({ home, driver: createPlaywrightDriver(), dialog: fakeDialog(approving) });   // 批准走真路径：21 → 假对话框回「批准」→ 原样重试
 });
 
 after(async () => {
@@ -248,13 +248,29 @@ test('open --touch gives only that session page a coarse pointer, and the report
 
 // ---- 只读模式（M2a）：真浏览器、真内核、真 CLI ----
 
-// 写好 rules.json 再跑 fn，无论成败都删掉，不影响后面按顺序跑的测试。
+// 改过规则以后第一次 open 要人批准：内核得 21，假对话框回「批准」，原样重试才成功（测试从不直接写批准记录）。
+// 已经批准过、或这份改动不进待批（文件有错）时第一次就成功，原样返回。
+async function openApproved(...args: string[]): Promise<Run> {
+  const first = await e2k('open', ...args);
+  return first.code === 21 ? e2k('open', ...args) : first;
+}
+
+async function loginBeginApproved(url: string): ReturnType<typeof call> {
+  const first = await call(home, 'login.begin', { url });
+  return !first.ok && first.error.code === 'wait-approval' ? call(home, 'login.begin', { url }) : first;
+}
+
+// 写好 rules.json 再跑 fn，无论成败都删掉，不影响后面按顺序跑的测试。删文件也是待批的改动：
+// 收尾时开一个探针会话把「删掉」批准掉，下一个测试从「没有规则」干净地开始。
 async function withRules(rules: unknown, fn: () => Promise<void>): Promise<void> {
   writeFileSync(home.rulesFile, typeof rules === 'string' ? rules : JSON.stringify(rules));
   try {
     await fn();
   } finally {
     rmSync(home.rulesFile, { force: true });
+    const probe = await openApproved(origin + '/index.html', '--name', 'rules-probe', '--json');
+    assert.equal(probe.code, 0, probe.err);
+    assert.equal((await e2k('close', JSON.parse(probe.out).session)).code, 0);
   }
 }
 
@@ -265,6 +281,10 @@ async function until(what: string, cond: () => boolean, ms = 10_000): Promise<vo
     assert.ok(t < ms, `timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 50));
   }
+}
+
+async function sessionCount(): Promise<number> {
+  return (JSON.parse((await e2k('status', '--json')).out) as { sessions: unknown[] }).sessions.length;
 }
 
 const settle = (ms = 500): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -282,7 +302,11 @@ async function closeResult(session: string): Promise<any> {
 test('read-only host: every write path is blocked, a strict query passes, and each block is on record', { timeout: 180_000 }, async () => {
   await withRules(readonlyRules('127.0.0.1'), async () => {
     const from = server.hits.length;
-    const open = JSON.parse((await e2k('open', origin + '/ro.html', '--json')).out);
+    const before = await sessionCount();
+    const gate = await e2k('open', origin + '/ro.html', '--json');
+    assert.equal(gate.code, 21, 'a changed rules.json has to be approved first, even a tightening one');
+    assert.equal(await sessionCount(), before, 'no page was opened while it waited');
+    const open = JSON.parse((await e2k('open', origin + '/ro.html', '--json')).out);   // 假对话框已经回了「批准」：原样重试
     try {
       assert.equal(open.mode, 'readonly');
       const fired = await stepJson(open.session, [{ op: 'click', target: '#fire' }, { op: 'wait', for: { text: 'all-sent' } },
@@ -319,7 +343,7 @@ test('read-only host: every write path is blocked, a strict query passes, and ea
 test('read-only host: a strict query that answers with a redirect is refused at the first hop', { timeout: 180_000 }, async () => {
   await withRules(readonlyRules('127.0.0.1'), async () => {
     const from = server.hits.length;
-    const open = JSON.parse((await e2k('open', origin + '/index.html', '--json')).out);
+    const open = JSON.parse((await openApproved(origin + '/index.html', '--json')).out);
     try {
       assert.equal(open.mode, 'readonly');
       const js = "fetch('/r307', { method: 'POST', body: '{\"query\":\"query{a}\"}', headers: { 'content-type': 'application/json' } }).then((r) => r.status, () => 'refused')";
@@ -387,7 +411,7 @@ test('a broken rules.json makes open fail with a usage error and rule list print
 test('login window: a write to a loginHost passes, a write back to the read-only host is blocked and counted', { timeout: 180_000 }, async () => {
   await withRules(readonlyRules('127.0.0.1', ['localhost']), async () => {
     const from = server.hits.length;
-    const begin = await call(home, 'login.begin', { url: origin + '/login-writes.html' });
+    const begin = await loginBeginApproved(origin + '/login-writes.html');
     assert.ok(begin.ok);
     const loginId = (begin as { result: { loginId: string } }).result.loginId;
     try {

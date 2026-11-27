@@ -1,7 +1,7 @@
 import { afterEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -21,10 +21,11 @@ import type { Mode } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { Approvals } from '../../src/kernel/approval.ts';
+import { Approvals, noDialog } from '../../src/kernel/approval.ts';
+import type { Dialog } from '../../src/kernel/approval.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
-import { createRulesResolver } from '../../src/kernel/rules.ts';
-import { fakeDialog } from '../support/fake-dialog.ts';
+import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
+import { approving, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 
 const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null };
 
@@ -735,20 +736,283 @@ function inner(sm: SessionManager, id: string): { topHost: string; pendingHosts:
 
 test('a readonly rule in an unapproved rules.json is already in force: the timeline says rule and carries the pending hash, result.json.rules carries it too', async () => {
   const tmp = makeTmpHome();
-  writeFileSync(tmp.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'example.com', mode: 'readonly' }] }));
   const modes = createRulesResolver(tmp.home.rulesFile, ApprovalStore.open(tmp.home.approvalsFile, () => {}));
-  const pendingHash = modes.state().pendingHash;
-  assert.match(pendingHash ?? '', /^sha256:[0-9a-f]{16}$/);
   const { sm, fake } = setup({ modes, policy, home: tmp.home });
   cleanups.push(async () => { tmp.cleanup(); });
+  const a = await sm.open({ url: 'http://localhost:5173/' });   // 开的时候还没有规则文件
+  const pageId = fake.openPages().at(-1)!;
+  writeFileSync(tmp.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'example.com', mode: 'readonly' }] }));
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'wait-approval');   // 新的 open 要先过批准；这一下也让规则文件进了待批
+  const pendingHash = modes.state().pendingHash;
+  assert.match(pendingHash ?? '', /^sha256:[0-9a-f]{16}$/);
+  // 已开的会话导航到 example.com：待批文件里的收紧已在生效
+  assert.deepEqual(await fake.emitRequest({ pageId, method: 'GET', url: RO, isNavigation: true, topFrame: true, topUrl: RO }), { action: 'continue' });
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://example.com/api', topUrl: RO, body: '{}', contentType: 'application/json' })).action, 'fulfill');
+  const timeline = inner(sm, a.session).recorder.modes as unknown as { mode: string; reason: string; rulesHash: string | null; pendingRulesHash: string | null }[];
+  const change = timeline.at(-1);
+  assert.deepEqual([change?.mode, change?.reason, change?.rulesHash, change?.pendingRulesHash], ['readonly', 'rule', null, pendingHash]);
+  const result = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(result.rules, { hash: null, count: 0, pendingHash });
+  assert.equal(result.modes.at(-1)?.pendingRulesHash, pendingHash);
+});
+
+// ---- 规则改动的入口闸门（M2b 任务 4） ----
+
+const GATE_RULES = { version: 1, rules: [{ match: 'example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] };
+const LOGIN_URL = 'http://localhost:5173/login.html';
+
+// 真的规则解析器和批准记录、假驱动、可编排的假对话框；规则文件由测试自己写。
+function setupGate(dialog: Dialog, rules: unknown = GATE_RULES) {
+  const tmp = makeTmpHome();
+  if (rules !== null) writeFileSync(tmp.home.rulesFile, JSON.stringify(rules));
+  const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
+  const modes = createRulesResolver(tmp.home.rulesFile, store);
+  const s = setup({ modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}) });
+  cleanups.push(async () => { tmp.cleanup(); });
+  return { ...s, modes, store, home: tmp.home };
+}
+
+const writeRules = (home: { rulesFile: string }, rules: unknown): void => { writeFileSync(home.rulesFile, JSON.stringify(rules)); };
+const isCode = (code: string) => (e: unknown): boolean => e instanceof E2kError && e.code === code;
+const settleDialog = (): Promise<void> => sleep(5);   // 假对话框在后台几个微任务里就答完了
+const fullText = (rules: unknown): string => JSON.stringify(rules);
+
+
+test('changed rules: the first open gets 21 and asks once; approving lets the retry through and the store holds the new hash; the next change asks again', async () => {
+  const { dialog, release } = holdingDialog();
+  const { sm, store, home } = setupGate(dialog);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));   // 框还开着时同一份改动再来：对上同一个框，不弹第二个
+  assert.equal(dialog.requests.length, 1);
+  const req = dialog.requests[0]!;
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['拒绝', '批准'], '拒绝', 120]);
+  assert.match(req.title, /^e2k：域名规则改了（请求 a-[0-9a-f]{6}）$/);
+  assert.match(req.lines[0]!, /^规则文件有改动（sha256:[0-9a-f]{16}），批准后才生效：$/);
+  assert.ok(req.lines.includes('+ 顶层登录主机：sso.example.com') && req.lines.includes('+ 规则 example.com（只读）'));
+  assert.deepEqual(req.lines.slice(-2), ['', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）']);
+  release();
+  await settleDialog();
   const r = await sm.open({ url: RO });
   assert.equal(r.mode, 'readonly');
-  const [change] = inner(sm, r.session).recorder.modes as unknown as { reason: string; rulesHash: string | null; pendingRulesHash: string | null }[];
-  assert.deepEqual([change?.reason, change?.rulesHash, change?.pendingRulesHash], ['rule', null, pendingHash]);
-  assert.equal((await fake.emitRequest({ pageId: fake.openPages().at(-1)!, method: 'POST', url: 'http://example.com/api', body: '{}', contentType: 'application/json' })).action, 'fulfill');
-  const result = readResult((await sm.close({ session: r.session })).runDir);
-  assert.deepEqual(result.rules, { hash: null, count: 0, pendingHash });
-  assert.equal(result.modes[0]?.pendingRulesHash, pendingHash);
+  assert.equal(store.get().rules?.text, fullText(GATE_RULES));
+  assert.equal(store.get().rules?.hash, contentHash(fullText(GATE_RULES)));
+  assert.equal(dialog.requests.length, 1, 'the retry does not ask again');
+  const next = { version: 1, rules: [{ match: 'example.com', mode: 'default' }] };
+  writeRules(home, next);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  assert.equal(dialog.requests.length, 2, 'a new change is a new request');
+});
+
+test('denied: the retry is a usage error, nothing is asked again, and every kind of open (also --readonly) and login stays refused', async () => {
+  const dialog = fakeDialog(denying);
+  const { sm, store, modes } = setupGate(dialog);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  for (const call of [() => sm.open({ url: RO }), () => sm.open({ url: 'http://localhost:5173/', readonly: true }), () => sm.loginBegin({ url: LOGIN_URL })]) {
+    await assert.rejects(call(), (e: E2kError) => e.code === 'usage' && /人拒绝了这次规则改动/.test(e.message) && /内核重启前同一份改动不会再问/.test(e.next ?? ''));
+  }
+  assert.equal(dialog.requests.length, 1);
+  assert.equal(store.get().rules, null, 'nothing was approved');
+  assert.notEqual(modes.pending(), null);
+});
+
+test('denied for a different change within 60 seconds of the last refusal says it was refused just now', async () => {
+  const { sm, home } = setupGate(fakeDialog(denying));
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  writeRules(home, { version: 1, rules: [{ match: 'example.org', mode: 'readonly' }] });
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'usage' && /刚被人拒过/.test(e.message));
+});
+
+test('a dialog that cannot be shown is needs-human (22) with the reason; a dialog nobody answers asks again on the retry', async () => {
+  const { sm: sm1 } = setupGate(noDialog);
+  await assert.rejects(sm1.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm1.open({ url: RO }), (e: E2kError) => e.code === 'needs-human' && e.message.includes('规则改了但弹不出批准框：内核以 --no-dialogs 启动') && e.next === '在有桌面的终端里起内核');
+  await assert.rejects(sm1.loginBegin({ url: LOGIN_URL }), isCode('needs-human'));
+  let shown = 0;
+  const timeout = fakeDialog(() => (++shown === 1 ? { kind: 'timeout' } : approving({ buttons: ['拒绝', '批准'] } as never)));
+  const { sm: sm2 } = setupGate(timeout);
+  await assert.rejects(sm2.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm2.open({ url: RO }), isCode('wait-approval'));   // 超时：没人理，再问一次
+  await settleDialog();
+  assert.equal(shown, 2);
+  assert.equal((await sm2.open({ url: RO })).mode, 'readonly');
+});
+
+test('login.begin goes through the same gate and shares the request with open', async () => {
+  const { dialog, release } = holdingDialog();
+  const { sm, fake } = setupGate(dialog);
+  await assert.rejects(sm.loginBegin({ url: LOGIN_URL }), isCode('wait-approval'));
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));   // 同一份改动：一个框
+  assert.equal(dialog.requests.length, 1);
+  assert.equal(fake.openPages().length, 0, 'no page was opened while the change was pending');
+  release();
+  await settleDialog();
+  const { loginId } = await sm.loginBegin({ url: LOGIN_URL });
+  await sm.loginEnd({ loginId });
+  assert.equal(dialog.requests.length, 1);
+});
+
+test('an open session keeps working while a change is pending: step carries the notice and the exit code is unaffected', async () => {
+  const { sm, home } = setupGate(fakeDialog(approving), null);
+  const a = await sm.open({ url: 'http://localhost:5173/' });
+  writeRules(home, GATE_RULES);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  const r = await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] });
+  assert.equal(r.exit, 0);
+  assert.ok(r.notices.includes('规则文件有未批准的改动（收紧的部分已生效）'), r.notices.join('|'));
+  await settleDialog();
+  await sm.open({ url: RO });   // 批准、重试：待批清掉了
+  assert.ok(!(await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] })).notices.some((n) => n.includes('未批准的改动')));
+});
+
+test('tightening is in force before approval (the next POST of an open session is blocked); relaxing waits for approval', async () => {
+  const dialog = fakeDialog(approving);
+  const { sm, fake, home } = setupGate(dialog, null);
+  // 1) 没有规则：example.com 上的会话是默认模式，写放行；加一条只读规则（待批）后，下一个 POST 立刻被拦
+  const a = await sm.open({ url: RO }); const pageA = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId: pageA, method: 'POST', url: 'http://example.com/api', topUrl: RO })).action, 'continue');
+  writeRules(home, GATE_RULES);
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/' }), isCode('wait-approval'));   // 此刻批准还没落盘
+  assert.equal((await fake.emitRequest({ pageId: pageA, method: 'POST', url: 'http://example.com/api', topUrl: RO })).action, 'fulfill');
+  await settleDialog();
+  await sm.open({ url: 'http://localhost:5173/' });   // 批准
+  // 2) 已批准只读；改成默认（放宽，待批）：已开的只读会话照旧只读，直到批准
+  const b = await sm.open({ url: RO }); const pageB = fake.openPages().at(-1)!;
+  assert.equal(b.mode, 'readonly');
+  writeRules(home, { version: 1, rules: [{ match: 'example.com', mode: 'default' }], loginHosts: ['sso.example.com'] });
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  assert.equal((await fake.emitRequest({ pageId: pageB, method: 'POST', url: 'http://example.com/api', topUrl: RO })).action, 'fulfill');
+  await settleDialog();
+  assert.equal((await sm.open({ url: RO })).mode, 'default');
+  await sm.close({ session: a.session });
+});
+
+test('a file changed after the dialog was shown is a different request: the first change is never approved', async () => {
+  const { dialog, release } = holdingDialog();
+  const { sm, store, home } = setupGate(dialog);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  const second = { version: 1, rules: [{ match: 'example.org', mode: 'readonly' }] };
+  writeRules(home, second);
+  release();   // 人批准的是第一份
+  await settleDialog();
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));   // 第二份是新的请求，要重新问
+  assert.equal(dialog.requests.length, 2);
+  assert.equal(store.get().rules, null, 'what was approved is not what is on disk now');
+});
+
+// 只管闸门本身的桩：待批的身份是完整哈希，批准比的就是它；写不进批准记录的 needs-human 原样往上。
+function stubGate(approve: (hash: string | null) => boolean) {
+  const hash = 'ab'.repeat(32);
+  const calls: (string | null)[] = []; let refreshes = 0; let cleared = false;
+  const pending = { hash, text: '{}', summary: ['+ 规则 example.com（只读）'], tooLong: false };
+  const modes: ModeResolver = { ...defaultOnlyResolver, refresh: () => { refreshes++; }, pending: () => (cleared ? null : pending),
+    state: () => ({ ...defaultOnlyResolver.state(), pending: { hash: 'sha256:abababababababab', tooLong: false }, pendingHash: 'sha256:abababababababab' }),
+    approvePending: (h) => { calls.push(h); const ok = approve(h); cleared ||= ok; return ok; } };
+  const dialog = fakeDialog(approving);
+  const s = setup({ modes, approvals: new Approvals(dialog, () => {}) });
+  return { ...s, hash, calls, refreshes: () => refreshes, dialogRequests: () => dialog.requests.length };
+}
+
+test('the gate approves with the full 64-digit hash of the pending file, and forgets the answer once it is applied', async () => {
+  let applied = false;
+  const g = stubGate(() => { applied = true; return true; });
+  await assert.rejects(g.sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal((await g.sm.open({ url: RO })).mode, 'default');
+  assert.deepEqual(g.calls, [g.hash]);
+  assert.ok(applied);
+});
+
+test('when the pending file is no longer the approved one the gate refreshes and asks for approval again; it never opens on the strength of the stale answer', async () => {
+  const g = stubGate(() => false);
+  await assert.rejects(g.sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(g.sm.open({ url: RO }), isCode('wait-approval'));   // 批准没能落到待批的那份上：重读后重新问
+  assert.equal(g.calls.length, 1);
+  assert.equal(g.refreshes(), 3, 'open refreshes once per call, the gate once more');
+  assert.equal(g.dialogRequests(), 2, 'the stale answer was dropped, so it is a new request');
+});
+
+test('a failure to write the approval is passed up as it is (needs-human), not wrapped as internal', async () => {
+  const g = stubGate(() => { throw new E2kError('needs-human', '批准记录写不进磁盘'); });
+  await assert.rejects(g.sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(g.sm.open({ url: RO }), (e: E2kError) => e.code === 'needs-human' && e.message === '批准记录写不进磁盘');
+  await assert.rejects(g.sm.loginBegin({ url: LOGIN_URL }), isCode('needs-human'));
+});
+
+test('deleting rules.json is a pending change too: the dialog says so, and approving it removes the approved rules', async () => {
+  const dialog = fakeDialog(approving);
+  const { sm, store, home } = setupGate(dialog);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  await sm.open({ url: RO });
+  rmSync(home.rulesFile);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  const req = dialog.requests[1]!;
+  assert.equal(req.lines[0], '规则文件有改动（文件被删了），批准后才生效：');
+  assert.ok(req.lines.includes('规则文件被删了：所有规则失效'));
+  await settleDialog();
+  assert.equal((await sm.open({ url: RO })).mode, 'default');
+  assert.equal(store.get().rules, null);
+});
+
+test('too many changes: the dialog has only a deny button and the result is a usage error that points at rule diff', async () => {
+  const dialog = fakeDialog(approving);   // 脚本想批准也没得批：框里没有「批准」
+  const many = { version: 1, rules: Array.from({ length: 13 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };
+  const { sm, store } = setupGate(dialog, many);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 1);
+  const req = dialog.requests[0]!;
+  assert.deepEqual([req.buttons, req.defaultButton], [['拒绝'], '拒绝']);
+  assert.ok(req.lines.join('\n').includes('e2k rule diff') && /sha256:[0-9a-f]{16}/.test(req.lines[0]!));
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'usage' && /人拒绝了这次规则改动/.test(e.message));
+  assert.equal(store.get().rules, null);
+});
+
+test('a dialog text that is too long is a usage error and nothing is shown', async () => {
+  const dialog = fakeDialog(approving);
+  const { sm } = setupGate(dialog, { version: 1, rules: [{ match: `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.example.com`, mode: 'readonly' }] });
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'usage' && /内容太长/.test(e.message));
+  assert.equal(dialog.requests.length, 0);
+});
+
+test('approvals.json deleted while the kernel runs: a readonly session stays readonly, step says the record was changed from outside', async () => {
+  const { sm, fake, home } = setupGate(fakeDialog(approving));
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  const a = await sm.open({ url: RO }); const pageA = fake.openPages().at(-1)!;
+  assert.equal(a.mode, 'readonly');
+  rmSync(home.approvalsFile);
+  const other = await sm.open({ url: 'http://localhost:5173/' });   // open 先重读规则，也就看见了批准记录没了
+  const r = await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] });
+  assert.ok(r.notices.includes('批准记录被内核以外的进程改过，已忽略'), r.notices.join('|'));
+  assert.equal((await fake.emitRequest({ pageId: pageA, method: 'POST', url: 'http://example.com/api', topUrl: RO })).action, 'fulfill');
+  assert.equal((await sm.open({ url: RO })).mode, 'readonly', 'the in-memory approval is still in force');
+  assert.ok(other.session);
+});
+
+test('an approvals record that cannot be read at start puts the existing rules.json up for approval again; a record that cannot be written is needs-human and changes nothing', async () => {
+  const tmp = makeTmpHome();
+  writeRules(tmp.home, GATE_RULES);
+  mkdirSync(tmp.home.approvalsFile);   // 读不了（不是普通文件），也写不进去（rename 不能盖掉目录）；不是在伪造批准
+  const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
+  const modes = createRulesResolver(tmp.home.rulesFile, store);
+  const dialog = fakeDialog(approving);
+  const { sm } = setup({ modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}) });
+  cleanups.push(async () => { tmp.cleanup(); });
+  assert.equal(modes.state().approvals, 'unreadable');
+  assert.notEqual(modes.pending(), null, 'with an empty snapshot the existing file is a pending change');
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'needs-human' && e.message === '批准记录写不进磁盘');   // 原样往上，不被包成 internal
+  assert.equal(modes.state().count, 0);
+  assert.notEqual(modes.pending(), null);
+  assert.equal(modes.state().approvals, 'unreadable');
 });
 
 test('read-only by rule: writes from the session page get a 403, a strict GraphQL query goes through without following redirects', async () => {

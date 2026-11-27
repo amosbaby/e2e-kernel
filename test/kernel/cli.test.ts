@@ -20,7 +20,7 @@ import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { fakeDialog } from '../support/fake-dialog.ts';
+import { approving, denying, fakeDialog } from '../support/fake-dialog.ts';
 import { approveRulesFile } from '../support/approve-rules.ts';
 
 // 一个不能出现在任何输出里的值：运行时拼出来，不写成字面量。
@@ -163,13 +163,18 @@ test('step text output prints each notice on its own line; a reply without notic
 
 test('open on a broken rules file is refused with exit 2 and a pointer to rule list; fixing the file lets it through', async () => {
   await withRules(GOOD_RULES, async (h) => {
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog() });
+    const dialog = fakeDialog(approving);
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog });
     try {
       writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');
       const t = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], t), 2);
       assert.match(t.errText(), /规则文件有错/); assert.match(t.errText(), /rule list/);
+      assert.equal(dialog.requests.length, 0, 'a broken file never reaches the approval dialog');
       writeFileSync(h.home.rulesFile, GOOD_RULES);
-      assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 0);
+      const first = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], first), 21);   // 改过的规则要人批准
+      assert.match(first.errText(), /等人在弹框里批准：域名规则的改动/);
+      assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 0);   // 人点了批准，原样重试
+      assert.equal(dialog.requests.length, 1);
     } finally { await kk.stop(); }
   });
 });
@@ -433,8 +438,9 @@ async function loginWithBlockedWrites(posts: number): Promise<string> {
   const h = makeTmpHome();
   const f = new FakeDriver({ pages: pages() });
   writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] }));
-  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog() });
+  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog(approving) });
   try {
+    assert.equal(await main(['login', 'http://app.example.com/login'], io({ env: h.env, isTTY: true })), 21);   // 规则文件是新的：先要人批准，再原样重试
     const t = io({ env: h.env, isTTY: true });
     t.stdin.readLine = async () => {
       const pageId = f.openPages().at(-1)!;
@@ -448,6 +454,24 @@ async function loginWithBlockedWrites(posts: number): Promise<string> {
     return t.outText();
   } finally { await kernel.stop(); h.cleanup(); }
 }
+
+test('open and login on changed rules: denied is exit 2, a kernel started without dialogs is exit 22, and neither opens a page', async () => {
+  for (const [dialog, want] of [[fakeDialog(denying), 2], [noDialog, 22]] as const) {
+    await withRules(GOOD_RULES, async (h) => {
+      const f = new FakeDriver({ pages: pages() });
+      const kk = await startKernel({ home: h.home, driver: f, dialog });
+      try {
+        assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 21);
+        await sleep(5);
+        const open = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], open), want);
+        const login = io({ env: h.env, isTTY: true }); assert.equal(await main(['login', 'http://localhost:5173/login.html'], login), want);
+        assert.equal(f.openPages().length, 0);
+        if (want === 2) assert.match(open.errText(), /人拒绝了这次规则改动/);
+        else assert.match(open.errText(), /规则改了但弹不出批准框/);
+      } finally { await kk.stop(); }
+    });
+  }
+});
 
 test('login prints the loginHosts hint when read-only rules blocked writes during the login, and nothing when none were blocked', async () => {
   const hinted = await loginWithBlockedWrites(2);
@@ -707,9 +731,11 @@ test('status from an older kernel (no rules field) still formats', () => {
 
 test('status carries rules (the approved ones); the text format adds a line for a broken file, for unapproved changes and when approvals.json was changed from outside', async () => {
   await withRules(GOOD_RULES, async (h) => {
-    approveRulesFile(h.home);   // 内核启动前批准好：运行中的内核没有「批准」这条路，要等后面的任务
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog() });
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(approving) });
     try {
+      assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 21);   // 批准走弹框：第一次 open 得 21，人点批准后重试
+      const opened = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/', '--json'], opened), 0);
+      assert.equal((await call(h.home, 'close', { session: (JSON.parse(opened.outText()) as { session: string }).session })).ok, true);
       const j = io({ env: h.env }); assert.equal(await main(['status', '--json'], j), 0);
       const r = JSON.parse(j.outText()) as { rules: { count: number; hash: string; error: unknown; pending: unknown; approvals: string; approvalsChanged: boolean } };
       assert.equal(r.rules.count, 2); assert.match(r.rules.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(r.rules.error, null);

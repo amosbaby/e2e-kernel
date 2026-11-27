@@ -14,3 +14,14 @@ export function fakeDialog(script?: (r: DialogRequest) => DialogResult | Promise
     },
   };
 }
+
+// 常用的编排：见到「批准」键就按它，没有（只有「拒绝」的框）就按「拒绝」；或一律按「拒绝」。
+export const approving = (r: DialogRequest): DialogResult => ({ kind: 'button', button: r.buttons.includes('批准') ? '批准' : '拒绝' });
+export const denying = (): DialogResult => ({ kind: 'button', button: '拒绝' });
+
+// 人还没点：框一直开着，release() 之后按「批准」答。
+export function holdingDialog(): { dialog: FakeDialog; release: () => void } {
+  let release = (): void => {};
+  const dialog = fakeDialog((r) => new Promise((resolve) => { release = () => { resolve(approving(r)); }; }));
+  return { dialog, release: () => { release(); } };
+}
