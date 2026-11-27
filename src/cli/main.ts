@@ -4,23 +4,22 @@ import { parseArgs } from 'node:util';
 import type { Driver } from '../driver/types.ts';
 import { noDialog } from '../kernel/approval.ts';
 import { inspectRules } from '../kernel/rules.ts';
+import { startMcp } from '../mcp/tools.ts';
 import { listenerErrorLogger, startKernel } from '../kernel/server.ts';
 import type { KernelHandle, KernelOptions } from '../kernel/server.ts';
-import type { StatusResult } from '../kernel/server.ts';
-import { call } from '../shared/client.ts';
 import { E2kError } from '../shared/errors.ts';
 import type { Viewport } from '../shared/ops.ts';
 import { resolveHome } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
 import { ExitCode, MAX_OPS_BYTES, exitCodeFor, validateParams } from '../shared/protocol.ts';
-import type { CloseResult, Method, OpenResult, StepResult } from '../shared/protocol.ts';
-import { redactText, safely } from '../shared/redact.ts';
+import type { Method } from '../shared/protocol.ts';
+import { redactText } from '../shared/redact.ts';
 import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
-import { runCaseFile, saveCase } from './commands.ts';
-import { runDoctor } from './doctor.ts';
+import { closeSession, doctorChecks, kernelStatus, listRules, makeSend, openSession, realClock, redactError, runCaseFile, saveCase, stepOps } from './commands.ts';
+import type { CommandOutcome } from './commands.ts';
 import { formatChecks, formatClose, formatError, formatOpen, formatRuleDiff, formatRuleList, formatRun, formatSaveCase, formatStatus, formatStep } from './format.ts';
-import type { RuleDiffResult, RuleListResult, RunResult, SaveCaseResult } from './format.ts';
+import type { RuleDiffResult, RunResult, SaveCaseResult } from './format.ts';
 
 // e2k 命令行（设计 5.9）。只做校验和转发：参数先用和内核同一套 validateParams 校验，再经 socket 发给内核。
 // rule 只有只读的 list 和 diff，没有任何批准类的命令。
@@ -36,6 +35,7 @@ export interface Io {
   onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP；每收到一次调用一次 cb
   exit(code: number): void;               // 真实实现是 process.exit：第二次停止信号时不再等收尾
   clock?: { now(): number; sleep(ms: number): Promise<void> };   // login 等弹框时重试用的时钟；缺省是真的时间，测试用假的，不真等
+  input?: NodeJS.ReadableStream;          // mcp 读请求的流；缺省是标准输入，测试给内存里的流
 }
 
 type Options = Record<string, { type: 'string' | 'boolean' }>;
@@ -81,6 +81,7 @@ function helpText(selfCmd: string): string {
     '                                          --name 给新会话起名（缺省用用例里的名字）；放行声明和不允许的域名仍要人在弹框里批准（21：每 2 秒重试，同一个请求等满 120 秒才退出 21）',
     '                                          退出码：撞到登录墙 20 > 失败 11 > 不符 10 > 0；open、step 出错时是那个错误的码（2、21、22），已开的会话仍会收尾成 undetermined',
     '  login <url> [--profile <组>[/<槽>]]    在专用 profile 里登录（要在终端里由人按回车确认）；--profile 同 open',
+    '  mcp                                    经标准输入输出提供 MCP 服务（每行一条 JSON-RPC；工具 open、step、close、run、save_case、status、doctor、rule_list；没有 login 和批准类工具；不带选项）',
     '  --version',
     '  help',
     '',
@@ -128,23 +129,20 @@ function parseViewport(v: string): Viewport {
   return { width: Number(m[1]), height: Number(m[2]) };
 }
 
-// 发给内核。内核没在跑时补上启动命令；内核回的错误原样往上抛（code、message、next 都不改）。
-async function send(ctx: Ctx, home: Home, method: Method, params: unknown): Promise<unknown> {
-  let r;
-  try {
-    r = await call(home, method, params);
-  } catch (e) {
-    if (e instanceof E2kError && e.code === 'needs-human' && e.next === undefined) {
-      throw new E2kError(e.code, e.message, `运行 ${ctx.io.selfCmd} start（前台运行，可以放到后台）`);
-    }
-    throw e;
-  }
-  if (!r.ok) throw new E2kError(r.error.code, r.error.message, r.error.next);
-  return r.result;
+// 发给内核（经共用的 makeSend：内核没在跑时补上启动命令；内核回的错误原样往上抛）。
+function send(ctx: Ctx, home: Home, method: Method, params: unknown): Promise<unknown> {
+  return makeSend(home, ctx.io.selfCmd)(method, params);
 }
 
 function print<T>(ctx: Ctx, result: T, format: (r: T) => string): void {
   ctx.io.out(ctx.json ? JSON.stringify(result) : format(result));
+}
+
+// 共用命令返回的结果：出错就当错误抛给 main 去打印，否则按格式打印、返回它的退出码。
+function settle<T>(ctx: Ctx, outcome: CommandOutcome, format: (r: T) => string): number {
+  if ('error' in outcome) throw new E2kError(outcome.error.code, outcome.error.message, outcome.error.next);
+  print(ctx, outcome.result as T, format);
+  return outcome.exit;
 }
 
 function needsTerminal(ctx: Ctx, command: string): void {
@@ -185,23 +183,13 @@ async function start(ctx: Ctx, args: string[]): Promise<number> {
 
 async function status(ctx: Ctx, args: string[]): Promise<number> {
   positionals(ctx, parse(ctx, args, JSON_OPTION), 0, '无');
-  const params = validateParams('status', {});
-  const result = await send(ctx, resolveHome(ctx.io.env), 'status', params) as StatusResult;
-  print(ctx, result, formatStatus);
-  return ExitCode.OK;
+  const home = resolveHome(ctx.io.env);
+  return settle(ctx, await kernelStatus((m, p) => send(ctx, home, m, p)), formatStatus);
 }
 
 async function doctor(ctx: Ctx, args: string[]): Promise<number> {
   positionals(ctx, parse(ctx, args, JSON_OPTION), 0, '无');
-  const home = resolveHome(ctx.io.env);
-  const checks = await runDoctor(home, await ctx.io.makeDriver(), ctx.io.selfCmd, ctx.io.managerName);
-  print(ctx, checks, formatChecks);
-  return checks.every((c) => c.ok) ? ExitCode.OK : ExitCode.NEEDS_HUMAN;
-}
-
-// 解析错误会带上文件里的未知键名，和主机写法一样先脱敏。
-function redactError(error: string | null): string | null {
-  return error === null ? null : safely(() => redactText(error));
+  return settle(ctx, await doctorChecks(resolveHome(ctx.io.env), ctx.io.makeDriver, ctx.io.selfCmd, ctx.io.managerName), formatChecks);
 }
 
 // 规则文件和批准记录由 CLI 自己读，不需要内核。文件有错：照样打印（--json 里在 error 字段），退出码 2。
@@ -221,28 +209,7 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
     print(ctx, result, formatRuleDiff);
     return f.error === null ? ExitCode.OK : ExitCode.USAGE;
   }
-  const approvedRule = (x: { match: string; mode: string }): boolean => r.approvedRules.rules.some((a) => a.match === x.match && a.mode === x.mode);
-  const approvedGroup = (g: (typeof f.groups)[number]): boolean => {
-    const a = r.approvedRules.groups.find((y) => y.name === g.name);
-    return a !== undefined && JSON.stringify(a) === JSON.stringify(g);
-  };
-  // 主机写法进输出前和别的命令一样先脱敏。
-  const result: RuleListResult = {
-    path: home.rulesFile,
-    rules: f.rules.map((x) => ({ match: redactText(x.match), mode: x.mode, approved: approvedRule(x) })),
-    loginHosts: f.loginHosts.map((x) => redactText(x)),
-    groups: f.groups.map((g) => ({
-      name: g.name, hosts: g.hosts.map((x) => redactText(x)), loginHosts: g.loginHosts.map((x) => redactText(x)),
-      readPosts: g.readPosts.length, persistedQueries: g.persistedQueries.length, logout: g.logout.length, identity: g.identity !== null,
-      approved: approvedGroup(g),
-    })),
-    hostModes: Object.entries(r.hostModes).map(([host, mode]) => ({ host: redactText(host), mode })),
-    writes: Object.entries(r.writes).flatMap(([scope, ds]) => ds.map((d) => ({ scope: redactText(scope), method: d.method, url: redactText(d.url), operation: d.operation === null ? null : redactText(d.operation) }))),
-    hash: f.hash, error: redactError(f.error),
-    approved: f.error === null && !r.pending && r.approvals !== 'unreadable', pending: r.pending, approvals: r.approvals,
-  };
-  print(ctx, result, formatRuleList);
-  return f.error === null ? ExitCode.OK : ExitCode.USAGE;
+  return settle(ctx, listRules(home), formatRuleList);
 }
 
 async function open(ctx: Ctx, args: string[]): Promise<number> {
@@ -259,12 +226,8 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
   if (p.values.readonly === true) raw.readonly = true;
   const allow = optString(p, 'allow');
   if (allow !== undefined) raw.allow = parseJson(allow, '--allow 必须是 JSON 数组');
-  const params = validateParams('open', raw);
-  const result = await send(ctx, resolveHome(ctx.io.env), 'open', params) as OpenResult;
-  print(ctx, result, formatOpen);
-  // 身份不符优先：会话开着，但账号不对，要人处理（22）；有密码框的页面也会先计数、再探身份，所以 blocked:'login' 和 identity:'mismatch' 可能同时出现，这时 22 优先。
-  if (result.identity === 'mismatch') return ExitCode.NEEDS_HUMAN;
-  return result.blocked === 'login' ? ExitCode.WAIT_LOGIN : ExitCode.OK;
+  const home = resolveHome(ctx.io.env);
+  return settle(ctx, await openSession((m, pp) => send(ctx, home, m, pp), raw), formatOpen);
 }
 
 async function step(ctx: Ctx, args: string[]): Promise<number> {
@@ -279,11 +242,8 @@ async function step(ctx: Ctx, args: string[]): Promise<number> {
   if (p.values['keep-going'] === true) raw.keepGoing = true;
   const allow = optString(p, 'allow');
   if (allow !== undefined) raw.allow = parseJson(allow, '--allow 必须是 JSON 数组');
-  const params = validateParams('step', raw);
-  const result = await send(ctx, resolveHome(ctx.io.env), 'step', params) as StepResult;
-  if (result.exit !== 0 && result.exit !== 10 && result.exit !== 11 && result.exit !== 20) throw malformed();
-  print(ctx, result, formatStep);
-  return result.exit;
+  const home = resolveHome(ctx.io.env);
+  return settle(ctx, await stepOps((m, pp) => send(ctx, home, m, pp), raw), formatStep);
 }
 
 async function close(ctx: Ctx, args: string[]): Promise<number> {
@@ -302,16 +262,13 @@ async function close(ctx: Ctx, args: string[]): Promise<number> {
   if (findings !== undefined) raw.findings = parseJson(findings, '--findings 必须是 JSON 数组');
   if (notDone !== undefined) raw.notDone = parseJson(notDone, '--not-done 必须是 JSON 数组');
   if (superseded !== undefined) raw.superseded = parseJson(superseded, '--superseded 必须是 JSON 数组');
-  const params = validateParams('close', raw);
-  const result = await send(ctx, resolveHome(ctx.io.env), 'close', params) as CloseResult;
-  if (result.exit !== 0 && result.exit !== 10) throw malformed();
-  print(ctx, result, formatClose);
-  return result.exit;
+  const home = resolveHome(ctx.io.env);
+  return settle(ctx, await closeSession((m, pp) => send(ctx, home, m, pp), raw), formatClose);
 }
 
 // 重试用的时钟：缺省是真的时间，测试注入假的。
 function clockOf(ctx: Ctx): NonNullable<Io['clock']> {
-  return ctx.io.clock ?? { now: () => Date.now(), sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }) };
+  return ctx.io.clock ?? realClock;
 }
 
 const LOGIN_WAIT_MS = 120_000;
@@ -383,9 +340,7 @@ async function saveCaseCmd(ctx: Ctx, args: string[]): Promise<number> {
   const outcome = saveCase(resolveHome(ctx.io.env), {
     session, out, ...(steps === undefined ? {} : { steps: parseJson(steps, '--steps 必须是 JSON 数组，如 [3,4,7]') as number[] }),
   });
-  if ('error' in outcome) throw new E2kError(outcome.error.code, outcome.error.message, outcome.error.next);
-  print(ctx, outcome.result as SaveCaseResult, formatSaveCase);
-  return outcome.exit;
+  return settle<SaveCaseResult>(ctx, outcome, formatSaveCase);
 }
 
 // run：读用例文件、重放。等人批准的提示走标准错误（--json 时标准输出只有结果）。
@@ -399,9 +354,7 @@ async function runCmd(ctx: Ctx, args: string[]): Promise<number> {
     clock: clockOf(ctx),
     onWaiting: (id) => { ctx.io.err(id === null ? '请在弹出的对话框里选择' : `请在弹出的对话框里选择（请求 ${id}）`); },
   });
-  if ('error' in outcome) throw new E2kError(outcome.error.code, outcome.error.message, outcome.error.next);
-  print(ctx, outcome.result as RunResult, formatRun);
-  return outcome.exit;
+  return settle<RunResult>(ctx, outcome, formatRun);
 }
 
 async function run(ctx: Ctx, argv: string[]): Promise<number> {
@@ -422,6 +375,9 @@ async function run(ctx: Ctx, argv: string[]): Promise<number> {
     case 'login': return login(ctx, rest);
     case 'save-case': return saveCaseCmd(ctx, rest);
     case 'run': return runCmd(ctx, rest);
+    case 'mcp':
+      positionals(ctx, parse(ctx, rest, {}), 0, '无');
+      return startMcp(ctx.io);
     default:
       // 不回显命令名：它可能是调用方误贴的任何东西。
       throw usage(command === undefined ? '缺少命令' : '没有这个命令', `${ctx.io.selfCmd} help 查看可用命令`);
