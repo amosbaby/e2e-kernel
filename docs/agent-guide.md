@@ -138,19 +138,19 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 
 ## 只读模式
 
-- `open <url> --readonly` 让这个会话只读，不管域名规则；人在 `rules.json` 里标为只读的域名上不带它也是只读，`open` 结果里 `mode` 为 `readonly`。只读时只放行读和严格的 GraphQL query，其余写（POST、PUT、PATCH、DELETE、mutation）一律被拦。
-- 被拦的写在页面上：fetch、XHR 收到 `403` 和 `{"error":"blocked by e2k read-only mode"}`（跨源时浏览器报 CORS 错误）；表单提交看到写着同一句话的 `403` 页面。这是内核挡的，不是页面坏了。
-- `step` 的 `writesBlocked` 是本批被拦的写数，`notices` 是整句提示，不改退出码；拦了什么看 `result.json` 的 `writes.blocked` 或 `report.html`。
+- `open <url> --readonly` 让会话只读，不管域名规则；`rules.json` 里标为只读的域名上不带它也是只读，`open` 结果里 `mode` 为 `readonly`。只读时只放行读和严格的 GraphQL query，其余写（POST、PUT、PATCH、DELETE、mutation）一律被拦。
+- 被拦的写在页面上：fetch、XHR 收到 `403` 和 `{"error":"blocked by e2k read-only mode"}`（跨源时浏览器报 CORS 错误）；表单提交看到同一句话的 `403` 页面。这是内核挡的，不是页面坏了。
+- `step` 的 `writesBlocked` 是本批被拦的写数，`notices` 是提示，不改退出码；拦了什么看 `result.json` 的 `writes.blocked` 或 `report.html`。
 - 验证需要真的写、又被拦了：`step … --allow '[{"method":"POST","url":"…"}]'` 申请放行（≤12 条，地址不带查询串，mutation 要加 `operation`）→ 21 → 人批准后原样重试；不批就停下告诉人，别换主机、换会话或用 `eval` 绕。
-- `rules.json` 有错时新的 `open` 会被拒（退出码 2），已开的会话照旧、`step` 的 `notices` 会提示。运行 `node bin/e2k.js rule list` 看错误，让人修；永远不要自己改 `rules.json`。
-- 规则被人改过后，新的 `open`、`login` 先得 21：等人点弹框再原样重试；拒绝是 2，弹不出框是 22。批准前只有新增或改严（只读、不允许）的 `rules` 条目生效；登出、登录主机、白名单、身份、组的改动都要等批准。
-- 域名在某组里，`open` 默认用那组的 profile；本地页面要用某组的登录加 `--profile <组>`（借用）。会话跳到别组的域名会 403（`notices` 有提示）；经重定向进去的会话被冻结（所有请求 403，`step` 退出 22），关掉后用 `--profile` 另开，不要绕。
+- `rules.json` 有错时新的 `open` 会被拒（退出码 2），已开的会话照旧、`step` 的 `notices` 会提示。运行 `node bin/e2k.js rule list` 看错误，让人修；绝不自己改 `rules.json`。
+- 规则被改后，新的 `open`、`login` 先得 21：人点弹框后原样重试；拒绝是 2，弹不出框是 22。批准前只有新增或改严（只读、不允许）的 `rules` 条目生效；登出、登录主机、白名单、身份、组的改动都要等批准。
+- 域名在某组里，`open` 默认用那组的 profile；本地页面要用某组的登录加 `--profile <组>`（借用）。会话跳到别组的域名会 403（`notices` 有提示）；经重定向进去则会话冻结（所有请求 403，`step` 退出 22），关掉后用 `--profile` 另开，不要绕。
 
 ## 不允许的域名
 
-- 人把域名配成「不允许」后，`open` 先得 21：等人选「只读」或「可写」后原样重试，拒绝是 2。批准只管这一个会话，5 分钟没用掉就作废；在它上面 `login`、借用含它的组也各要人点一次框。
-- `open --allow '[…]'`（格式同 `step --allow`）只用在不允许的域名上，人选「可写」才生效；在别的主机上给是 usage 错误。
-- 没经批准，页面发往不允许域名的请求一律被拦：子资源回 `403`，顶层导航（含 `goto`）被中止，那一步算动作失败（11），`notices` 有提示。别绕，告诉人。
+- 域名被配成「不允许」时，`open` 先得 21：人选「只读」或「可写」后原样重试，拒绝是 2。批准只管这一个会话，5 分钟没用掉就作废；在它上面 `login`、借用含它的组也各要人点一次框。
+- `open --allow '[…]'`（格式同 `step --allow`）只用于不允许的域名，人选「可写」才生效；用在别处是 usage 错误。
+- 没经批准，页面发往不允许域名的请求被拦：子资源回 `403`，顶层导航（含 `goto`）被中止，那步算动作失败（11），`notices` 有提示。重定向后续跳和 WebSocket 不拦（见 reference.md Known gaps）。别绕，告诉人。
 
 ## 存成用例和重跑
 
