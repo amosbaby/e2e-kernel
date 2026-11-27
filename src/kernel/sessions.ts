@@ -123,9 +123,10 @@ interface Session {
   readonly pendingHosts: Set<string>;
   // 本会话提过且已批准的放行声明（只增不减）。判定时才和批准记录里当前的内容、会话当前的组和页面主机核对（declaredFor）。
   readonly declared: DeclaredEntry[];
-  // 这个会话的 deny 授权（open 时人批准的）；deny 主机上 step --allow 的声明只活在会话里、绑主机（Task 6 写入，这里先是空的）。
+  // 这个会话的 deny 授权（open 时人批准的）；deny 主机上 step --allow 的声明只活在会话里、绑主机（gateDeclarations 写入）。
   readonly grant: DenyGrant;
   readonly denyAllow: { host: string; decl: Declaration }[];
+  readonly denyWriteKeys: Set<string>;       // 本会话问过的 deny-writes: 待批键：close 时一并 forget（不靠 stateOf 判有效，批准过期与否只有 ask 知道）
   lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
   // 身份探针（设计 5.2）：只探主页面。configured：探的时候组配了身份（报告里 identity 是不是 null 看它）；
   // checks / skipped：做了比较的次数（含没能确认的）/ 前提不满足跳过的次数；mismatch：只有确认是别的账号才记，一旦记下永久生效，直到 close（记的是当时的组和期望文字，不含页面文字）。
@@ -142,12 +143,15 @@ interface Session {
 }
 
 // 人对「打开不允许的域名」的批准（设计 5.4，R2）：只覆盖打开的那个主机（规范化后精确相等）。
-// mode：人选的「只读」或「可写」；allow：选「可写」时 open --allow 的放行清单（规范化后），其余为空；borrowGroup：借用的组（Task 6 写入）。没有授权时全 null / 空。
+// mode：人选的「只读」或「可写」；allow：选「可写」时 open --allow 的放行清单（规范化后），其余为空；borrowGroup：借用的含 deny 主机的组（人批准的，没借或借的组里没有 deny 主机时为 null）。没有授权时全 null / 空。
 export interface DenyGrant { host: string | null; mode: 'readonly' | 'writable' | null; allow: Declaration[]; borrowGroup: string | null }
 const noGrant = (): DenyGrant => ({ host: null, mode: null, allow: [], borrowGroup: null });
 
 // scope：批准是在哪个组、哪个页面主机上给的（`组/主机`；主机名里不会有 `/`，也不会撞上 `constructor` 一类原型上的名字）。
 interface DeclaredEntry { readonly scope: string; readonly decl: Declaration; readonly approved: DeclarationRecord['approved'] }
+
+// 放行声明的一道闸：error 为 null 才算过；commit 在所有闸都过了之后才做（记批准记录或记进会话）；remembered 是本来就记住了的条目。
+interface DeclGate { readonly error: E2kError | null; readonly commit: () => void; readonly remembered: Declaration[] }
 
 const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
@@ -326,15 +330,20 @@ export class SessionManager {
     const profile = profileKey(ref);
     const forced = p.readonly === true;
     const hostMode = this.deps.modes.resolve(host);
-    // 只读、不允许都靠拦网络请求落实：驱动拦不了就不能开，不开页，也不先弹框让人白点一次（失败关闭）。
-    if ((forced || hostMode !== 'default') && !this.deps.driver.capabilities.networkInterception) {
-      throw new E2kError('internal', hostMode === 'denied' ? '这个驱动不能拦网络请求，不能打开不允许的域名' : '这个驱动不能拦网络请求，不能以只读方式打开');
+    // 只读、不允许都靠拦网络请求落实：驱动拦不了就不能开，不开页，也不先弹框让人白点一次（失败关闭）。借用含不允许的域名的组也一样：发往它们的请求要靠拦。
+    const borrowsDeny = borrowed && this.deps.modes.groupHasDeny(ref.group);
+    if ((forced || hostMode !== 'default' || borrowsDeny) && !this.deps.driver.capabilities.networkInterception) {
+      throw new E2kError('internal', hostMode === 'denied' ? '这个驱动不能拦网络请求，不能打开不允许的域名'
+        : borrowsDeny ? '这个驱动不能拦网络请求，不能借用含不允许的域名的组' : '这个驱动不能拦网络请求，不能以只读方式打开');
     }
-    // 闸门的固定次序（设计 5.4、R7）：规则待批 → deny 主机 →（借用，Task 6）。全部同步，在第一个 await（safeCapture）之前：
-    // 两个并发的重试不能同时看到同一个 approved。全过了才一起 forget，免得后面的闸被拒时前面已批准的答复在重试时又被问一次。
+    // 闸门的固定次序（设计 5.4、R7）：规则待批 → deny 主机 → 借用含 deny 的组。全部同步，在第一个 await（safeCapture）之前：
+    // 两个并发的重试不能同时看到同一个 approved。全过了才一起 forget，免得后面的闸被拒时前面已批准的答复在重试时又被问一次
+    // （没用掉的答复 5 分钟后作废，R20）。每道闸各弹一次框，人点完原样重试，一次走通。
     const deny = this.gateDeny(p, host, profile);
+    const borrow = borrowsDeny ? this.gateBorrow(p, host, profile, ref.group) : null;
     if (deny !== null) this.deps.approvals.forget(deny.key);
-    const grant: DenyGrant = deny === null ? noGrant() : { ...deny.grant, borrowGroup: null };
+    if (borrow !== null) this.deps.approvals.forget(borrow);
+    const grant: DenyGrant = { ...(deny === null ? noGrant() : deny.grant), borrowGroup: borrow === null ? null : ref.group };
     // 授权覆盖的 denied 先映射成 readonly（R9）；会话建成后的有效模式由 sessionMode 统一算。
     const mode: Mode = forced ? 'readonly' : hostMode === 'denied' && grant.host !== null ? 'readonly' : hostMode;
     // 浏览器启动和开页会抢前台：启动之前先记下用户在用的应用，开完再还（失败时也还：浏览器可能已经起来抢过了）。
@@ -392,6 +401,34 @@ export class SessionManager {
         if (asked.button === '只读') return { key, grant: { host: normalized, mode: 'readonly', allow: [] } };
         if (asked.button === '可写' && canWrite) return { key, grant: { host: normalized, mode: 'writable', allow } };
         throw new E2kError('internal', '打开不允许的域名的答复对不上');   // 不放行
+    }
+  }
+
+  // 借用含不允许的域名的组的闸门（设计 5.4）：每次运行都要人点，只有「允许」和「拒绝」。调用方保证这次是借用、且被借的组里有 deny 主机。
+  // 答复的键绑定框里显示的全部内容：会话名、profile、页面主机；批准后 5 分钟没用掉作废（R20）。不 forget：由调用方等所有闸都过了一起 forget（R7）。返回答复的键。
+  private gateBorrow(p: OpenParams, host: string, profile: string, group: string): string {
+    const { approvals } = this.deps;
+    const name = p.name ?? DEFAULT_NAME;
+    const normalized = normalizeHost(host);   // requireValidHost 已查过
+    const key = `borrow:${sha256(JSON.stringify([name, profile, normalized]))}`;
+    const request: DialogRequest = {
+      title: 'e2k：借用登录',
+      lines: [`会话：${name}（profile ${profile}）`, `页面所在主机：${normalized}`, `要借用组 ${group} 的登录。这个组里有不允许的域名：发往它们的请求按只读算，也不能顶层打开。`,
+        '', '拒绝：不借用（默认）', '允许：这次会话借用这个组的登录'],
+      buttons: ['拒绝', '允许'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
+    const asked = approvals.ask(key, 'borrow', request, ['允许'], { ttlMs: DENY_TTL_MS });
+    switch (asked.status) {
+      case 'pending':
+        throw pendingError(asked.id, '借用含不允许的域名的组');
+      case 'denied':
+        if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试');
+        throw new E2kError('usage', '人拒绝了借用这个含不允许的域名的组', '内核重启前同一个请求不会再问');
+      case 'unavailable':
+        throw new E2kError('needs-human', `要借用含不允许的域名的组但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
+      case 'approved':
+        if (asked.button === '允许') return key;
+        throw new E2kError('internal', '借用含不允许的域名的组的答复对不上');   // 不放行
     }
   }
 
@@ -635,44 +672,60 @@ export class SessionManager {
   // 批准的是「这个组、这个页面主机上放行这些写」：记录按 `组/主机` 存，答复（待批表的键）绑定框里显示的全部内容：会话名、组、页面主机、
   // 待批的声明集合，框弹出后任何一样变了（页面搬了主机、声明多了或少了、换了个会话）旧答复都对不上，重新弹框。
   // 被拒的集合不带会话名记（deniedWrites）：换个会话也不重新弹框。批准用掉之后，别的没用掉的 writes 答复一并作废（基线变了）。
-  // 全过了才记进会话：没批准的这一批什么都不生效。
+  // deny 分支（R21）：条目的目标主机是不允许的域名、或会话页面主机是不允许的域名的，一律走 gateDenyDeclarations——每次都问、不进批准记录、只活在会话里。
+  // 两类条目同一次 step 里都有时两个框都先问，都批准了才一起生效：全有或全无，没批准的这一批什么都不记、什么都不执行。
   private gateDeclarations(s: Session, raw: readonly unknown[]): void {
-    const { store, approvals } = this.deps;
     const decls = normalizeDeclarations(raw);
     if (decls.length === 0) return;
     this.pruneAskedWrites();
     const host = s.topHost;
+    const pageDenied = this.deps.modes.resolve(host) === 'denied';
+    const denyDecls = decls.filter((d) => pageDenied || this.targetsDenied(d));
+    const plainDecls = decls.filter((d) => !denyDecls.includes(d));
+    const gates = [this.gateDenyDeclarations(s, denyDecls, host), this.gatePlainDeclarations(s, plainDecls, host)];
+    // 先把所有的框都问了；有没过的就抛，次序：被拒（usage）> 弹不出（needs-human）> 还在等（wait-approval）。
+    const rank = (e: E2kError): number => (e.code === 'usage' ? 0 : e.code === 'needs-human' ? 1 : 2);
+    const failed = gates.flatMap((g) => (g.error === null ? [] : [g.error])).sort((x, y) => rank(x) - rank(y));
+    if (failed.length > 0) throw failed[0]!;
+    // 写盘可能失败（needs-human）：会抛的先做，纯内存的后做，抛了就什么都没生效。
+    for (const g of gates) g.commit();
+    const scope = `${s.group}/${host}`;
+    for (const d of decls) {
+      if (s.declared.some((e) => e.scope === scope && sameDeclaration(e.decl, d))) continue;
+      s.declared.push({ scope, decl: d, approved: gates[1]!.remembered.some((r) => sameDeclaration(r, d)) ? 'remembered' : 'dialog' });
+    }
+  }
+
+  // 普通条目（目标和页面主机都不是不允许的域名）：问记住的批准。返回没过的错误（没有就是 null）、批准后才做的 commit、本来就记住了的条目。
+  private gatePlainDeclarations(s: Session, decls: Declaration[], host: string): DeclGate {
+    const { store, approvals } = this.deps;
+    const none: DeclGate = { error: null, commit: () => {}, remembered: [] };
+    if (decls.length === 0) return none;
     const scope = `${s.group}/${host}`;
     const have = store.writesFor(scope);
     const remembered = decls.filter((d) => have.some((h) => sameDeclaration(h, d)));
     const pending = decls.filter((d) => !remembered.includes(d));
-    if (pending.length > 0) {
-      const denyKey = sha256(JSON.stringify([s.group, host, pending.map(declarationKey)]));
-      const refused = new E2kError('usage', '人拒绝了这些放行声明', '内核重启前同一组声明不会再问；要放行请换成别的声明');
-      const key = `writes:${sha256(JSON.stringify([s.name, s.group, host, pending.map(declarationKey)]))}`;
-      const earlier = this.askedWrites.get(denyKey);
-      if (earlier !== undefined && [...earlier].some((k) => approvals.stateOf(k) === 'denied')) { this.deniedWrites.add(denyKey); this.askedWrites.delete(denyKey); }
-      if (this.deniedWrites.has(denyKey)) throw refused;
-      const request: DialogRequest = {
-        title: 'e2k：放行写请求',
-        lines: [`会话：${s.name}（组 ${s.group}）`, `页面所在主机：${host}`, '要放行这些写请求（批准后，只读主机上也能发出）：',
-          ...pending.map((d) => `${d.method} ${d.url}${d.operation === null ? '（这个地址上的所有写；GraphQL mutation 不在内，要放行 mutation 得写 operation）' : `（只放行 operation ${d.operation}）`}`),
-          '', '拒绝：不放行（默认）'],
-        buttons: ['拒绝', '放行'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC,
-      };
-      const asked = approvals.ask(key, 'writes', request, ['放行']);
-      switch (asked.status) {
-        case 'pending':
-          // 真有框在等人才登记（弹不出、冷却里拒绝的，待批表里没有这个键）。
-          this.askedWrites.set(denyKey, (this.askedWrites.get(denyKey) ?? new Set<string>()).add(key));
-          throw pendingError(asked.id, '放行写请求的声明');
-        case 'denied':
-          if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '换成别的声明，或等一分钟再试；内核重启前被拒的同一组声明不会再问');
-          this.deniedWrites.add(denyKey);
-          throw refused;
-        case 'unavailable':
-          throw new E2kError('needs-human', `要放行写请求但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
-        case 'approved':
+    if (pending.length === 0) return { ...none, remembered };
+    const denyKey = sha256(JSON.stringify([s.group, host, pending.map(declarationKey)]));
+    const refused = new E2kError('usage', '人拒绝了这些放行声明', '内核重启前同一组声明不会再问；要放行请换成别的声明');
+    const key = `writes:${sha256(JSON.stringify([s.name, s.group, host, pending.map(declarationKey)]))}`;
+    const earlier = this.askedWrites.get(denyKey);
+    if (earlier !== undefined && [...earlier].some((k) => approvals.stateOf(k) === 'denied')) { this.deniedWrites.add(denyKey); this.askedWrites.delete(denyKey); }
+    if (this.deniedWrites.has(denyKey)) return { ...none, error: refused };
+    const asked = approvals.ask(key, 'writes', this.writesRequest(s, host, pending, false), ['放行']);
+    switch (asked.status) {
+      case 'pending':
+        // 真有框在等人才登记（弹不出、冷却里拒绝的，待批表里没有这个键）。
+        this.askedWrites.set(denyKey, (this.askedWrites.get(denyKey) ?? new Set<string>()).add(key));
+        return { ...none, error: pendingError(asked.id, '放行写请求的声明') };
+      case 'denied':
+        if (asked.cooling) return { ...none, error: new E2kError('usage', '刚被人拒过，过一会儿再试', '换成别的声明，或等一分钟再试；内核重启前被拒的同一组声明不会再问') };
+        this.deniedWrites.add(denyKey);
+        return { ...none, error: refused };
+      case 'unavailable':
+        return { ...none, error: new E2kError('needs-human', `要放行写请求但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核') };
+      case 'approved':
+        return { error: null, remembered, commit: () => {
           // 写盘失败时 update 抛 needs-human，原样往上走；答复还留着，重试会再写一次。
           store.update((r) => {
             const cur = Object.hasOwn(r.writes, scope) ? r.writes[scope]! : [];
@@ -682,13 +735,54 @@ export class SessionManager {
           approvals.forget(key);
           approvals.forgetApproved((k) => k.startsWith('writes:'));
           this.askedWrites.delete(denyKey);
-          break;
-      }
+        } };
     }
-    for (const d of decls) {
-      if (s.declared.some((e) => e.scope === scope && sameDeclaration(e.decl, d))) continue;
-      s.declared.push({ scope, decl: d, approved: remembered.includes(d) ? 'remembered' : 'dialog' });
+  }
+
+  // deny 条目（R21）：已经在会话里的（open --allow 的可写清单且页面在授权的主机上、或之前在同一个页面主机上批准过的）不再问；其余每次都问，
+  // 批准只写进会话的 denyAllow（绑页面主机），不写批准记录。答复的键绑定会话 id、会话名、规范化的页面主机和待批条目，批准后 5 分钟没用掉作废（R20）；
+  // 不用 stateOf 判有没有批准（它不看过期），一律靠 ask：过期的答复 ask 会重新排队。键记在会话上，close 时一并 forget。
+  private gateDenyDeclarations(s: Session, decls: Declaration[], host: string): DeclGate {
+    const none: DeclGate = { error: null, commit: () => {}, remembered: [] };
+    if (decls.length === 0) return none;
+    const { approvals } = this.deps;
+    const top = this.normalizedOrNull(host);
+    if (top === null) return { ...none, error: new E2kError('usage', '页面所在的主机名不合法，不能放行写请求', '先让页面回到正常的地址') };
+    const covered = (d: Declaration): boolean =>
+      (s.grant.mode === 'writable' && top === s.grant.host && s.grant.allow.some((a) => sameDeclaration(a, d)))
+      || s.denyAllow.some((e) => this.normalizedOrNull(e.host) === top && sameDeclaration(e.decl, d));
+    const pending = decls.filter((d) => !covered(d));
+    if (pending.length === 0) return none;
+    const key = `deny-writes:${sha256(JSON.stringify([s.id, s.name, top, pending.map(declarationKey)]))}`;
+    s.denyWriteKeys.add(key);
+    const asked = approvals.ask(key, 'deny', this.writesRequest(s, top, pending, true), ['放行'], { ttlMs: DENY_TTL_MS });
+    switch (asked.status) {
+      case 'pending':
+        return { ...none, error: pendingError(asked.id, '放行写请求的声明（不允许的域名）') };
+      case 'denied':
+        if (asked.cooling) return { ...none, error: new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试') };
+        return { ...none, error: new E2kError('usage', '人拒绝了这些放行声明', '这个会话里同一组声明不会再问；要放行请换成别的声明') };
+      case 'unavailable':
+        return { ...none, error: new E2kError('needs-human', `要放行写请求但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核') };
+      case 'approved':
+        return { ...none, commit: () => {
+          for (const d of pending) if (!s.denyAllow.some((e) => this.normalizedOrNull(e.host) === top && sameDeclaration(e.decl, d))) s.denyAllow.push({ host, decl: d });
+          approvals.forget(key);
+          s.denyWriteKeys.delete(key);
+        } };
     }
+  }
+
+  // 「放行写请求」的框。deny 条目的多一行：只在这次会话里有效，不会记住。
+  private writesRequest(s: Session, host: string, pending: Declaration[], deny: boolean): DialogRequest {
+    return {
+      title: 'e2k：放行写请求',
+      lines: [`会话：${s.name}（组 ${s.group}）`, `页面所在主机：${host}`, '要放行这些写请求（批准后，只读主机上也能发出）：',
+        ...pending.map((d) => `${d.method} ${d.url}${d.operation === null ? '（这个地址上的所有写；GraphQL mutation 不在内，要放行 mutation 得写 operation）' : `（只放行 operation ${d.operation}）`}`),
+        ...(deny ? ['这是「不允许」的域名：只在这次会话里有效，不会记住'] : []),
+        '', '拒绝：不放行（默认）'],
+      buttons: ['拒绝', '放行'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
   }
 
   // 待批表里已经没有的键（超时、被丢弃、弹不出框）是死项，剪掉；集合空了就删这个集合。被拒的键在待批表里一直是 denied，不会被剪。
@@ -701,18 +795,19 @@ export class SessionManager {
 
   // 判定用的放行声明 = 会话提过的 ∩ 批准记录里当前的，而且要是在会话现在的组和页面主机上批准的（判定时再核对：记录里没了、页面搬了主机都失效）。
   // 页面在不允许的域名上（已授权，否则请求早被 denied 拦了）：声明只活在会话里（R7、R21）——open 时人批准的可写清单（只在授权的那个主机上），
-  // 加上 step --allow 在这个主机上批准的（denyAllow，Task 6 写入）；批准记录一律不看。其余主机照旧，但目标是 deny 主机的记住过的声明不用（R21）。
+  // 加上 step --allow 在这个主机上批准的（denyAllow）；批准记录一律不看。其余主机照旧，但目标是 deny 主机的记住过的声明不用（R21），
+  // 那类声明只来自 denyAllow（每次问、不记住、绑批准时的页面主机，页面搬走就不再生效）。
   private declaredFor(s: Session): Declaration[] {
+    const top = this.normalizedOrNull(s.topHost);
+    const fromDeny = top === null ? [] : s.denyAllow.filter((e) => this.normalizedOrNull(e.host) === top).map((e) => e.decl);
     if (this.deps.modes.resolve(s.topHost) === 'denied') {
-      const top = this.normalizedOrNull(s.topHost);
       if (top === null) return [];
       const own = s.grant.mode === 'writable' && top === s.grant.host ? s.grant.allow : [];
-      return [...own, ...s.denyAllow.filter((e) => this.normalizedOrNull(e.host) === top).map((e) => e.decl)];
+      return [...own, ...fromDeny];
     }
-    if (s.declared.length === 0) return [];
     const scope = `${s.group}/${s.topHost}`;
     const stored = this.deps.store.writesFor(scope);
-    return s.declared.filter((e) => e.scope === scope && stored.some((d) => sameDeclaration(d, e.decl)) && !this.targetsDenied(e.decl)).map((e) => e.decl);
+    return [...s.declared.filter((e) => e.scope === scope && stored.some((d) => sameDeclaration(d, e.decl)) && !this.targetsDenied(e.decl)).map((e) => e.decl), ...fromDeny];
   }
 
   private normalizedOrNull(host: string): string | null {
@@ -1179,7 +1274,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
-        group: o.group, crossCount: 0, deniedCount: 0, crossNotices: new Set(), refused: new Map(), frozen: null, declared: [], grant: o.grant, denyAllow: [],
+        group: o.group, crossCount: 0, deniedCount: 0, crossNotices: new Set(), refused: new Map(), frozen: null, declared: [], grant: o.grant, denyAllow: [], denyWriteKeys: new Set(),
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         pagesOpened: 0, identityConfigured: false, identityChecks: 0, identitySkipped: 0, identityMismatch: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
@@ -1253,6 +1348,9 @@ export class SessionManager {
 
   // 收尾的每一步各自接住异常、记日志、继续往下（页面可能已经没了）。报告没写成时最后抛 internal。
   private async wrapUp(s: Session, closedBy: ClosedBy, p: CloseParams | undefined): Promise<CloseResult> {
+    // 本会话的 deny-writes: 答复不能留给别的会话（键里有会话 id，撞号时也不行）：任何一种收尾都在这里 forget（没点完的框 forget 不动，靠 TTL 过期）。
+    for (const k of s.denyWriteKeys) this.deps.approvals.forget(k);
+    s.denyWriteKeys.clear();
     let webSockets = 0;
     try {
       webSockets = (await s.page.location()).webSockets;
@@ -1758,10 +1856,11 @@ export class SessionManager {
     if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
     // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
     // 目标主机是不允许的域名时也并进来（R18）：没授权的就是 denied，一律 403；授权覆盖的按只读判。
-    // 顶层导航的主机（导航目标）走 nav:true：借用只放行子请求的目标，不放行去那里的顶层导航（R2）。
+    // 请求所在页自己的顶层主机永远走 nav:true：借用只放宽子请求的目标，页面本身在被借组的 deny 主机上不能因此被放成只读。
+    // 目标主机：顶层导航走 nav:true（借用不放行去那里的顶层导航，R2），子请求走 nav:false（借用的组里的 deny 主机按只读判）。
     const nav = req.isNavigation && req.topFrame;
-    const mode = this.sessionMode(s, [...(nav ? [] : [topHost]), ...this.groupTargets(s.group, host, topHost), ...(targetMode === 'denied' && !nav ? [host] : [])],
-      nav ? [topHost, ...(targetMode === 'denied' ? [host] : [])] : []);
+    const targets = [...this.groupTargets(s.group, host, topHost), ...(targetMode === 'denied' ? [host] : [])];
+    const mode = this.sessionMode(s, nav ? [] : targets, [topHost, ...(nav ? targets : [])]);
     const verdict: PolicyVerdict = this.deps.policy.decide(req, this.policyCtx(mode, s.group, host, true, this.declaredFor(s)));
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
@@ -1782,7 +1881,7 @@ export class SessionManager {
     return !o.nav && s.grant.borrowGroup !== null && this.deps.modes.groupOf(h).name === s.grant.borrowGroup;
   }
 
-  // 会话的有效模式（R9）：成员 = 主页面顶层主机、待定主机、extraHosts（子请求的目标和请求所在页的顶层主机）、navHosts（顶层导航的目标），
+  // 会话的有效模式（R9）：成员 = 主页面顶层主机、待定主机、extraHosts（子请求的目标）、navHosts（请求所在页的顶层主机、顶层导航的目标），
   // 各自按规则解析；被授权覆盖的 denied 先映射成 readonly；--readonly 算一个 readonly 成员。取并：denied > readonly > default。
   // 主页面的顶层主机和待定主机一律按 nav:true 算：授权之外只有借用的子请求目标才放宽，顶层不放宽。
   private sessionMode(s: Session, extraHosts: string[], navHosts: string[] = []): Mode {

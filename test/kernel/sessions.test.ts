@@ -4229,7 +4229,11 @@ test('remembered declarations for a deny target are not used (R21): a grant-cove
   const toDeny = { method: 'POST', url: 'http://127.0.0.1:5173/api/save' };
   const toSelf = { method: 'POST', url: 'http://localhost:5173/api/ok' };
   store.update((rec) => { rec.writes['default/localhost'] = [{ ...toDeny, operation: null }, { ...toSelf, operation: null }]; return rec; });
-  assert.equal((await sm.step({ session: r.session, ops: [{ op: 'snapshot' }], allow: [toDeny, toSelf] })).exit, 0);   // 都是「已记住」：不弹框
+  assert.equal((await sm.step({ session: r.session, ops: [{ op: 'snapshot' }], allow: [toSelf] })).exit, 0);   // 「已记住」：不弹框
+  // 目标是 deny 主机的声明不走记住的路（Task 6：每次都问、只活在会话里），批准记录里记着的那一条在判定时也不用：
+  // 万一有这样的条目混进会话的 declared（这里直接塞进去），declaredFor 的过滤仍然挡住它。
+  await assert.rejects(sm.step({ session: r.session, ops: [{ op: 'snapshot' }], allow: [toDeny] }), isCode('wait-approval'));
+  (inner(sm, r.session) as unknown as { declared: unknown[] }).declared.push({ scope: 'default/localhost', decl: { ...toDeny, operation: null }, approved: 'remembered' });
   const declared = (sm as unknown as { declaredFor(s: unknown): { url: string }[] }).declaredFor(inner(sm, r.session));
   assert.deepEqual(declared.map((d) => d.url), [toSelf.url]);
   assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: toDeny.url, ...POST_JSON })), 403);
@@ -4595,4 +4599,296 @@ test('a login window on a default host that lands on a deny host treats the page
   assert.equal((await fake.emitRequest({ id: 'm1', pageId, method: 'GET', url: DENY_URL + 'x', topUrl: DENY_URL })).action, 'continue');
   assert.equal(status(await fake.emitRequest({ id: 'm2', pageId, url: HOME_URL + 'api', topUrl: DENY_URL, ...POST_JSON })), 403);
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});
+
+// ---- 借用含 deny 的组、deny 主机上的 step --allow（M3 任务 6） ----
+
+const BORROW_RULES = {
+  version: 1, rules: [{ match: '127.0.0.1', mode: 'deny' }, { match: 'api.g.example.com', mode: 'deny' }],
+  groups: [{ name: 'g', hosts: ['api.g.example.com'] }],
+};
+const BORROW_TITLE = 'e2k：借用登录';
+const WRITES_TITLE = 'e2k：放行写请求';
+const G_DENY = 'http://api.g.example.com/';
+const BORROW_OPEN = { url: HOME_URL, profile: 'g', name: 'bor' };
+const DENY_ONLY_NOTE = '这是「不允许」的域名：只在这次会话里有效，不会记住';
+const titleOf = (r: DialogRequest): string => r.title.replace(/（请求 .*$/, '');
+const borrowBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter((r) => r.title.startsWith(BORROW_TITLE));
+const writesBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter((r) => r.title.startsWith(WRITES_TITLE));
+// deny 三种框按 deny 的答，借用框答「允许」，放行写请求的框答「放行」，规则框批准。
+const everyBox = (deny: '只读' | '可写' = '只读') => (r: DialogRequest): DialogResult =>
+  r.title.startsWith(BORROW_TITLE) ? answeringDeny('允许')(r) : r.title.startsWith(WRITES_TITLE) ? allowing(r) : answeringDeny(deny)(r);
+const denyAllowOf = (sm: SessionManager, id: string): { host: string; decl: { method: string; url: string } }[] => (inner(sm, id) as unknown as { denyAllow: never }).denyAllow;
+const approvalsOf = (sm: SessionManager): Approvals => (sm as unknown as { deps: SessionDeps }).deps.approvals;
+
+test('borrowing a group that has a deny host asks every run (allow / refuse only): the box names the session, the page host and the group, and the retry opens a borrowed session', async () => {
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });   // 人还没点
+  const { sm, fake, dialog } = setupDeny((r) => held.then(() => everyBox()(r)), { rules: BORROW_RULES });
+  await assert.rejects(sm.open(BORROW_OPEN), isCode('wait-approval'));
+  await assert.rejects(sm.open(BORROW_OPEN), (e: E2kError) => e.code === 'wait-approval' && /等人在弹框里批准：借用含不允许的域名的组/.test(e.message));
+  assert.equal(dialog.requests.length, 1, 'the retry meets the same box');
+  assert.deepEqual(fake.openPages(), []); assert.equal(fake.launches, 0);
+  const req = dialog.requests[0]!;
+  assert.match(req.title, /^e2k：借用登录（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['拒绝', '允许'], '拒绝', 120]);
+  const body = req.lines.join('\n');
+  for (const part of ['bor', 'localhost', ' g ', '这个组里有不允许的域名']) assert.ok(body.includes(part), `${part}: ${body}`);
+  release();
+  await settleDialog();
+  const r = await sm.open(BORROW_OPEN);
+  assert.equal(r.borrowed, true);
+  assert.equal(r.profile, 'g');
+  assert.equal(r.grant, null, 'no deny host was opened, so there is no open grant to report');
+  assert.deepEqual(grantOf(sm, r.session), { host: null, mode: null, allow: [], borrowGroup: 'g' });
+  await sm.close({ session: r.session });
+  await assert.rejects(sm.open(BORROW_OPEN), isCode('wait-approval'));   // 同样参数再 open：又问一次
+  assert.equal(borrowBoxes(dialog).length, 2);
+});
+
+test('borrowing: 拒绝 is a usage error and opens nothing; an approval nobody used within 5 minutes is asked again; an unavailable dialog is needs-human', async () => {
+  const no = setupDeny(answeringDeny('拒绝'), { rules: BORROW_RULES });
+  await assert.rejects(no.sm.open(BORROW_OPEN), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(no.sm.open(BORROW_OPEN), (e: E2kError) => e.code === 'usage' && /人拒绝了借用/.test(e.message));
+  assert.equal(no.dialog.requests.length, 1);
+  assert.deepEqual(no.fake.openPages(), []); assert.deepEqual(no.sm.list(), []);
+  let t = 1_000_000;
+  const late = setupDeny(everyBox(), { rules: BORROW_RULES, now: () => t });
+  await assert.rejects(late.sm.open(BORROW_OPEN), isCode('wait-approval'));
+  await settleDialog();
+  t += 5 * 60_000 + 1;
+  await assert.rejects(late.sm.open(BORROW_OPEN), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(borrowBoxes(late.dialog).length, 2);
+  assert.equal((await late.sm.open(BORROW_OPEN)).borrowed, true);
+  const none = setupDeny(() => ({ kind: 'unavailable', why: '没有桌面' }), { rules: BORROW_RULES });
+  await assert.rejects(none.sm.open(BORROW_OPEN), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(none.sm.open(BORROW_OPEN), (e: E2kError) => e.code === 'needs-human' && e.message.includes('弹不出批准框：没有桌面'));
+});
+
+test('borrowing a group without deny hosts shows no dialog (M2b behaviour); a driver that cannot intercept cannot borrow a group with deny hosts, before any dialog', async () => {
+  const plain = setupDeny(answeringDeny('只读'), { rules: { version: 1, rules: [{ match: 'a.example.com', mode: 'readonly' }], groups: [{ name: 'a', hosts: ['a.example.com'] }] } });
+  const r = await plain.sm.open({ url: HOME_URL, profile: 'a' });
+  assert.deepEqual([r.borrowed, plain.dialog.requests.length], [true, 0]);
+  assert.deepEqual(grantOf(plain.sm, r.session), { host: null, mode: null, allow: [], borrowGroup: null });
+  const weak = setupDeny(everyBox(), { rules: BORROW_RULES, capabilities: { networkInterception: false } });
+  await assert.rejects(weak.sm.open(BORROW_OPEN), (e: E2kError) => e.code === 'internal' && e.message.includes('不能借用含不允许的域名的组'));
+  assert.equal(weak.dialog.requests.length, 0);
+  assert.deepEqual(weak.fake.openPages(), []);
+});
+
+test('a borrowed session\'s request to the group\'s deny host is judged read-only; a top-level navigation there is aborted and recorded as denied (R2)', async () => {
+  const { sm, fake } = setupDeny(everyBox(), { rules: BORROW_RULES });
+  const r = await openDenied(sm, fake, BORROW_OPEN);
+  const get = await fake.emitRequest({ pageId: r.pageId, method: 'GET', url: `${G_DENY}data`, topUrl: HOME_URL });
+  assert.equal(get.action, 'continue');
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: `${G_DENY}save`, topUrl: HOME_URL, ...POST_JSON })), 403);
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, method: 'GET', url: 'http://127.0.0.1:5173/x', topUrl: HOME_URL })), 403, 'a deny host outside the group is not covered');
+  assert.deepEqual(await topNav(fake, r.pageId, `${G_DENY}page`), { action: 'abort' });
+  assert.deepEqual(await topNav(fake, r.pageId, `${G_DENY}page`, 'POST'), { action: 'abort' });
+  assert.equal(inner(sm, r.session).topHost, 'localhost');
+  const st = await sm.step({ session: r.session, ops: [{ op: 'snapshot' }] });
+  assert.ok(st.notices.includes(DENIED_NAV('api.g.example.com')), st.notices.join('|'));
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.host, w.reason]), [['api.g.example.com', 'method'], ['127.0.0.1', 'denied'], ['api.g.example.com', 'denied'], ['api.g.example.com', 'denied']]);
+});
+
+test('a page whose own top is on the borrowed group\'s deny host is not relaxed by the borrow grant: its sub-requests are judged denied (nav:true for the page\'s own top)', async () => {
+  const { sm, fake } = setupDeny(everyBox(), { rules: BORROW_RULES });
+  const r = await openDenied(sm, fake, BORROW_OPEN);
+  // 防线之一（页面地址证据会先冻结会话）漏掉时的第二道：关掉它，单独看有效模式的算法。
+  mock.method(sm as unknown as { freezeIfOtherGroup: () => void }, 'freezeIfOtherGroup', () => {});
+  assert.equal((await fake.emitRequest({ id: `t${++navSeq}`, pageId: r.pageId, method: 'GET', url: `${G_DENY}x`, topUrl: HOME_URL })).action, 'continue', 'the target alone is covered');
+  const fromDenyTop = await fake.emitRequest({ id: `t${++navSeq}`, pageId: r.pageId, method: 'GET', url: HOME_URL + 'x', topUrl: `${G_DENY}page` });
+  assert.equal(status(fromDenyTop), 403);
+});
+
+test('an open that needs the rules, the deny and the borrow gates: each dialog once, one retry after each click, no loop', async () => {
+  const { sm, dialog, fake } = setupDeny(everyBox('只读'), { rules: BORROW_RULES, approveRules: false });
+  const p = { url: DENY_URL, profile: 'g', name: 'three' };
+  await assert.rejects(sm.open(p), isCode('wait-approval'));   // 规则待批
+  await settleDialog();
+  await assert.rejects(sm.open(p), isCode('wait-approval'));   // 规则批准了，轮到 deny 框
+  await settleDialog();
+  await assert.rejects(sm.open(p), isCode('wait-approval'));   // deny 批准了，轮到借用框（deny 的答复还在，不再问）
+  await settleDialog();
+  assert.deepEqual(dialog.requests.map(titleOf), ['e2k：域名规则改了', DENY_TITLE, BORROW_TITLE]);
+  const r = await sm.open(p);                                  // 三道都批准了：一次走通
+  assert.deepEqual([r.mode, r.borrowed, r.grant], ['readonly', true, { mode: 'readonly', allow: 0 }]);
+  assert.deepEqual(grantOf(sm, r.session), { host: '127.0.0.1', mode: 'readonly', allow: [], borrowGroup: 'g' });
+  assert.equal(dialog.requests.length, 3);
+  assert.deepEqual(fake.openPages().length, 1);
+  // 全部 forget 了：同样参数再开，两道框都重新问（先 deny、再借用）
+  await assert.rejects(sm.open(p), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm.open(p), isCode('wait-approval'));
+  await settleDialog();
+  assert.deepEqual(dialog.requests.slice(3).map(titleOf), [DENY_TITLE, BORROW_TITLE]);
+});
+
+test('the borrow box refused after the deny box was approved: the retry is a usage error, and the approved deny answer lapses after 5 minutes instead of waving a later open through', async () => {
+  let t = 1_000_000;
+  const { sm, dialog } = setupDeny((r) => (r.title.startsWith(BORROW_TITLE) ? { kind: 'button', button: '拒绝' } : answeringDeny('只读')(r)), { rules: BORROW_RULES, now: () => t });
+  const p = { url: DENY_URL, profile: 'g', name: 'part' };
+  await assert.rejects(sm.open(p), isCode('wait-approval'));   // deny 框
+  await settleDialog();
+  await assert.rejects(sm.open(p), isCode('wait-approval'));   // 借用框
+  await settleDialog();
+  await assert.rejects(sm.open(p), isCode('usage'));           // 借用被拒
+  t += 5 * 60_000 + 1;
+  await assert.rejects(sm.open(p), isCode('wait-approval'));   // deny 的答复过期了：重新问
+  await settleDialog();
+  assert.equal(denyBoxes(dialog).length, 2);
+});
+
+test('step --allow on a granted deny host asks every time and is never remembered: the box says so, the retry lets the write through, another session asks again, the store is untouched', async () => {
+  const { sm, fake, dialog, store } = setupDeny(everyBox(), {});
+  const one = await openDenied(sm, fake, { url: DENY_URL, name: 'one' });
+  const allow = [ALLOW_SAVE];
+  assert.equal(status(await fake.emitRequest({ pageId: one.pageId, url: ALLOW_SAVE.url, ...POST_JSON })), 403);
+  const snaps = methodCount(fake, 'snapshot');
+  await assert.rejects(sm.step({ session: one.session, ops: SNAP, allow }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(methodCount(fake, 'snapshot'), snaps, 'nothing ran');
+  assert.equal(writesBoxes(dialog).length, 1);
+  const req = writesBoxes(dialog)[0]!;
+  assert.match(req.title, /^e2k：放行写请求（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual([req.buttons, req.defaultButton], [['拒绝', '放行'], '拒绝']);
+  assert.deepEqual(req.lines.slice(0, 2), ['会话：one（组 default）', '页面所在主机：127.0.0.1']);
+  assert.ok(req.lines.includes(lineOf(ALLOW_SAVE)) && req.lines.includes(DENY_ONLY_NOTE), req.lines.join('\n'));
+  assert.equal(status(await fake.emitRequest({ pageId: one.pageId, url: ALLOW_SAVE.url, ...POST_JSON })), 403, 'answered but not yet in force');
+  await sm.step({ session: one.session, ops: SNAP, allow });   // 原样重试：放行
+  assert.equal(methodCount(fake, 'snapshot'), snaps + 1);
+  assert.equal((await fake.emitRequest({ pageId: one.pageId, url: ALLOW_SAVE.url, ...POST_JSON })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ pageId: one.pageId, url: 'http://127.0.0.1:5173/api/other', ...POST_JSON })), 403);
+  await sm.step({ session: one.session, ops: SNAP, allow });   // 同一会话再带：已批准，不再问
+  assert.equal(writesBoxes(dialog).length, 1);
+  assert.deepEqual(store.get().writes, {}, 'never remembered');
+  assert.deepEqual(denyAllowOf(sm, one.session), [{ host: '127.0.0.1', decl: { ...ALLOW_SAVE, operation: null } }]);
+  const res = readResult((await sm.close({ session: one.session })).runDir);
+  assert.deepEqual(res.declarations, [{ method: 'POST', url: ALLOW_SAVE.url, operation: null, approved: 'dialog' }]);
+  assert.deepEqual(res.writes.allowed.map((w) => w.allowedBy), ['declared']);
+  const two = await openDenied(sm, fake, { url: DENY_URL, name: 'two' });
+  await assert.rejects(sm.step({ session: two.session, ops: SNAP, allow }), isCode('wait-approval'));   // 另开会话：照样问
+  await settleDialog();
+  assert.equal(writesBoxes(dialog).length, 2);
+  assert.deepEqual(store.get().writes, {});
+});
+
+test('step --allow entries already in the open --allow list (granted 可写) are not asked again on that host; entries outside it are', async () => {
+  const { sm, fake, dialog } = setupDeny(everyBox('可写'), {});
+  const r = await openDenied(sm, fake, { url: DENY_URL, allow: [ALLOW_SAVE] });
+  await sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] });
+  assert.equal(writesBoxes(dialog).length, 0);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE, { method: 'PUT', url: 'http://127.0.0.1:5173/api/more' }] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.deepEqual(writesBoxes(dialog).map((d) => d.lines.filter((l) => l.startsWith('PUT ') || l.startsWith('POST '))), [['PUT http://127.0.0.1:5173/api/more（这个地址上的所有写；GraphQL mutation 不在内，要放行 mutation 得写 operation）']]);
+});
+
+test('step --allow refused for a deny host: usage error, nothing runs, nothing is in force', async () => {
+  const { sm, fake } = setupDeny((r) => (r.title.startsWith(WRITES_TITLE) ? { kind: 'button', button: '拒绝' } : answeringDeny('只读')(r)), {});
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  const snaps = methodCount(fake, 'snapshot');
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] }), isCode('usage'));
+  assert.equal(methodCount(fake, 'snapshot'), snaps);
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: ALLOW_SAVE.url, ...POST_JSON })), 403);
+  assert.deepEqual(denyAllowOf(sm, r.session), []);
+});
+
+test('a declaration whose target is a deny host, made on a borrowed default page, is asked every time and never remembered (R21)', async () => {
+  const { sm, fake, dialog, store } = setupDeny(everyBox(), { rules: BORROW_RULES });
+  const toG = { method: 'POST', url: `${G_DENY}api/save` };
+  const one = await openDenied(sm, fake, { ...BORROW_OPEN, name: 'one' });
+  assert.equal(status(await fake.emitRequest({ pageId: one.pageId, url: toG.url, topUrl: HOME_URL, ...POST_JSON })), 403);
+  await assert.rejects(sm.step({ session: one.session, ops: SNAP, allow: [toG] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.ok(writesBoxes(dialog)[0]!.lines.includes(DENY_ONLY_NOTE));
+  assert.deepEqual(writesBoxes(dialog)[0]!.lines.slice(0, 2), ['会话：one（组 g）', '页面所在主机：localhost']);
+  await sm.step({ session: one.session, ops: SNAP, allow: [toG] });
+  assert.equal((await fake.emitRequest({ pageId: one.pageId, url: toG.url, topUrl: HOME_URL, ...POST_JSON })).action, 'continue');
+  assert.deepEqual(store.get().writes, {});
+  const res = readResult((await sm.close({ session: one.session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => [w.host, w.allowedBy]), [['api.g.example.com', 'declared']]);
+  const two = await openDenied(sm, fake, { ...BORROW_OPEN, name: 'two' });
+  await assert.rejects(sm.step({ session: two.session, ops: SNAP, allow: [toG] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(writesBoxes(dialog).length, 2);
+  assert.deepEqual(store.get().writes, {});
+});
+
+test('a deny-host declaration approved on page host A does not apply after the page moves to host B', async () => {
+  const { sm, fake } = setupDeny(everyBox(), { rules: BORROW_RULES });
+  const toG = { method: 'POST', url: `${G_DENY}api/save` };
+  const r = await openDenied(sm, fake, BORROW_OPEN);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [toG] }), isCode('wait-approval'));
+  await settleDialog();
+  await sm.step({ session: r.session, ops: SNAP, allow: [toG] });
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, url: toG.url, topUrl: HOME_URL, ...POST_JSON })).action, 'continue');
+  await fake.emitRequest({ id: `m${++navSeq}`, pageId: r.pageId, method: 'GET', url: 'http://example.net/app.js', topUrl: 'http://example.net/' });   // 页面搬到别的主机
+  assert.equal(inner(sm, r.session).topHost, 'example.net');
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: toG.url, topUrl: 'http://example.net/', ...POST_JSON })), 403);
+});
+
+test('one step with a deny entry and a plain entry asks both boxes before anything runs; the retry after both clicks runs once; the plain one is remembered, the deny one is not', async () => {
+  const { sm, fake, dialog, store } = setupDeny(everyBox(), { rules: BORROW_RULES });
+  const toG = { method: 'POST', url: `${G_DENY}api/save` };
+  const plain = { method: 'POST', url: 'http://localhost:5173/api/ok' };
+  const r = await openDenied(sm, fake, BORROW_OPEN);
+  const snaps = methodCount(fake, 'snapshot');
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(writesBoxes(dialog).length, 2, 'both boxes were asked in the same step');
+  assert.deepEqual(writesBoxes(dialog).map((d) => d.lines.includes(DENY_ONLY_NOTE)).sort(), [false, true]);
+  assert.equal(methodCount(fake, 'snapshot'), snaps);
+  assert.deepEqual(store.get().writes, {}, 'nothing is recorded before both are approved');
+  assert.deepEqual(denyAllowOf(sm, r.session), []);
+  await sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] });
+  assert.equal(methodCount(fake, 'snapshot'), snaps + 1);
+  assert.equal(writesBoxes(dialog).length, 2);
+  assert.deepEqual(Object.values(store.get().writes).flat().map((d) => d.url), [plain.url]);
+  assert.equal(denyAllowOf(sm, r.session).length, 1);
+});
+
+test('one step with a deny entry and a plain entry: if the plain box is refused nothing is recorded or in force', async () => {
+  const { sm, fake, dialog, store } = setupDeny((r) => (r.title.startsWith(WRITES_TITLE) && !r.lines.includes(DENY_ONLY_NOTE) ? { kind: 'button', button: '拒绝' } : everyBox()(r)), { rules: BORROW_RULES });
+  const toG = { method: 'POST', url: `${G_DENY}api/save` };
+  const plain = { method: 'POST', url: 'http://localhost:5173/api/ok' };
+  const r = await openDenied(sm, fake, BORROW_OPEN);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] }), isCode('usage'));
+  assert.deepEqual(store.get().writes, {});
+  assert.deepEqual(denyAllowOf(sm, r.session), []);
+  assert.equal(writesBoxes(dialog).length, 2);
+});
+
+test('close forgets the session\'s deny-writes approvals, also ones nobody used', async () => {
+  const { sm, fake } = setupDeny(everyBox(), {});
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  const keys = [...(inner(sm, r.session) as unknown as { denyWriteKeys: Set<string> }).denyWriteKeys];
+  assert.equal(keys.length, 1);
+  assert.match(keys[0]!, /^deny-writes:[0-9a-f]{64}$/);
+  assert.equal(approvalsOf(sm).stateOf(keys[0]!), 'approved');
+  await sm.close({ session: r.session });
+  assert.equal(approvalsOf(sm).stateOf(keys[0]!), undefined);
+});
+
+test('a deny-writes approval nobody used within 5 minutes is asked again (R20): the old answer is not proof, ask re-queues it', async () => {
+  let t = 1_000_000;
+  const { sm, fake, dialog } = setupDeny(everyBox(), { now: () => t });
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  t += 5 * 60_000 + 1;
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(writesBoxes(dialog).length, 2);
+  await sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] });
+  assert.equal(writesBoxes(dialog).length, 2);
 });
