@@ -95,7 +95,7 @@ interface Session {
   readonly declared: DeclaredEntry[];
   lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
   // 身份探针（设计 5.2）：只探主页面。configured：探的时候组配了身份（报告里 identity 是不是 null 看它）；
-  // checks / skipped：做了比较的次数 / 前提不满足跳过的次数；mismatch：一旦记下永久生效，直到 close（记的是当时的组和期望文字，不含页面文字）。
+  // checks / skipped：做了比较的次数（含没能确认的）/ 前提不满足跳过的次数；mismatch：只有确认是别的账号才记，一旦记下永久生效，直到 close（记的是当时的组和期望文字，不含页面文字）。
   identityConfigured: boolean;
   identityChecks: number;
   identitySkipped: number;
@@ -154,6 +154,13 @@ const IDENTITY_NEXT = '账号或租户可能被别的会话切走了；请人确
 function identityMismatchError(m: { group: string; expect: string }): E2kError {
   return new E2kError('needs-human', `身份探针不符：组 ${m.group} 期望「${m.expect}」，页面上不是`, IDENTITY_NEXT);
 }
+// 没能确认（读不到身份元素、读取出错、超时）：不能证明是别的账号，只让这一次 step 22、什么都不执行，也不记在会话上；下一次 step 重新探。
+const IDENTITY_UNVERIFIED_NEXT = '身份探针这次没能确认账号（页面上还没读到期望的账号元素，或读取出错、超时）；等页面加载完再 step 一次会重新探，仍不行请人确认账号';
+function identityUnverifiedError(group: string): E2kError {
+  return new E2kError('needs-human', `身份探针没能确认账号：组 ${group} 的页面上没读到期望的账号元素（或读取出错、超时），这次没有执行任何操作`, IDENTITY_UNVERIFIED_NEXT);
+}
+// 探针内部的结果：unverified 对外（OpenResult.identity）仍报 mismatch，不加枚举值，但不永久记录。
+type IdentityOutcome = 'ok' | 'mismatch' | 'unverified' | 'skipped';
 
 // 冻结的会话 step 不执行：要人关掉它，用目标组的 profile 另开。group 为 null 是判断不出归属（失败关闭）。
 function frozenError(f: Freeze): E2kError {
@@ -348,8 +355,10 @@ export class SessionManager {
     let focus: { token: string | null; pagesBefore: number; loginOpenAtStart: boolean } | undefined;
     try {
       // 次序：冻结 → 身份探针 → 放行声明的批准 → 执行。账号不对时不该先弹「放行写请求」的框让人批。
-      await this.probeIdentity(s);
+      const probed = await this.probeIdentity(s);
       if (s.identityMismatch !== null) throw identityMismatchError(s.identityMismatch);
+      // 没能确认：这一次不执行任何操作（含放行声明的批准框），也不永久记录；下一次 step 重新探。
+      if (probed === 'unverified') throw identityUnverifiedError(s.group);
       const frozenNowOnProbe = frozenNow(s);   // 探针的 await 期间被重定向冻结了：和上面同一个错
       if (frozenNowOnProbe !== null) {
         await Promise.all([...frozenNowOnProbe.clearing]);
@@ -400,13 +409,14 @@ export class SessionManager {
 
   // 身份探针（设计 5.2）。身份每次从批准快照里会话所在组现取，不缓存；组没配身份返回 null、什么都不记。
   // 前提：主页面的主机属于会话的组（借用、停在身份提供方 / loginHosts 上都不满足），否则 skipped。
-  // 比较：`css=选择器` 恰好匹配 1 个、文字 trim 后等于期望才是 ok；其余是 mismatch；匹配 0 个且页面上有可见的密码框（疑似登录页）时是 skipped。驱动抛 DriverError、整体超时都按 mismatch（失败关闭）；
-  // 别的异常照常往上抛。页面已关（会话在收尾）时读不到不算不符。读到的文字只在这里比较，不进任何消息、记录、日志。
-  private async probeIdentity(s: Session): Promise<'ok' | 'mismatch' | 'skipped' | null> {
+  // 比较：`css=选择器` 恰好匹配 1 个、文字 trim 后等于期望才是 ok。「确认是别的账号」（恰好 1 个而文字不符，或 ≥2 个匹配）才是 mismatch，永久记在会话上；
+  // 「没能确认」（0 个匹配而页面没有密码框、驱动抛 DriverError、整体超时）是 unverified：失败关闭但只管这一次（step 不执行、返回 22），不永久记录（终审 I-6：单页应用的页头可能还没渲染）；
+  // 匹配 0 个且页面上有可见的密码框（疑似登录页）时是 skipped。别的异常照常往上抛。页面已关（会话在收尾）时读不到不算不符。读到的文字只在这里比较，不进任何消息、记录、日志。
+  private async probeIdentity(s: Session): Promise<IdentityOutcome | null> {
     const identity = this.deps.modes.group(s.group)?.identity ?? null;
     if (identity === null) return null;
     s.identityConfigured = true;
-    let outcome: 'ok' | 'mismatch' | 'skipped';
+    let outcome: IdentityOutcome;
     let timer: NodeJS.Timeout | undefined;
     try {
       const work = this.readIdentity(s, identity.selector, identity.expect);
@@ -417,7 +427,7 @@ export class SessionManager {
       outcome = await Promise.race([work, limit]);
     } catch (e) {
       if (!(e instanceof DriverError)) throw e;
-      outcome = s.gone ? 'skipped' : 'mismatch';
+      outcome = s.gone ? 'skipped' : 'unverified';
     } finally {
       clearTimeout(timer);
     }
@@ -433,7 +443,7 @@ export class SessionManager {
     return outcome;
   }
 
-  private async readIdentity(s: Session, selector: string, expect: string): Promise<'ok' | 'mismatch' | 'skipped'> {
+  private async readIdentity(s: Session, selector: string, expect: string): Promise<IdentityOutcome> {
     const loc = await s.page.location();
     let host: string;
     try {
@@ -446,7 +456,7 @@ export class SessionManager {
     const n = await s.page.read({ kind: 'count', target });
     // 先数再看密码框：登录墙检查只是给人的提示，不是安全判断（后台设置页常有掩码显示密钥的密码框），不能拿它关掉探针。
     // 页面上有密码框时：恰好 1 个照常比较，≥2 个不符，0 个才跳过（可能真的是登录页，身份元素不在）。
-    if (n === 0) return (await loginWall(s.page, s.start.url)).blocked !== null ? 'skipped' : 'mismatch';
+    if (n === 0) return (await loginWall(s.page, s.start.url)).blocked !== null ? 'skipped' : 'unverified';
     if (n !== 1) return 'mismatch';
     return (await s.page.text({ target })).trim() === expect ? 'ok' : 'mismatch';
   }
@@ -979,13 +989,15 @@ export class SessionManager {
       if (this.stopping) throw stopping();
       s.lastWall = wall.blocked;
       // 首屏之后探一次：不符照样把会话交出去（人要看到提示），记在会话上，下一次 step 起就是 22。状态还是 opening，没有别的调用能碰到它。
-      const identity = await this.probeIdentity(s);
+      const probed = await this.probeIdentity(s);
       if (this.stopping) throw stopping();
       s.url = safely(() => redactUrl(loc.url));
       s.state = 'idle';
       this.restartIdle(s);
       // 首屏不符：next 放 step 的错误里那句下一步（--json 里也看得到）；同时在登录墙上时仍以登录提示为准（blocked 是 login，next 要对得上它）。
-      const next = identity === 'mismatch' && wall.blocked === null ? IDENTITY_NEXT : wall.next;
+      // unverified 也报 mismatch（退出码 22，不加枚举值），但 next 说的是「会重新探」。
+      const identity = probed === 'unverified' ? 'mismatch' : probed;
+      const next = wall.blocked !== null ? wall.next : probed === 'mismatch' ? IDENTITY_NEXT : probed === 'unverified' ? IDENTITY_UNVERIFIED_NEXT : wall.next;
       return {
         session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: this.sessionMode(s, []), runDir: s.runDir,
         snapshot: cappedSnapshot(snapshot), ...wall, next, profile: o.profile, borrowed: o.borrowed, identity,

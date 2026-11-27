@@ -2962,13 +2962,59 @@ test('identity probe: a tenant switched inside one step by goto is only seen by 
   assert.deepEqual(readResult((await sm.close({ session: r.session })).runDir).identity, { group: 'a', checks: 3, skipped: 0, mismatch: true });
 });
 
-test('identity probe: not exactly one match is a mismatch (two, none, no element at all), and so is a different text', async () => {
-  for (const el of [{ count: 2, text: 'Test Tenant' }, { count: 0, text: 'Test Tenant' }, undefined, { count: 1, text: 'Test Tenant 2' }, { count: 1, text: '' }]) {
-    const { sm } = await setupIdent({ [ID_A]: { elements: el === undefined ? {} : { [ID_EL]: el } } });
+test('identity probe: a confirmed other account is a permanent mismatch: two matches, or exactly one with another text', async () => {
+  for (const el of [{ count: 2, text: 'Test Tenant' }, { count: 1, text: 'Test Tenant 2' }, { count: 1, text: '' }]) {
+    const { sm, fake } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: el } } });
     const r = await sm.open({ url: ID_A });
     assert.equal(r.identity, 'mismatch', JSON.stringify(el));
-    await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isCode('needs-human'), JSON.stringify(el));
+    assert.equal(r.next, '账号或租户可能被别的会话切走了；请人确认后关掉这个会话重开');
+    await assert.rejects(sm.step({ session: r.session, ops: SNAP }), (e: unknown) => isCode('needs-human')(e) && /^身份探针不符/.test((e as Error).message), JSON.stringify(el));
+    // 页面后来又对上了也不放：确认过是别的账号，永久，直到 close
+    fake.setElement(fake.openPages().at(-1)!, ID_EL, TENANT[ID_EL]);
+    await assert.rejects(sm.step({ session: r.session, ops: SNAP }), (e: unknown) => isCode('needs-human')(e) && /^身份探针不符/.test((e as Error).message), JSON.stringify(el));
+    assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity?.mismatch, true);
   }
+});
+
+// 终审 I-6：读不到身份元素（单页应用还没渲染出页头）、读取出错、超时，都不能证明是别的账号：只让这一次 step 22、不执行、不永久记录。
+const UNVERIFIED_MESSAGE = '身份探针没能确认账号：组 a 的页面上没读到期望的账号元素（或读取出错、超时），这次没有执行任何操作';
+const isUnverified = (e: unknown): boolean => {
+  assert.ok(e instanceof E2kError); assert.equal(e.code, 'needs-human');
+  assert.equal(e.message, UNVERIFIED_MESSAGE);
+  assert.ok(!/身份探针不符/.test(e.message));
+  return true;
+};
+
+test('identity probe: no match at all (and no password field) is not permanent: open reports mismatch (22), a step runs nothing and answers 22, the next probe starts afresh and a page that has rendered by then is ok', async () => {
+  for (const el of [{ count: 0, text: 'Test Tenant' }, undefined]) {
+    const { sm, fake } = await setupIdent({ [ID_A]: { elements: el === undefined ? {} : { [ID_EL]: el } } });
+    const r = await sm.open({ url: ID_A });
+    assert.equal(r.identity, 'mismatch', JSON.stringify(el));
+    assert.ok((r.next ?? '').includes('重新探'), String(r.next));
+    assert.ok(!(r.next ?? '').includes('关掉这个会话重开'));
+    const before = snapshots(fake);
+    await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isUnverified);
+    await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isUnverified, 'asking again probes again (and fails the same way while the element is missing)');
+    assert.equal(snapshots(fake), before, 'no operation reached the page');
+    // 页头渲染出来了：下一次 step 重新探，对上了就正常执行
+    fake.setElement(fake.openPages().at(-1)!, ID_EL, TENANT[ID_EL]);
+    assert.equal((await sm.step({ session: r.session, ops: SNAP })).results[0]?.outcome, 'ok');
+    assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+    assert.deepEqual(readResult((await sm.close({ session: r.session })).runDir).identity, { group: 'a', checks: 5, skipped: 0, mismatch: false });
+  }
+});
+
+test('identity probe: an element that disappears between steps (a page that is re-rendering) stops that step only; the session is not marked', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: TENANT } });
+  const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'ok');
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, { text: 'Test Tenant', count: 0 });
+  const before = snapshots(fake);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isUnverified);
+  assert.equal(snapshots(fake), before);
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, TENANT[ID_EL]);
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity?.mismatch, false);
 });
 
 test('identity probe: the count is read before the text, and the text is not read when the count is not 1', async () => {
@@ -2978,9 +3024,16 @@ test('identity probe: the count is read before the text, and the text is not rea
   assert.deepEqual(fake.calls.filter((c) => c.method === 'read').map((c) => c.args[0]), [{ kind: 'count', target: ID_EL }]);
 });
 
-test('identity probe: a driver error while reading is a mismatch (fail closed); an unrelated error is not swallowed', async () => {
-  const { sm } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readFails: true } } } });
-  assert.equal((await sm.open({ url: ID_A })).identity, 'mismatch');
+test('identity probe: a driver error while reading is unverified, not a permanent mismatch (fail closed for this step only); an unrelated error is not swallowed', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readFails: true } } } });
+  const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'mismatch');
+  const before = snapshots(fake);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isUnverified);
+  assert.equal(snapshots(fake), before);
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, TENANT[ID_EL]);   // 读取恢复了
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity?.mismatch, false);
   const crash = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readCrash: true } } } });
   await assert.rejects(crash.sm.open({ url: ID_A }), TypeError);   // 不是 DriverError：原样抛，不变成不符，也不留会话
   assert.deepEqual(crash.sm.list(), []);
@@ -2996,12 +3049,16 @@ test('identity probe: a failure that is not a driver error at a step is thrown a
   assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity?.mismatch, false);
 });
 
-test('identity probe: a probe that never settles is cut off after the configured time and counts as a mismatch', async () => {
-  const { sm } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readHangs: true } } } }, { identityProbeMs: 30 });
+test('identity probe: a probe that never settles is cut off after the configured time: unverified for that step only, and the next step probes afresh', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readHangs: true } } } }, { identityProbeMs: 30 });
   const t0 = Date.now();
   const r = await sm.open({ url: ID_A });
   assert.equal(r.identity, 'mismatch');
   assert.ok(Date.now() - t0 < 1500);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isUnverified);
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, TENANT[ID_EL]);
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity?.mismatch, false);
 });
 
 test('identity probe: a password field on the page does not switch the probe off: the match is counted first, one match is compared (ok or mismatch), two are a mismatch, none is skipped', async () => {

@@ -1106,7 +1106,8 @@ test('formatOpen: always prints the profile key (also when not borrowed); an old
 test('formatOpen: an identity mismatch gets a conspicuous first line (no page text); ok, skipped, null and an older kernel\'s reply (no identity) print none', () => {
   const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null, profile: 'a', borrowed: false };
   const out = formatOpen({ ...base, identity: 'mismatch' });
-  assert.ok(out.split('\n')[0]!.startsWith('!! 身份探针不符'));
+  assert.ok(out.split('\n')[0]!.startsWith('!! 身份探针没通过'));
+  assert.ok(out.split('\n')[0]!.includes('重新探'), 'it may only be a page that has not rendered yet, so the line says both cases');
   for (const identity of ['ok', 'skipped', null] as const) assert.ok(!formatOpen({ ...base, identity }).includes('身份探针'));
   assert.ok(!formatOpen(base as never).includes('身份探针'));
 });
@@ -1125,7 +1126,7 @@ test('open and step with an identity probe: a mismatch is exit 22 at open (the s
     assert.equal(JSON.parse(good.outText()).identity, 'ok');
     const bad = io({ env: h.env });
     assert.equal(await main(['open', 'http://c.example.com/'], bad), 22);
-    assert.ok(bad.outText().split('\n')[0]!.startsWith('!! 身份探针不符'));
+    assert.ok(bad.outText().split('\n')[0]!.startsWith('!! 身份探针没通过'));
     assert.ok(!bad.outText().includes('Zq7x91'));
     const id = /s-[0-9a-f]{6}/.exec(bad.outText())![0];
     const step = io({ env: h.env });

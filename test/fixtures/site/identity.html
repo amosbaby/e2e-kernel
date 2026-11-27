@@ -7,9 +7,16 @@
 <body>
 <!-- 身份元素的文字取自查询串 ?who=（缺省 none）；按钮向 /api/identity-fired 发一次 POST，用来看「身份不符时 step 里的点击没发出去」。 -->
 <span id="who"></span>
+<!-- ?delay=N（毫秒）：#who 要 N 毫秒之后才出现，像单页应用异步渲染出来的页头。 -->
 <button id="fire">fire</button>
 <script>
-  document.getElementById('who').textContent = new URLSearchParams(location.search).get('who') ?? 'none';
+  const params = new URLSearchParams(location.search);
+  const who = document.getElementById('who');
+  const delay = Number(params.get('delay') ?? '0');
+  if (delay > 0) who.remove();
+  const text = params.get('who') ?? 'none';
+  if (delay > 0) setTimeout(() => { who.textContent = text; document.body.prepend(who); }, delay);
+  else who.textContent = text;
   document.getElementById('fire').addEventListener('click', () => {
     fetch('/api/identity-fired', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"term":"x"}' });
   });

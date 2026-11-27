@@ -759,6 +759,37 @@ test('an identity probe that does not match: open still hands the page over, the
   }
 });
 
+// 弹框数：1（规则）。终审 I-6：身份元素还没渲染出来（单页应用异步渲染页头）不能把会话永久判死。
+test('an identity element that is not on the page yet does not kill the session: open and an early step answer 22 and run nothing, the step after it rendered goes through', { timeout: 180_000 }, async () => {
+  const rules = { version: 1, rules: [], loginHosts: [], groups: [{ name: 'a', hosts: ['127.0.0.1'], identity: { selector: '#who', expect: 'Test Tenant' } }] };
+  const o = await startOwn(rules, approving);
+  const fired = (): number => server.hits.filter((h) => h.path === '/api/identity-fired').length;
+  const click = [{ op: 'click', target: '#fire' }];
+  const base = fired();   // 服务端的记录在整份文件里共用
+  try {
+    const warm = await openOwn(o, origin + '/identity.html?who=Test%20Tenant');   // 第一次 open 要先过规则的批准框（21 → 批准 → 重试）
+    assert.equal(warm.identity, 'ok');
+    assert.equal((await o.run(undefined, 'close', warm.session)).code, 0);
+    const run = await o.run(undefined, 'open', origin + '/identity.html?who=Test%20Tenant&delay=2500', '--json');
+    assert.equal(run.code, 22, run.out + run.err);
+    const early = JSON.parse(run.out);
+    assert.equal(early.identity, 'mismatch', 'open reports it so that a person sees it');
+    const step = await stepOwn(o, early.session, click);
+    assert.equal(step.code, 22, step.out + step.err);
+    assert.ok(!(step.out + step.err).includes('身份探针不符'), 'not a confirmed mismatch');
+    await settle();
+    assert.equal(fired(), base, 'the click of the refused step never reached the server');
+    await settle(2600);   // 页头渲染出来了
+    const late = await stepOwn(o, early.session, click);
+    assert.equal(late.code, 0, late.out + late.err);
+    await until('the click to arrive', () => fired() === base + 1);
+    const result = await closeOwn(o, early.session);
+    assert.equal(result.identity.mismatch, false);
+  } finally {
+    await o.stop();
+  }
+});
+
 test('permissions and shutdown', { timeout: 180_000 }, async () => {
   assert.equal(statSync(home.root).mode & 0o777, 0o700);
   assert.equal(statSync(home.socket).mode & 0o777, 0o600);
