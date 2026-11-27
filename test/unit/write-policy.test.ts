@@ -129,7 +129,8 @@ test('unattributed requests get the same read-only check as session requests: a 
 });
 
 const DENY_JSON = { action: 'fulfill', status: 403, contentType: 'application/json', body: `{"error":"${DENY_MESSAGE}"}` };
-const DENY_HTML = { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${DENY_MESSAGE}</p>` };
+// 导航不回 403 页（页面会提交在 deny 主机的源上，脚本能读写那个源的存储）：直接 abort，什么都不提交（R4a）。
+const DENY_ABORT = { action: 'abort' };
 
 test('the deny message is fixed', () => {
   assert.equal(DENY_MESSAGE, 'blocked by e2k: host not allowed');
@@ -145,9 +146,10 @@ test('denied mode blocks every request with 403 and reason denied', () => {
   // 命中放行声明的写也拦：denied 先于一切
   const hit = req({ method: 'POST', url: 'http://localhost/api/save', contentType: JSON_CT, body: '{}' });
   assert.deepEqual(dn(hit, { declared }), { decision: DENY_JSON, reason: 'denied', allowedBy: null });
-  // 导航回含同一句的 403 页
-  assert.deepEqual(dn(req({ method: 'GET', isNavigation: true, topFrame: true })), { decision: DENY_HTML, reason: 'denied', allowedBy: null });
-  assert.ok(DENY_HTML.body.includes('blocked by e2k: host not allowed') && DENY_JSON.body.includes('blocked by e2k: host not allowed'));
+  // 顶层导航 abort，不回页面（子 frame 的导航也一样：isNavigation 就 abort）
+  assert.deepEqual(dn(req({ method: 'GET', isNavigation: true, topFrame: true })), { decision: DENY_ABORT, reason: 'denied', allowedBy: null });
+  assert.deepEqual(dn(req({ method: 'POST', isNavigation: true, topFrame: true, body: 'a=1', contentType: 'application/x-www-form-urlencoded' })), { decision: DENY_ABORT, reason: 'denied', allowedBy: null });
+  assert.ok(DENY_JSON.body.includes('blocked by e2k: host not allowed'));
   // 不认识的模式仍是 abort（失败关闭）
   assert.deepEqual(policy.decide(req(), { ...DEFAULT_CTX, mode: 'bogus' as never }), { decision: { action: 'abort' }, reason: 'method', allowedBy: null });
 });
@@ -158,8 +160,8 @@ test('an unattributed request with denied set is blocked whatever the method', (
       assert.deepEqual(policy.decideUnattributed(req({ method }), { anyReadonly, logout: [], denied: true }), { decision: DENY_JSON, reason: 'denied', allowedBy: null }, `${method} ${anyReadonly}`);
     }
   }
-  // 未归属的导航也回 403 页，同一句话
-  assert.deepEqual(policy.decideUnattributed(req({ isNavigation: true, topFrame: true }), { anyReadonly: false, logout: [], denied: true }), { decision: DENY_HTML, reason: 'denied', allowedBy: null });
+  // 未归属的导航也 abort（弹窗的首跳可能是 302 进 deny 主机，不能让它提交）
+  assert.deepEqual(policy.decideUnattributed(req({ isNavigation: true, topFrame: true }), { anyReadonly: false, logout: [], denied: true }), { decision: DENY_ABORT, reason: 'denied', allowedBy: null });
   // denied 先于登出名单
   const logout = [ep('*', 'http://localhost/logout')];
   assert.equal(policy.decideUnattributed(req({ url: 'http://localhost/logout' }), { anyReadonly: true, logout, denied: true }).reason, 'denied');
@@ -249,15 +251,15 @@ test('a frozen session answers every request with a fixed 403 (HTML for navigati
   assert.ok(frozenMessage(null).includes('判断不出归属'));
 });
 
-test('a session frozen by a redirect into a deny host answers like a frozen one but with reason denied and its own sentence; the denied-navigation notice names the host', () => {
-  const sentence = '会话已冻结：页面经重定向进了不允许的域名。请关掉这个会话；要去这个域名，用 open 经人批准另开。';
-  assert.equal(frozenMessage('b', true), sentence);
-  assert.equal(frozenMessage(null, true), sentence);
+test('a session frozen by a redirect into a deny host answers navigations with abort and other requests with a 403 JSON, both with reason denied; the denied-navigation notice names the host', () => {
   const nav = blockFrozen(req({ method: 'GET', isNavigation: true, topFrame: true }), null, true);
   assert.equal(nav.reason, 'denied');
-  assert.deepEqual(nav.decision, { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${sentence}</p>` });
-  const sub = blockFrozen(req({ method: 'POST' }), null, true);
-  assert.ok(sub.reason === 'denied' && sub.decision.action === 'fulfill' && sub.decision.status === 403 && sub.decision.contentType === 'application/json');
+  assert.deepEqual(nav.decision, { action: 'abort' });   // 冻结在 deny 之后的导航也 abort：不让 deny 源的页面提交
+  for (const method of ['GET', 'POST']) {
+    const sub = blockFrozen(req({ method }), null, true);
+    assert.ok(sub.reason === 'denied' && sub.decision.action === 'fulfill' && sub.decision.status === 403 && sub.decision.contentType === 'application/json' && sub.decision.body.includes('session frozen'));
+  }
+  assert.deepEqual(blockFrozen(req({ method: 'GET', isNavigation: true, topFrame: true }), 'b').decision.action, 'fulfill');   // 别的组的冻结照旧回 403 页
   assert.equal(deniedNavMessage('a.example.com'), '这个域名是「不允许」的，没经批准不能打开：a.example.com');
 });
 

@@ -790,6 +790,44 @@ test('an identity element that is not on the page yet does not kill the session:
   }
 });
 
+// 弹框数：1（规则）。deny 主机的导航要 abort，不回 403 页：回的页面会提交在 deny 主机的源上，脚本能读写那个源的存储（R4a）。
+test('a navigation into a deny host commits nothing on the deny origin', { timeout: 180_000 }, async () => {
+  const o = await startOwn({ version: 1, rules: [{ match: 'localhost', mode: 'deny' }], loginHosts: [] }, approving);
+  try {
+    const open = await openOwn(o, origin + '/index.html');
+    const from = server.hits.length;
+    const denyOrigin = server.altOrigin;
+    // 表单 POST 的顶层导航：不提交，deny 主机的服务端什么都没收到（fixture 只记写，所以用 POST 来证明请求没发出去）
+    const post = JSON.parse((await stepOwn(o, open.session, [
+      { op: 'eval', js: `const f = document.createElement('form'); f.method = 'post'; f.action = ${JSON.stringify(denyOrigin + '/api/save')}; f.innerHTML = '<input name="x" value="1">'; document.body.append(f); f.submit(); 'submitted'` },
+      { op: 'wait', for: { ms: 500 } },
+    ])).out);
+    assert.equal(post.results[0].outcome, 'ok', JSON.stringify(post));
+    assert.equal(server.hits.slice(from).length, 0, 'no request to the deny host reached the server');
+    // goto 一个 deny 地址：被拦，这一步失败；之后页面不在 deny 主机的源上（停在默认主机，或浏览器自己的错误页，源是 null），deny 源里什么都没提交
+    const go = JSON.parse((await stepOwn(o, open.session, [{ op: 'goto', url: denyOrigin + '/index.html' }])).out);
+    assert.notEqual(go.results[0].outcome, 'ok', JSON.stringify(go.results));
+    assert.ok(go.notices.some((n: string) => n.includes('这个域名是「不允许」的，没经批准不能打开')), JSON.stringify(go.notices));
+    const probe = JSON.parse((await stepOwn(o, open.session, [
+      { op: 'eval', js: 'location.origin' },
+      { op: 'eval', js: "(() => { try { localStorage.setItem('k', 'v'); return location.origin + ':stored'; } catch { return 'blocked'; } })()" },
+      { op: 'eval', js: 'location.href' },
+    ])).out);
+    assert.equal(probe.exit, 0, JSON.stringify(probe));
+    for (const r of probe.results) assert.ok(!String(r.output).includes('localhost'), `the page is not on the deny origin: ${r.output}`);
+    assert.ok(String(probe.results[0].output).includes(origin) || String(probe.results[0].output).includes('null'), `default host or an error page: ${probe.results[0].output}`);
+    const again = await stepOwn(o, open.session, [{ op: 'snapshot' }]);
+    assert.equal(again.code, 0, 'the session is still usable and not frozen');
+    const result = await closeOwn(o, open.session);
+    const blocked: any[] = result.writes.blocked;
+    assert.ok(blocked.length >= 2 && blocked.every((w) => w.reason === 'denied' && w.decision === 'blocked' && w.host === 'localhost'), JSON.stringify(blocked));
+    assert.ok(!result.hosts.some((h: any) => h.host === 'localhost'), 'the deny host does not count as visited');
+    assert.equal(o.d.requests.length, 1, 'one dialog: the rules');
+  } finally {
+    await o.stop();
+  }
+});
+
 test('permissions and shutdown', { timeout: 180_000 }, async () => {
   assert.equal(statSync(home.root).mode & 0o777, 0o700);
   assert.equal(statSync(home.socket).mode & 0o777, 0o600);

@@ -51,10 +51,11 @@ function block(req: RequestInfo, reason: BlockReason): PolicyVerdict {
   return { decision, reason, allowedBy: null };
 }
 
-// 不允许的域名（denied）：任何方法一律 403，子资源回 JSON，导航回一张页面；原因 denied。
+// 不允许的域名（denied）：任何方法一律拦，原因 denied。子资源回 403 JSON；导航直接 abort，不回页面：
+// 回的页面会提交在被拦的 URL 上，页面源就是 deny 主机，脚本能读写那个源的 cookie 和存储（R4a）。
 export function blockDenied(req: RequestInfo): PolicyVerdict {
   const decision: Decision = req.isNavigation
-    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${DENY_MESSAGE}</p>` }
+    ? { action: 'abort' }
     : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: DENY_MESSAGE }) };
   return { decision, reason: 'denied', allowedBy: null };
 }
@@ -76,20 +77,25 @@ export function deniedNavMessage(host: string): string {
   return `这个域名是「不允许」的，没经批准不能打开：${host}`;
 }
 
-// 会话已冻结（页面经重定向进了别的组的域名，或没授权的不允许的域名）：它所有页的所有请求，含 GET，一律 403，
-// 原因记 other-group（denied 为 true 时记 denied）。组名只含小写字母、数字、_、-，不用转义。
-// group 为 null 是判断不出归属（失败关闭）；denied 为 true 时组名不用。
-export function frozenMessage(group: string | null, denied = false): string {
-  if (denied) return '会话已冻结：页面经重定向进了不允许的域名。请关掉这个会话；要去这个域名，用 open 经人批准另开。';
+// 会话已冻结：它所有页的所有请求，含 GET，一律拦。
+// 进了别的组的域名：回 403，原因记 other-group，导航回一张页面（组名只含小写字母、数字、_、-，不用转义）；group 为 null 是判断不出归属（失败关闭）。
+// 进了不允许的域名（denied 为 true）：原因记 denied，导航 abort（不回页面，原因同 blockDenied），其余回 403 JSON。
+export function frozenMessage(group: string | null): string {
   return group === null ? '会话已冻结：页面经重定向去了判断不出归属的域名。请关掉这个会话，重新开。'
     : `会话已冻结：页面经重定向进了组 ${group} 的域名。请关掉这个会话，用 --profile ${group} 另开。`;
 }
 
 export function blockFrozen(req: RequestInfo, group: string | null, denied = false): PolicyVerdict {
+  if (denied) {
+    const decision: Decision = req.isNavigation
+      ? { action: 'abort' }
+      : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'blocked by e2k: session frozen after a redirect into a host not allowed' }) };
+    return { decision, reason: 'denied', allowedBy: null };
+  }
   const decision: Decision = req.isNavigation
-    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${frozenMessage(group, denied)}</p>` }
-    : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: denied ? 'blocked by e2k: session frozen after a redirect into a host not allowed' : 'blocked by e2k: session frozen after a cross-group redirect' }) };
-  return { decision, reason: denied ? 'denied' : 'other-group', allowedBy: null };
+    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${frozenMessage(group)}</p>` }
+    : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'blocked by e2k: session frozen after a cross-group redirect' }) };
+  return { decision, reason: 'other-group', allowedBy: null };
 }
 
 // 登出名单的匹配：拦截名单窄了是漏拦（失败开放），所以和放行名单（精确匹配）不同，按路径匹配：先去掉请求 URL 的 fragment 和查询串，
