@@ -2,8 +2,9 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { createPlaywrightDriver } from '../../src/drivers/playwright/driver.ts';
 import { startKernel } from '../../src/kernel/server.ts';
 import type { KernelHandle } from '../../src/kernel/server.ts';
@@ -11,7 +12,7 @@ import { call } from '../../src/shared/client.ts';
 import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { approving, choosingMode, denying, fakeDialog } from '../support/fake-dialog.ts';
+import { answeringDeny, approving, choosingMode, denying, fakeDialog } from '../support/fake-dialog.ts';
 import type { FakeDialog } from '../support/fake-dialog.ts';
 import type { DialogRequest, DialogResult } from '../../src/kernel/approval.ts';
 import { noFocus } from '../../src/kernel/focus.ts';
@@ -824,6 +825,272 @@ test('a navigation into a deny host commits nothing on the deny origin', { timeo
     assert.ok(!result.hosts.some((h: any) => h.host === 'localhost'), 'the deny host does not count as visited');
     assert.equal(o.d.requests.length, 1, 'one dialog: the rules');
   } finally {
+    await o.stop();
+  }
+});
+
+// ---- deny 模式、save-case → run、MCP 壳（M3）：各用各的内核和 home，对话框脚本自己编排 ----
+
+// open 要过几道框（规则、deny）：21 就等假对话框作答再原样重试，最多重试 4 次。返回最后一次的结果。
+async function openThrough(o: Own, ...args: string[]): Promise<Run> {
+  let r = await o.run(undefined, 'open', ...args, '--json');
+  for (let i = 0; i < 4 && r.code === 21; i++) {
+    await settle();
+    r = await o.run(undefined, 'open', ...args, '--json');
+  }
+  return r;
+}
+
+const denyRules = (host: string): unknown => ({ version: 1, rules: [{ match: host, mode: 'deny' }], loginHosts: [] });
+const hitsOf = (path: string): number => server.hits.filter((h) => h.path === path).length;
+
+// 弹框数：拒绝的内核 2（规则、deny），另一个内核 3（规则、只读、可写）。被人拒过的 deny 请求一分钟内不再问，所以拒绝单独用一个内核。
+test('a deny host is not opened without a person; 只读 opens it read-only; 可写 lets exactly the declared write through', { timeout: 180_000 }, async () => {
+  const allow = JSON.stringify([{ method: 'POST', url: origin + '/api/declared' }]);
+  const click = (id: string): unknown[] => [{ op: 'click', target: '#' + id }, { op: 'wait', for: { text: id + ':' } }];
+  const from = server.hits.length;
+  const declaredBase = hitsOf('/api/declared');   // 服务端的记录在整份文件里共用：前面的组测试也打过 /api/declared
+  const otherBase = hitsOf('/api/other');
+
+  // 人拒绝：没有会话、没有一个请求到达服务端
+  const no = await startOwn(denyRules('127.0.0.1'), answeringDeny('拒绝'));
+  try {
+    const refused = await openThrough(no, origin + '/declare.html', '--allow', allow);
+    assert.equal(refused.code, 2, refused.out + refused.err);
+    assert.ok((refused.out + refused.err).includes('人拒绝了打开这个不允许的域名'), refused.out + refused.err);
+    assert.equal(JSON.parse((await no.run(undefined, 'status', '--json')).out).sessions.length, 0, 'a refused open leaves no session');
+    assert.equal(server.hits.slice(from).length, 0, 'nothing reached the server');
+    assert.ok(no.d.requests.some((r) => r.title.startsWith('e2k：打开不允许的域名') && r.buttons[0] === '拒绝'), 'the deny dialog was shown, 拒绝 first');
+  } finally {
+    await no.stop();
+  }
+
+  let answer: (r: DialogRequest) => DialogResult = answeringDeny('只读');
+  const o = await startOwn(denyRules('127.0.0.1'), (r) => answer(r));
+  try {
+    // 人选「只读」：会话开了，声明的写照样被拦
+    const ro = await openThrough(o, origin + '/declare.html', '--allow', allow, '--name', 'deny-readonly');
+    assert.equal(ro.code, 0, ro.out + ro.err);
+    const roOpen = JSON.parse(ro.out);
+    const roStep = JSON.parse((await stepOwn(o, roOpen.session, click('declared'))).out);
+    assert.equal(roStep.exit, 0, JSON.stringify(roStep));
+    await settle();
+    assert.equal(hitsOf('/api/declared'), declaredBase, '只读 blocks even the declared write');
+    assert.equal((await closeOwn(o, roOpen.session)).start.deny.allow.length, 0, 'the list does nothing under 只读');
+
+    // 人选「可写」：只有清单里的那条写到达，别的写照样被拦
+    answer = answeringDeny('可写');
+    const rw = await openThrough(o, origin + '/declare.html', '--allow', allow, '--name', 'deny-writable');
+    assert.equal(rw.code, 0, rw.out + rw.err);
+    const rwOpen = JSON.parse(rw.out);
+    const rwStep = JSON.parse((await stepOwn(o, rwOpen.session, [...click('declared'), ...click('other')])).out);
+    assert.equal(rwStep.exit, 0, JSON.stringify(rwStep));
+    await settle();
+    const result = await closeOwn(o, rwOpen.session);
+    assert.equal(hitsOf('/api/declared'), declaredBase + 1, 'the declared write arrived');
+    assert.equal(hitsOf('/api/other'), otherBase, 'any other write was blocked');
+    assert.equal(result.start.deny.allow.length, 1);
+    assert.deepEqual(result.writes.allowed.map((w: any) => [w.method, w.allowedBy]), [['POST', 'declared']]);
+    assert.ok(result.writes.blocked.length === 1 && result.writes.blocked[0].url.endsWith('/api/other'), JSON.stringify(result.writes.blocked));
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则）。默认主机是 localhost，deny 的是 127.0.0.1。顶层导航进 deny 主机在 R4a 里是 abort，不是 403 页：页面留在原地，会话照常用。
+test('a link from a default page into the deny host is refused, nothing commits on the deny origin and the session goes on', { timeout: 180_000 }, async () => {
+  const o = await startOwn(denyRules('127.0.0.1'), approving);
+  try {
+    const open = await openOwn(o, server.altOrigin + '/index.html');
+    assert.equal(open.grant, null, 'the session is not on a deny host');
+    const from = server.hits.length;
+    const click = JSON.parse((await stepOwn(o, open.session, [
+      { op: 'eval', js: `const a = document.createElement('a'); a.id = 'to-deny'; a.href = ${JSON.stringify(origin + '/index.html')}; a.textContent = 'deny'; document.body.append(a); 'added'` },
+      { op: 'click', target: '#to-deny' },
+      { op: 'wait', for: { ms: 500 } },
+      { op: 'eval', js: 'location.origin' },
+    ])).out);
+    assert.ok(click.notices.some((n: string) => n.includes('这个域名是「不允许」的，没经批准不能打开')), JSON.stringify(click.notices));
+    const where = String(click.results[3].output);
+    assert.ok(!where.includes('127.0.0.1'), `the page is not on the deny origin: ${where}`);   // 停在原地，或浏览器自己的错误页（源是 null）
+    assert.equal(server.hits.slice(from).length, 0, 'no write reached the server');
+    const again = await stepOwn(o, open.session, [{ op: 'goto', url: server.altOrigin + '/index.html' }, { op: 'text', target: 'h1' }]);
+    assert.equal(again.code, 0, 'the session is not frozen: ' + again.out + again.err);
+    assert.equal(JSON.parse(again.out).results[1].output, 'Items');
+    const result = await closeOwn(o, open.session);
+    const blocked: any[] = result.writes.blocked;
+    assert.ok(blocked.length >= 1 && blocked.every((w) => w.reason === 'denied' && w.decision === 'blocked' && w.host === '127.0.0.1'), JSON.stringify(blocked));
+    assert.ok(!result.hosts.some((h: any) => h.host === '127.0.0.1'), 'the deny host does not count as visited');
+    assert.equal(o.d.requests.length, 1, 'one dialog: the rules');
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则）。R18：默认主机上的页面发往没授权的 deny 主机的请求，不分方法、不分 fetch 还是 iframe，一律拦。
+// 用 no-cors 的简单请求：要是放行，浏览器没有预检拦着，POST 会直接到服务端，fixture 的写记录里就会有它（no-cors 的回应是不透明的，fetch 本身成败不说明什么，所以看服务端和报告）。
+test('a page on a default host cannot reach the deny host through fetch or an iframe', { timeout: 180_000 }, async () => {
+  const o = await startOwn(denyRules('127.0.0.1'), approving);
+  try {
+    const open = await openOwn(o, server.altOrigin + '/index.html');
+    const from = server.hits.length;
+    const probe = JSON.parse((await stepOwn(o, open.session, [
+      { op: 'eval', js: `fetch(${JSON.stringify(origin + '/api/r18')}, { method: 'POST', mode: 'no-cors', headers: { 'content-type': 'text/plain' }, body: 'x' }).then(() => 'settled', () => 'settled')` },
+      { op: 'eval', js: `fetch(${JSON.stringify(origin + '/index.html?r18=get')}, { mode: 'no-cors' }).then(() => 'settled', () => 'settled')` },
+      { op: 'eval', js: `(() => { const f = document.createElement('iframe'); f.id = 'deny-frame'; f.src = ${JSON.stringify(origin + '/index.html?r18=frame')}; document.body.append(f); return 'added'; })()` },
+      { op: 'eval', js: `fetch(${JSON.stringify(server.altOrigin + '/api/r18-control')}, { method: 'POST', mode: 'no-cors', headers: { 'content-type': 'text/plain' }, body: 'x' }).then(() => 'settled', () => 'settled')` },   // 对照：同样的请求发往默认主机，会到达
+      { op: 'wait', for: { ms: 800 } },
+    ])).out);
+    assert.equal(probe.exit, 0, JSON.stringify(probe));
+    assert.deepEqual(server.hits.slice(from).map((h) => h.path), ['/api/r18-control'], 'only the control write reached the server');
+    const result = await closeOwn(o, open.session);
+    const blocked: any[] = result.writes.blocked;
+    for (const [method, needle] of [['POST', '/api/r18'], ['GET', 'r18=get'], ['GET', 'r18=frame']] as const) {
+      assert.ok(blocked.some((w) => w.method === method && String(w.url).includes(needle) && w.reason === 'denied' && w.host === '127.0.0.1' && w.decision === 'blocked'), `${method} ${needle} is on record as denied: ${JSON.stringify(blocked)}`);
+    }
+    assert.ok(!result.hosts.some((h: any) => h.host === '127.0.0.1'), 'the deny host does not count as visited');
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则）。用例文件放在状态目录之外的临时目录里。
+test('save-case then run reproduces the session and the second report says pass', { timeout: 180_000 }, async () => {
+  const o = await startOwn(denyRules('example.org'), approving);
+  const dir = mkdtempSync(join(tmpdir(), 'e2k-case-'));
+  const caseFile = join(dir, 'case.json');
+  const base = hitsOf('/api/items');   // 服务端的记录在整份文件里共用
+  try {
+    const first = await openThrough(o, origin + '/index.html', '--name', 'orig');
+    assert.equal(first.code, 0, first.out + first.err);
+    const sid1: string = JSON.parse(first.out).session;
+    const steps = [
+      { op: 'fill', target: '#new-item', value: 'Gamma' },
+      { op: 'click', target: '[data-testid="add"]' },
+      { op: 'assert', kind: 'text', target: '#status', cmp: 'contains', expected: 'Added' },
+    ];
+    const ran = JSON.parse((await stepOwn(o, sid1, steps)).out);
+    assert.equal(ran.exit, 0, JSON.stringify(ran));
+    const result1 = await closeOwn(o, sid1);
+    await until('the original write to arrive', () => hitsOf('/api/items') === base + 1);
+
+    const saved = await o.run(undefined, 'save-case', sid1, '--out', caseFile, '--json');
+    assert.equal(saved.code, 0, saved.out + saved.err);
+    const file = JSON.parse(readFileSync(caseFile, 'utf8'));
+    assert.equal(file.e2kCase, 1);
+    assert.deepEqual(file.steps.map((x: any) => x.op.op), ['fill', 'click', 'assert']);
+    assert.equal(file.containsWrites, true);
+    assert.equal((await o.run(undefined, 'save-case', sid1, '--out', caseFile)).code, 2, 'an existing file is not overwritten');
+
+    const replay = await o.run(undefined, 'run', caseFile, '--name', 'replayed', '--json');
+    assert.equal(replay.code, 0, replay.out + replay.err);
+    const out = JSON.parse(replay.out);
+    assert.equal(out.verdict, 'pass');
+    assert.notEqual(out.session, sid1, 'the replay is a new session');
+    await until('the replayed write to arrive', () => hitsOf('/api/items') === base + 2);
+    const result2 = JSON.parse(readFileSync(join(dirname(out.reportPath), 'result.json'), 'utf8'));
+    assert.equal(result2.session, out.session);
+    assert.equal(result2.verdict.value, 'pass');
+    assert.deepEqual(result2.actions.map((a: any) => a.op.op), result1.actions.map((a: any) => a.op.op), 'the same operations ran');
+    assert.deepEqual(result2.actions.map((a: any) => a.outcome), result1.actions.map((a: any) => a.outcome));
+    assert.equal(result2.name, 'replayed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则）。MCP 壳是单独的子进程，连测试进程里的内核；stdout 只许有协议消息，逐行解析，数一数行数。
+test('the MCP shell over stdio: initialize, tools/list, open, step, close against the running kernel', { timeout: 180_000 }, async () => {
+  const o = await startOwn(denyRules('example.org'), approving);
+  const child = spawn(process.execPath, [BIN, 'mcp'], { cwd: REPO, env: { ...process.env, E2K_HOME: o.h.root }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const lines: string[] = [];
+  const waiting = new Map<number, (m: any) => void>();
+  const messages: any[] = [];
+  let buf = '';
+  let err = '';
+  child.stdout.setEncoding('utf8').on('data', (d: string) => {
+    buf += d;
+    for (let i = buf.indexOf('\n'); i >= 0; i = buf.indexOf('\n')) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      lines.push(line);
+      const m = JSON.parse(line);   // 不是 JSON 的行在这里就抛：stdout 不许有协议之外的东西
+      messages.push(m);
+      waiting.get(m.id)?.(m);
+    }
+  });
+  child.stderr.setEncoding('utf8').on('data', (d: string) => { err += d; });
+  const exited = new Promise<number | null>((resolve) => { child.once('close', (code) => resolve(code)); });
+  child.stdin.on('error', () => {});
+  let nextId = 0;
+  const rpc = (method: string, params?: unknown): Promise<any> => new Promise((resolve, reject) => {
+    const id = ++nextId;
+    const timer = setTimeout(() => { reject(new Error(`no answer to ${method}: ${err}`)); }, 60_000);
+    waiting.set(id, (m) => { clearTimeout(timer); resolve(m); });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) }) + '\n');
+  });
+  const callTool = async (name: string, args: unknown): Promise<{ isError: boolean; body: any }> => {
+    const m = await rpc('tools/call', { name, arguments: args });
+    assert.equal(m.error, undefined, JSON.stringify(m));
+    assert.equal(m.result.content.length, 1);
+    assert.equal(m.result.content[0].type, 'text');
+    return { isError: m.result.isError, body: JSON.parse(m.result.content[0].text) };
+  };
+  try {
+    const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '0' } });
+    assert.equal(init.jsonrpc, '2.0');
+    assert.equal(init.result.protocolVersion, '2025-06-18');
+    assert.equal(init.result.serverInfo.name, 'e2k');
+    assert.deepEqual(init.result.capabilities, { tools: {} });
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');   // 通知：没有回应
+
+    const list = await rpc('tools/list');
+    const names: string[] = list.result.tools.map((t: any) => t.name);
+    assert.deepEqual([...names].sort(), ['close', 'doctor', 'open', 'rule_list', 'run', 'save_case', 'status', 'step']);
+    assert.ok(list.result.tools.every((t: any) => typeof t.description === 'string' && t.inputSchema.type === 'object'));
+
+    // 第一次 open 要过规则的批准框：exit 21 是正常结果（isError 不置位），等假对话框作答再原样重试
+    const gate = await callTool('open', { url: origin + '/index.html', name: 'mcp-session' });
+    assert.equal(gate.body.exit, 21, JSON.stringify(gate.body));
+    assert.equal(gate.isError, false);
+    await settle();
+    const opened = await callTool('open', { url: origin + '/index.html', name: 'mcp-session' });
+    assert.equal(opened.body.exit, 0, JSON.stringify(opened.body));
+    assert.equal(opened.isError, false);
+    const session: string = opened.body.result.session;
+    assert.match(session, /^s-[0-9a-f]{6}$/);
+
+    const step = await callTool('step', { session, ops: [{ op: 'click', target: '#save' }, { op: 'assert', kind: 'text', target: '#status', cmp: 'contains', expected: 'Saved' }] });
+    assert.equal(step.body.exit, 0, JSON.stringify(step.body));
+    assert.equal(step.body.result.tallies.match, 1);
+
+    const bad = await callTool('step', { session, ops: [], extra: 1 });   // 多余的键：用法错误，工具结果里 isError，不是协议错误
+    assert.equal(bad.body.exit, 2);
+    assert.equal(bad.isError, true);
+
+    const closed = await callTool('close', { session, verdict: 'undetermined', because: 'e2e probe' });
+    assert.equal(closed.body.exit, 0, JSON.stringify(closed.body));
+    const result = JSON.parse(readFileSync(closed.body.result.resultPath, 'utf8'));
+    assert.equal(result.session, session);
+    assert.deepEqual(result.actions.map((a: any) => a.op.op), ['click', 'assert']);
+
+    const doctor = await callTool('doctor', {});   // 自检会往 stderr 写诊断也好、不写也好：stdout 上不能多出东西
+    assert.equal(typeof doctor.body.exit, 'number');
+
+    // 通知之后服务还在答；未知方法按 JSON-RPC 回错误，之后照常服务
+    const unknown = await rpc('nope/nothing');
+    assert.equal(unknown.error.code, -32601);
+    assert.equal((await rpc('ping')).error, undefined);
+
+    child.stdin.end();   // 关掉标准输入：服务收尾退出
+    assert.equal(await exited, 0, err);
+    assert.equal(buf, '', 'no partial line left on stdout');
+    assert.equal(lines.length, nextId, 'one stdout line per request, nothing else');
+    assert.ok(messages.every((m) => m.jsonrpc === '2.0' && typeof m.id === 'number'), 'every stdout line is a protocol response');
+  } finally {
+    child.kill();
+    await exited;
     await o.stop();
   }
 });
