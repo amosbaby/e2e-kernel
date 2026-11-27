@@ -17,12 +17,12 @@ import { RUN_DIR_RE, runDirName } from '../../src/report/store.ts';
 import type { RunResult } from '../../src/report/result.ts';
 import { E2kError } from '../../src/shared/errors.ts';
 import type { Op } from '../../src/shared/ops.ts';
-import type { Mode } from '../../src/shared/protocol.ts';
+import type { Mode, StepParams } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 import { Approvals, noDialog } from '../../src/kernel/approval.ts';
-import type { Dialog } from '../../src/kernel/approval.ts';
+import type { Dialog, DialogRequest, DialogResult } from '../../src/kernel/approval.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
 import { approving, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
@@ -2494,4 +2494,282 @@ test('whitelist: every whitelisted allow is sent without following redirects (th
   const res = readResult((await sm.close({ session: a.session })).runDir);
   assert.deepEqual(res.writes.allowed.map((w) => [w.url, w.allowedBy, w.status]), [[API_GRAPHQL, 'persisted-query', 200]]);
   assert.deepEqual(res.writes.blocked.map((w) => [w.url, w.reason, w.allowedBy]), [[API_SEARCH, 'redirected-write', undefined]]);
+});
+
+// ---- 放行声明（M2b 任务 9） ----
+// 四条请求路径：会话页和会话弹窗（认得出归属的）认「会话的声明 ∩ 批准记录」；弹窗的第一个导航和未归属的请求认不出归属，不享受声明；
+// 登录页（含弹窗）declared 传空。
+
+type AllowItem = NonNullable<StepParams['allow']>[number];
+const D_URL = 'http://example.com/api/items';           // 只读页面所在主机上的接口
+const D_API = 'http://api.example.com/v1/items';        // 默认模式主机上的接口
+const D_GQL = 'http://api.example.com/graphql';
+const D_A: AllowItem = { method: 'POST', url: D_URL };
+const D_B: AllowItem = { method: 'PUT', url: D_API };
+const D_C: AllowItem = { method: 'DELETE', url: D_API };
+const D_SAVE: AllowItem = { method: 'POST', url: D_GQL, operation: 'Save' };
+const SNAP: Op[] = [{ op: 'snapshot' }];
+const allowing = (r: DialogRequest): DialogResult => ({ kind: 'button', button: r.buttons.includes('放行') ? '放行' : '拒绝' });
+const gqlMutation = (op: string): string => JSON.stringify({ operationName: op, query: `mutation ${op} { a }` });
+const lineOf = (a: AllowItem): string => `${a.method} ${a.url}${a.operation === undefined ? '（这个地址上的所有写；GraphQL mutation 不在内，要放行 mutation 得写 operation）' : `（只放行 operation ${a.operation}）`}`;
+
+function setupDecl(dialog: Dialog, readonlyHosts: string[] = ['example.com'], now?: () => number) {
+  const rules = mutableRules(readonlyHosts);
+  const s = setup({ modes: rules.resolver, policy, approvals: new Approvals(dialog, () => {}, now === undefined ? {} : { now }),
+    extraPages: { [RO]: HOME_PAGE, 'http://example.org/': HOME_PAGE } });
+  const store = (s.sm as unknown as { deps: SessionDeps }).deps.store;
+  return { ...s, ...rules, store, dialog };
+}
+type DeclCtx = ReturnType<typeof setupDecl>;
+
+async function openAt(c: DeclCtx, name: string, url: string = RO) {
+  const r = await c.sm.open({ url, name });
+  return { session: r.session, pageId: c.fake.openPages().at(-1)!, runDir: r.runDir };
+}
+const dPost = (c: DeclCtx, pageId: string | null, url: string, body: string | null = '{"a":1}', topUrl: string | null = RO, more: Partial<Parameters<FakeDriver['emitRequest']>[0]> = {}) =>
+  c.fake.emitRequest({ id: `d${++navSeq}`, pageId, method: 'POST', url, topUrl, body, contentType: body === null ? null : 'application/json', ...more });
+// 页面真的搬到了另一个主机（主页面的请求带着新的顶层地址 = 已提交的证据）
+const moveTo = (c: DeclCtx, pageId: string, top: string) => c.fake.emitRequest({ id: `d${++navSeq}`, pageId, method: 'GET', url: `${top}app.js`, topUrl: top });
+// 第一次 21，人点了以后原样重试
+async function declare(c: DeclCtx, session: string, allow: AllowItem[]): Promise<void> {
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow }), isCode('wait-approval'));
+  await settleDialog();
+  await c.sm.step({ session, ops: SNAP, allow });
+}
+const usageWith = (re: RegExp) => (e: unknown): boolean => isCode('usage')(e) && re.test((e as Error).message);
+const storedCount = (c: DeclCtx): number => Object.values(c.store.get().writes).flat().length;
+
+test('declared writes: step --allow on a read-only session answers 21 and runs nothing; after 放行 the same call goes through and the declared writes pass with allowedBy declared', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const { session, pageId } = await openAt(c, 'decl');
+  const allow = [D_A, D_SAVE];
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL)));
+  const snaps = methodCount(c.fake, 'snapshot');
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(methodCount(c.fake, 'snapshot'), snaps, 'nothing ran');
+  assert.equal(dialog.requests.length, 1);
+  const req = dialog.requests[0]!;
+  assert.match(req.title, /^e2k：放行写请求（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual([req.buttons, req.defaultButton], [['拒绝', '放行'], '拒绝']);
+  assert.deepEqual(req.lines.slice(0, 2), ['会话：decl（组 default）', '页面所在主机：example.com']);
+  assert.ok(req.lines.includes(lineOf(D_A)) && req.lines.includes(lineOf(D_SAVE)), req.lines.join('\n'));
+  // 人点了「放行」、还没重试：声明还没生效
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL)));
+  assert.deepEqual(c.store.get().writes, {});
+  await c.sm.step({ session, ops: SNAP, allow });
+  assert.equal(methodCount(c.fake, 'snapshot'), snaps + 1);
+  assert.deepEqual(await dPost(c, pageId, D_URL), NO_REDIRECT);
+  assert.deepEqual(await dPost(c, pageId, D_GQL, gqlMutation('Save')), NO_REDIRECT);
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL, gqlMutation('Save'))), 'no operation declared for this address: a mutation is not covered');
+  assert.ok(isFulfill403(await dPost(c, pageId, D_GQL, gqlMutation('Other'))));
+  assert.ok(isFulfill403(await dPost(c, pageId, 'http://example.com/api/other')));
+  assert.ok(isFulfill403(await c.fake.emitRequest({ id: `d${++navSeq}`, pageId, method: 'PUT', url: D_URL, topUrl: RO, body: '{}', contentType: 'application/json' })), 'method must agree');
+  await c.sm.step({ session, ops: SNAP });   // 之后的 step 不带 allow：本会话已批准的声明还在
+  assert.deepEqual(await dPost(c, pageId, D_URL), NO_REDIRECT);
+  const res = readResult((await c.sm.close({ session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => [w.url, w.allowedBy]), [[D_URL, 'declared'], [D_GQL, 'declared'], [D_URL, 'declared']]);
+  assert.deepEqual(res.declarations, [{ method: 'POST', url: D_GQL, operation: 'Save', approved: 'dialog' }, { method: 'POST', url: D_URL, operation: null, approved: 'dialog' }]);
+  assert.equal(dialog.requests.length, 1);
+});
+
+test('declared writes: a new session with the same declaration is not asked again (remembered); a subset is not asked; a new entry asks for the new one only', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const one = await openAt(c, 'one');
+  await declare(c, one.session, [D_A, D_B]);
+  assert.equal(dialog.requests.length, 1);
+  assert.ok(dialog.requests[0]!.lines.includes(lineOf(D_A)) && dialog.requests[0]!.lines.includes(lineOf(D_B)));
+  const two = await openAt(c, 'two');
+  assert.ok(isFulfill403(await dPost(c, two.pageId, D_URL)), 'a new session starts with nothing declared');
+  await c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] });   // 子集
+  assert.equal(dialog.requests.length, 1, 'a subset of what was approved does not ask');
+  assert.deepEqual(await dPost(c, two.pageId, D_URL), NO_REDIRECT);
+  assert.ok(isFulfill403(await dPost(c, two.pageId, D_API.replace('/v1/items', '/x'))));
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A, D_C] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  const lines = dialog.requests[1]!.lines;
+  assert.ok(lines.includes(lineOf(D_C)) && !lines.includes(lineOf(D_A)) && !lines.includes(lineOf(D_B)), lines.join('\n'));
+  await c.sm.step({ session: two.session, ops: SNAP, allow: [D_A, D_C] });
+  assert.equal(storedCount(c), 3);
+  const r1 = readResult((await c.sm.close({ session: one.session })).runDir);
+  const r2 = readResult((await c.sm.close({ session: two.session })).runDir);
+  assert.deepEqual(r1.declarations.map((d) => d.approved), ['dialog', 'dialog']);
+  assert.deepEqual(r2.declarations.map((d) => [d.method, d.approved]).sort(), [['DELETE', 'dialog'], ['POST', 'remembered']]);
+});
+
+test('declared writes: a read-only page declaring a write to a default-mode host is asked too, and until the person approves that POST is still blocked', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const { session, pageId } = await openAt(c, 'cross');
+  const toApi: AllowItem = { method: 'POST', url: D_API };
+  assert.ok(isFulfill403(await dPost(c, pageId, D_API)));   // 页面只读：发往默认主机的写也拦
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow: [toApi] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 1);
+  assert.ok(isFulfill403(await dPost(c, pageId, D_API)), 'asked but not yet in force');
+  await c.sm.step({ session, ops: SNAP, allow: [toApi] });
+  assert.deepEqual(await dPost(c, pageId, D_API), NO_REDIRECT);
+});
+
+test('declared writes: a default-mode session is asked as well (any target mode), and the dialog names its page host', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const { session } = await openAt(c, 'plain', HOME_URL);
+  await declare(c, session, [D_A]);
+  assert.equal(dialog.requests.length, 1);
+  assert.deepEqual(dialog.requests[0]!.lines.slice(0, 2), ['会话：plain（组 default）', '页面所在主机：localhost']);
+});
+
+test('declared writes: 拒绝 makes the retry a usage error, the same set is not asked again (also from another session); another set right after is cooling; the POST stays blocked', async () => {
+  let t = 1_000_000;
+  const dialog = fakeDialog(() => ({ kind: 'button', button: '拒绝' }));
+  const c = setupDecl(dialog, ['example.com'], () => t);
+  const one = await openAt(c, 'one');
+  const two = await openAt(c, 'two');
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  const denied = usageWith(/人拒绝了这些放行声明/);
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), denied);
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), denied);
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] }), denied, 'a refusal is not forgotten because the session changed');
+  assert.equal(dialog.requests.length, 1);
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_B] }), usageWith(/刚被人拒过/));
+  assert.equal(dialog.requests.length, 1);
+  t += 61_000;
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_B] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  assert.ok(isFulfill403(await dPost(c, one.pageId, D_URL)));
+  assert.deepEqual(c.store.get().writes, {});
+});
+
+test('declared writes: a dialog that cannot be shown is needs-human; nothing is declared and nothing runs', async () => {
+  const c = setupDecl(fakeDialog());
+  const { session, pageId } = await openAt(c, 'nodlg');
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  const snaps = methodCount(c.fake, 'snapshot');
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow: [D_A] }), isCode('needs-human'));
+  assert.equal(methodCount(c.fake, 'snapshot'), snaps);
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL)));
+  assert.deepEqual(c.store.get().writes, {});
+});
+
+test('declared writes: no operation → a mutation is blocked; with an operation, a batch that mixes another operation, a duplicated key and a hash-only persisted query are blocked', async () => {
+  const c = setupDecl(fakeDialog(allowing));
+  const { session, pageId } = await openAt(c, 'ops');
+  await declare(c, session, [D_A, { method: 'POST', url: D_GQL, operation: 'A' }]);
+  const hashOnly = (op: string, query?: string) => JSON.stringify({ operationName: op, ...(query === undefined ? {} : { query }), extensions: { persistedQuery: { version: 1, sha256Hash: 'e'.repeat(64) } } });
+  assert.deepEqual(await dPost(c, pageId, D_URL, '{"plain":1}'), NO_REDIRECT);
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL, gqlMutation('A'))));
+  assert.deepEqual(await dPost(c, pageId, D_GQL, gqlMutation('A')), NO_REDIRECT);
+  assert.deepEqual(await dPost(c, pageId, D_GQL, `[${gqlMutation('A')},${gqlMutation('A')}]`), NO_REDIRECT);
+  assert.ok(isFulfill403(await dPost(c, pageId, D_GQL, `[${gqlMutation('A')},${gqlMutation('B')}]`)));
+  assert.ok(isFulfill403(await dPost(c, pageId, D_GQL, gqlMutation('B'))));
+  assert.ok(isFulfill403(await dPost(c, pageId, D_GQL, '{"operationName":"A","operationName":"B","query":"mutation A { a }"}')));
+  assert.ok(isFulfill403(await dPost(c, pageId, D_GQL, hashOnly('A'))), 'a hash-only persisted query is never covered by a declaration');
+  assert.ok(isFulfill403(await dPost(c, pageId, D_GQL, hashOnly('A', ''))), 'nor one with an empty query');
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL, hashOnly('A'))));
+  const res = readResult((await c.sm.close({ session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => w.reason), ['graphql-mutation', 'graphql-mutation', 'graphql-mutation', 'graphql-mutation', 'persisted-query', 'persisted-query', 'persisted-query']);
+});
+
+test('declared writes: the answer is bound to what the box showed: the page host moved after the dialog came up, so the old answer does not apply and a new box asks', async () => {
+  let release = (): void => {};
+  const dialog = fakeDialog((r) => new Promise((resolve) => { release = () => { resolve(allowing(r)); }; }));
+  const c = setupDecl(dialog, ['example.com', 'example.org']);
+  const { session, pageId } = await openAt(c, 'moved');
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await moveTo(c, pageId, 'http://example.org/');
+  assert.equal(inner(c.sm, session).topHost, 'example.org');
+  release();
+  await settleDialog();
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));   // 房间换了：不用上一个框的答复
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  assert.equal(dialog.requests[1]!.lines[1], '页面所在主机：example.org');
+  assert.deepEqual(c.store.get().writes, {});
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL, '{"a":1}', 'http://example.org/')));
+});
+
+test('declared writes: an answer covers exactly the set the box listed: a bigger set asks again, a smaller one that was approved elsewhere asks only for the rest', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const one = await openAt(c, 'one');
+  const two = await openAt(c, 'two');
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();                                                                                       // 人对 {A} 点了放行，还没用掉
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A, D_B] }), isCode('wait-approval'));   // 比框里列的多一条
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  assert.ok(dialog.requests[1]!.lines.includes(lineOf(D_A)) && dialog.requests[1]!.lines.includes(lineOf(D_B)));
+  assert.deepEqual(c.store.get().writes, {}, 'nothing was used yet');
+  await declare(c, two.session, [D_C]);                                                                       // 别的会话批准并用掉了 {C}：之前没用掉的 writes 答复一并作废
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 4, 'the unused answer for {A} was voided when another approval was used');
+  assert.ok(isFulfill403(await dPost(c, one.pageId, D_URL)), 'a step that waited for approval declared nothing');
+});
+
+test('declared writes: the answer is also bound to the session: another session with the same set gets its own box, naming itself', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const one = await openAt(c, 'one');
+  const two = await openAt(c, 'two');
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  assert.equal(dialog.requests[1]!.lines[0], '会话：two（组 default）');
+});
+
+test('declared writes: a declaration only works where it was approved: the page moving to another host, or the record losing the entry, switches it off', async () => {
+  const c = setupDecl(fakeDialog(allowing), ['example.com', 'example.org']);
+  const { session, pageId } = await openAt(c, 'bound');
+  await declare(c, session, [D_A]);
+  assert.deepEqual(await dPost(c, pageId, D_URL), NO_REDIRECT);
+  await moveTo(c, pageId, 'http://example.org/');
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL, '{"a":1}', 'http://example.org/')), 'approved for another page host');
+  await moveTo(c, pageId, RO);
+  assert.deepEqual(await dPost(c, pageId, D_URL), NO_REDIRECT);
+  c.store.update((r) => ({ ...r, writes: {} }));                  // 批准记录里没有了：判定时再核对
+  assert.ok(isFulfill403(await dPost(c, pageId, D_URL)));
+});
+
+test('declared writes, four paths: session page and attributed popup use them; the popup\'s first navigation, a login window and unattributed requests do not', async () => {
+  const c = setupDecl(fakeDialog(allowing));
+  const { session, pageId } = await openAt(c, 'paths');
+  await declare(c, session, [D_A]);
+  assert.deepEqual(await dPost(c, pageId, D_URL), NO_REDIRECT);                                                    // 会话页
+  const popup = c.fake.emitPopup(pageId, 'about:blank');
+  assert.deepEqual(await dPost(c, popup.id, D_URL), NO_REDIRECT);                                                  // 认得出归属的弹窗
+  const first = await dPost(c, null, D_URL, 'x=1', D_URL, { openerPageId: pageId, isNavigation: true, topFrame: true, contentType: 'application/x-www-form-urlencoded' });
+  assert.ok(isFulfill403(first), 'the first navigation of a popup cannot be attributed: fail closed');
+  assert.ok(isFulfill403(await dPost(c, null, D_URL, '{"a":1}', null)), 'unattributed');
+  const { loginId } = await c.sm.loginBegin({ url: `${RO}login` });
+  const loginPage = c.fake.openPages().at(-1)!;
+  assert.ok(isFulfill403(await dPost(c, loginPage, D_URL, '{"a":1}', `${RO}login`)), 'a login window has no declarations');
+  assert.deepEqual(await c.sm.loginEnd({ loginId }), { writesBlocked: 1 });
+  const res = readResult((await c.sm.close({ session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => w.allowedBy), ['declared', 'declared']);
+  assert.deepEqual(res.writes.unattributed.map((w) => w.reason), ['unattributed', 'unattributed']);
+});
+
+test('declared writes: a box that would be too long is refused before it is shown; bad declarations are usage errors and never reach the dialog', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const { session } = await openAt(c, 'bad');
+  const long = `http://example.com/${'a'.repeat(160)}`;
+  await assert.rejects(c.sm.step({ session, ops: SNAP, allow: [{ method: 'POST', url: long }] }), usageWith(/内容太长/));
+  for (const allow of [[{ method: 'GET', url: D_URL }], [{ method: 'POST', url: `${D_URL}?x=1` }], [{ method: 'POST', url: D_URL, operation: 'a-b' }],
+    Array.from({ length: 13 }, (_, i) => ({ method: 'POST', url: `${D_URL}/${i}` }))]) {
+    await assert.rejects(c.sm.step({ session, ops: SNAP, allow }), isCode('usage'), JSON.stringify(allow).slice(0, 80));
+  }
+  assert.equal(dialog.requests.length, 0);
+  await c.sm.step({ session, ops: SNAP, allow: [] });   // 空的声明就是没有声明
+  assert.equal(dialog.requests.length, 0);
 });

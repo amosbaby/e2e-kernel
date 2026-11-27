@@ -235,6 +235,13 @@ test('isPersistedOnly: a persistedQuery extension without a string query', () =>
   assert.equal(isPersistedOnly('{"extensions":{"persistedQuery":'), false);
   assert.equal(isPersistedOnly('query { a }'), false);
   assert.equal(isPersistedOnly(null), false);
+  // query 是空串或全空白（Apollo 把它当没给）：照样是只带哈希
+  assert.equal(isPersistedOnly(j({ query: '', extensions: ext })), true);
+  assert.equal(isPersistedOnly(j({ query: ' \n\t ', extensions: ext })), true);
+  assert.equal(isPersistedOnly(j({ query: ' ,\ufeff', extensions: ext })), true);
+  assert.equal(isPersistedOnly(j([{ query: 'query{a}' }, { query: '  ', extensions: ext }])), true);
+  assert.equal(isPersistedOnly(j({ query: '', extensions: { other: 1 } })), false);
+  assert.equal(isPersistedOnly(j({ query: ' { a } ', extensions: ext })), false, 'a real document in the body');
 });
 
 test('isStrictQuery: accepts only a POST query with a selection set in a known content type', () => {

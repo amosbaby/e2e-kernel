@@ -50,7 +50,9 @@ export interface Supersede { failed: number; by: number }
 // profile：`组` 或 `组/槽`（只在协议层校验类型和长度，规范化和选择在内核里做）。
 export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean; readonly?: boolean; profile?: string }
 export interface LoginBeginParams { url: string; profile?: string }
-export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean }
+// 放行声明（只在 step 上提，一律要人批准）：协议层只查形状和长度，规范化（地址写法、operation 名）在内核里做。
+export interface AllowItem { method: string; url: string; operation?: string }
+export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean; allow?: AllowItem[] }
 export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[]; superseded?: Supersede[] }
 export type Outcome = 'ok' | 'match' | 'mismatch' | 'failed' | 'not-run';
 export interface RequestSummary { id: string; method: string; url: string; status: number | null; resourceType: string }
@@ -105,6 +107,8 @@ const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const LOGIN_ID = /^l-[0-9a-f]{6}$/;
 const MAX_LIST = 20;
 const MAX_SUPERSEDED = 50;
+const MAX_ALLOW = 12;
+const ALLOW_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'] as const;
 const MAX_PROFILE_ARG = 65;   // 组 32 + "/" + 槽 32
 
 function usage(message: string): E2kError {
@@ -169,6 +173,13 @@ function supersede(v: unknown, name: string): Supersede {
   return { failed, by };
 }
 
+function allowItem(v: unknown, name: string): AllowItem {
+  const o = plainObject(v, name, ['method', 'url', 'operation']);
+  const out: AllowItem = { method: oneOf(o.method, `${name}.method`, ALLOW_METHODS), url: str(o.url, `${name}.url`, { min: 1, max: 2048 }) };
+  if (o.operation !== undefined) out.operation = str(o.operation, `${name}.operation`, { min: 1, max: 100 });
+  return out;
+}
+
 function session(v: unknown): string {
   return str(v, 'params.session', { min: 1, max: 8, pattern: SESSION_ID });
 }
@@ -195,9 +206,10 @@ export function validateParams(method: Method, p: unknown): unknown {
       return out;
     }
     case 'step': {
-      const o = plainObject(p, 'params', ['session', 'ops', 'keepGoing']);
+      const o = plainObject(p, 'params', ['session', 'ops', 'keepGoing', 'allow']);
       const out: StepParams = { session: session(o.session), ops: validateOps(o.ops) };
       if (o.keepGoing !== undefined) out.keepGoing = bool(o.keepGoing, 'params.keepGoing');
+      if (o.allow !== undefined) out.allow = list(o.allow, 'params.allow', MAX_ALLOW).map((x, i) => allowItem(x, `params.allow[${i}]`));
       return out;
     }
     case 'close': {

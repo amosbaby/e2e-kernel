@@ -184,8 +184,11 @@ function graphqlOfBody(body: string | null, contentType: string | null, url: str
   return kind;
 }
 
+const BLANK_QUERY = /^[\s,\uFEFF]*$/;
+
 // 只带持久化查询哈希、没有查询文档的请求：服务端会按哈希去取一份我们看不到的文档，无法判断是不是 mutation。
-// JSON 对象，或数组里任一项，带 extensions.persistedQuery 且没有字符串 query。读不出来一律 false（别的判断会照样拦住它）。
+// JSON 对象，或数组里任一项，带 extensions.persistedQuery 且没有字符串 query（空串、全是空白和逗号的 query 也算没有：
+// Apollo 一类服务端把它当没给，照样按哈希取文档）。读不出来一律 false（别的判断会照样拦住它）。
 export function isPersistedOnly(body: string | null): boolean {
   if (body === null) return false;
   let value: unknown;
@@ -195,7 +198,7 @@ export function isPersistedOnly(body: string | null): boolean {
     return false;
   }
   const items = Array.isArray(value) ? value : [value];
-  return items.some((o) => isRecord(o) && isRecord(o.extensions) && Object.hasOwn(o.extensions, 'persistedQuery') && typeof o.query !== 'string');
+  return items.some((o) => isRecord(o) && isRecord(o.extensions) && Object.hasOwn(o.extensions, 'persistedQuery') && (typeof o.query !== 'string' || BLANK_QUERY.test(o.query)));
 }
 
 // 注释只从 `#` 删到行尾，不分字符串里外。这个检查只是挡掉 `query builder` 这类明显当不了操作的文本，不是文法校验：

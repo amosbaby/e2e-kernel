@@ -33,7 +33,7 @@ function input(o: Partial<RunInput> = {}): RunInput {
   return { kernelVersion: '0.1.0', session: 's-a41f00', name: 'session', startedAt: new Date('2026-11-26T15:30:00Z'),
     endedAt: new Date('2026-11-26T15:31:00Z'), closedBy: 'agent', start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'default' },
     driver: driverWith(), actions: [], writes: [], unattributedWrites: [], hosts: [{ host: 'localhost', mode: 'default' }], webSockets: 0,
-    verdict: null, findings: [], notDone: [], superseded: [],
+    verdict: null, findings: [], notDone: [], superseded: [], declarations: [],
     modes: [], rules: { hash: null, count: 0, pendingHash: null }, blocked: null, forced: false, ...o };
 }
 function textOf(html: string, id: string): string {
@@ -316,6 +316,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     unattributedWrites: [{ ...write('PUT', 'http://localhost/b', null, { reason: 'unattributed', mode: 'readonly' }), decision: 'blocked' }],
     modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: 'sha256:fedcba9876543210' }],
     rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' }, blocked: 'login', forced: true,
+    declarations: [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' }, { method: 'PUT', url: 'http://localhost/b', operation: null, approved: 'remembered' }],
   }));
   const bad: string[] = [];
   const walk = (v: unknown): void => {
@@ -333,7 +334,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   collect(r);
   for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
-    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy']) assert.ok(keys.has(k), k);
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy', 'declarations', 'operation', 'approved']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 
@@ -771,4 +772,26 @@ test('an allowedBy value that is a key of Object.prototype is shown as unknown, 
     const r = buildResult(input({ writes: [write('POST', 'http://x.example.com/a', 200, { allowedBy: v as never })] }));
     assert.ok(section(renderReport(r), 'writes').includes('放行依据 未知'), v);
   }
+});
+
+test('declarations: result.json carries them as given; with none it is an empty array', () => {
+  assert.deepEqual(buildResult(input({})).declarations, []);
+  const given = [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' as const }, { method: 'DELETE', url: 'http://localhost/b', operation: null, approved: 'remembered' as const }];
+  const r = buildResult(input({ declarations: given }));
+  assert.deepEqual(r.declarations, given);
+  assert.notEqual(r.declarations[0], given[0], 'a copy, not the same object');
+});
+
+test('the report lists the declarations: method, address, operation or the whole address, and how they were approved; nothing is listed when there are none', () => {
+  const none = section(renderReport(buildResult(input({}))), 'declarations');
+  assert.ok(none.includes('<p>无</p>'));
+  const html = section(renderReport(buildResult(input({ declarations: [
+    { method: 'POST', url: 'http://localhost/graphql', operation: 'Save', approved: 'dialog' },
+    { method: 'DELETE', url: 'http://localhost/items/*', operation: null, approved: 'remembered' },
+    { method: 'POST', url: 'http://localhost/<b>x</b>', operation: '<i>' as never, approved: 'other' as never },
+  ] }))), 'declarations');
+  assert.ok(html.includes('POST') && html.includes('http://localhost/graphql') && html.includes('operation Save') && html.includes('弹框批准'));
+  assert.ok(html.includes('DELETE') && html.includes('这个地址上的所有写') && html.includes('沿用之前的批准'));
+  assert.ok(html.includes('未知'), 'an unknown approval value is shown as unknown');
+  assert.ok(!html.includes('<b>x</b>') && !html.includes('<i>'), 'escaped');
 });

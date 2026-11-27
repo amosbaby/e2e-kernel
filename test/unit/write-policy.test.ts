@@ -413,6 +413,16 @@ test('a hash-only persisted query is never covered by a declaration, with or wit
   allowedAs(policy.decide(pqPost(pqBody(HASH_A, { operationName: 'Save' })), ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')], persisted: pqCtx.persisted })), 'persisted-query');
 });
 
+test('a hash-only persisted query whose query is empty or blank is hash-only too: no declaration covers it', () => {
+  const ext = { persistedQuery: { version: 1, sha256Hash: HASH_B } };
+  const withOp = ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')] });
+  for (const query of ['', '   ', '\n\t']) {
+    blocked(policy.decide(pqPost(j({ operationName: 'Save', query, extensions: ext })), withOp), 'persisted-query');
+    blocked(policy.decide(pqPost(j({ operationName: 'Save', query, extensions: ext })), ctxOf({ declared: [decl('POST', `${API}/graphql`, null)] })), 'persisted-query');
+  }
+  blocked(policy.decide(pqPost(j([{ operationName: 'Save', query: 'query{a}' }, { operationName: 'Save', query: '', extensions: ext }])), withOp), 'persisted-query');
+});
+
 test('read-POST: a body whose GraphQL kind is unknown is not a read-post (truncated Apollo-style mutation, multipart upload), while ordinary bodies still are', () => {
   const verdict = (r: RequestInfo) => policy.decide(r, readPostCtx);
   // 驱动在 64 KB 处截断：query 键还没出现，键序 operationName, variables, query

@@ -62,8 +62,10 @@ function helpText(selfCmd: string): string {
     '                                          --profile 选 profile：不写就用域名所在的组；域名没编组时可借用某个组的登录（不能带槽）；域名属于别的组则拒绝',
     '                                          --readonly 强制这个会话只读（不管域名规则）：只放行读和严格的 GraphQL query，其余写请求一律拦下；驱动不能拦网络时 open 失败',
     '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
-    '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
-    '  step <会话> --stdin [--keep-going] [--json]        从标准输入读 JSON 数组',
+    '  step <会话> <JSON 数组> [--keep-going] [--allow <JSON>] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
+    '  step <会话> --stdin [--keep-going] [--allow <JSON>] [--json]        从标准输入读 JSON 数组',
+    '                                          --allow 如 [{"method":"POST","url":"https://x.example.com/api/save","operation":"Save"}]：只读主机上被拦的写，要放行得声明，每次最多 12 条，',
+    '                                          一律弹框要人批准（21，批准后原样重试）；operation 可省（省了不放行 GraphQL mutation）；地址不带查询串',
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
     '               [--findings <JSON>] [--not-done <JSON>] [--superseded <JSON>] [--json]',
     '                                          --findings 每条可带 "verdict"；--superseded 如 [{"failed":3,"by":5}]：序号 3 的失败由之后的序号 5 取代',
@@ -249,7 +251,7 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function step(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { ...JSON_OPTION, stdin: { type: 'boolean' }, 'keep-going': { type: 'boolean' } });
+  const p = parse(ctx, args, { ...JSON_OPTION, stdin: { type: 'boolean' }, 'keep-going': { type: 'boolean' }, allow: { type: 'string' } });
   const fromStdin = p.values.stdin === true;
   const [session, inlineOps] = positionals(ctx, p, fromStdin ? 1 : 2, fromStdin ? '<会话>' : '<会话> <JSON 数组>');
   // 先查长度、不解析：超长的一律当用法错误，什么都不发。
@@ -258,6 +260,8 @@ async function step(ctx: Ctx, args: string[]): Promise<number> {
   const ops = parseJson(text, '操作必须是一个 JSON 数组');
   const raw: Record<string, unknown> = { session, ops };
   if (p.values['keep-going'] === true) raw.keepGoing = true;
+  const allow = optString(p, 'allow');
+  if (allow !== undefined) raw.allow = parseJson(allow, '--allow 必须是 JSON 数组');
   const params = validateParams('step', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'step', params) as StepResult;
   if (result.exit !== 0 && result.exit !== 10 && result.exit !== 11 && result.exit !== 20) throw malformed();

@@ -3,7 +3,7 @@ import { escapeHtml } from '../shared/escape.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { Outcome, VerdictValue } from '../shared/protocol.ts';
 import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
-import type { BlockedSummaryRow, ClosedBy, RunResult, SupersededEntry } from './result.ts';
+import type { BlockedSummaryRow, ClosedBy, DeclarationRecord, RunResult, SupersededEntry } from './result.ts';
 import type { ModeChange } from '../kernel/recorder.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。
@@ -34,6 +34,10 @@ const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
 };
 const ALLOWED_BY_TEXT: Record<NonNullable<WriteRecord['allowedBy']>, string> = {
   'read-post': '读型 POST 白名单', 'persisted-query': '持久化查询白名单', 'declared': '放行声明',
+};
+
+const APPROVED_TEXT: Record<DeclarationRecord['approved'], string> = {
+  'dialog': '弹框批准', 'remembered': '沿用之前的批准',
 };
 
 function clip(s: string, max: number): string {
@@ -133,6 +137,17 @@ function writesSection(r: RunResult): string {
       + `<ul>${unattributed.map(writeItem).join('')}</ul>`;
   }
   return `${out}</section>`;
+}
+
+// 放行声明：报告也可能从磁盘上读回来，字段按页面内容处理（脱敏、转义），不认识的批准方式落到「未知」。
+function declarationsSection(r: RunResult): string {
+  const list = Array.isArray(r.declarations) ? r.declarations : [];
+  const head = '<section id="declarations"><h2>放行声明</h2>';
+  if (list.length === 0) return `${head}<p>无</p></section>`;
+  const items = list.map((d) => `<li><code>${page(d.method)} ${pageUrl(d.url)}</code> `
+    + `${d.operation === null ? '这个地址上的所有写（GraphQL mutation 不在内）' : `只放行 operation ${page(d.operation)}`}，`
+    + `${escapeHtml(Object.hasOwn(APPROVED_TEXT, d.approved) ? APPROVED_TEXT[d.approved] : '未知')}</li>`);
+  return `${head}<ul>${items.join('')}</ul></section>`;
 }
 
 // 模式变更时间线：只有一条且是默认模式（或一条也没有）时写「全程默认模式」。host 是页面内容，脱敏后转义。
@@ -254,6 +269,6 @@ export function renderReport(r: RunResult): string {
     + `<meta http-equiv="Content-Security-Policy" content="${CSP}">`
     + `<title>e2e 报告 ${own(r.name)}</title><style>${STYLE}</style></head><body>`
     + `<h1>e2e 报告：${own(r.name)}（${own(r.session)}）</h1>`
-    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
+    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + declarationsSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
     + '</body></html>\n';
 }

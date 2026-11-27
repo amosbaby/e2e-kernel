@@ -2,6 +2,7 @@ import type { Decision, RequestInfo } from '../driver/types.ts';
 import type { Mode } from '../shared/protocol.ts';
 import type { Declaration } from './approval-store.ts';
 import { graphqlKind, isMutationLikeUrl, isPersistedOnly, isStrictQuery, looksGraphql, operationsAre, persistedHashes } from './graphql.ts';
+import { DECLARABLE_METHODS } from './declarations.ts';
 import { matchEndpoint, parseEndpoint } from './rules.ts';
 import type { Endpoint, PersistedSet } from './rules.ts';
 
@@ -74,8 +75,6 @@ export function blockFrozen(req: RequestInfo, group: string | null): PolicyVerdi
     : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'blocked by e2k: session frozen after a cross-group redirect' }) };
   return { decision, reason: 'other-group', allowedBy: null };
 }
-
-const DECLARABLE_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'] as const;
 
 // 登出名单的匹配：拦截名单窄了是漏拦（失败开放），所以和放行名单（精确匹配）不同，按路径匹配：先去掉请求 URL 的 fragment 和查询串，
 // 路径结尾的单个 `/` 视为等同（名单写 /logout 命中 /logout/，写 /logout/ 命中 /logout）。主机、协议、端口、方法仍要一致。

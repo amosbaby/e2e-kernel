@@ -1,10 +1,10 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { lstatSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DriverError } from '../driver/types.ts';
 import type { Decision, Driver, Instance, Page, RequestInfo } from '../driver/types.ts';
 import { buildResult, resolveSuperseded } from '../report/result.ts';
-import type { ClosedBy, RunResult } from '../report/result.ts';
+import type { ClosedBy, DeclarationRecord, RunResult } from '../report/result.ts';
 import { pruneRuns, runDirName, writeRun } from '../report/store.ts';
 import { E2kError } from '../shared/errors.ts';
 import type { Viewport } from '../shared/ops.ts';
@@ -17,7 +17,8 @@ import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
 import { pendingError } from './approval.ts';
 import type { Approvals, DialogRequest } from './approval.ts';
-import type { ApprovalStore } from './approval-store.ts';
+import type { ApprovalStore, Declaration } from './approval-store.ts';
+import { declarationKey, normalizeDeclarations, sameDeclaration } from './declarations.ts';
 import type { ModeResolver } from './mode.ts';
 import { checkProfileKey, parseProfileArg, prepareProfileDir, profileKey, recordLogin } from './profiles.ts';
 import type { ProfileRef } from './profiles.ts';
@@ -84,6 +85,8 @@ interface Session {
   // 已放行、但还没有证据说明提交了的顶层导航目标（下载、204、没人看见的重定向都可能让导航根本没提交）：
   // 和 topHost 一起参与有效模式的计算，直到页面自己的请求或页面地址证明落在哪里。
   readonly pendingHosts: Set<string>;
+  // 本会话提过且已批准的放行声明（只增不减）。判定时才和批准记录里当前的内容、会话当前的组和页面主机核对（declaredFor）。
+  readonly declared: DeclaredEntry[];
   lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
   url: string;                               // 首屏读数里的地址（已脱敏），给 list()
   state: State;
@@ -92,6 +95,11 @@ interface Session {
   timer: NodeJS.Timeout | undefined;
   finished: Promise<CloseResult> | undefined;
 }
+
+// scope：批准是在哪个组、哪个页面主机上给的（`组/主机`；主机名里不会有 `/`，也不会撞上 `constructor` 一类原型上的名字）。
+interface DeclaredEntry { readonly scope: string; readonly decl: Declaration; readonly approved: DeclarationRecord['approved'] }
+
+const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
 // 登录页（设计 5.5）：内核开的那一页，加上它弹出的窗口。这些页的请求不进任何会话记录；
 // loginHosts 之外的写照只读规则拦（目标主机或请求所在页的顶层主机在 loginHosts 里的免拦）。
@@ -206,6 +214,8 @@ export class SessionManager {
   private readonly unattributed: WriteRecord[] = [];
   // 每个 profile（key）一个浏览器实例，懒启动。
   private readonly slots = new Map<string, InstanceSlot>();
+  // 被人拒绝过的放行声明集合（不含会话名，所以换个会话也不重新弹框）；键 = sha256(组、页面主机、声明集合)，内核重启前一直有效。
+  private readonly deniedWrites = new Set<string>();
   private hopSeq = 0;   // 冻结时造的导航记录的编号
   private useClock = 0;   // 给 lastUsed 用的单调序号：比时间戳稳，同一毫秒里的先后也分得清
   // 关停是终态：一旦开始，不再接受任何调用，也不再启动浏览器。
@@ -278,6 +288,8 @@ export class SessionManager {
       await Promise.all([...s.frozen.clearing]);
       throw frozenError(s.frozen);
     }
+    // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；没有 await，和上面的状态检查之间不会交错。
+    if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow);
     s.state = 'stepping';
     this.pauseIdle(s);
     try {
@@ -337,6 +349,81 @@ export class SessionManager {
         url: s.url,
         idleSec: s.state === 'stepping' ? 0 : Math.max(0, Math.floor((now - s.lastActive) / 1000)),
       }));
+  }
+
+  // 放行声明的批准（设计 5.4）。不管目标主机是什么模式都弹框，只有批准记录里已有的（规范化后全等）不再问。
+  // 批准的是「这个组、这个页面主机上放行这些写」：记录按 `组/主机` 存，答复（待批表的键）绑定框里显示的全部内容：会话名、组、页面主机、
+  // 待批的声明集合，框弹出后任何一样变了（页面搬了主机、声明多了或少了、换了个会话）旧答复都对不上，重新弹框。
+  // 被拒的集合不带会话名记（deniedWrites）：换个会话也不重新弹框。批准用掉之后，别的没用掉的 writes 答复一并作废（基线变了）。
+  // 全过了才记进会话：没批准的这一批什么都不生效。
+  private gateDeclarations(s: Session, raw: readonly unknown[]): void {
+    const { store, approvals } = this.deps;
+    const decls = normalizeDeclarations(raw);
+    if (decls.length === 0) return;
+    const host = s.topHost;
+    const scope = `${s.group}/${host}`;
+    const have = store.writesFor(scope);
+    const remembered = decls.filter((d) => have.some((h) => sameDeclaration(h, d)));
+    const pending = decls.filter((d) => !remembered.includes(d));
+    if (pending.length > 0) {
+      const denyKey = sha256(JSON.stringify([s.group, host, pending.map(declarationKey)]));
+      const refused = new E2kError('usage', '人拒绝了这些放行声明', '内核重启前同一组声明不会再问；要放行请换成别的声明');
+      if (this.deniedWrites.has(denyKey)) throw refused;
+      const key = `writes:${sha256(JSON.stringify([s.name, s.group, host, pending.map(declarationKey)]))}`;
+      const request: DialogRequest = {
+        title: 'e2k：放行写请求',
+        lines: [`会话：${s.name}（组 ${s.group}）`, `页面所在主机：${host}`, '要放行这些写请求（批准后，只读主机上也能发出）：',
+          ...pending.map((d) => `${d.method} ${d.url}${d.operation === null ? '（这个地址上的所有写；GraphQL mutation 不在内，要放行 mutation 得写 operation）' : `（只放行 operation ${d.operation}）`}`),
+          '', '拒绝：不放行（默认）'],
+        buttons: ['拒绝', '放行'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC,
+      };
+      const asked = approvals.ask(key, 'writes', request, ['放行']);
+      switch (asked.status) {
+        case 'pending':
+          throw pendingError(asked.id, '放行写请求的声明');
+        case 'denied':
+          if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '换成别的声明，或等一分钟再试；内核重启前被拒的同一组声明不会再问');
+          this.deniedWrites.add(denyKey);
+          throw refused;
+        case 'unavailable':
+          throw new E2kError('needs-human', `要放行写请求但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
+        case 'approved':
+          // 写盘失败时 update 抛 needs-human，原样往上走；答复还留着，重试会再写一次。
+          store.update((r) => {
+            const cur = Object.hasOwn(r.writes, scope) ? r.writes[scope]! : [];
+            r.writes[scope] = [...cur, ...pending.filter((d) => !cur.some((c) => sameDeclaration(c, d)))];
+            return r;
+          });
+          approvals.forget(key);
+          approvals.forgetApproved((k) => k.startsWith('writes:'));
+          break;
+      }
+    }
+    for (const d of decls) {
+      if (s.declared.some((e) => e.scope === scope && sameDeclaration(e.decl, d))) continue;
+      s.declared.push({ scope, decl: d, approved: remembered.includes(d) ? 'remembered' : 'dialog' });
+    }
+  }
+
+  // 判定用的放行声明 = 会话提过的 ∩ 批准记录里当前的，而且要是在会话现在的组和页面主机上批准的（判定时再核对：记录里没了、页面搬了主机都失效）。
+  private declaredFor(s: Session): Declaration[] {
+    if (s.declared.length === 0) return [];
+    const scope = `${s.group}/${s.topHost}`;
+    const stored = this.deps.store.writesFor(scope);
+    return s.declared.filter((e) => e.scope === scope && stored.some((d) => sameDeclaration(d, e.decl))).map((e) => e.decl);
+  }
+
+  // 报告里的放行声明：同一条（方法、地址、operation）只列一次，先提的在前。
+  private declarationRecords(s: Session): DeclarationRecord[] {
+    const seen = new Set<string>();
+    const out: DeclarationRecord[] = [];
+    for (const e of s.declared) {
+      const k = declarationKey(e.decl);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ method: e.decl.method, url: e.decl.url, operation: e.decl.operation, approved: e.approved });
+    }
+    return out;
   }
 
   // 入口闸门（设计 5.4）：规则文件有待批的改动时，新的 open 和 login 先过人工批准，含收紧、含删文件。
@@ -671,7 +758,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
-        group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null,
+        group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [],
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
@@ -757,7 +844,7 @@ export class SessionManager {
         kernelVersion: this.deps.kernelVersion, session: s.id, name: s.name, startedAt: s.startedAt, endedAt, closedBy,
         start: s.start, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
         actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
-        verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [],
+        verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [], declarations: this.declarationRecords(s),
         modes: s.recorder.modes, rules: this.rulesInForce(), blocked: s.lastWall, forced: s.forced,
       });
       paths = writeRun(s.runDir, result);
@@ -958,7 +1045,7 @@ export class SessionManager {
     else {
       const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...this.groupTargets(login.group, hostOf(req.url), topHost)].map((h) => modes.resolve(h))];
       const mode: Mode = all.includes('readonly') ? 'readonly' : all.includes('denied') ? 'denied' : 'default';
-      // 登录窗口里允许登出（好换账号），也没有放行声明：logout、declared 传空；读型 POST、持久化查询照目标主机所在组。
+      // 登录窗口里允许登出（好换账号），也没有放行声明（声明属于会话）：logout、declared 传空；读型 POST、持久化查询照目标主机所在组。
       const verdict = this.deps.policy.decide(req, this.policyCtx(mode, null, hostOf(req.url), false));
       decision = verdict.decision;
       const method = KNOWN_METHODS.has(req.method.toUpperCase()) ? req.method.toUpperCase() : 'OTHER';
@@ -1002,12 +1089,12 @@ export class SessionManager {
   }
 
   // 一次写策略判定的上下文：登出 = 会话组的 ∪ 目标主机组的（withLogout 为 false 时是空，登录窗口用）；读型 POST、持久化查询只取目标主机所在组的
-  // （组只认已批准的快照；接口的主机在组内由规则解析保证）。放行声明本任务不传。
-  private policyCtx(mode: Mode, ownGroup: string | null, targetHost: string, withLogout: boolean): PolicyCtx {
+  // （组只认已批准的快照；接口的主机在组内由规则解析保证）。放行声明只有会话页和会话弹窗传（declaredFor），登录页、未归属请求不传。
+  private policyCtx(mode: Mode, ownGroup: string | null, targetHost: string, withLogout: boolean, declared: readonly Declaration[] = []): PolicyCtx {
     const { modes } = this.deps;
     const target = modes.groupOf(targetHost);
     const own = ownGroup === null ? null : modes.group(ownGroup);
-    return { mode, logout: withLogout ? [...(own?.logout ?? []), ...target.logout] : [], readPosts: target.readPosts, persisted: target.persistedQueries, declared: [] };
+    return { mode, logout: withLogout ? [...(own?.logout ?? []), ...target.logout] : [], readPosts: target.readPosts, persisted: target.persistedQueries, declared };
   }
 
   // message 是给 step 的提示句（和 403 页面上的是同一句）。
@@ -1189,7 +1276,7 @@ export class SessionManager {
     if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
     // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
     const mode = this.sessionMode(s, [topHost, ...this.groupTargets(s.group, host, topHost)]);
-    const verdict: PolicyVerdict = this.deps.policy.decide(req, this.policyCtx(mode, s.group, host, true));
+    const verdict: PolicyVerdict = this.deps.policy.decide(req, this.policyCtx(mode, s.group, host, true, this.declaredFor(s)));
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
     // 判定之后才动主机。放行的顶层导航只记成待定（不确定它会不会提交）；主页面的其他请求带着的顶层地址是「已提交」的证据，

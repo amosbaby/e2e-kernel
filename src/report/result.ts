@@ -21,11 +21,15 @@ export interface RunInput {
   hosts: { host: string; mode: Mode }[]; webSockets: number;
   verdict: Verdict | null; findings: Finding[]; notDone: string[];
   superseded: Supersede[];   // agent 声明的；buildResult 对着 actions 校验，再补上两边的操作名和目标
+  declarations: DeclarationRecord[];   // 放行声明：本会话提过且已批准的
   modes: ModeChange[];       // 模式变更时间线
   rules: { hash: string | null; count: number; pendingHash: string | null };   // hash、count：收尾时已批准的规则；pendingHash：同时生效（取更严）的待批文件
   blocked: 'login' | null;   // 会话最后一次登录墙检查的结果
   forced: boolean;           // open --readonly
 }
+
+// 本会话提过、人批准了的放行声明（url 是规范化后的地址，不带查询串）。approved：本次在弹框里批准的 / 之前批准过、这次沿用的。
+export interface DeclarationRecord { method: string; url: string; operation: string | null; approved: 'dialog' | 'remembered' }
 
 // 一条已恢复的失败：序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代。op 和 target 来自记录，不来自 agent。
 // target 是已脱敏的选择器或引用，没有就是 null。byReadOnly：取代者是只读操作（含 wait），而被取代的是动作（读一下页面或等一会儿不能证明动作做成了）。
@@ -45,6 +49,7 @@ export interface RunResult {
   start: Omit<RunInput['start'], 'borrowed'> & { borrowed: boolean; readonly: boolean }; driver: RunInput['driver']; hosts: RunInput['hosts'];
   modes: ModeChange[]; rules: RunInput['rules'];
   verdict: Verdict | null; findings: Finding[]; notDone: string[]; superseded: SupersededEntry[];
+  declarations: DeclarationRecord[];
   tallies: Tallies; consistency: 'ok' | 'conflict'; conflicts: ConflictReason[];
   actions: ActionRecord[];
   writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[]; summary: WriteSummaryRow[]; blockedSummary: BlockedSummaryRow[] };
@@ -186,6 +191,7 @@ export function buildResult(input: RunInput): RunResult {
     findings: input.findings.map((f) => ({ ...f })),
     notDone: [...input.notDone],
     superseded,
+    declarations: input.declarations.map((d) => ({ ...d })),
     tallies,
     consistency: conflicts.length > 0 ? 'conflict' : 'ok',
     conflicts,

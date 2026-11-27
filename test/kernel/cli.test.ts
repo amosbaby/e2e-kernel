@@ -125,7 +125,7 @@ test('kernel not running: exit 22 and the command that starts the kernel', async
 
 test('--version and help', async () => {
   const v = io(); assert.equal(await main(['--version'], v), 0); assert.equal(v.outText(), '0.1.0');
-  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url>/); assert.match(h.outText(), /step .*--keep-going/);
+  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /open <url>/); assert.match(h.outText(), /step .*--keep-going/); assert.match(h.outText(), /--allow/);
   assert.ok(!/approve|save-case/.test(h.outText()));
   assert.match(h.outText(), /退出码：.*10 .*11 .*20 .*22/);   // 退出码一行要列到 20 和 22
   assert.equal(await main([], io()), 2);
@@ -1064,5 +1064,33 @@ test('login end: cross-group navigations that were blocked get their own sentenc
     // 什么都没拦：两句都没有
     const none = await run([], async () => {});
     assert.ok(!none.includes('只读规则拦下') && !none.includes('跳到别的组'));
+  });
+});
+
+test('step --allow: unreadable or non-write declarations are usage errors that send nothing; a good one is 21 until a person approves, then the step runs', async () => {
+  await withRules(null, async (h) => {
+    const dialog = fakeDialog((r) => ({ kind: 'button', button: r.buttons.includes('放行') ? '放行' : '拒绝' }));
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog });
+    try {
+      const o = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/', '--json'], o), 0);
+      const sid = (JSON.parse(o.outText()) as { session: string }).session;
+      const ops = '[{"op":"snapshot"}]';
+      const allow = '[{"method":"POST","url":"http://localhost:5173/api/items","operation":"Save"}]';
+      for (const bad of ['not json', '{}', '[{"method":"GET","url":"http://localhost:5173/x"}]', '[{"method":"POST","url":"http://localhost:5173/x?y=1"}]',
+        '[{"method":"POST","url":"http://localhost:5173/x","operation":"a-b"}]']) {
+        assert.equal(await main(['step', sid, ops, '--allow', bad], io({ env: h.env })), 2, bad);
+      }
+      assert.equal(await main(['step', sid, ops, '--allow'], io({ env: h.env })), 2);
+      assert.equal(dialog.requests.length, 0, 'nothing reached the dialog');
+      const first = io({ env: h.env }); assert.equal(await main(['step', sid, ops, '--allow', allow], first), 21);
+      assert.match(first.errText(), /等人在弹框里批准：放行写请求的声明/);
+      await sleep(20);                                                                                                 // 假对话框在后台答复
+      const again = io({ env: h.env }); assert.equal(await main(['step', sid, ops, '--allow', allow, '--json'], again), 0);
+      assert.equal(dialog.requests.length, 1);
+      assert.match(dialog.requests[0]!.lines.join('\n'), /POST http:\/\/localhost:5173\/api\/items（只放行 operation Save）/);
+      assert.equal(await main(['step', sid, '--stdin', '--allow', allow], io({ env: h.env, stdinText: ops })), 0);   // 已批准：不再弹框
+      assert.equal(dialog.requests.length, 1);
+      assert.equal((await call(h.home, 'close', { session: sid })).ok, true);
+    } finally { await kk.stop(); }
   });
 });

@@ -168,7 +168,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 - `open <url> --readonly` 让这个会话只读，不管域名规则；人配在 `rules.json` 里标为只读的域名上，不带 `--readonly` 也是只读。`open` 结果里 `mode` 为 `readonly` 就是只读。只读时只放行读和严格的 GraphQL query，其余写（POST、PUT、PATCH、DELETE、mutation）一律被拦。
 - 被拦的写在页面上是这样：fetch、XHR 收到 `403` 和 `{"error":"blocked by e2k read-only mode"}`（跨源时浏览器报 CORS 错误）；表单提交看到一张写着同一句话的 `403` 页面。这是内核挡的，不是页面坏了。
 - `step` 的结果里 `writesBlocked` 是本批被拦的写的条数，`notices` 是整句提示；有被拦的写不改退出码。想知道拦了什么，看 `result.json` 的 `writes.blocked` 或 `report.html`。
-- 验证需要真的写、又被拦了：停下告诉人，由人决定改规则或另开会话；不要换主机、换会话或用 `eval` 去绕。
+- 验证需要真的写、又被拦了：`step … --allow '[{"method":"POST","url":"…"}]'` 申请放行（≤12 条，地址不带查询串，mutation 要加 `operation`）→ 21 → 人批准后原样重试；不批就停下告诉人，不要换主机、换会话或用 `eval` 去绕。
 - `rules.json` 有错时新的 `open` 会被拒（退出码 2），已开的会话照旧、`step` 的 `notices` 会提示。运行 `node bin/e2k.js rule list` 看错误，让人修。永远不要自己改 `rules.json`。
 - 规则被人改过后，新的 `open`、`login` 先得 21：等人点弹框再原样重试；人拒绝是 2，弹不出框是 22。批准前收紧已生效，放宽要等批准。
 - 域名在某组里，`open` 默认用那组的 profile；本地页面要用某组的登录：`--profile <组>`（借用）。会话跳到别组的域名会 403（`notices` 有提示）；经重定向进去的会话被冻结（所有请求 403，`step` 退出 22），关掉后用 `--profile` 另开，不要绕。

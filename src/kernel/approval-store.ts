@@ -157,6 +157,11 @@ export class ApprovalStore {
     return structuredClone(this.record);
   }
 
+  // 某个键下已批准的放行声明（副本）；没有这个键就是空列表。键不一定是自己人写的：只认自己的属性（'constructor' 之类不算）。
+  writesFor(key: string): Declaration[] {
+    return Object.hasOwn(this.record.writes, key) ? structuredClone(this.record.writes[key]!) : [];
+  }
+
   // f 拿到副本，返回新记录。先落盘、成功了才换内存里的：太大、形状不对、写不出去，内存和磁盘都不变。
   update(f: (r: ApprovalRecord) => ApprovalRecord): void {
     const next = f(structuredClone(this.record));

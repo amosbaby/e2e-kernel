@@ -96,6 +96,28 @@ test('step takes an optional boolean keepGoing and nothing else new', () => {
     assert.throws(() => validateParams('step', { session: 's-a41f00', ops: [{ op: 'snapshot' }], ...bad }), isUsage, JSON.stringify(bad));
 });
 
+test('step takes an optional allow list: at most 12 { method, url, operation? } items, write methods only, types and lengths checked', () => {
+  const base = { session: 's-a41f00', ops: [{ op: 'snapshot' }] };
+  const one = { method: 'POST', url: 'http://api.example.com/x', operation: 'Save' };
+  const two = { method: 'DELETE', url: 'http://api.example.com/y' };
+  assert.deepEqual(validateParams('step', { ...base, allow: [one, two] }), { ...base, allow: [one, two] });
+  assert.deepEqual(validateParams('step', { ...base, allow: [] }), { ...base, allow: [] });
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) assert.doesNotThrow(() => validateParams('step', { ...base, allow: [{ method, url: 'http://api.example.com/x' }] }));
+  const many = (n: number) => Array.from({ length: n }, (_, i) => ({ method: 'POST', url: `http://api.example.com/${i}` }));
+  assert.equal(validateParams('step', { ...base, allow: many(12) }).allow?.length, 12);
+  const bad: unknown[] = [
+    many(13), 'x', null, {}, [null], [[]], ['POST http://api.example.com/x'],
+    [{ method: 'GET', url: 'http://api.example.com/x' }], [{ method: 'HEAD', url: 'http://api.example.com/x' }], [{ method: 'post', url: 'http://api.example.com/x' }],
+    [{ url: 'http://api.example.com/x' }], [{ method: 'POST' }], [{ method: 1, url: 'http://api.example.com/x' }], [{ method: 'POST', url: 5 }], [{ method: 'POST', url: '' }],
+    [{ method: 'POST', url: `http://api.example.com/${'a'.repeat(2048)}` }],
+    [{ method: 'POST', url: 'http://api.example.com/x', operation: 5 }], [{ method: 'POST', url: 'http://api.example.com/x', operation: '' }],
+    [{ method: 'POST', url: 'http://api.example.com/x', operation: 'A'.repeat(101) }], [{ method: 'POST', url: 'http://api.example.com/x', extra: 1 }],
+  ];
+  for (const allow of bad) assert.throws(() => validateParams('step', { ...base, allow }), isUsage, JSON.stringify(allow)?.slice(0, 60));
+  // 查询串、operation 的写法是内核里的规范化管：协议层只收类型和长度
+  assert.doesNotThrow(() => validateParams('step', { ...base, allow: [{ method: 'POST', url: 'http://api.example.com/x?y=1', operation: 'not valid' }] }));
+});
+
 test('close takes superseded pairs and a verdict per finding', () => {
   const close = { session: 's-a41f00', verdict: { value: 'pass' }, superseded: [{ failed: 1, by: 3 }, { failed: 2, by: 4 }],
     findings: [{ claim: 'a', basis: 'b', verdict: 'fail' }, { claim: 'c', basis: 'd' }] };
