@@ -2109,8 +2109,10 @@ test('a hop of the session page into another group freezes it: every page and ev
   assert.ok(res.writes.blocked.some((w) => w.host === 'b.example.com' && w.method === 'GET'));                              // 那一跳
   assert.ok(res.writes.blocked.some((w) => w.host === 'a.example.com' && w.method === 'POST'));                             // 冻结后的写
   assert.ok(res.writes.blockedSummary.every((r) => r.reason === 'other-group'));
+  assert.deepEqual(res.frozen, { group: 'b', host: 'b.example.com' });   // 冻结写进报告：组和第一跳的主机
+  assert.ok(readFileSync(closed.reportPath, 'utf8').includes('<h3>冻结</h3>'));
   assert.ok(!res.hosts.some((h) => h.host === 'b.example.com'));                                                            // 没算「到过」
-  await sm.close({ session: other.session }); await sm.close({ session: plain.session });
+  for (const s2 of [other, plain]) assert.equal(readResult((await sm.close({ session: s2.session })).runDir).frozen, null);   // 没冻结的会话是 null
 });
 
 test('every hop of the chain is checked: unlisted hosts and the own group pass, a later hop into another group freezes; a default-group session is frozen by a hop into a group', async () => {

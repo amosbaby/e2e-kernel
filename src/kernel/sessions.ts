@@ -1033,6 +1033,7 @@ export class SessionManager {
         verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [], declarations: this.declarationRecords(s),
         modes: s.recorder.modes, rules: this.rulesInForce(), blocked: s.lastWall, forced: s.forced,
         identity: s.identityConfigured ? { group: s.group, checks: s.identityChecks, skipped: s.identitySkipped, mismatch: s.identityMismatch !== null } : null,
+        frozen: s.frozen === null ? null : { group: s.frozen.group, host: this.frozenHost(s.frozen) },
       });
       paths = writeRun(s.runDir, result);
     } catch (e) {
@@ -1359,6 +1360,12 @@ export class SessionManager {
     login.blocked++;
     login.crossBlocked++;
     return blockFrozen(req, frozen.group).decision;
+  }
+
+  // 报告里写的冻结主机：第一跳的主机，脱敏后再写；没有就是 null。
+  private frozenHost(f: Freeze): string | null {
+    const first = f.hosts.values().next();
+    return first.done === true ? null : safely(() => redactText(first.value));
   }
 
   // 冻结的共同部分：记下第一次跨进去的组，对这一跳的主机清 cookie（只在这个会话所在的实例上）。

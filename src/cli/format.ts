@@ -72,6 +72,11 @@ function waitLine(r: { blocked: 'login' | null; next: string | null }): string[]
   return r.blocked === 'login' && r.next !== null ? [`等登录：${inline(r.next)}`] : [];
 }
 
+// profile 总是打出来（`组` 或 `组@槽`）；老内核的回应没有 profile：不打。
+function openProfileLine(r: OpenResult): string[] {
+  return typeof r.profile === 'string' ? [`profile: ${inline(r.profile)}`] : [];
+}
+
 // 借用时多一行：组名取自 profile key（`组` 或 `组@槽`，借用不带槽）。老内核的回应没有 borrowed：当作没借用。
 function borrowedLine(r: OpenResult): string[] {
   if (r.borrowed !== true) return [];
@@ -88,7 +93,7 @@ function identityLine(r: OpenResult): string[] {
 
 export function formatOpen(r: OpenResult): string {
   return [...identityLine(r), `${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`,
-    ...borrowedLine(r), ...waitLine(r), block(r.snapshot)].join('\n');
+    ...openProfileLine(r), ...borrowedLine(r), ...waitLine(r), block(r.snapshot)].join('\n');
 }
 
 export function formatStep(r: StepResult): string {

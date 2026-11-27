@@ -44,8 +44,9 @@ function textOf(html: string, id: string): string {
 function outcomes(html: string): string[] {
   return [...html.matchAll(/<td class="outcome">([^<]*)<\/td>/g)].map((m) => m[1]!);
 }
+// 小节：整节（section）或模式一节下的子块（div）。子块不嵌套，非贪婪匹配到第一个同名结束标签。
 function section(html: string, id: string): string {
-  return new RegExp(`<section id="${id}">.*?</section>`, 's').exec(html)?.[0] ?? '';
+  return new RegExp(`<(section|div) id="${id}">.*?</\\1>`, 's').exec(html)?.[0] ?? '';
 }
 
 let tmp: string;
@@ -317,7 +318,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: 'sha256:fedcba9876543210' }],
     rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' }, blocked: 'login', forced: true,
     declarations: [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' }, { method: 'PUT', url: 'http://localhost/b', operation: null, approved: 'remembered' }],
-    identity: { group: 'a', checks: 2, skipped: 1, mismatch: true },
+    identity: { group: 'a', checks: 2, skipped: 1, mismatch: true }, frozen: { group: 'a', host: 'b.example.com' },
   }));
   const bad: string[] = [];
   const walk = (v: unknown): void => {
@@ -335,7 +336,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   collect(r);
   for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
-    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy', 'declarations', 'operation', 'approved', 'identity', 'group', 'checks', 'skipped', 'mismatch']) assert.ok(keys.has(k), k);
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy', 'declarations', 'operation', 'approved', 'identity', 'group', 'checks', 'skipped', 'mismatch', 'frozen']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 
@@ -386,9 +387,11 @@ test('start.borrowed is false unless the session borrowed a group\'s login; the 
   const plain = buildResult(input({}));
   assert.equal(plain.start.borrowed, false);
   assert.ok(!renderReport(plain).includes('（借用）'));
+  assert.ok(section(renderReport(plain), 'mode-profile').includes('profile default') && !section(renderReport(plain), 'mode-profile').includes('借用'));
   const borrowed = buildResult(input({ start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'a', borrowed: true } }));
   assert.deepEqual([borrowed.start.profile, borrowed.start.borrowed], ['a', true]);
-  assert.ok(section(renderReport(borrowed), 'env').includes('profile a（借用）'));
+  assert.ok(section(renderReport(borrowed), 'mode-profile').includes('profile a（借用）'));
+  assert.ok(!section(renderReport(borrowed), 'env').includes('profile a') && !section(renderReport(borrowed), 'env').includes('借用'), 'the profile is shown once, under the mode section');
   const cross = buildResult(input({ writes: [blockedWrite('GET', 'http://b.example.com/x', 'other-group')] }));
   assert.deepEqual(cross.writes.blockedSummary, [{ host: 'b.example.com', method: 'GET', reason: 'other-group', count: 1, unattributed: false }]);
   const sec = section(renderReport(cross), 'blocked-writes');
@@ -817,4 +820,73 @@ test('identity: the report has a section only when the group has an identity; a 
   const old = JSON.parse(JSON.stringify(buildResult(input({})))) as Record<string, unknown>;
   delete old.identity;   // 老版本的 result.json 没有这个字段
   assert.equal(section(renderReport(old as never), 'identity'), '');
+});
+
+test('frozen: result.json carries it as given; a session that was not frozen has null', () => {
+  assert.equal(buildResult(input({})).frozen, null);
+  assert.equal(buildResult(input({ frozen: null })).frozen, null);
+  const given = { group: 'a', host: 'b.example.com' };
+  const r = buildResult(input({ frozen: given }));
+  assert.deepEqual(r.frozen, given);
+  assert.notEqual(r.frozen, given, 'a copy, not the same object');
+  assert.deepEqual(buildResult(input({ frozen: { group: null, host: null } })).frozen, { group: null, host: null });
+});
+
+// 模式一节下集中显示：profile、放行声明、身份探针、冻结。每段只出现一次，不另起顶层小节。
+test('the mode section gathers profile, declarations, identity probe and freeze under their own headings, each once', () => {
+  const html = renderReport(buildResult(input({
+    start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'a', borrowed: true },
+    declarations: [{ method: 'POST', url: 'http://localhost/a', operation: null, approved: 'dialog' }],
+    identity: { group: 'a', checks: 2, skipped: 0, mismatch: true }, frozen: { group: 'b', host: 'b.example.com' },
+  })));
+  const modes = section(html, 'modes');
+  const headings = [...modes.matchAll(/<h3>([^<]*)<\/h3>/g)].map((m) => m[1]);
+  assert.deepEqual(headings, ['profile', '放行声明', '身份探针', '冻结']);
+  for (const title of ['profile', '放行声明', '身份探针', '冻结']) assert.equal(html.split(`>${title}</h`).length - 1, 1, title);
+  assert.ok(!html.includes('<section id="declarations">') && !html.includes('<section id="identity">'), 'no separate top-level sections');
+  assert.ok(section(modes, 'mode-profile').includes('profile a（借用）'));
+  assert.ok(section(modes, 'declarations').includes('http://localhost/a') && section(modes, 'declarations').includes('弹框批准'));
+  assert.ok(section(modes, 'identity').includes('id="identity-mismatch"') && section(modes, 'identity').includes('核对 2 次'));
+  assert.ok(section(modes, 'frozen').includes('组 b') && section(modes, 'frozen').includes('b.example.com'));
+  // 全程默认模式的早返回路径也带这几段
+  const plain = section(renderReport(buildResult(input({ frozen: { group: null, host: null } }))), 'modes');
+  assert.ok(plain.includes('全程默认模式') && plain.includes('<h3>profile</h3>') && plain.includes('<h3>放行声明</h3>') && plain.includes('<h3>冻结</h3>'));
+});
+
+test('freeze: the reason names the group and the redacted host; an unknown group is said so; no freeze means no freeze heading', () => {
+  const known = section(renderReport(buildResult(input({ frozen: { group: 'b', host: 'b.example.com' } }))), 'frozen');
+  assert.ok(known.includes('组 b') && known.includes('b.example.com') && known.includes('冻结'), known);
+  const unknown = section(renderReport(buildResult(input({ frozen: { group: null, host: null } }))), 'frozen');
+  assert.ok(unknown.includes('判断不出归属') && !unknown.includes('组 null'), unknown);
+  const none = renderReport(buildResult(input({})));
+  assert.ok(!none.includes('<h3>冻结</h3>') && section(none, 'frozen') === '');
+});
+
+test('freeze, declarations, profile: page-derived values are redacted and escaped', () => {
+  const html = renderReport(buildResult(input({
+    start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'p<i>q', borrowed: false },
+    declarations: [{ method: 'P<b>', url: 'http://localhost/a<script>x</script>', operation: 'O<u>' as never, approved: 'dialog' }],
+    frozen: { group: 'g<s>', host: `${jwt}.exa<em>mple.com` },
+  })));
+  const modes = section(html, 'modes');
+  for (const raw of ['<script>', '<b>', '<i>', '<u>', '<s>', '<em>']) assert.ok(!modes.includes(raw), raw);
+  assert.ok(modes.includes('a%3Cscript%3Ex') && modes.includes('P&lt;b&gt;') && modes.includes('O&lt;u&gt;') && modes.includes('g&lt;s&gt;') && modes.includes('p&lt;i&gt;q'));
+  assert.ok(!html.includes(jwt), 'a token in the frozen host must not leak');
+});
+
+test('an older result.json without declarations, identity, frozen or start.borrowed still renders; the missing parts are absent, not an error', () => {
+  const old = JSON.parse(JSON.stringify(buildResult(input({})))) as Record<string, unknown>;
+  for (const k of ['declarations', 'identity', 'frozen']) delete old[k];
+  delete (old.start as Record<string, unknown>).borrowed;
+  const modes = section(renderReport(old as never), 'modes');
+  assert.ok(modes.includes('<h3>profile</h3>') && modes.includes('profile default') && !modes.includes('借用'));
+  assert.ok(section(modes, 'identity') === '' && section(modes, 'frozen') === '');
+  assert.ok(section(modes, 'declarations').includes('<p>无</p>'));
+  for (const bad of [null, 'x', 5, []]) {
+    const r = JSON.parse(JSON.stringify(old)) as Record<string, unknown>;
+    r.frozen = bad; r.identity = bad; r.declarations = bad;
+    assert.doesNotThrow(() => renderReport(r as never), String(bad));
+    const m = section(renderReport(r as never), 'modes');
+    assert.ok(section(m, 'frozen') === '' && section(m, 'identity') === '', `a malformed value (${JSON.stringify(bad)}) shows no freeze or identity block`);
+  }
 });

@@ -1092,6 +1092,17 @@ test('formatOpen: the borrowed line is only printed for borrowed:true; an older 
   assert.ok(formatOpen({ ...base, profile: 'a@t1', borrowed: true }).includes('借用组 a 的登录'));
 });
 
+test('formatOpen: always prints the profile key (also when not borrowed); an older kernel\'s reply (no profile) prints none; control characters cannot forge a line', () => {
+  const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null, identity: null };
+  const lines = (o: object): string[] => formatOpen(o as never).split('\n');
+  assert.ok(lines({ ...base, profile: 'default', borrowed: false }).includes('profile: default'));
+  assert.ok(lines({ ...base, profile: 'a@t1', borrowed: false }).includes('profile: a@t1'));
+  const borrowed = lines({ ...base, profile: 'a', borrowed: true });
+  assert.ok(borrowed.includes('profile: a') && borrowed.some((l) => l.startsWith('借用组 a')));
+  assert.ok(!formatOpen(base as never).includes('profile:'));
+  assert.ok(!lines({ ...base, profile: 'a\nmode: x', borrowed: false }).includes('mode: x'));
+});
+
 test('formatOpen: an identity mismatch gets a conspicuous first line (no page text); ok, skipped, null and an older kernel\'s reply (no identity) print none', () => {
   const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null, profile: 'a', borrowed: false };
   const out = formatOpen({ ...base, identity: 'mismatch' });

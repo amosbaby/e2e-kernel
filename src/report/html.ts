@@ -139,25 +139,42 @@ function writesSection(r: RunResult): string {
   return `${out}</section>`;
 }
 
-// 放行声明：报告也可能从磁盘上读回来，字段按页面内容处理（脱敏、转义），不认识的批准方式落到「未知」。
-function declarationsSection(r: RunResult): string {
+// 「模式」一节下的四个小块（profile、放行声明、身份探针、冻结）：不另起顶层小节，每块只在这里出现一次。
+// 报告也可能从磁盘上读回来：老版本没有的字段，整块（或该行）不出现，不抛错。
+
+// profile：key 是 `组` 或 `组@槽`；借用别的组的登录时注明。
+function profileBlock(r: RunResult): string {
+  return `<div id="mode-profile"><h3>profile</h3><p>profile ${own(r.start.profile)}${r.start.borrowed === true ? '（借用）' : ''}</p></div>`;
+}
+
+// 放行声明：字段按页面内容处理（脱敏、转义），不认识的批准方式落到「未知」。
+function declarationsBlock(r: RunResult): string {
   const list = Array.isArray(r.declarations) ? r.declarations : [];
-  const head = '<section id="declarations"><h2>放行声明</h2>';
-  if (list.length === 0) return `${head}<p>无</p></section>`;
+  const head = '<div id="declarations"><h3>放行声明</h3>';
+  if (list.length === 0) return `${head}<p>无</p></div>`;
   const items = list.map((d) => `<li><code>${page(d.method)} ${pageUrl(d.url)}</code> `
     + `${d.operation === null ? '这个地址上的所有写（GraphQL mutation 不在内）' : `只放行 operation ${page(d.operation)}`}，`
     + `${escapeHtml(Object.hasOwn(APPROVED_TEXT, d.approved) ? APPROVED_TEXT[d.approved] : '未知')}</li>`);
-  return `${head}<ul>${items.join('')}</ul></section>`;
+  return `${head}<ul>${items.join('')}</ul></div>`;
 }
 
-// 身份探针：组没配身份（或老版本的 result.json 没有这个字段）整节不出现。只有组名和次数，不含页面上读到的任何文字。
-function identitySection(r: RunResult): string {
+// 身份探针：组没配身份（或老版本的 result.json 没有这个字段）整块不出现。只有组名和次数，不含页面上读到的任何文字。
+function identityBlock(r: RunResult): string {
   const id = r.identity;
-  if (id === null || id === undefined || typeof id !== 'object') return '';
+  if (id === null || id === undefined || typeof id !== 'object' || Array.isArray(id)) return '';
   const counts = `<p>组 ${own(id.group)}：核对 ${own(id.checks)} 次，跳过 ${own(id.skipped)} 次（登录墙、页面不在本组的主机上、借用时不核对）</p>`;
-  return '<section id="identity"><h2>身份探针</h2>'
+  return '<div id="identity"><h3>身份探针</h3>'
     + (id.mismatch === true ? '<p id="identity-mismatch" class="flag">身份不符：页面上的账号或租户不是组配置里期望的那个，这场会话在不符之后没有执行任何操作</p>' : '<p>未发现不符</p>')
-    + `${counts}</section>`;
+    + `${counts}</div>`;
+}
+
+// 冻结：页面经重定向进了别的组的域名，会话此后不再执行任何操作。没冻结（或老版本没有这个字段）整块不出现。group 是 null 表示判断不出归属。
+function frozenBlock(r: RunResult): string {
+  const f = r.frozen;
+  if (f === null || f === undefined || typeof f !== 'object' || Array.isArray(f)) return '';
+  const where = f.group === null || f.group === undefined ? '判断不出归属的域名' : `组 ${page(f.group)} 的域名`;
+  const host = typeof f.host === 'string' && f.host !== '' ? ` ${page(f.host)}` : '';
+  return `<div id="frozen"><h3>冻结</h3><p class="flag">页面经重定向进了${where}${host}，会话已冻结：此后所有请求一律被拦下，不再执行任何操作，需要关掉后重开</p></div>`;
 }
 
 // 模式变更时间线：只有一条且是默认模式（或一条也没有）时写「全程默认模式」。host 是页面内容，脱敏后转义。
@@ -167,11 +184,12 @@ function modesSection(r: RunResult): string {
   const approvedLine = rules.hash === null ? '<p>没有已批准的规则</p>' : `<p>收尾时生效的已批准规则 ${own(rules.count)} 条，哈希 <code>${own(rules.hash)}</code></p>`;
   const rulesLine = rules.pendingHash == null ? approvedLine
     : `${approvedLine}<p>另有未批准的规则文件，哈希 <code>${own(rules.pendingHash)}</code>（其中的收紧已按更严合并生效）</p>`;
+  const tail = profileBlock(r) + declarationsBlock(r) + identityBlock(r) + frozenBlock(r);
   let out = '<section id="modes"><h2>模式</h2>';
-  if (modes.length === 0 || (modes.length === 1 && modes[0]!.mode === 'default')) return `${out}<p>全程默认模式</p>${rulesLine}</section>`;
+  if (modes.length === 0 || (modes.length === 1 && modes[0]!.mode === 'default')) return `${out}<p>全程默认模式</p>${rulesLine}${tail}</section>`;
   const rows = modes.map((m) => `<tr><td>${own(m.at)}</td><td>${page(m.host)}</td><td>${own(m.mode)}</td><td>${escapeHtml(MODE_REASON_TEXT[m.reason] ?? '未知')}</td></tr>`).join('');
   out += `<table><thead><tr><th>时间</th><th>主机</th><th>模式</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table>`;
-  return `${out}${rulesLine}</section>`;
+  return `${out}${rulesLine}${tail}</section>`;
 }
 
 // 被拦下的写（含未归属的）：主机名、方法、原因、次数，不带路径和请求体。
@@ -262,7 +280,7 @@ function envSection(r: RunResult): string {
     + `<h3>域名和当时的模式</h3>${listOrNone(hosts)}`
     + `<h3>驱动和能力</h3><p>${own(r.driver.name)}</p>${listOrNone(capLines)}`
     + `<h3>覆盖说明</h3>${listOrNone(notes)}`
-    + `<p>起始地址 ${pageUrl(r.start.url)}，视口 ${vp}，触屏模拟 ${r.start.touch ? '是' : '否'}，profile ${own(r.start.profile)}${r.start.borrowed === true ? '（借用）' : ''}</p>`
+    + `<p>起始地址 ${pageUrl(r.start.url)}，视口 ${vp}，触屏模拟 ${r.start.touch ? '是' : '否'}</p>`
     + `<p>开始 ${own(r.startedAt)}，结束 ${own(r.endedAt)}，结束方式 ${CLOSED_BY_TEXT[r.closedBy] ?? '未知'}，内核版本 ${own(r.kernelVersion)}</p>`
     + (r.blocked === 'login' ? '<p id="env-blocked">收尾时停在登录页</p>' : '')
     + (r.next === null ? '' : `<p>${own(r.next)}</p>`)
@@ -279,6 +297,6 @@ export function renderReport(r: RunResult): string {
     + `<meta http-equiv="Content-Security-Policy" content="${CSP}">`
     + `<title>e2e 报告 ${own(r.name)}</title><style>${STYLE}</style></head><body>`
     + `<h1>e2e 报告：${own(r.name)}（${own(r.session)}）</h1>`
-    + verdictSection(r) + identitySection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + declarationsSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
+    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
     + '</body></html>\n';
 }
