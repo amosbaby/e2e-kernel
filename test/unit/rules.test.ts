@@ -273,6 +273,7 @@ describe('groups', () => {
     bad(withGroups(grp({ name: 'x' }), grp({ name: 'y', hosts: ['b.example.com'], loginHosts: ['a.example.com'] })), /another group's hosts/);
     bad(withGroups(grp({ name: 'x', hosts: ['a.example.com'] }), grp({ name: 'y', hosts: ['b.example.com'], loginHosts: ['*.example.com'] })), /another group's hosts/);
     bad(withGroups(grp({ name: 'x', hosts: ['*.example.org'] }), grp({ name: 'y', hosts: ['b.example.com'], loginHosts: ['sso.example.org'] })), /another group's hosts/);
+    bad(withGroups(grp({ name: 'x', hosts: ['a.example.com'] }), grp({ name: 'y', hosts: ['b.example.com'], loginHosts: ['a.example.com'] })), /host of another group/);   // 精确写法落在别组
     bad(withGroups(grp({ readPosts: [{ method: 'POST', url: 'https://other.example.net/x' }] })), /host must be in this group/);
     bad(withGroups(grp({ logout: [{ url: 'https://other.example.net/logout' }] })), /host must be in this group/);
     bad(withGroups(grp({ persistedQueries: [{ url: 'https://other.example.net/g', hashes: [HASH] }] })), /host must be in this group/);
@@ -300,6 +301,14 @@ describe('groups', () => {
     // 合法的边界：每个上限刚好
     parseRules(JSON.stringify({ version: 1, groups: Array.from({ length: 20 }, (_, i) => grp({ name: `g${i}`, hosts: [`h${i}.example.com`] })) }));
     parseRules(withGroups(grp({ hosts: Array.from({ length: 50 }, (_, i) => `h${i}.example.com`), logout: Array.from({ length: 50 }, () => ({ url: 'https://h1.example.com/x' })) })));
+  });
+
+  test('an exact login host inside its own more specific group is fine even under another group\'s wildcard', () => {
+    const r = parseRules(withGroups({ name: 'wide', hosts: ['*.example.com'] }, { name: 'sso', hosts: ['sso.example.com'], loginHosts: ['sso.example.com'] }));
+    assert.equal(groupOf(r, 'sso.example.com').name, 'sso');
+    assert.deepEqual(groupOf(r, 'sso.example.com').loginHosts, ['sso.example.com']);
+    // 反过来：通配组把别组的精确主机当登录主机，仍然拒
+    assert.throws(() => parseRules(withGroups({ name: 'wide', hosts: ['*.example.com'], loginHosts: ['sso.example.com'] }, { name: 'sso', hosts: ['sso.example.com'] })), { code: 'usage' });
   });
 
   test('two groups may share a login host that is in no group', () => {
@@ -341,6 +350,17 @@ describe('groups', () => {
       assert.equal(hit(u), false, u);
     }
     assert.equal(hit('https://api.example.com/v1/a.b/search'), true);   // 普通的点放行，只有 `.`、`..` 和编码点不行
+    // `*` 段是白名单：路径参数、编码、双重编码都不行
+    for (const u of ['https://api.example.com/v1/..;/search', 'https://api.example.com/v1/.;/search', 'https://api.example.com/v1/a;x=1/search',
+      'https://api.example.com/v1/%3B/search', 'https://api.example.com/v1/%3b/search', 'https://api.example.com/v1/%252e%252e/search',
+      'https://api.example.com/v1/.hidden/search', 'https://api.example.com/v1/a%20b/search', 'https://api.example.com/v1/a,b/search']) {
+      assert.equal(hit(u), false, u);
+    }
+    for (const u of ['https://api.example.com/v1/a/search', 'https://api.example.com/v1/A_b-c~1/search', 'https://api.example.com/v1/_x/search', 'https://api.example.com/v1/9/search']) {
+      assert.equal(hit(u), true, u);
+    }
+    // 接口主机里不能有 `*`（永远不会匹配）
+    for (const u of ['https://*.example.com/x', 'https://a.*/x', 'https://*/x']) assert.throws(() => ok(u), { code: 'usage' }, u);
     // 方法 '*'：任何方法
     const any = parseEndpoint({ url: 'https://a.example.com/logout' }, 'e', { methods: 'any' });
     assert.equal(matchEndpoint(any, 'GET', 'https://a.example.com/logout'), true);
@@ -370,7 +390,7 @@ describe('groups', () => {
 
   test('identity selector shapes', () => {
     const sel = (selector: string, expect = 'T'): string => withGroups(grp({ identity: { selector, expect } }));
-    for (const bad of ['e12', 'f1e3', ' e12 ', 'text=x', 'css=a', 'role=button[name="x"]', 'a >> b', 'role:button', 'getByRole("button")', 'getByText("x")',
+    for (const bad of ['e12', 'f1e3', ' e12 ', 'text=x', 'css=a', 'text =x', '(//div)[1]', '((//div))[1]', 'h1=x', '*=x', 'a+b=c', 'css:light=a', ' text=x', 'role=button[name="x"]', 'a >> b', 'role:button', 'getByRole("button")', 'getByText("x")',
       'internal:role=button', '//div', '../x', '"text"', "'text'", '', 'a'.repeat(301), 'a\nb']) {
       assert.throws(() => parseRules(sel(bad)), { code: 'usage' }, JSON.stringify(bad));
     }

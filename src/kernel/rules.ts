@@ -139,7 +139,8 @@ export function parseRules(text: string): Rules {
 const RAW_URL = /^(https?):\/\/([^/?#]*)(\/[^?#]*)?$/i;
 const DOT_SEGMENT = /^(\.|%2e){1,2}$/i;
 const ENCODED_SEPARATOR = /%2f|%5c/i;
-const UNSAFE_WILDCARD_SEGMENT = /%2f|%5c|%2e/i;
+// `*` 匹配的那段只收这个白名单：非空、不以点开头，不含 `%`（编码）、`;`（路径参数）等。
+const WILDCARD_SEGMENT = /^[A-Za-z0-9_~-][A-Za-z0-9._~-]*$/;
 
 function splitPath(rawPath: string): string[] {
   return rawPath.slice(1).split('/');
@@ -159,7 +160,7 @@ export function parseEndpoint(v: unknown, name: string, o: { methods: readonly s
   const s = str(obj.url, `${name}.url`, { min: 1, max: MAX_ENDPOINT_URL });
   if (/[^\x21-\x7e]/.test(s) || s.includes('\\')) throw usage(bad);
   const m = RAW_URL.exec(s);
-  if (m === null || m[2]!.includes('@')) throw usage(bad);
+  if (m === null || /[@*]/.test(m[2]!)) throw usage(bad);
   let u: URL;
   try {
     u = new URL(s);
@@ -194,22 +195,23 @@ export function matchEndpoint(e: Endpoint, method: string, url: string): boolean
   return e.path.every((want, i) => {
     const got = segs[i]!;
     if (want !== '*') return got === want;
-    return got !== '' && !DOT_SEGMENT.test(got) && !UNSAFE_WILDCARD_SEGMENT.test(got);
+    return WILDCARD_SEGMENT.test(got);
   });
 }
 
 // ---- 身份探针 ----
 
-// 会被 driver 的 locate 或 Playwright 当成别的东西的写法一律不收：快照引用、`role=…` 一类引擎前缀、`>>` 链、
-// role:/getBy…/internal:、XPath（`//`、`..` 开头）、引号开头的文本选择器。
+// 会被 driver 的 locate 或 Playwright 当成别的东西的写法一律不收：快照引用、引擎前缀（照 Playwright：trim 后
+// 开头是 `[a-zA-Z_0-9+:*-]+` 再接可有空白的 `=`，如 `text =x`、`css:light=a`）、`>>` 链、role:/getBy…/internal:、
+// XPath（`//`、`(//`、`..` 开头）、引号开头的文本选择器。
 function parseIdentity(v: unknown, name: string): Identity {
   const o = plainObject(v, name, ['selector', 'expect']);
   const selector = str(o.selector, `${name}.selector`, { min: 1, max: MAX_SELECTOR });
   const expect = str(o.expect, `${name}.expect`, { min: 1, max: MAX_EXPECT });
   const t = selector.trim();
   if (/[\x00-\x1f\x7f]/.test(selector) || /[\x00-\x1f\x7f]/.test(expect)) throw usage(`${name} must not contain control characters`);
-  if (t === '' || /^(f\d+)?e\d+$/.test(t) || t.includes('>>') || /^[a-z_-]+=/i.test(t)
-    || /^(role:|getBy|internal:)/i.test(t) || /^(\/\/|\.\.|['"])/.test(t)) {
+  if (t === '' || /^(f\d+)?e\d+$/.test(t) || t.includes('>>') || /^[a-zA-Z_0-9+:*-]+\s*=/.test(t)
+    || /^(role:|getBy|internal:)/i.test(t) || /^\(*\/\//.test(t) || /^(\.\.|['"])/.test(t)) {
     throw usage(`${name}.selector must be a plain CSS selector (no snapshot reference, engine prefix, ">>" chain, role or XPath form)`);
   }
   return { selector, expect };
@@ -293,13 +295,20 @@ function parseGroups(v: unknown): Group[] {
       hostOwner.set(h, i);
     }
   });
-  // 某组的登录主机不能落在另一组的域名里（否则两组的登录会混在一起）。
+  // 某组的登录主机不能落在另一组的域名里（否则两组的登录会混在一起）。精确写法用 groupOf 判（最具体的组不是本组才拒）；
+  // 通配写法覆盖的范围不止一个主机，只要和别组的 hosts 写法重叠就拒。
+  const asRules: Rules = { rules: [], loginHosts: [], groups };
   groups.forEach((g, i) => {
-    for (const l of g.loginHosts) {
-      if (groups.some((other, j) => j !== i && other.hosts.some((h) => overlaps(l, h)))) {
-        throw usage(`groups[${i}].loginHosts has an entry that falls in another group's hosts`);
+    g.loginHosts.forEach((l, k) => {
+      if (l.startsWith('*.')) {
+        if (groups.some((other, j) => j !== i && other.hosts.some((h) => overlaps(l, h)))) {
+          throw usage(`groups[${i}].loginHosts[${k}] is a wildcard that overlaps another group's hosts`);
+        }
+      } else {
+        const owner = groupOf(asRules, l).name;
+        if (owner !== DEFAULT_GROUP_NAME && owner !== g.name) throw usage(`groups[${i}].loginHosts[${k}] is a host of another group's hosts`);
       }
-    }
+    });
   });
   return groups;
 }
