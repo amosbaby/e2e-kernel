@@ -173,7 +173,7 @@ node bin/e2k.js run ./smoke.case.json
 状态目录默认是 `~/.e2e-kernel/`，可用绝对路径的 `E2K_HOME` 覆盖。会话的目录是 `runs/<会话名>/<UTC 开始时间>-<会话 id>/`（`open` 结果里的 `runDir`），结束后里面有：
 
 - `report.html`：给人看的报告。
-- `result.json`：操作记录和汇总。其中 `eval` 的源码和不能确认安全的 `fill` 值都是 `[REDACTED]`，不能直接重放（要重跑用 `save-case`，见下）。
+- `result.json`：操作记录和汇总。其中 `eval` 的源码和不能确认安全的 `fill` 值都是 `[REDACTED]`，不能直接重放（要重跑用 `save-case`，见上）。
 - `shots/`：截图。动作失败时会自动留一张。
 
 ## 不能做什么
