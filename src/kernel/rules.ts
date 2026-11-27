@@ -529,7 +529,9 @@ function diffGroup(old: Group | null, now: Group, relax: string[], tighten: stri
 }
 
 // 规则 b 相对 a 的完整差异（不截断）：放宽的在前，收紧的在后。a 是已批准的，b 是待批的。
-export function diffRules(a: Rules, b: Rules): string[] {
+// hostModes 是批准记录里登录时选的模式：选了「不允许」的主机，若 a 没有规则命中它（所以 deny 在生效）、b 有规则命中且模式比 deny 松，
+// 这条规则等于把人选的「不允许」放宽了：每个受影响的主机在放宽段多一行。
+export function diffRules(a: Rules, b: Rules, hostModes: Readonly<Record<string, string>> = {}): string[] {
   const relax: string[] = [];
   const tighten: string[] = [];
 
@@ -562,13 +564,23 @@ export function diffRules(a: Rules, b: Rules): string[] {
   for (const [match, mode] of aRules) {
     if (!bRules.has(match)) (STRICTNESS[mode] > 0 ? relax : tighten).push(`- 规则 ${match}（${MODE_TEXT[mode]}）`);
   }
+  for (const [host, chosen] of Object.entries(hostModes)) {
+    if (chosen !== 'deny') continue;
+    try {
+      if (matchRule(a.rules, host) !== null) continue;   // 已批准的规则已经盖住了这个选择，规则行自己会分类
+      const hit = matchRule(b.rules, host);
+      if (hit !== null && STRICTNESS[hit.mode] < STRICTNESS.deny) relax.push(`~ 登录时选的不允许 ${host} → ${MODE_TEXT[hit.mode]}（规则 ${hit.match}）`);
+    } catch {
+      // 记录里的主机不合格：不参与
+    }
+  }
   return [...relax, ...tighten];
 }
 
 // 待批改动的说明：文件被删（b 为 null）、没有逐字段的差异（只是写法变了）也各有一行。
-export function summarizeChange(approved: Rules, pending: Rules | null): string[] {
+export function summarizeChange(approved: Rules, pending: Rules | null, hostModes: Readonly<Record<string, string>> = {}): string[] {
   if (pending === null) return ['规则文件被删了：所有规则失效'];
-  const lines = diffRules(approved, pending);
+  const lines = diffRules(approved, pending, hostModes);
   return lines.length === 0 ? ['规则文件内容变了，解析出来的规则没有差别'] : lines;
 }
 
@@ -578,7 +590,7 @@ type Comparison =
   | { kind: 'error'; error: string }
   | { kind: 'changed'; hash: string | null; shortHash: string | null; text: string | null; rules: Rules | null; summary: string[] };   // hash：完整 sha256（待批的身份）；shortHash：显示用；删文件都是 null
 
-function compareWithApproved(loaded: Loaded, snap: Snapshot): Comparison {
+function compareWithApproved(loaded: Loaded, snap: Snapshot, hostModes: Readonly<Record<string, string>>): Comparison {
   if (loaded.kind === 'absent') {
     return snap.text === null ? { kind: 'same' } : { kind: 'changed', hash: null, shortHash: null, text: null, rules: null, summary: summarizeChange(snap.rules, null) };
   }
@@ -590,7 +602,7 @@ function compareWithApproved(loaded: Loaded, snap: Snapshot): Comparison {
   } catch (e) {
     return { kind: 'error', error: parseError(e) };
   }
-  return { kind: 'changed', hash: fullHash(loaded.text), shortHash: loaded.hash, text: loaded.text, rules, summary: summarizeChange(snap.rules, rules) };
+  return { kind: 'changed', hash: fullHash(loaded.text), shortHash: loaded.hash, text: loaded.text, rules, summary: summarizeChange(snap.rules, rules, hostModes) };
 }
 
 // 给 CLI（rule list、rule diff、doctor）：自己读规则文件和批准记录，不经内核。批准记录读不了或没有，快照就是空的。
@@ -611,7 +623,7 @@ export function inspectRules(rulesFile: string, approvalsFile: string, io: Rules
   const loaded = loadFile(rulesFile, io);
   const { record, status } = readApprovals(approvalsFile);
   const snap = snapshotOf(record.rules);
-  const c = compareWithApproved(loaded, snap);
+  const c = compareWithApproved(loaded, snap, record.hostModes);
   const approvals: ApprovalsStatus = snap.valid ? status : 'unreadable';
   const base = { file: toRulesFile(loaded), approvals, approvedRules: snap.rules, approvedCount: snap.rules.rules.length, hostModes: record.hostModes, writes: record.writes };
   if (c.kind !== 'changed') return { ...base, pending: false, fileDeleted: false, hash: null, summary: [] };
@@ -649,24 +661,28 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
   let approvalsChanged = false;
 
   const refresh = (): void => {
-    const c = compareWithApproved(loadFile(file, io), snap);
+    const c = compareWithApproved(loadFile(file, io), snap, store.get().hostModes);
     if (c.kind === 'changed') { pending = { hash: c.hash, shortHash: c.shortHash, text: c.text, rules: c.rules, summary: c.summary }; error = null; }
     else if (c.kind === 'error') { pending = null; error = c.error; }
     else { pending = null; error = null; }
     approvalsChanged = store.externallyChanged();
   };
 
-  // 已批准和待批文件里更严的那份；主机不合格时抛出（resolve 据此失败关闭，ruleFor 据此给 null）。
-  const effective = (host: string): RuleMode | null => {
-    const a = matchRule(snap.rules.rules, host)?.mode ?? null;
+  // 已批准的规则命中的模式；没有就用登录时选的模式（hostModes，精确主机）当基线。主机不合格时抛出。
+  const approvedRule = (host: string): RuleMode | null => matchRule(snap.rules.rules, host)?.mode ?? null;
+  // 待批文件里命中的只读 / 不允许（待批的 default 是放宽，不算）。
+  const pendingTight = (host: string): RuleMode | null => {
     const p = pending?.rules == null ? null : matchRule(pending.rules.rules, host)?.mode ?? null;
-    // 待批的 default 不算（它是放宽，也不能盖住登录时选的模式）；只有只读 / 不允许才参与取严。
-    const tight = p !== null && STRICTNESS[p] > 0 ? p : null;
-    return tight !== null && (a === null || STRICTNESS[tight] > STRICTNESS[a]) ? tight : a;
+    return p !== null && STRICTNESS[p] > 0 ? p : null;
   };
 
-  // 登录时选的模式：精确的规范化主机；只在没有任何规则覆盖（含待批里的只读）时才轮到它。主机不合格时抛出。
-  const modeOf = (host: string): RuleMode | null => effective(host) ?? store.hostModeFor(normalizeHost(host));
+  // 基线（已批准的规则，没有命中才轮到登录时选的模式）和待批文件里更严的那份取严：待批只能收紧，不能把基线放宽
+  // （比如待批的只读规则不能把登录时选的「不允许」降成只读）；主机不合格时抛出（resolve 据此失败关闭，ruleFor 据此给 null）。
+  const modeOf = (host: string): RuleMode | null => {
+    const base = approvedRule(host) ?? store.hostModeFor(normalizeHost(host));
+    const tight = pendingTight(host);
+    return tight !== null && (base === null || STRICTNESS[tight] > STRICTNESS[base]) ? tight : base;
+  };
 
   const ruleFor = (host: string): RuleMode | null => {
     try {
@@ -676,9 +692,13 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     }
   };
 
+  // 模式只因为登录时选过才有：没有已批准的规则命中，且待批的收紧也没有盖过它（持平算规则）。
   const hostChoice = (host: string): RuleMode | null => {
     try {
-      return effective(host) === null ? store.hostModeFor(normalizeHost(host)) : null;
+      if (approvedRule(host) !== null) return null;
+      const chosen = store.hostModeFor(normalizeHost(host));
+      const tight = pendingTight(host);
+      return chosen === null || (tight !== null && STRICTNESS[tight] >= STRICTNESS[chosen]) ? null : chosen;
     } catch {
       return null;
     }

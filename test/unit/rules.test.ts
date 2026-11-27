@@ -979,6 +979,81 @@ test('hostModes can hold deny (the two-step login box): it resolves to denied wi
   assert.equal(m.groupHasDeny('g'), false, 'hostModes hosts are by definition not in any group, and groupHasDeny only looks at rules');
 });
 
+// 待批的规则只能收紧：不能把登录时选的「不允许」降成只读 / 默认（评审实测过的漏洞）。
+test('a stored deny host choice stays denied under a pending read-only or default rule (exact and wildcard); a pending deny keeps it denied and takes the reason', () => {
+  const rules = (extra: object[]) => JSON.stringify({ version: 1, rules: [{ match: 'other.example.org', mode: 'default' }, ...extra] });
+  const { f, io } = fakeIo(rules([]));
+  const store = newStore();
+  const m = resolverOf(io, store);
+  approveNow(m);
+  chooseNow(store, 'picked.example.com', 'deny');
+  const check = (extra: object[], want: { mode: string; rule: string; choice: string | null }): void => {
+    f.text = rules(extra);
+    m.refresh();
+    assert.ok(m.pending() !== null || extra.length === 0);
+    assert.deepEqual([m.resolve('picked.example.com'), m.ruleFor('picked.example.com'), m.hostChoice('picked.example.com')], [want.mode, want.rule, want.choice], JSON.stringify(extra));
+  };
+  check([], { mode: 'denied', rule: 'deny', choice: 'deny' });
+  check([{ match: 'picked.example.com', mode: 'readonly' }], { mode: 'denied', rule: 'deny', choice: 'deny' });
+  check([{ match: '*.example.com', mode: 'readonly' }], { mode: 'denied', rule: 'deny', choice: 'deny' });
+  check([{ match: 'picked.example.com', mode: 'default' }], { mode: 'denied', rule: 'deny', choice: 'deny' });
+  check([{ match: '*.example.com', mode: 'default' }], { mode: 'denied', rule: 'deny', choice: 'deny' });
+  check([{ match: 'picked.example.com', mode: 'deny' }], { mode: 'denied', rule: 'deny', choice: null });   // 待批的 deny 持平：算规则
+  // 对照：登录时选的是默认 / 只读，待批的更严规则照旧立刻生效
+  chooseNow(store, 'free.example.com', 'default');
+  f.text = rules([{ match: 'free.example.com', mode: 'readonly' }]);
+  m.refresh();
+  assert.deepEqual([m.resolve('free.example.com'), m.hostChoice('free.example.com')], ['readonly', null]);
+});
+
+test('once a rule that relaxes a stored deny is approved, the approved rule wins (a wrong choice can be corrected by a rule)', () => {
+  const { f, io } = fakeIo(JSON.stringify({ version: 1, rules: [] }));
+  const store = newStore();
+  const m = resolverOf(io, store);
+  approveNow(m);
+  chooseNow(store, 'picked.example.com', 'deny');
+  f.text = JSON.stringify({ version: 1, rules: [{ match: 'picked.example.com', mode: 'readonly' }] });
+  m.refresh();
+  assert.equal(m.resolve('picked.example.com'), 'denied');
+  approveNow(m);
+  assert.deepEqual([m.resolve('picked.example.com'), m.hostChoice('picked.example.com')], ['readonly', null]);
+});
+
+describe('a rule that relaxes a stored deny host choice is listed as a relaxation', () => {
+  function summaryWith(choices: string[], next: object[]): string[] {
+    const { f, io } = fakeIo(JSON.stringify({ version: 1, rules: [{ match: 'other.example.org', mode: 'default' }] }));
+    const store = newStore();
+    const m = resolverOf(io, store);
+    approveNow(m);
+    for (const h of choices) chooseNow(store, h, 'deny');
+    f.text = JSON.stringify({ version: 1, rules: [{ match: 'other.example.org', mode: 'default' }, ...next] });
+    m.refresh();
+    return m.pending()?.summary ?? [];
+  }
+
+  test('an exact rule: one relax line for the host (before the tightening line of the rule itself)', () => {
+    assert.deepEqual(summaryWith(['picked.example.com'], [{ match: 'picked.example.com', mode: 'readonly' }]),
+      ['~ 登录时选的不允许 picked.example.com → 只读（规则 picked.example.com）', '+ 规则 picked.example.com（只读）']);
+  });
+
+  test('a wildcard rule: one line per affected host, with the rule that hits it; default shows as 默认; unaffected hosts and deny rules add nothing', () => {
+    const lines = summaryWith(['a.example.com', 'b.example.com', 'c.example.net'], [{ match: '*.example.com', mode: 'default' }]);
+    assert.deepEqual(lines, ['+ 规则 *.example.com（默认）', '~ 登录时选的不允许 a.example.com → 默认（规则 *.example.com）', '~ 登录时选的不允许 b.example.com → 默认（规则 *.example.com）']);
+    assert.deepEqual(summaryWith(['a.example.com'], [{ match: '*.example.com', mode: 'deny' }]), ['+ 规则 *.example.com（不允许）']);
+  });
+
+  test('a host the approved rules already cover is not listed again (the rule line classifies itself)', () => {
+    const { f, io } = fakeIo(JSON.stringify({ version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }] }));
+    const store = newStore();
+    const m = resolverOf(io, store);
+    approveNow(m);
+    chooseNow(store, 'a.example.com', 'deny');
+    f.text = JSON.stringify({ version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'a.example.com', mode: 'default' }] });
+    m.refresh();
+    assert.deepEqual(m.pending()?.summary, ['+ 规则 a.example.com（默认）']);
+  });
+});
+
 describe('deny in the pending summary', () => {
   function summary(base: { match: string; mode: string }[], next: { match: string; mode: string }[] | null): string[] {
     const { f, io } = fakeIo(rulesFile(base));

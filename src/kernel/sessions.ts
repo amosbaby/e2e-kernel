@@ -939,7 +939,7 @@ export class SessionManager {
 
   // 登录前的弹框确认（设计 5.2「第一次登录问模式」），两步：主机没列明（已批准的规则、登录时选过、组、任何 loginHosts 都没有）就先问人。
   // 第一步（键 `login:` + 规范化主机）：不登录 / 默认 / 更严…。「默认」写 hostModes 就完；「更严…」什么都不写，进第二步。
-  // 第二步（键 `login-strict:` + 规范化主机，kind 仍是 login）：不登录 / 只读 / 不允许，选择记进批准记录的 hostModes（不改 rules.json）。
+  // 第二步（键 `login-strict:` + 规范化主机 + `|` + profile，kind 仍是 login；框里还显示 profile）：不登录 / 只读 / 不允许，选择记进批准记录的 hostModes（不改 rules.json）。
   // 按钮不叫「取消」：避免被 osascript 当成系统取消键，见 approval.ts 的 isUserCancel（对话框最多 3 个按钮，所以要两步）。
   // 要在规则闸门之后、算 login.mode 之前，窗口也还没开；两步都在同一个同步段里（第一个 await 之前）。
   // 答复绑定框里显示的全部内容：框里只有这个主机和选项，所以键已经绑定了。第一步答了「更严…」的答复留着，直到第二步答完才和第二步的一起 forget。
@@ -947,15 +947,14 @@ export class SessionManager {
   // 选「不允许」的这次登录本身就是 R5 的那次批准：gateLoginDeny 在它之前跑过了（那时主机还不是 deny），所以这次不再弹「在不允许的域名上登录」；
   // 窗口里 denied 照旧按只读算，下一次 login 这个主机就照 R5 每次弹框。
   // 规范化不了的主机（含取不到主机）不弹框，直接 usage：失败关闭。写盘失败时 needs-human 原样往上走，答复还留着，重试会再写一次。
-  private gateLoginHost(rawHost: string): void {
+  private gateLoginHost(rawHost: string, profile: string): void {
     const { modes, approvals, store } = this.deps;
     if (modes.isListed(rawHost)) {
       // 已列明（比如规则后来批准了）：之前没用掉的答复不能留着，免得以后又没列明时直接生效。
       try {
         const h = normalizeHost(rawHost);
-        for (const stale of [`login:${h}`, `login-strict:${h}`]) {
-          if (approvals.stateOf(stale) === 'approved') approvals.forget(stale);
-        }
+        if (approvals.stateOf(`login:${h}`) === 'approved') approvals.forget(`login:${h}`);
+        approvals.forgetApproved((k) => k.startsWith(`login-strict:${h}|`));   // 第二步的键带 profile：任何 profile 的旧答复都丢
       } catch {
         // 规范化不了的主机谈不上有旧答复
       }
@@ -993,10 +992,10 @@ export class SessionManager {
       return;
     }
     if (asked.button !== '更严…') throw new E2kError('internal', '登录的答复对不上');   // 不放行
-    const strictKey = `login-strict:${host}`;
+    const strictKey = `login-strict:${host}|${profile}`;   // 框里显示主机和 profile，键就绑这两样
     const second: DialogRequest = {
       title: 'e2k：在新域名上登录（更严的模式）',
-      lines: [`要在 ${host} 上打开登录窗口。`, '只读：写请求会被拦下', '不允许：以后每次打开这个域名（open、login、借用）都要人点框批准；这次登录窗口里按只读拦写', '不登录：不打开'],
+      lines: [`要在 ${host} 上打开登录窗口。`, `profile：${profile}`, '只读：写请求会被拦下', '不允许：以后每次打开这个域名（open、login、借用）都要人点框批准；这次登录窗口里按只读拦写', '不登录：不打开'],
       buttons: ['不登录', '只读', '不允许'], defaultButton: '不登录', timeoutSec: APPROVAL_TIMEOUT_SEC,
     };
     const strict = approvals.ask(strictKey, 'login', second, ['只读', '不允许']);
@@ -1055,7 +1054,7 @@ export class SessionManager {
     const profile = profileKey(ref);
     // 闸门全部同步：先问在不允许的域名上登录（R5），再问没列明的主机的模式；全过了才用掉 deny 的答复（R7），免得后一道抛错、重试时又被问。
     const denyKey = this.gateLoginDeny(host, profile);
-    this.gateLoginHost(host);
+    this.gateLoginHost(host, profile);
     if (denyKey !== null) this.deps.approvals.forget(denyKey);
     this.loginsOpening++;   // pin 之前加：登记进 logins 之前的整段窗口都算「正在开」；finally 里减，pin 抛错、启动失败、成功都减
     try {
