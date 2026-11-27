@@ -9,6 +9,9 @@ It does not call a model, does not type passwords and does not solve CAPTCHAs: *
 - **Real, headed browser**: Chromium driven by Playwright, one browser per login profile.
 - **Read-only where you say so**: `rules.json` marks hosts read-only; writes there are blocked and recorded.
 - **A person approves the exceptions**: rule changes and declared writes wait for a click in a native dialog. There is no `approve` command.
+- **Deny where it matters**: a host marked `deny` cannot be opened by an agent on its own; every run needs a person's approval ([Deny mode](docs/reference.md#deny-mode)).
+- **Save a run as a case and replay it**: `save-case` exports a replayable case file from a closed session, `run` replays it without an agent ([Cases](docs/reference.md#cases)).
+- **An MCP shell**: `e2k mcp` serves the same commands over stdio for agents that prefer MCP; it has no login, rule-editing or approval tool ([MCP shell](docs/reference.md#mcp-shell)).
 - **A report for people**: every session ends in `report.html` and `result.json`, redacted.
 
 If you are an AI agent, read [docs/agent-guide.md](docs/agent-guide.md) first. The full reference is [docs/reference.md](docs/reference.md).
@@ -33,7 +36,7 @@ node bin/e2k.js step s-1a2b3c '[{"op":"click","target":"e7"},{"op":"assert","kin
 node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by one"
 ```
 
-`open` returns a session id and a first snapshot with refs (`e7`); `step` runs a JSON batch of up to 50 operations; `close` writes the report under `~/.e2e-kernel/runs/`. A person signs in with `node bin/e2k.js login <url>`. Other commands: `status`, `doctor`, `rule list`, `rule diff`, `help`. After `npm link` you can type `e2k <command>`; run `npm run build` after changing the source.
+`open` returns a session id and a first snapshot with refs (`e7`); `step` runs a JSON batch of up to 50 operations; `close` writes the report under `~/.e2e-kernel/runs/`. A person signs in with `node bin/e2k.js login <url>`. Other commands: `save-case`, `run`, `mcp`, `status`, `doctor`, `rule list`, `rule diff`, `help`. After `npm link` you can type `e2k <command>`; run `npm run build` after changing the source.
 
 ## Read-only mode and approvals
 
@@ -59,7 +62,7 @@ The kernel never types a password (`fill` refuses password-like fields), redacts
 
 ## Status and documents
 
-Status: M2b (kernel, CLI, read-only mode, approvals, domain groups and profiles, identity probe, foreground handed back). `deny` mode, `save-case` / `run` and an MCP shell are M3; see [Not in this version](docs/reference.md#not-in-this-version).
+Status: M3 (kernel, CLI, read-only mode, approvals, domain groups and profiles, identity probe, foreground handed back, `deny` mode, `save-case` / `run`, an MCP shell). Running Claude Code and Codex CLI through the MCP shell is still a manual acceptance step; see [MCP shell](docs/reference.md#mcp-shell) and [Not in this version](docs/reference.md#not-in-this-version).
 
 | document | what it is |
 |---|---|

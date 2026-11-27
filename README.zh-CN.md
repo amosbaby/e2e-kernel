@@ -9,6 +9,9 @@
 - **真实的有头浏览器**：由 Playwright 驱动的 Chromium，每个登录 profile 一个浏览器。
 - **你说只读就只读**：`rules.json` 把主机标成只读，在那里的写请求被拦下并记录。
 - **例外由人批准**：规则改动和声明要放行的写，都要等人在原生弹框里点一下。没有 `approve` 命令。
+- **要紧的域名可以设成不允许**：标成 `deny` 的主机，agent 不能自己打开，每次运行都要人批准（见 [Deny mode](docs/reference.md#deny-mode)）。
+- **存成用例，重跑**：`save-case` 把已 close 的会话导出成可重放的用例文件，`run` 不需要 agent 在场就能重跑（见 [Cases](docs/reference.md#cases)）。
+- **MCP 外壳**：`e2k mcp` 经标准输入输出提供同样的命令，给偏好 MCP 的 agent 用；没有登录、改规则和批准类工具（见 [MCP shell](docs/reference.md#mcp-shell)）。
 - **给人看的报告**：每个会话结束时生成 `report.html` 和 `result.json`，已脱敏。
 
 如果你是 AI agent，先读 [docs/agent-guide.md](docs/agent-guide.md)。完整参考见 [docs/reference.md](docs/reference.md)（英文）。
@@ -33,7 +36,7 @@ node bin/e2k.js step s-1a2b3c '[{"op":"click","target":"e7"},{"op":"assert","kin
 node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by one"
 ```
 
-`open` 返回会话 id 和带引用（`e7`）的第一份快照；`step` 执行一批 JSON 操作，一次最多 50 个；`close` 把报告写到 `~/.e2e-kernel/runs/` 下。人用 `node bin/e2k.js login <url>` 登录。其他命令：`status`、`doctor`、`rule list`、`rule diff`、`help`。`npm link` 之后可以直接写 `e2k <命令>`；改了源码要跑 `npm run build`。
+`open` 返回会话 id 和带引用（`e7`）的第一份快照；`step` 执行一批 JSON 操作，一次最多 50 个；`close` 把报告写到 `~/.e2e-kernel/runs/` 下。人用 `node bin/e2k.js login <url>` 登录。其他命令：`save-case`、`run`、`mcp`、`status`、`doctor`、`rule list`、`rule diff`、`help`。`npm link` 之后可以直接写 `e2k <命令>`；改了源码要跑 `npm run build`。
 
 ## 只读模式与人工批准
 
@@ -59,7 +62,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by o
 
 ## 状态与文档
 
-状态：M2b（内核、CLI、只读模式、人工批准、域名组和 profile、身份探针、开会话不抢前台）。`deny` 模式、`save-case` / `run` 和 MCP 外壳在 M3；见 [Not in this version](docs/reference.md#not-in-this-version)。
+状态：M3（内核、CLI、只读模式、人工批准、域名组和 profile、身份探针、开会话不抢前台、`deny` 模式、`save-case` / `run`、MCP 外壳）。让 Claude Code 和 Codex CLI 真实地通过 MCP 外壳各跑一遍还是人工验收的一步；见 [MCP shell](docs/reference.md#mcp-shell) 和 [Not in this version](docs/reference.md#not-in-this-version)。
 
 | 文档 | 内容 |
 |---|---|
