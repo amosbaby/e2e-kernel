@@ -1,4 +1,5 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { E2kError } from '../shared/errors.ts';
 import type { Home } from '../shared/paths.ts';
 import { resolveInside } from '../shared/paths.ts';
@@ -46,22 +47,51 @@ export function readResult(dir: string): unknown {
   }
 }
 
-export function findRunDir(home: Home, session: string): string {
-  if (typeof session !== 'string' || !SESSION_ID.test(session)) throw usage('会话 id 的格式不对');
-  let names: string[];
+function listDir(dir: string): string[] {
   try {
-    names = readdirSync(home.runsDir);
+    return readdirSync(dir);
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT' && code !== 'ENOTDIR') throw e;
-    names = [];
+    return [];
   }
-  const newest = names.filter((n) => RUN_DIR_RE.test(n) && n.endsWith(`-${session}`)).sort().pop();
+}
+
+function isRealDir(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+// 内核落盘在 runs/<会话名>/<时间戳>-<id>/：遍历每个会话名目录（符号链接的忽略），把所有名下的候选合起来按目录名（时间戳在前）取最新的。
+// 返回目录和已读出的 result.json（调用方不必再读一遍）。
+export function findRun(home: Home, session: string): { dir: string; result: Record<string, unknown> } {
+  if (typeof session !== 'string' || !SESSION_ID.test(session)) throw usage('会话 id 的格式不对');
+  const suffix = `-${session}`;
+  const candidates: { name: string; dir: string }[] = [];
+  for (const nameEntry of listDir(home.runsDir)) {
+    let nameDir: string;
+    try {
+      nameDir = resolveInside(home.runsDir, nameEntry);
+    } catch {
+      continue;
+    }
+    if (!isRealDir(nameDir)) continue;
+    for (const entry of listDir(nameDir)) {
+      if (RUN_DIR_RE.test(entry) && entry.endsWith(suffix)) candidates.push({ name: entry, dir: join(nameDir, entry) });
+    }
+  }
+  const newest = candidates.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).pop();
   if (newest === undefined) throw usage('没有这个会话的记录');
-  const dir = resolveInside(home.runsDir, newest);
-  const st = lstatSync(dir);
-  if (!st.isDirectory()) throw usage('这个会话的记录目录不对');
-  const result = readResult(dir);
+  if (!isRealDir(newest.dir)) throw usage('这个会话的记录目录不对');
+  const result = readResult(newest.dir);
   if (!isObject(result) || result.session !== session) throw usage('记录里的会话 id 和目录对不上');
-  return dir;
+  return { dir: newest.dir, result };
+}
+
+export function findRunDir(home: Home, session: string): string {
+  return findRun(home, session).dir;
 }

@@ -1,7 +1,8 @@
-import { closeSync, constants, fchmodSync, openSync, realpathSync, rmSync, writeSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { closeSync, constants, fchmodSync, openSync, realpathSync, rmSync, statSync, writeSync } from 'node:fs';
+import type { Stats } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { MAX_CASE_BYTES, buildCase, parseCase } from '../cases/case.ts';
-import { findRunDir, readResult } from '../cases/find-run.ts';
+import { findRun } from '../cases/find-run.ts';
 import { E2kError } from '../shared/errors.ts';
 import type { ErrorCode } from '../shared/errors.ts';
 import type { Home } from '../shared/paths.ts';
@@ -17,6 +18,33 @@ function usage(message: string): E2kError {
   return new E2kError('usage', message);
 }
 
+// dir 是不是 root 本身或在它之内：从 dir 沿父目录往上逐级比 dev + ino，不比路径字符串
+// （大小写不敏感的卷上 realpath 不规范化大小写，字符串比较能被 H2 / h2 这样的写法绕过）。
+// root 不存在（取不到 ino）时退回按小写比路径字符串。
+function isInsideOrSame(root: string, dir: string): boolean {
+  let rootStat: Stats | null = null;
+  try {
+    rootStat = statSync(root);
+  } catch {
+    rootStat = null;
+  }
+  const rootLower = resolve(root).toLowerCase();
+  let cur = dir;
+  for (;;) {
+    if (rootStat !== null) {
+      try {
+        const st = statSync(cur);
+        if (st.dev === rootStat.dev && st.ino === rootStat.ino) return true;
+      } catch { /* 这一级读不了：继续往上 */ }
+    } else if (cur.toLowerCase() === rootLower) {
+      return true;
+    }
+    const up = dirname(cur);
+    if (up === cur) return false;
+    cur = up;
+  }
+}
+
 // --out：必须是 .json，所在目录要存在，而且按真实路径不能在状态目录（$E2K_HOME）之内（也不能经符号链接绕进去）。
 // 返回要写的真实路径（父目录取真实路径，减少检查和写之间被换掉的余地）。
 function checkOut(home: Home, out: unknown): string {
@@ -29,16 +57,7 @@ function checkOut(home: Home, out: unknown): string {
   } catch {
     throw usage('--out 所在的目录不存在');
   }
-  let realRoot: string | null = null;
-  try {
-    realRoot = realpathSync(home.root);
-  } catch {
-    realRoot = null;   // 状态目录不存在：自然不在里面
-  }
-  if (realRoot !== null) {
-    const rel = relative(realRoot, realParent);
-    if (rel === '' || !(rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))) throw usage('--out 不能放在状态目录里，请换一个位置');
-  }
+  if (isInsideOrSame(home.root, realParent)) throw usage('--out 不能放在状态目录里，请换一个位置');
   return join(realParent, basename(abs));
 }
 
@@ -75,8 +94,7 @@ function toOutcome(e: unknown): CommandOutcome {
 export function saveCase(home: Home, p: { session: string; out: string; steps?: number[] }): CommandOutcome {
   try {
     const path = checkOut(home, p.out);
-    const run = readResult(findRunDir(home, p.session));
-    const c = buildCase(run, p.steps === undefined ? {} : { steps: p.steps });
+    const c = buildCase(findRun(home, p.session).result, p.steps === undefined ? {} : { steps: p.steps });
     const text = `${JSON.stringify(c, null, 2)}\n`;
     // 两格缩进会比紧凑写法大一些：写出去的必须仍在上限内、仍被 parseCase 认。
     if (Buffer.byteLength(text, 'utf8') > MAX_CASE_BYTES) throw usage('导出的用例超过大小上限，请用 --steps 只选一部分');

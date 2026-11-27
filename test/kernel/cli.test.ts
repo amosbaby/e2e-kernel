@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
+import { saveCase } from '../../src/cli/commands.ts';
 import { formatClose, formatOpen, formatStatus, formatStep } from '../../src/cli/format.ts';
 import type { Io } from '../../src/cli/main.ts';
 import { noDialog } from '../../src/kernel/approval.ts';
@@ -1382,6 +1383,25 @@ test('open --allow with bad JSON, a wrong shape, or a missing value is a usage e
 
 // ---- save-case：在客户端读已脱敏的 result.json 导出用例，不需要内核 ----
 
+test('a session really opened and closed through the kernel can be exported by save-case', async () => {
+  const o = io(); assert.equal(await main(['open', 'http://localhost:5173/', '--name', 'e2e-export', '--json'], o), 0);
+  const id = (JSON.parse(o.outText()) as OpenResult).session;
+  assert.equal(await main(['step', id, '[{"op":"click","target":"e2"},{"op":"assert","kind":"text","target":"#status","cmp":"eq","expected":"Added"}]'], io()), 0);
+  assert.equal(await main(['close', id], io()), 0);
+  const out = join(realpathSync(mkdtempSync(join(tmpdir(), 'e2k-out-'))), 'real.json');
+  try {
+    const r = saveCase(kernelTmp.home, { session: id, out });
+    assert.equal(r.exit, 0, JSON.stringify(r));
+    const c = JSON.parse(readFileSync(out, 'utf8')) as { name: string; source: { session: string }; steps: { seq: number; op?: { op: string }; skip?: { op: string } }[] };
+    assert.equal(c.name, 'e2e-export'); assert.equal(c.source.session, id);
+    assert.equal(c.steps.length, 2);
+    assert.equal(c.steps[0]?.op?.op ?? c.steps[0]?.skip?.op, 'click');   // 假驱动给不出稳定选择器：引用成了 skip
+    assert.equal(c.steps[1]?.op?.op, 'assert');
+  } finally {
+    rmSync(dirname(out), { recursive: true, force: true });
+  }
+});
+
 describe('save-case', () => {
   const sc = makeTmpHome();
   after(() => { sc.cleanup(); });
@@ -1401,8 +1421,9 @@ describe('save-case', () => {
   }
 
   // 在状态目录里放一份记录：result 是 null 时只建目录，不写 result.json（会话还没 close）。
-  function putRun(session: string, stamp: string, result: Record<string, unknown> | null): string {
-    const dir = join(sc.home.runsDir, `${stamp}-${session}`);
+  // 真实布局：runs/<会话名>/<时间戳>-<id>/（内核 sessions.ts 就这么落盘）。
+  function putRun(session: string, stamp: string, result: Record<string, unknown> | null, name = 'demo'): string {
+    const dir = join(sc.home.runsDir, name, `${stamp}-${session}`);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (result !== null) writeFileSync(join(dir, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
     return dir;
@@ -1498,6 +1519,17 @@ describe('save-case', () => {
     }
   });
 
+  test('save-case --out written with a different letter case than the state directory is refused too', async (t) => {
+    putRun('s-a00012', '20260101-000000', resultFor('s-a00012'));
+    const upper = join(dirname(sc.home.root), basename(sc.home.root).toUpperCase());
+    if (upper === sc.home.root || !existsSync(upper)) { t.skip('this volume is case-sensitive'); return; }
+    const out = join(upper, 'inside.json');
+    const e = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00012', '--out', out], e), 2);
+    assert.match(e.errText(), /状态目录/);
+    assert.ok(!existsSync(join(sc.home.root, 'inside.json')));
+  });
+
   test('save-case picks the newest run directory of a reused session id, and says close first when that one has no result.json', async () => {
     putRun('s-a00008', '20260101-000000', resultFor('s-a00008', { name: 'old-run' }));
     putRun('s-a00008', '20260202-000000', resultFor('s-a00008', { name: 'new-run' }));
@@ -1508,6 +1540,28 @@ describe('save-case', () => {
     const t = io({ env: scEnv });
     assert.equal(await main(['save-case', 's-a00008', '--out', outPath()], t), 2);
     assert.match(t.errText(), /close/);
+  });
+
+  test('save-case finds the newest run of one id across session-name directories, and ignores a name directory that is a symlink', async () => {
+    putRun('s-a00010', '20260101-000000', resultFor('s-a00010', { name: 'older' }), 'alpha');
+    putRun('s-a00010', '20260505-000000', resultFor('s-a00010', { name: 'newer' }), 'beta');
+    putRun('s-a00010', '20260303-000000', resultFor('s-a00010', { name: 'middle' }), 'gamma');
+    const out = outPath();
+    assert.equal(await main(['save-case', 's-a00010', '--out', out], io({ env: scEnv })), 0);
+    assert.equal((JSON.parse(readFileSync(out, 'utf8')) as { name: string }).name, 'newer');
+    // 会话名目录是符号链接：里面的记录不算（即使更新）
+    const elsewhere = join(outDir, 'elsewhere');
+    mkdirSync(join(elsewhere, '20260909-000000-s-a00011'), { recursive: true });
+    writeFileSync(join(elsewhere, '20260909-000000-s-a00011', 'result.json'), JSON.stringify(resultFor('s-a00011')));
+    symlinkSync(elsewhere, join(sc.home.runsDir, 'linked-name'));
+    const t = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00011', '--out', outPath()], t), 2);
+    assert.match(t.errText(), /没有这个会话的记录/);
+    // 同一个 id 在最新的名下还没 close：先 close，不退回更旧的
+    putRun('s-a00010', '20260606-000000', null, 'delta');
+    const nc = io({ env: scEnv });
+    assert.equal(await main(['save-case', 's-a00010', '--out', outPath()], nc), 2);
+    assert.match(nc.errText(), /close/);
   });
 
   test('save-case refuses a record whose session id does not match, a result.json that is a symlink, and one that is not JSON', async () => {

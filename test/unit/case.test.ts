@@ -305,6 +305,26 @@ test('parseCase refuses a bad op, eval, a step with both op and skip (or neither
   assert.doesNotThrow(() => parseCase(withSteps([{ seq: 4, skip: { op: 'eval', why: '不能重放' } }])));
 });
 
+test('parseCase refuses an executable step with [REDACTED] in any string or with a snapshot-ref target, without echoing', () => {
+  const g = goodCase();
+  const withSteps = (steps: unknown): string => JSON.stringify({ ...g, steps });
+  const bads: Record<string, unknown>[] = [
+    { op: 'fill', target: '#a', value: `x ${REDACTED} ${probe}` }, { op: 'wait', for: { text: `${REDACTED}${probe}` } }, { op: 'wait', for: { urlContains: REDACTED } },
+    { op: 'click', target: `[title=${REDACTED}]` }, { op: 'goto', url: `http://localhost:5173/${REDACTED}` },
+    { op: 'click', target: 'e5' }, { op: 'hover', target: 'f2e11' }, { op: 'wait', for: { target: 'e3', state: 'visible' } }, { op: 'screenshot', mask: ['#a', 'e4'] },
+    { op: 'text', target: 'e1' }, { op: 'assert', kind: 'text', target: 'e2', cmp: 'eq', expected: probe },
+  ];
+  for (const op of bads) refuses(withSteps([{ seq: 1, op }]), JSON.stringify(op));
+  // 选择器长得不像引用就可以
+  assert.doesNotThrow(() => parseCase(withSteps([{ seq: 1, op: { op: 'click', target: '#e5' } }])));
+});
+
+test('containsWrites is also true when the case carries an open.allow list (a deny-host write list)', () => {
+  const deny = { host: 'd.example.com', mode: 'writable', allow: [{ method: 'POST', url: 'http://d.example.com/api', operation: null }] };
+  assert.equal(buildCase(run({ start: start({ url: 'http://d.example.com/', deny }) }), {}).containsWrites, true);
+  assert.equal(buildCase(run({ start: start({ url: 'http://d.example.com/', deny: { ...deny, mode: 'readonly', allow: [] } }) }), {}).containsWrites, false);
+});
+
 test('parseCase refuses bad allow entries and more than 12 for one seq', () => {
   const g = goodCase();
   const withAllow = (allow: unknown): string => JSON.stringify({ ...g, allow });

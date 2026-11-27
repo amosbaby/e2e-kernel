@@ -69,6 +69,14 @@ function exact(v: unknown, path: string, fail: (path: string) => E2kError, requi
   return v;
 }
 
+// op 里任一目标（target、wait 的 for.target、截图遮罩 mask）是快照引用的形状。
+function hasRefTarget(op: Op): boolean {
+  const o = op as unknown as Record<string, unknown>;
+  const ref = (t: unknown): boolean => typeof t === 'string' && isRef(t);
+  const waitFor = o.for;
+  return ref(o.target) || (isObject(waitFor) && ref(waitFor.target)) || (Array.isArray(o.mask) && o.mask.some(ref));
+}
+
 // ---- parseCase ----
 
 function parseViewport(v: unknown, path: string): Viewport | null {
@@ -113,6 +121,8 @@ function parseStep(v: unknown, path: string): CaseStep {
   const op = guard(bad, `${path}.op`, () => validateOps([o.op])[0]!);
   // 导出的用例里 eval 一律是 skip：手改塞进一个可执行的 eval 不放行。
   if (op.op === 'eval') throw bad(`${path}.op`);
+  // 纵深防御：导出的可执行步骤里没有脱敏标记，也没有快照引用（重放时没有快照，引用无意义）。
+  if (hasRedacted(op) || hasRefTarget(op)) throw bad(`${path}.op`);
   return { seq, op };
 }
 
@@ -345,7 +355,7 @@ export function buildCase(run: unknown, o: { steps?: number[]; name?: string }):
     steps: chosen.map(stepFor),
     allow,
     findings,
-    containsWrites: w.allowed.length > 0 || declared.length > 0,
+    containsWrites: w.allowed.length > 0 || declared.length > 0 || openAllow.length > 0,
   };
   // 出口再过一遍 parseCase：导出的永远是 parseCase 认的，认不了就拒绝导出（不写出一份重放不了的文件）。
   try {
