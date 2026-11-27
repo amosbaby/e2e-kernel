@@ -321,12 +321,45 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
   assert.equal(redactSelector('[pw^=secret][x=1]'), `[pw^=${REDACTED}][x=1]`);
   assert.equal(redactSelector('[sid |= abc][x=1]'), `[sid |= ${REDACTED}][x=1]`);
   // 不紧跟 `[` 的 `名字=`：换到串尾，不在 `]` 处停下（失败关闭）。
-  for (const sel of ['#x token=ab]cd', 'a[href="/cb?token=abc]def"]', 'div;token=ab]cd ef', 'text=x&token=ab]cd', 'token=ab]cd']) {
+  for (const sel of ['[ a]token=abc]def', '#x token=ab]cd', 'a[href="/cb?token=abc]def"]', 'div;token=ab]cd ef', 'text=x&token=ab]cd', 'token=ab]cd']) {
     const out = redactSelector(sel);
     assert.ok(out.endsWith(REDACTED) && !out.includes('cd') && !out.includes('def'), `${sel} -> ${out}`);
     assert.equal(redactSelector(out), out);
   }
   assert.equal(redactSelector('#x token=abc >> div[x=1]'), `#x token=${REDACTED}`);
+  // 名字里的 CSS 转义、命名空间前缀、XPath 的 `@`、`-`/`_` 分段里的精确敏感名：先还原名字再判断。
+  const named: Array<[string, string]> = [
+    ['[t\\oken=secret][x=1]', `[t\\oken=${REDACTED}][x=1]`],
+    ['[\\74oken=secret][x=1]', `[\\74oken=${REDACTED}][x=1]`],
+    ['[\\74 oken=secret][x=1]', `[\\74 oken=${REDACTED}][x=1]`],
+    ['[\\000074oken = secret][x=1]', `[\\000074oken = ${REDACTED}][x=1]`],
+    ['[\\000070ass=secret][x=1]', `[\\000070ass=${REDACTED}][x=1]`],
+    ['[token| =secret][x=1]', `[token| =${REDACTED}][x=1]`],
+    ['[\\apikey =secret][x=1]', `[\\apikey =${REDACTED}][x=1]`],
+    ['[a\\[pw = secret][x=1]', `[a\\[pw = ${REDACTED}][x=1]`],
+    ['[a\\[pw^=secret][x=1]', `[a\\[pw^=${REDACTED}][x=1]`],
+    ['\\[a\\[ pw = secret][x=1]', `\\[a\\[ pw = ${REDACTED}][x=1]`],
+    ['[ns|pw=secret][x=1]', `[ns|pw=${REDACTED}][x=1]`],
+    ['[*|pw^=secret][x=1]', `[*|pw^=${REDACTED}][x=1]`],
+    ['[|sid=secret][x=1]', `[|sid=${REDACTED}][x=1]`],
+    ['[data-pw=secret][x=1]', `[data-pw=${REDACTED}][x=1]`],
+    ['[data_pass="secret"][x=1]', `[data_pass=${REDACTED}][x=1]`],
+    ['xpath=//input[@pw = "secret"]', `xpath=//input[@pw = ${REDACTED}]`],
+  ];
+  for (const [sel, want] of named) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // 引号里、或紧跟 `=` 的 `名字=`（`text=token=…`、可访问名里的 `token=…`）：换到串尾。
+  for (const sel of ['role=textbox[name="token=abc"]', 'text="token=abc"', "text='token=abc'", ':has-text("token=abc")', 'text=token=abc >> div']) {
+    const out = redactSelector(sel);
+    assert.ok(out.endsWith(REDACTED) && !out.includes('abc'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out);
+  }
+  // 不敏感的照旧（含转义名、引号里的 `名字=`）。
+  for (const sel of ['[d\\61ta-x=1][y=2]', '[data-x="a=b"]', 'role=button[name="Author=me"]', '[data-passage=1]', 'text="Sign in"']) {
+    assert.equal(redactSelector(sel), sel);
+  }
   // 引号没闭合：换到串尾（失败关闭）。
   assert.equal(redactSelector('[token=ab"cd][x=1]'), `[token=${REDACTED}`);
   assert.equal(redactSelector('[data-token = "abc][x=1]'), `[data-token = ${REDACTED}`);
@@ -351,7 +384,9 @@ test('redactSelector stays fast on adversarial input', () => {
   const inputs = ['[token=' + '['.repeat(1e5), '[token=['.repeat(30000), '[token=]'.repeat(30000), '[a=['.repeat(30000),
     '[token=' + '[]'.repeat(50000), '[token=' + ']'.repeat(1e5), '[token=a'.repeat(30000) + ']', '[token=' + '\\'.repeat(1e5), '[token=\\'.repeat(30000),
     '[' + 'a'.repeat(1e5), '[a '.repeat(30000), '[ '.repeat(30000), '[a^'.repeat(30000), '[token = "'.repeat(30000),
-    '[token="' + '\\'.repeat(1e5), '[token = ['.repeat(30000), '[token="' + ']'.repeat(1e5), "[a='".repeat(30000)];
+    '[token="' + '\\'.repeat(1e5), '[token = ['.repeat(30000), '[token="' + ']'.repeat(1e5), "[a='".repeat(30000),
+    '[' + '\\1'.repeat(50000), '[' + '\\111111'.repeat(30000), '[\\'.repeat(30000), '"a='.repeat(30000), "'a=".repeat(30000),
+    '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5)];
   const start = performance.now();
   for (const s of inputs) redactSelector(s);
   assert.ok(performance.now() - start < 2000);

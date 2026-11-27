@@ -36,9 +36,10 @@ const TOKEN_VALUE = /^[A-Za-z0-9+/_-]{32,}={0,2}$/;
 // 否则 `;a;a;a…` 这样的输入会让每个起点都扫到结尾。值在哪结束由 redactParamsInText 逐字符定，不交给正则。
 const URL_PARAM_NAME = /(^|[?&#\s;,({\[])([^=&#?\s"'<>;,({\[]+)=/g;
 const PARAM_VALUE_END = /[&#\s"<>]/;
-// 选择器里的 `[名字 运算符 值]`：`[`、名字、`=` 之间可以有空白，运算符是 `=` 或 `~ | ^ $ *` 加 `=`。
-// 名字的字符类不含空白、`=`、方括号和引号，和前后的 `\s*` 不相交，也不跨过下一个 `[`，所以不回溯。值在哪结束由 selectorValueEnd 定。
-const SELECTOR_ATTR = /\[\s*([^\s=\[\]"']+?)\s*[~|^$*]?=\s*/g;
+// 选择器里的 `名字=`：和 URL_PARAM_NAME 一样，只是名字前的分隔符另外认引号和 `=`（`text=token=…`、`[name="token=…"]`），
+// 并且分隔符放在后顾里，前一个匹配吃掉的 `=` 也能当分隔符。名字的字符类不含这些分隔符，所以每段名字只有一个起点，不回溯。
+const SELECTOR_PARAM_NAME = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)=/g;
+const ATTR_OPS = new Set(['~', '|', '^', '$', '*']);
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 // 自由文本里 JSON 形态的 `"名字" : "`，以及套了一层转义的 `\"名字\" : \"`。值的结尾由 redactJsonPairsInText 逐字符找。
 const JSON_PAIR_NAME = /"([^"\\\r\n]{1,100})"\s*:\s*"/g;
@@ -86,19 +87,20 @@ function redactCookieLine(line: string): string {
 // 自由文本里的 URL 参数，线性扫描：名字敏感时，值从 `=` 后一直到第一个 `&`、`#`、空白、`"`、`<`、`>` 或结尾
 // （`?` 不结束值，空值也换掉），换成 [REDACTED] 后从值的结尾接着找；名字不敏感时从 `=` 后接着找，
 // 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
-// selector 为真时（只用于选择器）：名字紧跟 `[` 的，值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
+// selector 为真时（只用于选择器）：名字前的分隔符另外认引号和 `=`（SELECTOR_PARAM_NAME）；名字紧跟 `[`（中间可有空白）、本身不含 `]` 的，
+// 值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
 function redactParamsInText(s: string, selector = false): string {
-  const re = new RegExp(URL_PARAM_NAME.source, 'g');
+  const re = new RegExp((selector ? SELECTOR_PARAM_NAME : URL_PARAM_NAME).source, 'g');
   let out = '';
   let copied = 0;
   for (let m = re.exec(s); m !== null; m = re.exec(s)) {
-    if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值
+    if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值（选择器模式下在后顾里）
     let start = m.index + m[0].length;
     if (selector) {
       // 名字紧跟 `[`（中间可有空白）：属性值，到配对的 `]` 为止。别的位置不知道值在哪结束，换到串尾（失败关闭，再过一遍也不变）。
-      let b = m.index + m[1]!.length - 1;
+      let b = start - 1 - m[2]!.length - 1;               // 名字前一个字符
       while (b >= 0 && /\s/.test(s[b]!)) b--;
-      const end = b >= 0 && s[b] === '[' ? selectorValueEnd(s, start) : s.length;
+      const end = b >= 0 && s[b] === '[' && !m[2]!.includes(']') ? selectorValueEnd(s, start) : s.length;
       out += s.slice(copied, start) + REDACTED;
       copied = end;
       re.lastIndex = end;
@@ -151,18 +153,72 @@ function selectorValueEnd(s: string, start: number): number {
   return s.length;
 }
 
-// 选择器里名字敏感的 `[名字 运算符 值]`，值换掉（含引号），名字、运算符、空白和 `]` 保留。名字不敏感时从值开头接着找。
+// CSS 转义在 i 处（s[i] 是 `\`）的结尾（不含）：`\` 加 1–6 位十六进制、可再跟一个空白；或者 `\` 加任意一个字符。
+function cssEscapeEnd(s: string, i: number): number {
+  let j = i + 1;
+  while (j < s.length && j - i <= 6 && /[0-9A-Fa-f]/.test(s[j]!)) j++;
+  if (j === i + 1) return Math.min(j + 1, s.length);
+  return j < s.length && /\s/.test(s[j]!) ? j + 1 : j;
+}
+
+// 选择器属性名是否敏感：先解开 CSS 转义，去掉命名空间前缀（最后一个 `|` 及之前）和 XPath 的 `@`；
+// 原样的名字、还原后的名字、URL 解码后的名字，或其中按 `-`、`_` 分出的任一段是敏感键，就算敏感（`data-pw`、`data_pass`；拿不准时偏向敏感）。
+function selectorAttrNameSensitive(raw: string): boolean {
+  let name = '';
+  for (let i = 0; i < raw.length;) {
+    if (raw[i] !== '\\') {
+      name += raw[i];
+      i++;
+      continue;
+    }
+    const end = cssEscapeEnd(raw, i);
+    const body = raw.slice(i + 1, end).trim();
+    if (/^[0-9A-Fa-f]+$/.test(body)) {
+      const cp = parseInt(body, 16);
+      name += cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '\ufffd';
+    } else name += body;
+    i = end;
+  }
+  name = name.slice(name.lastIndexOf('|') + 1);
+  if (name.startsWith('@')) name = name.slice(1);
+  return [raw, name, safeDecode(name)].some((n) => isSensitiveKey(n) || n.split(/[-_]/).some((part) => isSensitiveKey(part)));
+}
+
+// 选择器里名字敏感的 `[名字 运算符 值]`，值换掉（含引号），名字、运算符、空白和 `]` 保留。手写扫描，不交给正则：
+// `[`、名字、运算符、`=` 之间可以有空白；运算符是 `~ | ^ $ *` 加 `=`；名字到空白、`=`、方括号、引号或「运算符=」为止，
+// 反斜杠转义（见 cssEscapeEnd）算进名字。没匹配上就从名字里最后一个转义的 `[`（没有就从名字结尾）找下一个 `[`：
+// 名字里不含真正的 `[`，所以只有最后一个转义的 `[` 可能另起一个属性；每个字符最多扫两次。
 function redactSelectorAttrs(s: string): string {
-  const re = new RegExp(SELECTOR_ATTR.source, 'g');
   let out = '';
   let copied = 0;
-  for (let m = re.exec(s); m !== null; m = re.exec(s)) {
-    if (!isSensitiveKey(safeDecode(m[1]!))) continue;
-    const start = m.index + m[0].length;
-    const end = selectorValueEnd(s, start);
-    out += s.slice(copied, start) + REDACTED;
-    copied = end;
-    re.lastIndex = end;
+  let i = s.indexOf('[');
+  while (i >= 0) {
+    let j = i + 1;
+    while (j < s.length && /\s/.test(s[j]!)) j++;
+    const nameStart = j;
+    let escBracket = -1;                                   // 名字里最后一个被转义的 `[`：没匹配上时它也可能是属性开头
+    while (j < s.length) {
+      const c = s[j]!;
+      if (c === '\\') {
+        if (s[j + 1] === '[') escBracket = j + 1;
+        j = cssEscapeEnd(s, j);
+      }
+      else if (/[\s=[\]"']/.test(c) || (ATTR_OPS.has(c) && s[j + 1] === '=')) break;
+      else j++;
+    }
+    const nameEnd = j;
+    while (j < s.length && /\s/.test(s[j]!)) j++;
+    if (j < s.length && ATTR_OPS.has(s[j]!) && s[j + 1] === '=') j++;
+    if (nameEnd > nameStart && s[j] === '=' && selectorAttrNameSensitive(s.slice(nameStart, nameEnd))) {
+      j++;
+      while (j < s.length && /\s/.test(s[j]!)) j++;
+      const end = selectorValueEnd(s, j);
+      out += s.slice(copied, j) + REDACTED;
+      copied = end;
+      i = s.indexOf('[', end);
+      continue;
+    }
+    i = escBracket >= 0 ? escBracket : s.indexOf('[', nameEnd);
   }
   return out + s.slice(copied);
 }
