@@ -4699,6 +4699,7 @@ test('a page whose own top is on the borrowed group\'s deny host is not relaxed 
   const { sm, fake } = setupDeny(everyBox(), { rules: BORROW_RULES });
   const r = await openDenied(sm, fake, BORROW_OPEN);
   // 防线之一（页面地址证据会先冻结会话）漏掉时的第二道：关掉它，单独看有效模式的算法。
+  // 注意：这里按名字 mock 的是私有方法 freezeIfOtherGroup，它改名时这个测试要跟着改。
   mock.method(sm as unknown as { freezeIfOtherGroup: () => void }, 'freezeIfOtherGroup', () => {});
   assert.equal((await fake.emitRequest({ id: `t${++navSeq}`, pageId: r.pageId, method: 'GET', url: `${G_DENY}x`, topUrl: HOME_URL })).action, 'continue', 'the target alone is covered');
   const fromDenyTop = await fake.emitRequest({ id: `t${++navSeq}`, pageId: r.pageId, method: 'GET', url: HOME_URL + 'x', topUrl: `${G_DENY}page` });
@@ -4891,4 +4892,52 @@ test('a deny-writes approval nobody used within 5 minutes is asked again (R20): 
   assert.equal(writesBoxes(dialog).length, 2);
   await sm.step({ session: r.session, ops: SNAP, allow: [ALLOW_SAVE] });
   assert.equal(writesBoxes(dialog).length, 2);
+});
+
+test('both kinds in one step and the disk write fails: the step is needs-human, nothing is in force (denyAllow empty, nothing new in declared), and the write stays blocked; after the disk recovers the same retry goes through', async () => {
+  const { sm, fake, store } = setupDeny(everyBox(), { rules: BORROW_RULES });
+  const toG = { method: 'POST', url: `${G_DENY}api/save` };
+  const plain = { method: 'POST', url: 'http://localhost:5173/api/ok' };
+  const r = await openDenied(sm, fake, BORROW_OPEN);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] }), isCode('wait-approval'));
+  await settleDialog();   // 两个框都批准了
+  const declaredBefore = (inner(sm, r.session) as unknown as { declared: unknown[] }).declared.length;
+  const failing = mock.method(store, 'update', () => { throw new E2kError('needs-human', '写批准记录失败', '检查磁盘'); });
+  const snaps = methodCount(fake, 'snapshot');
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] }), isCode('needs-human'));
+  assert.equal(methodCount(fake, 'snapshot'), snaps, 'nothing ran');
+  assert.deepEqual(denyAllowOf(sm, r.session), []);
+  assert.equal((inner(sm, r.session) as unknown as { declared: unknown[] }).declared.length, declaredBefore);
+  await sm.step({ session: r.session, ops: SNAP });   // 之后不带 allow 的 step：deny 的写照样拦
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: toG.url, topUrl: HOME_URL, ...POST_JSON })), 403);
+  failing.mock.restore();
+  await sm.step({ session: r.session, ops: SNAP, allow: [toG, plain] });   // 磁盘好了：答复还在，原样重试走通
+  assert.equal(denyAllowOf(sm, r.session).length, 1);
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, url: toG.url, topUrl: HOME_URL, ...POST_JSON })).action, 'continue');
+});
+
+test('a step that cannot pass any more does not queue the other gate\'s box: a refused deny-writes key stops the plain box, a refused plain set stops the deny box', async () => {
+  const toG = { method: 'POST', url: `${G_DENY}api/save` };
+  const toG2 = { method: 'POST', url: `${G_DENY}api/other` };
+  const plain = { method: 'POST', url: 'http://localhost:5173/api/ok' };
+  const plain2 = { method: 'POST', url: 'http://localhost:5173/api/ok2' };
+  const isDenyBox = (r: DialogRequest): boolean => r.title.startsWith(WRITES_TITLE) && r.lines.includes(DENY_ONLY_NOTE);
+  // 1. deny 的框被拒了：同一组 deny 条目再来，不再为新的普通条目弹框
+  const a = setupDeny((r) => (isDenyBox(r) ? { kind: 'button', button: '拒绝' } : everyBox()(r)), { rules: BORROW_RULES });
+  const ra = await openDenied(a.sm, a.fake, BORROW_OPEN);
+  await assert.rejects(a.sm.step({ session: ra.session, ops: SNAP, allow: [toG, plain] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(writesBoxes(a.dialog).length, 2);
+  await assert.rejects(a.sm.step({ session: ra.session, ops: SNAP, allow: [toG, plain2] }), isCode('usage'));
+  await settleDialog();
+  assert.equal(writesBoxes(a.dialog).length, 2, 'no box for plain2');
+  // 2. 普通条目的框被拒了：同一组普通条目再来，不再为新的 deny 条目弹框
+  const b = setupDeny((r) => (r.title.startsWith(WRITES_TITLE) && !isDenyBox(r) ? { kind: 'button', button: '拒绝' } : everyBox()(r)), { rules: BORROW_RULES });
+  const rb = await openDenied(b.sm, b.fake, BORROW_OPEN);
+  await assert.rejects(b.sm.step({ session: rb.session, ops: SNAP, allow: [toG, plain] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(writesBoxes(b.dialog).length, 2);
+  await assert.rejects(b.sm.step({ session: rb.session, ops: SNAP, allow: [toG2, plain] }), isCode('usage'));
+  await settleDialog();
+  assert.equal(writesBoxes(b.dialog).length, 2, 'no box for toG2');
 });

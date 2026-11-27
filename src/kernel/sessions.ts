@@ -682,36 +682,51 @@ export class SessionManager {
     const pageDenied = this.deps.modes.resolve(host) === 'denied';
     const denyDecls = decls.filter((d) => pageDenied || this.targetsDenied(d));
     const plainDecls = decls.filter((d) => !denyDecls.includes(d));
-    const gates = [this.gateDenyDeclarations(s, denyDecls, host), this.gatePlainDeclarations(s, plainDecls, host)];
-    // 先把所有的框都问了；有没过的就抛，次序：被拒（usage）> 弹不出（needs-human）> 还在等（wait-approval）。
+    // 已经注定过不了的（被拒过）先抛，不为它再给人弹另一个框：普通条目的被拒记录不用问就知道，deny 条目问出来是被拒、冷却或弹不出（不是还在等）的也一样。
+    const plain = this.preparePlainDeclarations(s, plainDecls, host);
+    if (plain.refused !== null) throw plain.refused;
+    const deny = this.gateDenyDeclarations(s, denyDecls, host);
+    if (deny.error !== null && deny.error.code !== 'wait-approval') throw deny.error;
+    const plainGate = plain.ask();
+    // 两个框都问了；有没过的就抛，次序：被拒（usage）> 弹不出（needs-human）> 还在等（wait-approval）。
     const rank = (e: E2kError): number => (e.code === 'usage' ? 0 : e.code === 'needs-human' ? 1 : 2);
-    const failed = gates.flatMap((g) => (g.error === null ? [] : [g.error])).sort((x, y) => rank(x) - rank(y));
+    const failed = [deny.error, plainGate.error].flatMap((e) => (e === null ? [] : [e])).sort((x, y) => rank(x) - rank(y));
     if (failed.length > 0) throw failed[0]!;
-    // 写盘可能失败（needs-human）：会抛的先做，纯内存的后做，抛了就什么都没生效。
-    for (const g of gates) g.commit();
+    // 全有或全无：写盘可能失败（needs-human），所以先做会抛的普通条目的 commit，再做纯内存的 deny 条目的 commit；抛了就什么都没生效。
+    plainGate.commit();
+    deny.commit();
     const scope = `${s.group}/${host}`;
     for (const d of decls) {
       if (s.declared.some((e) => e.scope === scope && sameDeclaration(e.decl, d))) continue;
-      s.declared.push({ scope, decl: d, approved: gates[1]!.remembered.some((r) => sameDeclaration(r, d)) ? 'remembered' : 'dialog' });
+      s.declared.push({ scope, decl: d, approved: plainGate.remembered.some((r) => sameDeclaration(r, d)) ? 'remembered' : 'dialog' });
     }
   }
 
-  // 普通条目（目标和页面主机都不是不允许的域名）：问记住的批准。返回没过的错误（没有就是 null）、批准后才做的 commit、本来就记住了的条目。
-  private gatePlainDeclarations(s: Session, decls: Declaration[], host: string): DeclGate {
+  // 普通条目（目标和页面主机都不是不允许的域名）：问记住的批准。分两步：prepare 不弹框，只看这一组声明是不是已经被人拒过（refused，注定过不了）；
+  // ask 才去问，返回没过的错误（没有就是 null）、批准后才做的 commit、本来就记住了的条目。
+  private preparePlainDeclarations(s: Session, decls: Declaration[], host: string): { refused: E2kError | null; ask: () => DeclGate } {
     const { store, approvals } = this.deps;
     const none: DeclGate = { error: null, commit: () => {}, remembered: [] };
-    if (decls.length === 0) return none;
+    if (decls.length === 0) return { refused: null, ask: () => none };
     const scope = `${s.group}/${host}`;
     const have = store.writesFor(scope);
     const remembered = decls.filter((d) => have.some((h) => sameDeclaration(h, d)));
     const pending = decls.filter((d) => !remembered.includes(d));
-    if (pending.length === 0) return { ...none, remembered };
+    if (pending.length === 0) return { refused: null, ask: () => ({ ...none, remembered }) };
     const denyKey = sha256(JSON.stringify([s.group, host, pending.map(declarationKey)]));
     const refused = new E2kError('usage', '人拒绝了这些放行声明', '内核重启前同一组声明不会再问；要放行请换成别的声明');
     const key = `writes:${sha256(JSON.stringify([s.name, s.group, host, pending.map(declarationKey)]))}`;
     const earlier = this.askedWrites.get(denyKey);
     if (earlier !== undefined && [...earlier].some((k) => approvals.stateOf(k) === 'denied')) { this.deniedWrites.add(denyKey); this.askedWrites.delete(denyKey); }
-    if (this.deniedWrites.has(denyKey)) return { ...none, error: refused };
+    if (this.deniedWrites.has(denyKey)) return { refused, ask: () => ({ ...none, error: refused }) };
+    return { refused: null, ask: () => this.askPlainDeclarations(s, { scope, key, denyKey, pending, remembered, refused }) };
+  }
+
+  private askPlainDeclarations(s: Session, o: { scope: string; key: string; denyKey: string; pending: Declaration[]; remembered: Declaration[]; refused: E2kError }): DeclGate {
+    const { store, approvals } = this.deps;
+    const { scope, key, denyKey, pending, remembered, refused } = o;
+    const none: DeclGate = { error: null, commit: () => {}, remembered: [] };
+    const host = s.topHost;
     const asked = approvals.ask(key, 'writes', this.writesRequest(s, host, pending, false), ['放行']);
     switch (asked.status) {
       case 'pending':
