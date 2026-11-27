@@ -360,7 +360,7 @@ describe('groups', () => {
       assert.equal(hit(u), true, u);
     }
     // 接口主机里不能有 `*`（永远不会匹配）
-    for (const u of ['https://*.example.com/x', 'https://a.*/x', 'https://*/x']) assert.throws(() => ok(u), { code: 'usage' }, u);
+    for (const u of ['https://*.example.com/x', 'https://*.example.org:8443/x', 'https://*/x']) assert.throws(() => ok(u), { code: 'usage' }, u);
     // 方法 '*'：任何方法
     const any = parseEndpoint({ url: 'https://a.example.com/logout' }, 'e', { methods: 'any' });
     assert.equal(matchEndpoint(any, 'GET', 'https://a.example.com/logout'), true);
