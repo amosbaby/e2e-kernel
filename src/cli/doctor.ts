@@ -6,7 +6,7 @@ import { call } from '../shared/client.ts';
 import { redactText, safely } from '../shared/redact.ts';
 import { PROFILE_STATE_TEXT, lastLoginText } from './format.ts';
 import { DEFAULT_PROFILE, profileInfo } from '../kernel/profiles.ts';
-import { createRulesResolver } from '../kernel/rules.ts';
+import { inspectRules } from '../kernel/rules.ts';
 import { E2kError } from '../shared/errors.ts';
 import { assertSocketPathFits, ensurePrivateDir } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
@@ -87,13 +87,18 @@ function profileCheck(home: Home): Check {
   return { name, ok: true, detail: `profiles/${DEFAULT_PROFILE} ${PROFILE_STATE_TEXT[info.state]}；${login}` };
 }
 
-// 域名规则：自己读文件，不要内核在跑。没有文件不算失败；文件有错 open 会被拒绝，所以算失败。
+// 域名规则：自己读规则文件和批准记录，不要内核在跑。没有文件不算失败；文件有错 open 会被拒绝，批准记录读不了
+// 要重新批准全部规则，都算失败；有未批准的改动只是提醒（等人在弹框里批准）。
 function rulesCheck(home: Home, selfCmd: string): Check {
   const name = 'rules';
-  const s = createRulesResolver(home.rulesFile).state();
-  const { error } = s;
+  const r = inspectRules(home.rulesFile, home.approvalsFile);
+  const { error } = r.file;
   if (error !== null) return { name, ok: false, detail: safely(() => redactText(error)), fix: `改好 $E2K_HOME/rules.json，或运行 ${selfCmd} rule list 看错误` };
-  return { name, ok: true, detail: s.hash === null ? '没有规则' : `${s.count} 条规则` };
+  if (r.approvals === 'unreadable') {
+    return { name, ok: false, detail: '批准记录读不了：现有规则全部要重新批准', fix: `停掉内核，检查 $E2K_HOME/approvals.json（内核自己的状态文件，不要手改），再运行 ${selfCmd} start` };
+  }
+  if (r.pending) return { name, ok: true, detail: `${r.file.rules.length} 条，有未批准的改动（${selfCmd} rule diff 查看）` };
+  return { name, ok: true, detail: r.file.hash === null ? '没有规则' : `${r.file.rules.length} 条，已批准` };
 }
 
 async function kernelChecks(home: Home, selfCmd: string): Promise<Check[]> {

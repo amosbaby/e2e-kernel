@@ -1,16 +1,29 @@
 import type { Mode } from '../shared/protocol.ts';
+import type { ApprovalsStatus } from './approval-store.ts';
 import type { Group } from './rules.ts';
 
 // 域名规则里能写的模式。'denied' 是 M3 的事，规则文件现在不收。
 export type RuleMode = 'readonly' | 'default';
 
-// 规则缓存的当前状态。hash：当前生效那份文件内容的 'sha256:' + 前 16 位十六进制；没有文件为 null。
-// 文件改坏了：hash 仍是上一份好文件的（生效的那份），error 非 null。
-export interface RulesState { count: number; hash: string | null; error: string | null }
+// 规则的当前状态。count、hash：当前**生效**的那份（人批准过的快照）；没有批准过为 0 条、hash 为 null。
+// error：规则文件现在改坏了（生效的仍是批准快照）。
+// pending：规则文件和批准快照不一致，等人批准（hash 为 null 表示文件被删了）；没有为 null。
+// approvals：启动时批准记录的状态（读不了 = 现有规则全部重新批准）；approvalsChanged：运行中磁盘上的批准记录被外部改过
+// （只是提示，生效的仍是内存里最后一次批准）。
+export interface RulesState {
+  count: number; hash: string | null; error: string | null;
+  pending: { hash: string | null; tooLong: boolean } | null;
+  approvals: ApprovalsStatus; approvalsChanged: boolean;
+}
+
+// 待批的规则改动。text 是内存里留着的原文（批准时写的就是它，不重读磁盘），hash 是它的内容哈希；文件被删时两者都是 null。
+// summary 是和已批准内容逐字段比较的完整差异，放宽的排前面；超过 12 行 tooLong 为 true。
+export interface PendingRules { hash: string | null; text: string | null; summary: string[]; tooLong: boolean }
 
 // 按主机名（不带端口）定会话模式（设计 5.2）。
 export interface ModeResolver {
   // 入口先规范化主机；规范化失败按 'readonly'（失败关闭）。用缓存，不碰文件。
+  // 只认批准快照；规则文件有待批的改动时，取「已批准」和「待批文件」里更严的那份（待批是删文件则只看已批准的）。
   resolve(host: string): Mode;
   // 命中的规则模式，没命中（或主机不合格）为 null。给 ModeChange.reason 用。
   ruleFor(host: string): RuleMode | null;
@@ -20,9 +33,15 @@ export interface ModeResolver {
   group(name: string): Group | null;
   // 入口先规范化主机；失败为 false。只看 group 那个组的 loginHosts（'default' 组 = 顶层 loginHosts）；没有这个组为 false。
   isLoginHost(host: string, group: string): boolean;
-  // 读文件比内容哈希，变了才重新解析。解析失败：保留上一份好的，error 置为说明。
+  // 读规则文件和它的批准状态：和已批准的快照一样 = 无待批；不一样且解析得了 = 待批；改坏 = error（坏文件不进待批）。
+  // 生效的永远是批准快照；这里只更新「待批」和「有错」。
   refresh(): void;
   state(): RulesState;
+  // 内存里待批的那份（没有为 null）。
+  pending(): PendingRules | null;
+  // 只有内存里待批的哈希等于 hash 时，把内存里那份原文写进批准记录并生效，返回 true；否则 false（调用方重新 refresh）。
+  // 不重读磁盘。批准记录写不进磁盘时抛 E2kError，什么都不变。
+  approvePending(hash: string | null): boolean;
 }
 
 const emptyDefaultGroup = (): Group => ({ name: 'default', hosts: [], loginHosts: [], readPosts: [], persistedQueries: [], logout: [], identity: null });
@@ -35,5 +54,7 @@ export const defaultOnlyResolver: ModeResolver = Object.freeze({
   group: (name: string): Group | null => (name === 'default' ? emptyDefaultGroup() : null),
   isLoginHost: (): boolean => false,
   refresh: (): void => {},
-  state: (): RulesState => ({ count: 0, hash: null, error: null }),
+  state: (): RulesState => ({ count: 0, hash: null, error: null, pending: null, approvals: 'absent', approvalsChanged: false }),
+  pending: (): PendingRules | null => null,
+  approvePending: (): boolean => false,
 });

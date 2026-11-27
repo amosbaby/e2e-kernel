@@ -16,6 +16,7 @@ import type { CloseParams, CloseResult, Mode, OpenParams, OpenResult, SessionInf
 import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
 import type { Approvals } from './approval.ts';
+import type { ApprovalStore } from './approval-store.ts';
 import type { ModeResolver } from './mode.ts';
 import { DEFAULT_PROFILE, recordLogin } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
@@ -27,6 +28,7 @@ import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
 
 export interface SessionDeps {
   driver: Driver; home: Home; modes: ModeResolver; policy: WritePolicy;
+  store: ApprovalStore;   // 批准记录：放行声明、主机模式的批准存在这里（调用方在后面的任务里接上）
   idleMs: number; keepRuns: number; now(): Date; kernelVersion: string; log(line: string): void;
   approvals: Approvals;   // 待批表：弹框和结果都在这里（调用方在后面的任务里接上）
 }

@@ -17,7 +17,7 @@ const isCode = (code: string) => (e: unknown) => e instanceof E2kError && e.code
 
 test('resolveHome', () => {
   assert.deepEqual(resolveHome({ E2K_HOME: '/tmp/x' }), { root: '/tmp/x', socket: '/tmp/x/kernel.sock', pidFile: '/tmp/x/kernel.pid',
-    logFile: '/tmp/x/kernel.log', rulesFile: '/tmp/x/rules.json', profilesDir: '/tmp/x/profiles', runsDir: '/tmp/x/runs' });
+    logFile: '/tmp/x/kernel.log', rulesFile: '/tmp/x/rules.json', approvalsFile: '/tmp/x/approvals.json', profilesDir: '/tmp/x/profiles', runsDir: '/tmp/x/runs' });
   assert.ok(resolveHome({}).root.endsWith('/.e2e-kernel'));
   assert.throws(() => resolveHome({ E2K_HOME: 'relative/dir' }), E2kError);
 });

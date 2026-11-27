@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { E2kError } from './errors.ts';
 
-export interface Home { root: string; socket: string; pidFile: string; logFile: string; rulesFile: string; profilesDir: string; runsDir: string }
+export interface Home { root: string; socket: string; pidFile: string; logFile: string; rulesFile: string; approvalsFile: string; profilesDir: string; runsDir: string }
 
 // macOS 的 sockaddr_un.sun_path 是 104 字节，含结尾的 NUL，所以路径本身最多 103 字节。
 const MAX_SOCKET_PATH_BYTES = 103;
@@ -26,6 +26,7 @@ export function resolveHome(env: NodeJS.ProcessEnv): Home {
     pidFile: join(root, 'kernel.pid'),
     logFile: join(root, 'kernel.log'),
     rulesFile: join(root, 'rules.json'),
+    approvalsFile: join(root, 'approvals.json'),
     profilesDir: join(root, 'profiles'),
     runsDir: join(root, 'runs'),
   };

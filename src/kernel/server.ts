@@ -15,6 +15,7 @@ import { kernelVersion } from '../shared/version.ts';
 import { Approvals, osascriptDialog } from './approval.ts';
 import type { Dialog } from './approval.ts';
 import type { RulesState } from './mode.ts';
+import { ApprovalStore } from './approval-store.ts';
 import { createRulesResolver } from './rules.ts';
 import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
 import type { ProfileInfo } from './profiles.ts';
@@ -259,9 +260,10 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   const stopDeadlineMs = o.stopDeadlineMs ?? DEFAULT_STOP_DEADLINE_MS;
   const instances = new Set<Instance>();
   // 唯一组装 SessionDeps 的地方：M2 换掉 modes 和 policy 就接上了。
-  const modes = createRulesResolver(home.rulesFile);
+  const store = ApprovalStore.open(home.approvalsFile, (line) => { log.write(line); });
+  const modes = createRulesResolver(home.rulesFile, store);
   const sessions = new SessionManager({
-    driver: trackInstances(driver, instances), home, modes, policy,
+    driver: trackInstances(driver, instances), home, modes, store, policy,
     idleMs: o.idleMs ?? DEFAULT_IDLE_MS, keepRuns: o.keepRuns ?? DEFAULT_KEEP_RUNS, now: () => new Date(),
     kernelVersion: version, log: (line) => { log.write(line); },
     approvals: new Approvals(o.dialog ?? osascriptDialog(), (line) => { log.write(line); }),

@@ -1,6 +1,7 @@
 import type { Check } from '../driver/types.ts';
+import type { ApprovalsStatus } from '../kernel/approval-store.ts';
 import type { ProfileInfo } from '../kernel/profiles.ts';
-import type { RulesFile } from '../kernel/rules.ts';
+import type { Rule, RulesFile } from '../kernel/rules.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { CloseResult, OpResult, OpenResult, StepResult, Tallies } from '../shared/protocol.ts';
@@ -106,12 +107,15 @@ function profileLine(p: ProfileInfo): string {
   return `profile ${inline(p.name)} ${PROFILE_STATE_TEXT[p.state]}，最近一次 login ${lastLoginText(p)}`;
 }
 
-// 旧内核的 status 没有 rules：跳过这两行，不抛。
+// 旧内核的 status 没有 rules：跳过这些行，不抛；旧内核没有批准相关的字段也不抛。
 function rulesLines(rules: StatusResult['rules'] | undefined): string[] {
   if (rules === undefined) return [];
   return [
     rules.hash === null ? `规则 ${rules.count} 条` : `规则 ${rules.count} 条 ${inline(rules.hash)}`,
     ...(rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(rules.error)}`]),
+    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，收紧立刻按更严的判（rule diff 查看）']),
+    ...(rules.approvals === 'unreadable' ? ['批准记录读不了：现有规则全部要重新批准'] : []),
+    ...(rules.approvalsChanged === true ? ['批准记录文件被外部改过：运行中仍按内存里的批准，重启内核时以磁盘上的为准'] : []),
   ];
 }
 
@@ -131,25 +135,47 @@ export function formatStatus(r: StatusResult): string {
   return lines.join('\n');
 }
 
-// `rule list` 的结果：规则文件现在的样子，由 CLI 自己读，不经内核。
+// `rule list` 的结果：规则文件现在的样子加批准状态，由 CLI 自己读，不经内核。
 // 组只列名字、主机和各清单的条数：接口路径和身份探针留在文件里，不进输出。
+// approved（每条规则、每个组）：和批准快照里的一样；顶层 approved：文件没有错、也没有未批准的改动。
 export interface RuleGroupSummary {
   name: string; hosts: string[]; loginHosts: string[];
-  readPosts: number; persistedQueries: number; logout: number; identity: boolean;
+  readPosts: number; persistedQueries: number; logout: number; identity: boolean; approved: boolean;
 }
-export interface RuleListResult extends Omit<RulesFile, 'groups'> { path: string; groups: RuleGroupSummary[] }
+export interface RuleListResult extends Omit<RulesFile, 'groups' | 'rules'> {
+  path: string; rules: (Rule & { approved: boolean })[]; groups: RuleGroupSummary[];
+  approved: boolean; pending: boolean; approvals: ApprovalsStatus;
+}
+
+const APPROVED_TEXT = (ok: boolean): string => (ok ? '（已批准）' : '（未批准）');
+const PENDING_LINE = '有未批准的改动（rule diff 查看）';
+const UNREADABLE_LINE = '批准记录读不了：现有规则全部要重新批准';
 
 export function formatRuleList(r: RuleListResult): string {
   if (r.error !== null) return [`规则文件 ${inline(r.path)}`, inline(r.error)].join('\n');
-  if (r.hash === null) return '没有 rules.json，所有域名都是默认模式';
+  const notes = [...(r.pending ? [PENDING_LINE] : []), ...(r.approvals === 'unreadable' ? [UNREADABLE_LINE] : [])];
+  if (r.hash === null) return [r.pending ? '没有 rules.json，但批准记录里还有规则，生效的仍是已批准的那份' : '没有 rules.json，所有域名都是默认模式', ...notes].join('\n');
   return [
     `规则文件 ${inline(r.path)}`,
-    ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode)}`)),
+    ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode)}  ${APPROVED_TEXT(x.approved)}`)),
     `loginHosts  ${r.loginHosts.length === 0 ? '（无）' : r.loginHosts.map(inline).join(', ')}`,
     ...r.groups.map((g) => `组 ${inline(g.name)}  hosts ${g.hosts.map(inline).join(', ')}  loginHosts ${g.loginHosts.length === 0 ? '（无）' : g.loginHosts.map(inline).join(', ')}`
-      + `  readPosts ${g.readPosts}  persistedQueries ${g.persistedQueries}  logout ${g.logout}  identity ${g.identity ? '有' : '无'}`),
+      + `  readPosts ${g.readPosts}  persistedQueries ${g.persistedQueries}  logout ${g.logout}  identity ${g.identity ? '有' : '无'}  ${APPROVED_TEXT(g.approved)}`),
     `hash  ${inline(r.hash)}`,
+    ...notes,
   ].join('\n');
+}
+
+// `rule diff` 的结果：规则文件和批准快照之间的完整差异（不截断）。
+export interface RuleDiffResult { path: string; approvals: ApprovalsStatus; pending: boolean; hash: string | null; lines: string[]; error: string | null }
+
+export function formatRuleDiff(r: RuleDiffResult): string {
+  if (r.error !== null) return [`规则文件 ${inline(r.path)}`, inline(r.error)].join('\n');
+  const unreadable = r.approvals === 'unreadable' ? [UNREADABLE_LINE] : [];
+  if (!r.pending) return [...unreadable, '没有未批准的改动'].join('\n');
+  // 待批文件的短哈希：sha256: 加前 12 位十六进制；文件被删了没有哈希。
+  const head = r.hash === null ? '待批文件 无（文件被删了）' : `待批文件 ${inline(r.hash.slice(0, 'sha256:'.length + 12))}`;
+  return [head, ...unreadable, ...r.lines.map(inline)].join('\n');
 }
 
 export function formatChecks(c: Check[]): string {

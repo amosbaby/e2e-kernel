@@ -21,6 +21,7 @@ import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 import { fakeDialog } from '../support/fake-dialog.ts';
+import { approveRulesFile } from '../support/approve-rules.ts';
 
 // 一个不能出现在任何输出里的值：运行时拼出来，不写成字面量。
 const secret = ['pw', 'Zq7', 'x91', 'Lk'].join('-');
@@ -538,7 +539,7 @@ test('rule list without a rules file: says every host is default, exit 0, and cr
     assert.equal(t.outText(), '没有 rules.json，所有域名都是默认模式');
     assert.ok(!existsSync(h.home.root));
     const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
-    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], groups: [], hash: null, error: null });
+    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], groups: [], hash: null, error: null, approved: true, pending: false, approvals: 'absent' });
   });
 });
 
@@ -549,26 +550,111 @@ test('rule list shows groups with host lists and counts only, not endpoint paths
     identity: { selector: '#tenant', expect: 'Test Tenant' } }] });
   await withRules(withGroup, async (h) => {
     const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
-    assert.match(t.outText(), /^组 admin {2}hosts admin\.example\.com {2}loginHosts sso\.example\.org {2}readPosts 1 {2}persistedQueries 0 {2}logout 1 {2}identity 有$/m);
+    assert.match(t.outText(), /^组 admin {2}hosts admin\.example\.com {2}loginHosts sso\.example\.org {2}readPosts 1 {2}persistedQueries 0 {2}logout 1 {2}identity 有 {2}（未批准）$/m);
     assert.ok(!t.outText().includes('secret-path') && !t.outText().includes('Test Tenant'));
     const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
     const r = JSON.parse(j.outText()) as { groups: unknown[] };
-    assert.deepEqual(r.groups, [{ name: 'admin', hosts: ['admin.example.com'], loginHosts: ['sso.example.org'], readPosts: 1, persistedQueries: 0, logout: 1, identity: true }]);
+    assert.deepEqual(r.groups, [{ name: 'admin', hosts: ['admin.example.com'], loginHosts: ['sso.example.org'], readPosts: 1, persistedQueries: 0, logout: 1, identity: true, approved: false }]);
     assert.ok(!j.outText().includes('secret-path') && !j.outText().includes('Test Tenant'));
+    approveRulesFile(h.home);
+    const t2 = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t2), 0);
+    assert.match(t2.outText(), /identity 有 {2}（已批准）$/m);
+    const j2 = io({ env: h.env }); await main(['rule', 'list', '--json'], j2);
+    assert.deepEqual((JSON.parse(j2.outText()) as { groups: { approved: boolean }[] }).groups.map((g) => g.approved), [true]);
   });
 });
 
-test('rule list prints one line per rule, the login hosts and the hash; does not need the kernel', async () => {
+test('rule list prints one line per rule with its approval, the login hosts and the hash; says when there are unapproved changes; does not need the kernel', async () => {
   await withRules(GOOD_RULES, async (h) => {
     const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
     const out = t.outText();
-    assert.match(out, /^\*\.example\.com {2}readonly$/m); assert.match(out, /^app\.example\.com {2}default$/m);
+    assert.match(out, /^\*\.example\.com {2}readonly {2}（未批准）$/m); assert.match(out, /^app\.example\.com {2}default {2}（未批准）$/m);
     assert.match(out, /^loginHosts {2}sso\.example\.com$/m); assert.match(out, /^hash {2}sha256:[0-9a-f]{16}$/m);
+    assert.match(out, /^有未批准的改动（rule diff 查看）$/m);
     const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
-    const r = JSON.parse(j.outText()) as { path: string; rules: unknown[]; loginHosts: string[]; hash: string; error: null };
-    assert.equal(r.path, h.home.rulesFile); assert.deepEqual(r.rules, [{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'default' }]);
+    const r = JSON.parse(j.outText()) as { path: string; rules: unknown[]; loginHosts: string[]; hash: string; error: null; approved: boolean; pending: boolean; approvals: string };
+    assert.equal(r.path, h.home.rulesFile);
+    assert.deepEqual(r.rules, [{ match: '*.example.com', mode: 'readonly', approved: false }, { match: 'app.example.com', mode: 'default', approved: false }]);
     assert.deepEqual(r.loginHosts, ['sso.example.com']); assert.match(r.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(r.error, null);
+    assert.deepEqual([r.approved, r.pending, r.approvals], [false, true, 'absent']);
     assert.ok(out.includes(r.hash));
+    approveRulesFile(h.home);
+    const t2 = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t2), 0);
+    assert.match(t2.outText(), /^\*\.example\.com {2}readonly {2}（已批准）$/m); assert.ok(!t2.outText().includes('未批准') && !t2.outText().includes('rule diff'));
+    const j2 = io({ env: h.env }); await main(['rule', 'list', '--json'], j2);
+    const r2 = JSON.parse(j2.outText()) as { rules: { approved: boolean }[]; approved: boolean; pending: boolean; approvals: string };
+    assert.deepEqual([r2.approved, r2.pending, r2.approvals, r2.rules.map((x) => x.approved)], [true, false, 'ok', [true, true]]);
+    writeFileSync(h.home.rulesFile, GOOD_RULES.replace('"readonly"', '"default"'));   // 改一条：已批准的快照里没有它
+    const t3 = io({ env: h.env }); await main(['rule', 'list'], t3);
+    assert.match(t3.outText(), /^\*\.example\.com {2}default {2}（未批准）$/m); assert.match(t3.outText(), /^app\.example\.com {2}default {2}（已批准）$/m);
+    assert.match(t3.outText(), /rule diff/);
+  });
+});
+
+test('rule list when the approvals file is unreadable: every rule is unapproved and it says so; a deleted rules.json with approved rules is a pending change', async () => {
+  await withRules(GOOD_RULES, async (h) => {
+    writeFileSync(h.home.approvalsFile, '{broken');
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    assert.match(t.outText(), /^批准记录读不了：现有规则全部要重新批准$/m); assert.match(t.outText(), /（未批准）/);
+    const j = io({ env: h.env }); await main(['rule', 'list', '--json'], j);
+    const r = JSON.parse(j.outText()) as { approved: boolean; approvals: string };
+    assert.deepEqual([r.approved, r.approvals], [false, 'unreadable']);
+  });
+  await withRules(GOOD_RULES, async (h) => {
+    approveRulesFile(h.home);
+    rmSync(h.home.rulesFile);
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    assert.match(t.outText(), /^没有 rules\.json，但批准记录里还有规则/m); assert.match(t.outText(), /^有未批准的改动（rule diff 查看）$/m);
+    const j = io({ env: h.env }); await main(['rule', 'list', '--json'], j);
+    assert.deepEqual([(JSON.parse(j.outText()) as { approved: boolean }).approved], [false]);
+  });
+});
+
+test('rule diff prints the pending file hash first, then the whole difference, relaxing lines before tightening ones', async () => {
+  const base = { version: 1, rules: [{ match: 'app.example.com', mode: 'default' }] };
+  await withRules(JSON.stringify(base), async (h) => {
+    approveRulesFile(h.home);
+    const none = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], none), 0); assert.equal(none.outText(), '没有未批准的改动');
+    const next = { version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }, { match: 'new.example.com', mode: 'default' }],
+      loginHosts: ['sso.example.org'] };
+    writeFileSync(h.home.rulesFile, JSON.stringify(next));
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], t), 0);
+    const lines = t.outText().split('\n');
+    assert.match(lines[0]!, /^待批文件 sha256:[0-9a-f]{12}$/);
+    assert.deepEqual(lines.slice(1), ['+ 顶层登录主机：sso.example.org', '+ 规则 new.example.com（默认）', '~ 规则 app.example.com：默认→只读']);
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'diff', '--json'], j), 0);
+    const r = JSON.parse(j.outText()) as { path: string; approvals: string; pending: boolean; hash: string; lines: string[]; error: null };
+    assert.deepEqual([r.path, r.approvals, r.pending, r.error], [h.home.rulesFile, 'ok', true, null]);
+    assert.ok(`待批文件 ${r.hash.slice(0, 19)}` === lines[0]); assert.equal(r.lines.length, 3);
+  });
+});
+
+test('rule diff is not truncated at 12 lines; a deleted rules.json, a bad file and unreadable approvals each have their own output', async () => {
+  const many = { version: 1, rules: Array.from({ length: 15 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };
+  await withRules(JSON.stringify(many), async (h) => {
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], t), 0);
+    assert.equal(t.outText().split('\n').length, 1 + 15);
+    approveRulesFile(h.home);
+    rmSync(h.home.rulesFile);
+    const d = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], d), 0);
+    assert.deepEqual(d.outText().split('\n'), ['待批文件 无（文件被删了）', '规则文件被删了：所有规则失效']);
+    writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');
+    const b = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], b), 2);
+    assert.match(b.outText(), /规则文件格式有误：rules must be an array/);
+    const bj = io({ env: h.env }); assert.equal(await main(['rule', 'diff', '--json'], bj), 2);
+    assert.match((JSON.parse(bj.outText()) as { error: string }).error, /rules must be an array/);
+    writeFileSync(h.home.rulesFile, JSON.stringify(many)); writeFileSync(h.home.approvalsFile, 'garbage');
+    const u = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], u), 0);
+    assert.match(u.outText(), /^批准记录读不了：现有规则全部要重新批准$/m); assert.equal(u.outText().split('\n').length, 1 + 1 + 15);
+  });
+});
+
+test('rule diff reads the files itself and writes nothing: no approvals.json appears, and it takes no extra arguments', async () => {
+  await withRules(GOOD_RULES, async (h) => {
+    assert.equal(await main(['rule', 'diff'], io({ env: h.env })), 0);
+    assert.ok(!existsSync(h.home.approvalsFile));
+    assert.equal(await main(['rule', 'diff', 'x'], io({ env: h.env })), 2);
+    assert.equal(await main(['rule', 'approve'], io({ env: h.env })), 2);
   });
 });
 
@@ -583,11 +669,11 @@ test('rule list on a bad file: prints the parse error and exits 2; --json carrie
   await withRules('not json', async (h) => { assert.equal(await main(['rule', 'list'], io({ env: h.env })), 2); });
 });
 
-test('rule: needs the list subcommand and takes no extra arguments; help lists it', async () => {
+test('rule: needs the list or diff subcommand and takes no extra arguments; help lists them', async () => {
   assert.equal(await main(['rule'], io()), 2);
   assert.equal(await main(['rule', 'add'], io()), 2);
   assert.equal(await main(['rule', 'list', 'x'], io()), 2);
-  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /rule list \[--json\]/);
+  const h = io(); assert.equal(await main(['help'], h), 0); assert.match(h.outText(), /rule list \[--json\]/); assert.match(h.outText(), /rule diff \[--json\]/);
 });
 
 test('a token-shaped key in a bad rules file is redacted in rule list (text and --json) and in doctor', async () => {
@@ -611,21 +697,36 @@ test('status from an older kernel (no rules field) still formats', () => {
   assert.ok(!formatStatus(old).includes('规则'));
 });
 
-test('status carries rules; the text format adds a line only when the file is broken', async () => {
+test('status carries rules (the approved ones); the text format adds a line for a broken file, for unapproved changes and when approvals.json was changed from outside', async () => {
   await withRules(GOOD_RULES, async (h) => {
+    approveRulesFile(h.home);   // 内核启动前批准好：运行中的内核没有「批准」这条路，要等后面的任务
     const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog() });
     try {
       const j = io({ env: h.env }); assert.equal(await main(['status', '--json'], j), 0);
-      const r = JSON.parse(j.outText()) as { rules: { count: number; hash: string; error: unknown } };
+      const r = JSON.parse(j.outText()) as { rules: { count: number; hash: string; error: unknown; pending: unknown; approvals: string; approvalsChanged: boolean } };
       assert.equal(r.rules.count, 2); assert.match(r.rules.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(r.rules.error, null);
+      assert.deepEqual([r.rules.pending, r.rules.approvals, r.rules.approvalsChanged], [null, 'ok', false]);
       const t = io({ env: h.env }); await main(['status'], t);
-      assert.match(t.outText(), /^规则 2 条 sha256:[0-9a-f]{16}$/m); assert.ok(!t.outText().includes('规则文件有错'));
-      writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');   // status 之前会先重读文件
+      assert.match(t.outText(), /^规则 2 条 sha256:[0-9a-f]{16}$/m); assert.ok(!t.outText().includes('规则文件有错') && !t.outText().includes('未批准'));
+      writeFileSync(h.home.rulesFile, GOOD_RULES.replace('"readonly"', '"default"'));   // status 之前会先重读文件
+      const pend = io({ env: h.env }); assert.equal(await main(['status'], pend), 0);
+      assert.match(pend.outText(), /^规则文件有未批准的改动：.*rule diff 查看/m); assert.match(pend.outText(), /^规则 2 条 sha256:/m);
+      const pj = io({ env: h.env }); await main(['status', '--json'], pj);
+      const pr = JSON.parse(pj.outText()) as { rules: { count: number; hash: string; pending: { hash: string; tooLong: boolean } } };
+      assert.equal(pr.rules.count, 2); assert.equal(pr.rules.hash, r.rules.hash); assert.match(pr.rules.pending.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(pr.rules.pending.tooLong, false);
+      writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');
       const bad = io({ env: h.env }); assert.equal(await main(['status'], bad), 0);
       assert.match(bad.outText(), /^规则文件有错，open 会被拒绝：规则文件格式有误：rules must be an array$/m);
       const bj = io({ env: h.env }); await main(['status', '--json'], bj);
-      const br = JSON.parse(bj.outText()) as { rules: { count: number; hash: string; error: string } };
-      assert.equal(br.rules.count, 2); assert.match(br.rules.error, /rules must be an array/);   // 仍用上一份好的
+      const br = JSON.parse(bj.outText()) as { rules: { count: number; hash: string; error: string; pending: unknown } };
+      assert.equal(br.rules.count, 2); assert.match(br.rules.error, /rules must be an array/); assert.equal(br.rules.pending, null);   // 仍用批准的那份，坏文件不进待批
+      writeFileSync(h.home.rulesFile, GOOD_RULES);
+      rmSync(h.home.approvalsFile);                                                  // 运行中被删：内存里的批准不降级，只报提示
+      const gone = io({ env: h.env }); await main(['status'], gone);
+      assert.match(gone.outText(), /^批准记录文件被外部改过/m); assert.match(gone.outText(), /^规则 2 条 sha256:/m);
+      const gj = io({ env: h.env }); await main(['status', '--json'], gj);
+      const gr = JSON.parse(gj.outText()) as { rules: { count: number; approvalsChanged: boolean; pending: unknown } };
+      assert.deepEqual([gr.rules.count, gr.rules.approvalsChanged, gr.rules.pending], [2, true, null]);
     } finally { await kk.stop(); }
   });
 });
@@ -635,7 +736,7 @@ test('status without a rules file says there are none', async () => {
   assert.match(t.outText(), /^规则 0 条$/m);
 });
 
-test('doctor reports the domain rules even when the kernel is not running', async () => {
+test('doctor reports the domain rules even when the kernel is not running: none, unapproved changes, approved, unreadable approvals', async () => {
   await withRules(null, async (h) => {
     const { code, checks } = await doctorChecks(h.env);
     const c = checks.find((x) => x.name === 'rules');
@@ -643,7 +744,16 @@ test('doctor reports the domain rules even when the kernel is not running', asyn
   });
   await withRules(GOOD_RULES, async (h) => {
     const c = (await doctorChecks(h.env)).checks.find((x) => x.name === 'rules');
-    assert.equal(c?.ok, true); assert.equal(c?.detail, '2 条规则');
+    assert.equal(c?.ok, true); assert.equal(c?.detail, '2 条，有未批准的改动（node bin/e2k.js rule diff 查看）');
+    approveRulesFile(h.home);
+    const d = (await doctorChecks(h.env)).checks.find((x) => x.name === 'rules');
+    assert.equal(d?.ok, true); assert.equal(d?.detail, '2 条，已批准');
+    writeFileSync(h.home.rulesFile, GOOD_RULES.replace('"readonly"', '"default"'));
+    assert.equal((await doctorChecks(h.env)).checks.find((x) => x.name === 'rules')?.detail, '2 条，有未批准的改动（node bin/e2k.js rule diff 查看）');
+    writeFileSync(h.home.approvalsFile, '{broken');
+    const { code, checks } = await doctorChecks(h.env);
+    const u = checks.find((x) => x.name === 'rules');
+    assert.equal(u?.ok, false); assert.equal(u?.detail, '批准记录读不了：现有规则全部要重新批准'); assert.match(u?.fix ?? '', /approvals\.json/); assert.equal(code, 22);
   });
 });
 

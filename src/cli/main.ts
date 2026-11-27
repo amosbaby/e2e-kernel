@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import type { Driver } from '../driver/types.ts';
 import { noDialog } from '../kernel/approval.ts';
-import { readRulesFile } from '../kernel/rules.ts';
+import { inspectRules } from '../kernel/rules.ts';
 import { listenerErrorLogger, startKernel } from '../kernel/server.ts';
 import type { KernelHandle, KernelOptions } from '../kernel/server.ts';
 import type { StatusResult } from '../kernel/server.ts';
@@ -18,11 +18,11 @@ import { redactText, safely } from '../shared/redact.ts';
 import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { runDoctor } from './doctor.ts';
-import { formatChecks, formatClose, formatError, formatOpen, formatRuleList, formatStatus, formatStep } from './format.ts';
-import type { RuleListResult } from './format.ts';
+import { formatChecks, formatClose, formatError, formatOpen, formatRuleDiff, formatRuleList, formatStatus, formatStep } from './format.ts';
+import type { RuleDiffResult, RuleListResult } from './format.ts';
 
 // e2k 命令行（设计 5.9）。只做校验和转发：参数先用和内核同一套 validateParams 校验，再经 socket 发给内核。
-// 这一版没有 run、save-case，rule 只有只读的 list，也没有任何批准类的命令。
+// 这一版没有 run、save-case，rule 只有只读的 list 和 diff，也没有任何批准类的命令。
 // 报错不回显调用方给的值：参数解析、JSON 解析的原始错误消息都不打印。
 
 export interface Io {
@@ -56,7 +56,8 @@ function helpText(selfCmd: string): string {
     '  start [--no-dialogs]                   前台运行内核（Ctrl-C 或 SIGTERM 停止）；--no-dialogs 不弹确认框，需要人批准的事一律走不通（22）',
     '  status [--json]                        版本、驱动、浏览器、会话、profile（含最近一次 login）和域名规则',
     '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
-    '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则（只读，不需要内核；规则文件只由人维护）',
+    '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则，注明是否已批准（只读，不需要内核；规则文件只由人维护）',
+    '  rule diff [--json]                     规则文件和已批准的规则之间的完整差异（只读，不需要内核；批准只能由人在内核弹出的框里做）',
     '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--json]',
     '                                          --readonly 强制这个会话只读（不管域名规则）：只放行读和严格的 GraphQL query，其余写请求一律拦下；驱动不能拦网络时 open 失败',
     '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
@@ -189,23 +190,40 @@ function redactError(error: string | null): string | null {
   return error === null ? null : safely(() => redactText(error));
 }
 
-// 规则文件由 CLI 自己读，不需要内核。文件有错：照样打印（--json 里在 error 字段），退出码 2。
+// 规则文件和批准记录由 CLI 自己读，不需要内核。文件有错：照样打印（--json 里在 error 字段），退出码 2。
 async function rule(ctx: Ctx, args: string[]): Promise<number> {
   const [sub, ...rest] = args;
-  if (sub !== 'list') throw usage(sub === undefined ? '缺少子命令' : '没有这个子命令', `${ctx.io.selfCmd} help 查看可用命令`);
+  if (sub !== 'list' && sub !== 'diff') throw usage(sub === undefined ? '缺少子命令' : '没有这个子命令', `${ctx.io.selfCmd} help 查看可用命令`);
   positionals(ctx, parse(ctx, rest, JSON_OPTION), 0, '无');
   const home = resolveHome(ctx.io.env);
-  const f = readRulesFile(home.rulesFile);
+  const r = inspectRules(home.rulesFile, home.approvalsFile);
+  const f = r.file;
+  if (sub === 'diff') {
+    // 差异里的主机和接口写法进输出前同样先脱敏。
+    const result: RuleDiffResult = {
+      path: home.rulesFile, approvals: r.approvals, pending: r.pending, hash: r.hash,
+      lines: r.summary.map((x) => redactText(x)), error: redactError(f.error),
+    };
+    print(ctx, result, formatRuleDiff);
+    return f.error === null ? ExitCode.OK : ExitCode.USAGE;
+  }
+  const approvedRule = (x: { match: string; mode: string }): boolean => r.approvedRules.rules.some((a) => a.match === x.match && a.mode === x.mode);
+  const approvedGroup = (g: (typeof f.groups)[number]): boolean => {
+    const a = r.approvedRules.groups.find((y) => y.name === g.name);
+    return a !== undefined && JSON.stringify(a) === JSON.stringify(g);
+  };
   // 主机写法进输出前和别的命令一样先脱敏。
   const result: RuleListResult = {
     path: home.rulesFile,
-    rules: f.rules.map((x) => ({ match: redactText(x.match), mode: x.mode })),
+    rules: f.rules.map((x) => ({ match: redactText(x.match), mode: x.mode, approved: approvedRule(x) })),
     loginHosts: f.loginHosts.map((x) => redactText(x)),
     groups: f.groups.map((g) => ({
       name: g.name, hosts: g.hosts.map((x) => redactText(x)), loginHosts: g.loginHosts.map((x) => redactText(x)),
       readPosts: g.readPosts.length, persistedQueries: g.persistedQueries.length, logout: g.logout.length, identity: g.identity !== null,
+      approved: approvedGroup(g),
     })),
     hash: f.hash, error: redactError(f.error),
+    approved: f.error === null && !r.pending, pending: r.pending, approvals: r.approvals,
   };
   print(ctx, result, formatRuleList);
   return f.error === null ? ExitCode.OK : ExitCode.USAGE;

@@ -3,7 +3,9 @@ import { readFileSync, statSync } from 'node:fs';
 import { E2kError } from '../shared/errors.ts';
 import { oneOf, plainObject, str } from '../shared/validate.ts';
 import type { Mode } from '../shared/protocol.ts';
-import type { ModeResolver, RuleMode, RulesState } from './mode.ts';
+import { readApprovals } from './approval-store.ts';
+import type { ApprovalRecord, ApprovalStore, ApprovalsStatus } from './approval-store.ts';
+import type { ModeResolver, PendingRules, RuleMode, RulesState } from './mode.ts';
 
 // $E2K_HOME/rules.json：哪些主机默认只读、哪些是登录主机（设计 5.2）。格式见 README。
 export interface Rule { match: string; mode: RuleMode }
@@ -373,13 +375,13 @@ const defaultIo: RulesIo = {
   read: (p) => readFileSync(p, 'utf8'),
 };
 
-function contentHash(text: string): string {
+export function contentHash(text: string): string {
   return 'sha256:' + createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16);
 }
 
 type Loaded = { kind: 'absent' } | { kind: 'bad'; error: string } | { kind: 'text'; text: string; hash: string };
 
-// 读规则文件的原文：没有文件、读不了或超限，都在这里变成说明。resolver 和 readRulesFile 共用。
+// 读规则文件的原文：没有文件、读不了或超限，都在这里变成说明。resolver 和 inspectRules 共用。
 function loadFile(file: string, io: RulesIo): Loaded {
   try {
     const st = io.stat(file);
@@ -403,11 +405,10 @@ function parseError(e: unknown): string {
   return `规则文件格式有误：${e instanceof E2kError ? e.message : '无法解析'}`;
 }
 
-// 规则文件现在的样子（不碰任何缓存），给 `rule list` 用。error 非 null 时 rules、loginHosts 和 groups 为空、hash 为 null。
+// 规则文件现在的样子（不碰任何缓存），给 `rule list` 用（经 inspectRules）。error 非 null 时 rules、loginHosts 和 groups 为空、hash 为 null。
 export interface RulesFile { rules: Rule[]; loginHosts: string[]; groups: Group[]; hash: string | null; error: string | null }
 
-export function readRulesFile(file: string, io: RulesIo = defaultIo): RulesFile {
-  const loaded = loadFile(file, io);
+function toRulesFile(loaded: Loaded): RulesFile {
   if (loaded.kind === 'absent') return { rules: [], loginHosts: [], groups: [], hash: null, error: null };
   if (loaded.kind === 'bad') return { rules: [], loginHosts: [], groups: [], hash: null, error: loaded.error };
   try {
@@ -417,57 +418,247 @@ export function readRulesFile(file: string, io: RulesIo = defaultIo): RulesFile 
   }
 }
 
-// 规则缓存。构造时读一次；之后只有 refresh() 碰文件。每次 refresh 都读文件比内容哈希（不看 mtime/大小）。
-// 缓存是全局的：合法的新规则在任何一次 refresh 之后对所有会话生效；只有「改坏了」时才继续用上一份好的。
-export function createRulesResolver(file: string, io: RulesIo = defaultIo): ModeResolver {
-  let current: Rules = { rules: [], loginHosts: [], groups: [] };
-  let hash: string | null = null;
+// ---- 批准快照 ----
+
+const EMPTY_RULES: Rules = { rules: [], loginHosts: [], groups: [] };
+export const MAX_SUMMARY_LINES = 12;
+
+// 批准记录里的规则：哈希对得上原文、原文解析得了才算数；对不上或解析不了（被改过，或解析器收紧了）当没批准过。
+interface Snapshot { rules: Rules; hash: string | null; text: string | null; valid: boolean }
+
+function snapshotOf(approved: ApprovalRecord['rules']): Snapshot {
+  if (approved === null) return { rules: EMPTY_RULES, hash: null, text: null, valid: true };
+  try {
+    if (contentHash(approved.text) !== approved.hash) throw new Error('hash');
+    return { rules: parseRules(approved.text), hash: approved.hash, text: approved.text, valid: true };
+  } catch {
+    return { rules: EMPTY_RULES, hash: null, text: null, valid: false };
+  }
+}
+
+// ---- 差异 ----
+
+const MODE_TEXT: Record<RuleMode, string> = { readonly: '只读', default: '默认' };
+
+function endpointKey(e: Endpoint): string {
+  return `${e.method} ${e.origin}/${e.path.join('/')}`;
+}
+
+// 写出来给人看的接口：有具体方法就带上方法。
+function endpointText(e: Endpoint): string {
+  return `${e.method === '*' ? '' : `${e.method} `}${e.origin}/${e.path.join('/')}`;
+}
+
+function urlText(e: Endpoint): string {
+  return `${e.origin}/${e.path.join('/')}`;
+}
+
+function hostGroups(r: Rules): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const g of r.groups) for (const h of g.hosts) m.set(h, g.name);
+  return m;
+}
+
+function sameIdentity(a: Identity | null, b: Identity | null): boolean {
+  return a === null || b === null ? a === b : a.selector === b.selector && a.expect === b.expect;
+}
+
+// 一个组里的变化，分成「放宽」和「收紧」两摞。old 为 null 表示新建的组（里面的东西都算新加的）。
+function diffGroup(old: Group | null, now: Group, relax: string[], tighten: string[]): void {
+  const g = now.name;
+  const oldPosts = new Set((old?.readPosts ?? []).map(endpointKey));
+  const nowPosts = new Set(now.readPosts.map(endpointKey));
+  for (const e of now.readPosts) if (!oldPosts.has(endpointKey(e))) relax.push(`+ 读型 POST ${g}：${endpointText(e)}`);
+  for (const e of old?.readPosts ?? []) if (!nowPosts.has(endpointKey(e))) tighten.push(`- 读型 POST ${g}：${endpointText(e)}`);
+
+  const oldSets = new Map((old?.persistedQueries ?? []).map((p) => [endpointKey(p.endpoint), p]));
+  const nowSets = new Map(now.persistedQueries.map((p) => [endpointKey(p.endpoint), p]));
+  for (const [key, p] of nowSets) {
+    const had = new Set(oldSets.get(key)?.hashes ?? []);
+    const added = p.hashes.filter((h) => !had.has(h)).length;
+    if (added > 0) relax.push(`+ 持久化查询 ${g}：${urlText(p.endpoint)}（+${added} 个哈希）`);
+  }
+  for (const [key, p] of oldSets) {
+    const has = new Set(nowSets.get(key)?.hashes ?? []);
+    const removed = p.hashes.filter((h) => !has.has(h)).length;
+    if (removed > 0) tighten.push(`- 持久化查询 ${g}：${urlText(p.endpoint)}（-${removed} 个哈希）`);
+  }
+
+  const oldLogins = new Set(old?.loginHosts ?? []);
+  const nowLogins = new Set(now.loginHosts);
+  for (const h of now.loginHosts) if (!oldLogins.has(h)) relax.push(`+ 登录主机 ${g}：${h}`);
+  for (const h of old?.loginHosts ?? []) if (!nowLogins.has(h)) tighten.push(`- 登录主机 ${g}：${h}`);
+
+  // 登出接口是被拦的：删掉一条等于放宽，加一条是收紧。
+  const oldLogout = new Set((old?.logout ?? []).map(endpointKey));
+  const nowLogout = new Set(now.logout.map(endpointKey));
+  for (const e of old?.logout ?? []) if (!nowLogout.has(endpointKey(e))) relax.push(`- 登出 ${g}：${endpointText(e)}`);
+  for (const e of now.logout) if (!oldLogout.has(endpointKey(e))) tighten.push(`+ 登出 ${g}：${endpointText(e)}`);
+
+  if (!sameIdentity(old?.identity ?? null, now.identity)) relax.push(`~ 身份探针 ${g}`);
+}
+
+// 规则 b 相对 a 的完整差异（不截断）：放宽的在前，收紧的在后。a 是已批准的，b 是待批的。
+export function diffRules(a: Rules, b: Rules): string[] {
+  const relax: string[] = [];
+  const tighten: string[] = [];
+
+  const aGroups = new Map(a.groups.map((g) => [g.name, g]));
+  const bGroups = new Map(b.groups.map((g) => [g.name, g]));
+  for (const g of b.groups) diffGroup(aGroups.get(g.name) ?? null, g, relax, tighten);
+  for (const g of a.groups) if (!bGroups.has(g.name)) relax.push(`- 组 ${g.name}`);
+  for (const g of b.groups) if (!aGroups.has(g.name)) tighten.push(`+ 组 ${g.name}`);
+
+  const aTop = new Set(a.loginHosts);
+  const bTop = new Set(b.loginHosts);
+  for (const h of b.loginHosts) if (!aTop.has(h)) relax.push(`+ 顶层登录主机：${h}`);
+  for (const h of a.loginHosts) if (!bTop.has(h)) tighten.push(`- 顶层登录主机：${h}`);
+
+  const aHosts = hostGroups(a);
+  const bHosts = hostGroups(b);
+  for (const h of new Set([...bHosts.keys(), ...aHosts.keys()])) {
+    const from = aHosts.get(h) ?? DEFAULT_GROUP_NAME;
+    const to = bHosts.get(h) ?? DEFAULT_GROUP_NAME;
+    if (from !== to) relax.push(`~ 主机 ${h} 从组 ${from} 移到组 ${to}`);
+  }
+
+  const aRules = new Map(a.rules.map((r) => [r.match, r.mode]));
+  const bRules = new Map(b.rules.map((r) => [r.match, r.mode]));
+  for (const [match, mode] of bRules) {
+    const was = aRules.get(match);
+    if (was === undefined) (mode === 'readonly' ? tighten : relax).push(`+ 规则 ${match}（${MODE_TEXT[mode]}）`);
+    else if (was !== mode) (mode === 'readonly' ? tighten : relax).push(`~ 规则 ${match}：${MODE_TEXT[was]}→${MODE_TEXT[mode]}`);
+  }
+  for (const [match, mode] of aRules) {
+    if (!bRules.has(match)) (mode === 'readonly' ? relax : tighten).push(`- 规则 ${match}（${MODE_TEXT[mode]}）`);
+  }
+  return [...relax, ...tighten];
+}
+
+// 待批改动的说明：文件被删（b 为 null）、没有逐字段的差异（只是写法变了）也各有一行。
+export function summarizeChange(approved: Rules, pending: Rules | null): string[] {
+  if (pending === null) return ['规则文件被删了：所有规则失效'];
+  const lines = diffRules(approved, pending);
+  return lines.length === 0 ? ['规则文件内容变了，解析出来的规则没有差别'] : lines;
+}
+
+// 规则文件和批准快照的比较，resolver 和 inspectRules 共用。
+type Comparison =
+  | { kind: 'same' }
+  | { kind: 'error'; error: string }
+  | { kind: 'changed'; hash: string | null; text: string | null; rules: Rules | null; summary: string[] };
+
+function compareWithApproved(loaded: Loaded, snap: Snapshot): Comparison {
+  if (loaded.kind === 'absent') {
+    return snap.text === null ? { kind: 'same' } : { kind: 'changed', hash: null, text: null, rules: null, summary: summarizeChange(snap.rules, null) };
+  }
+  if (loaded.kind === 'bad') return { kind: 'error', error: loaded.error };
+  if (loaded.text === snap.text) return { kind: 'same' };   // 比原文，不只比 64 位的哈希
+  let rules: Rules;
+  try {
+    rules = parseRules(loaded.text);
+  } catch (e) {
+    return { kind: 'error', error: parseError(e) };
+  }
+  return { kind: 'changed', hash: loaded.hash, text: loaded.text, rules, summary: summarizeChange(snap.rules, rules) };
+}
+
+// 给 CLI（rule list、rule diff、doctor）：自己读规则文件和批准记录，不经内核。批准记录读不了或没有，快照就是空的。
+export interface RulesInspection {
+  file: RulesFile;                 // 规则文件现在的样子
+  approvals: ApprovalsStatus;
+  approvedRules: Rules;            // 批准快照里的规则
+  approvedCount: number;
+  pending: boolean;                // 文件和快照不一致且解析得了（文件有错不算）；文件被删而快照里有规则也算
+  fileDeleted: boolean;            // 待批的改动是「文件被删了」
+  hash: string | null;             // 待批文件的内容哈希
+  summary: string[];               // 完整差异；没有待批为空
+}
+
+export function inspectRules(rulesFile: string, approvalsFile: string, io: RulesIo = defaultIo): RulesInspection {
+  const loaded = loadFile(rulesFile, io);
+  const { record, status } = readApprovals(approvalsFile);
+  const snap = snapshotOf(record.rules);
+  const c = compareWithApproved(loaded, snap);
+  const approvals: ApprovalsStatus = snap.valid ? status : 'unreadable';
+  const base = { file: toRulesFile(loaded), approvals, approvedRules: snap.rules, approvedCount: snap.rules.rules.length };
+  if (c.kind !== 'changed') return { ...base, pending: false, fileDeleted: false, hash: null, summary: [] };
+  return { ...base, pending: true, fileDeleted: c.text === null, hash: c.hash, summary: c.summary };
+}
+
+// 规则解析器。生效的是批准快照（ApprovalStore 里最后一次批准的那份规则）；规则文件只产生「待批」。
+// 每次 refresh 读文件和快照原文比：一样 = 无待批；不一样且解析得了 = 待批；改坏 = error，坏文件不进待批。
+// 待批期间 resolve 取「已批准」和「待批文件」里更严的（任一只读就只读），所以收紧立刻生效、放宽要等批准；
+// 组、白名单、loginHosts 只认已批准的。批准只认内存里留着的原文和哈希，不重读磁盘。
+export function createRulesResolver(file: string, store: ApprovalStore, io: RulesIo = defaultIo): ModeResolver {
+  let snap = snapshotOf(store.get().rules);
+  const approvals: ApprovalsStatus = snap.valid ? store.startupStatus : 'unreadable';
+  let pending: { hash: string | null; text: string | null; rules: Rules | null; summary: string[] } | null = null;
   let error: string | null = null;
+  let approvalsChanged = false;
 
   const refresh = (): void => {
-    const loaded = loadFile(file, io);
-    if (loaded.kind === 'absent') {
-      current = { rules: [], loginHosts: [], groups: [] }; hash = null; error = null;
-      return;
-    }
-    if (loaded.kind === 'bad') { error = loaded.error; return; }
-    if (loaded.hash === hash) { error = null; return; }   // 内容没变（含「改坏后又改回」）
-    try {
-      current = parseRules(loaded.text); hash = loaded.hash; error = null;
-    } catch (e) {
-      error = parseError(e);
-    }
+    const c = compareWithApproved(loadFile(file, io), snap);
+    if (c.kind === 'changed') { pending = { hash: c.hash, text: c.text, rules: c.rules, summary: c.summary }; error = null; }
+    else if (c.kind === 'error') { pending = null; error = c.error; }
+    else { pending = null; error = null; }
+    approvalsChanged = store.externallyChanged();
+  };
+
+  // 已批准和待批文件里更严的那份；主机不合格时抛出（resolve 据此失败关闭，ruleFor 据此给 null）。
+  const effective = (host: string): RuleMode | null => {
+    const a = matchRule(snap.rules.rules, host)?.mode ?? null;
+    const p = pending?.rules == null ? null : matchRule(pending.rules.rules, host)?.mode ?? null;
+    return a === 'readonly' || p === 'readonly' ? 'readonly' : a;
   };
 
   const ruleFor = (host: string): RuleMode | null => {
     try {
-      return matchRule(current.rules, host)?.mode ?? null;
+      return effective(host);
     } catch {
       return null;
     }
   };
 
+  const pendingView = (): PendingRules | null => pending === null ? null
+    : { hash: pending.hash, text: pending.text, summary: [...pending.summary], tooLong: pending.summary.length > MAX_SUMMARY_LINES };
+
   refresh();
   return {
     resolve(host): Mode {
       try {
-        return matchRule(current.rules, host)?.mode === 'readonly' ? 'readonly' : 'default';
+        return effective(host) === 'readonly' ? 'readonly' : 'default';
       } catch {
         return 'readonly';   // 失败关闭
       }
     },
     ruleFor,
-    groupOf: (host) => groupOf(current, host),
-    group: (name) => (name === DEFAULT_GROUP_NAME ? defaultGroup(current) : current.groups.find((g) => g.name === name) ?? null),
+    groupOf: (host) => groupOf(snap.rules, host),
+    group: (name) => (name === DEFAULT_GROUP_NAME ? defaultGroup(snap.rules) : snap.rules.groups.find((g) => g.name === name) ?? null),
     isLoginHost(host, group) {
       try {
-        const logins = group === DEFAULT_GROUP_NAME ? current.loginHosts : current.groups.find((g) => g.name === group)?.loginHosts;
+        const logins = group === DEFAULT_GROUP_NAME ? snap.rules.loginHosts : snap.rules.groups.find((g) => g.name === group)?.loginHosts;
         return logins === undefined ? false : hostListed(logins, host);
       } catch {
         return false;
       }
     },
     refresh,
-    state: (): RulesState => ({ count: current.rules.length, hash, error }),
+    state: (): RulesState => ({
+      count: snap.rules.rules.length, hash: snap.hash, error,
+      pending: pending === null ? null : { hash: pending.hash, tooLong: pending.summary.length > MAX_SUMMARY_LINES },
+      approvals, approvalsChanged,
+    }),
+    pending: pendingView,
+    approvePending(hash): boolean {
+      if (pending === null || pending.hash !== hash) return false;
+      const { text } = pending;
+      store.update((r) => ({ ...r, rules: text === null || hash === null ? null : { hash, text } }));
+      snap = snapshotOf(store.get().rules);
+      pending = null;
+      error = null;
+      approvalsChanged = store.externallyChanged();
+      return true;
+    },
   };
 }

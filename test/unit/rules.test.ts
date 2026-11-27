@@ -1,8 +1,13 @@
-import { describe, test } from 'node:test';
+import { after, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createRulesResolver, groupOf, hostListed, matchEndpoint, matchRule, normalizeHost, parseEndpoint, parseRules } from '../../src/kernel/rules.ts';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ApprovalStore } from '../../src/kernel/approval-store.ts';
+import type { ModeResolver } from '../../src/kernel/mode.ts';
+import { contentHash, createRulesResolver, groupOf, inspectRules, hostListed, matchEndpoint, matchRule, normalizeHost, parseEndpoint, parseRules } from '../../src/kernel/rules.ts';
 
-type Io = NonNullable<Parameters<typeof createRulesResolver>[1]>;
+type Io = NonNullable<Parameters<typeof createRulesResolver>[2]>;
 
 test('normalizeHost lowercases, drops the port and one trailing dot, applies punycode', () => {
   assert.equal(normalizeHost('App.Example.COM.'), 'app.example.com');
@@ -108,87 +113,190 @@ function fakeIo(initial: string | null) {
 }
 const good = JSON.stringify({ version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'default' }], loginHosts: ['sso.example.com'] });
 
-test('resolver: no file means no rules', () => {
+const tmpDirs: string[] = [];
+after(() => { for (const d of tmpDirs) rmSync(d, { recursive: true, force: true }); });
+function storeFile(): string {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), 'e2k-rs-')));
+  tmpDirs.push(d);
+  return join(d, 'approvals.json');
+}
+// 一个全新的批准记录；resolver 的批准只走 approvePending 这条真路径。
+function newStore(): ApprovalStore { return ApprovalStore.open(storeFile(), () => {}); }
+function resolverOf(io: Io, store: ApprovalStore = newStore()): ModeResolver { return createRulesResolver('/x/rules.json', store, io); }
+function approveNow(m: ModeResolver): void {
+  const p = m.pending();
+  assert.ok(p !== null, 'there is something pending');
+  assert.equal(m.approvePending(p.hash), true);
+}
+const NO_STATE = { count: 0, hash: null, error: null, pending: null, approvals: 'absent', approvalsChanged: false };
+
+test('resolver: no file and nothing approved means no rules and nothing pending', () => {
   const { io } = fakeIo(null);
-  const m = createRulesResolver('/x/rules.json', io);
+  const m = resolverOf(io);
   assert.equal(m.resolve('anything.example.com'), 'default');
   assert.equal(m.ruleFor('anything.example.com'), null);
   assert.equal(m.isLoginHost('sso.example.com', 'default'), false);
-  assert.deepEqual(m.state(), { count: 0, hash: null, error: null });
+  assert.deepEqual(m.state(), NO_STATE);
+  assert.equal(m.pending(), null);
+  assert.equal(m.approvePending(null), false);   // 没有待批的：什么都批不了
 });
 
-test('resolver: a good file takes effect on refresh, not before', () => {
+test('resolver: a good file is pending until approved; only the stricter of approved and pending applies meanwhile', () => {
   const { f, io } = fakeIo(null);
-  const m = createRulesResolver('/x/rules.json', io);
+  const m = resolverOf(io);
   f.text = good;
-  assert.equal(m.resolve('x.example.com'), 'default');  // resolve never touches the file
+  assert.equal(m.resolve('x.example.com'), 'default');  // resolve 和 state 不碰文件
   m.refresh();
+  const s0 = m.state();
+  assert.equal(s0.count, 0); assert.equal(s0.hash, null); assert.equal(s0.error, null);
+  assert.deepEqual(s0.pending, { hash: s0.pending?.hash, tooLong: false });
+  assert.match(s0.pending?.hash ?? '', /^sha256:[0-9a-f]{16}$/);
+  // 待批文件里 *.example.com 只读：收紧立刻生效；app.example.com 的「默认」是放宽，要等批准（还不存在已批准的规则，所以也是 default）
   assert.equal(m.resolve('x.example.com'), 'readonly');
   assert.equal(m.resolve('X.example.com.'), 'readonly');
-  assert.equal(m.resolve('app.example.com.'), 'default');
   assert.equal(m.ruleFor('x.example.com'), 'readonly');
+  assert.equal(m.resolve('other.example.org'), 'default');
+  assert.equal(m.isLoginHost('sso.example.com', 'default'), false);   // 白名单只认已批准的
+  assert.equal(m.pending()?.text, good);
+  approveNow(m);
+  const s = m.state();
+  assert.equal(s.count, 2); assert.equal(s.error, null); assert.equal(s.pending, null); assert.equal(s.approvalsChanged, false);
+  assert.match(s.hash ?? '', /^sha256:[0-9a-f]{16}$/);
+  assert.equal(m.resolve('x.example.com'), 'readonly');
+  assert.equal(m.resolve('app.example.com.'), 'default');
   assert.equal(m.ruleFor('app.example.com'), 'default');
   assert.equal(m.ruleFor('other.example.org'), null);
   assert.equal(m.isLoginHost('SSO.example.com.', 'default'), true);
   assert.equal(m.isLoginHost('x.example.com', 'default'), false);
-  const s = m.state();
-  assert.equal(s.count, 2); assert.equal(s.error, null);
-  assert.match(s.hash ?? '', /^sha256:[0-9a-f]{16}$/);
+  assert.equal(m.pending(), null);
 });
 
-test('resolver: loads at construction', () => {
+test('resolver: a file present at construction is pending too, not in effect', () => {
   const { io } = fakeIo(good);
-  const m = createRulesResolver('/x/rules.json', io);
-  assert.equal(m.resolve('x.example.com'), 'readonly');
+  const m = resolverOf(io);
+  assert.equal(m.resolve('x.example.com'), 'readonly');   // 更严的那份
+  assert.equal(m.state().count, 0); assert.notEqual(m.state().pending, null);
+  assert.equal(m.resolve('app.example.com'), 'default');   // 文件里 app 是例外（默认），没有只读那份可取
+});
+
+test('resolver: relaxing an approved readonly rule waits for approval, tightening applies at once', () => {
+  const ro = JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }] });
+  const relaxed = JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'default' }] });
+  const { f, io } = fakeIo(ro);
+  const m = resolverOf(io);
+  approveNow(m);
+  assert.equal(m.resolve('app.example.com'), 'readonly');
+  f.text = relaxed; m.refresh();
+  assert.equal(m.resolve('app.example.com'), 'readonly');   // 放宽：批准前仍是更严的已批准那份
+  assert.equal(m.ruleFor('app.example.com'), 'readonly');
+  assert.deepEqual(m.pending()?.summary, ['~ 规则 app.example.com：只读→默认']);
+  approveNow(m);
+  assert.equal(m.resolve('app.example.com'), 'default');
+  f.text = ro; m.refresh();
+  assert.equal(m.resolve('app.example.com'), 'readonly');   // 收紧：不用批准就生效
+  assert.equal(m.state().count, 1); assert.equal(m.state().pending?.tooLong, false);
+});
+
+test('resolver: approvePending with an old or wrong hash is refused and approves nothing', () => {
+  const { f, io } = fakeIo(good);
+  const m = resolverOf(io);
+  const first = m.pending()?.hash ?? null;
+  f.text = good.replace('"readonly"', '"default" ');
+  m.refresh();
+  assert.notEqual(m.pending()?.hash, first);
+  assert.equal(m.approvePending(first), false);
+  assert.equal(m.approvePending(null), false);
+  assert.equal(m.approvePending('sha256:0000000000000000'), false);
+  assert.equal(m.state().count, 0); assert.notEqual(m.state().pending, null);
+  assert.equal(m.approvePending(m.pending()?.hash ?? null), true);
   assert.equal(m.state().count, 2);
 });
 
-test('resolver: an unchanged file keeps the same hash; a same-size edit is noticed', () => {
+test('resolver: approvePending writes the text held in memory, not whatever the file says by then', () => {
   const { f, io } = fakeIo(good);
-  const m = createRulesResolver('/x/rules.json', io);
-  const h1 = m.state().hash;
+  const m = resolverOf(io);
+  const hash = m.pending()?.hash ?? null;
+  f.text = JSON.stringify({ version: 1, rules: [{ match: 'evil.example.com', mode: 'default' }], loginHosts: ['evil.example.com'] });   // 批准前一刻被换了
+  const reads = f.readCalls;
+  assert.equal(m.approvePending(hash), true);
+  assert.equal(f.readCalls, reads);                           // 没有重读文件
+  assert.equal(m.isLoginHost('evil.example.com', 'default'), false);
+  assert.equal(m.isLoginHost('sso.example.com', 'default'), true);
+  assert.equal(m.resolve('x.example.com'), 'readonly');
+  m.refresh();                                                // 现在的文件和刚批准的不一样：又是待批
+  assert.notEqual(m.pending(), null);
+});
+
+test('resolver: an unchanged file keeps the same pending hash; a same-size edit is noticed', () => {
+  const { f, io } = fakeIo(good);
+  const m = resolverOf(io);
+  const h1 = m.state().pending?.hash;
   m.refresh();
-  assert.equal(m.state().hash, h1);
+  assert.equal(m.state().pending?.hash, h1);
   f.text = good.replace('"readonly"', '"default" ');   // 字节数不变
   assert.equal(Buffer.byteLength(f.text), Buffer.byteLength(good));
   m.refresh();
-  assert.notEqual(m.state().hash, h1);
-  assert.equal(m.resolve('x.example.com'), 'default');
+  assert.notEqual(m.state().pending?.hash, h1);
+  assert.equal(m.resolve('x.example.com'), 'default');   // 文件里没有只读了，也没有已批准的
 });
 
-test('resolver: a broken file keeps the last good rules and reports the error; a fix clears it', () => {
+test('resolver: a broken file leaves the approved rules in force, is an error and not pending; a fix clears it', () => {
   const { f, io } = fakeIo(good);
-  const m = createRulesResolver('/x/rules.json', io);
+  const m = resolverOf(io);
+  approveNow(m);
   const h1 = m.state().hash;
   f.text = '{"version":1,"rules":[{"match":"*","mode":"readonly"}]}';
   m.refresh();
   assert.equal(m.resolve('x.example.com'), 'readonly');
   assert.equal(m.resolve('app.example.com'), 'default');
-  assert.deepEqual({ ...m.state(), error: m.state().error === null ? null : 'set' }, { count: 2, hash: h1, error: 'set' });
+  assert.equal(m.state().pending?.hash, m.pending()?.hash);
+  f.text = '{"version":1,"rules":null}';
+  m.refresh();
+  assert.deepEqual({ ...m.state(), error: m.state().error === null ? null : 'set' }, { ...NO_STATE, count: 2, hash: h1, error: 'set', approvals: 'absent' });
+  assert.equal(m.pending(), null);
   f.text = good;   // 改回原内容：错误清掉
   m.refresh();
-  assert.deepEqual(m.state(), { count: 2, hash: h1, error: null });
+  assert.deepEqual(m.state(), { ...NO_STATE, count: 2, hash: h1 });
 });
 
-test('resolver: a file broken from the start means no rules and an error', () => {
+test('resolver: a file broken from the start means an error, no rules and nothing pending', () => {
   const { io } = fakeIo('nope');
-  const m = createRulesResolver('/x/rules.json', io);
-  assert.equal(m.state().count, 0); assert.equal(m.state().hash, null); assert.notEqual(m.state().error, null);
+  const m = resolverOf(io);
+  assert.equal(m.state().count, 0); assert.equal(m.state().hash, null); assert.notEqual(m.state().error, null); assert.equal(m.state().pending, null);
+  assert.equal(m.pending(), null);
   assert.equal(m.resolve('x.example.com'), 'default');
 });
 
-test('resolver: deleting the file goes back to no rules', () => {
+test('resolver: deleting the file is a pending change (hash null); the approved rules and modes stay until a person approves', () => {
   const { f, io } = fakeIo(good);
-  const m = createRulesResolver('/x/rules.json', io);
+  const m = resolverOf(io);
+  approveNow(m);
   f.text = null;
   m.refresh();
-  assert.deepEqual(m.state(), { count: 0, hash: null, error: null });
+  assert.equal(m.state().count, 2); assert.deepEqual(m.state().pending, { hash: null, tooLong: false });
+  assert.deepEqual(m.pending(), { hash: null, text: null, summary: ['规则文件被删了：所有规则失效'], tooLong: false });
+  assert.equal(m.resolve('x.example.com'), 'readonly');       // 只看已批准的
+  assert.equal(m.isLoginHost('sso.example.com', 'default'), true);
+  assert.equal(m.approvePending('sha256:0000000000000000'), false);
+  assert.equal(m.approvePending(null), true);
+  assert.deepEqual(m.state(), NO_STATE);
   assert.equal(m.resolve('x.example.com'), 'default');
+  assert.equal(m.isLoginHost('sso.example.com', 'default'), false);
+  m.refresh();
+  assert.equal(m.pending(), null);                            // 文件还是没有：批准了「没有规则」
 });
 
-test('resolver: not a regular file, too large, or unreadable is an error and keeps the old rules', () => {
+test('resolver: deleting the file when nothing was ever approved is not a change', () => {
+  const { f, io } = fakeIo(null);
+  const m = resolverOf(io);
+  f.text = good; m.refresh(); f.text = null; m.refresh();
+  assert.deepEqual(m.state(), NO_STATE);
+});
+
+test('resolver: not a regular file, too large, or unreadable is an error and keeps the approved rules', () => {
   const { f, io } = fakeIo(good);
-  const m = createRulesResolver('/x/rules.json', io);
+  const m = resolverOf(io);
+  approveNow(m);
   const reads = f.readCalls;
   f.isFile = false; m.refresh();
   assert.notEqual(m.state().error, null); assert.equal(f.readCalls, reads);
@@ -204,13 +312,63 @@ test('resolver: not a regular file, too large, or unreadable is an error and kee
 
 test('resolver: a file that grows past the limit between stat and read is rejected', () => {
   const { f, io } = fakeIo(good);
-  const m = createRulesResolver('/x/rules.json', io);
+  const m = resolverOf(io);
   f.text = good + ' '.repeat(256 * 1024); f.size = 10; m.refresh();
-  assert.notEqual(m.state().error, null);
+  assert.notEqual(m.state().error, null); assert.equal(m.state().pending, null);
+});
+
+test('resolver: approvals survive a restart through the store; a new resolver on the same store starts with them', () => {
+  const file = storeFile();
+  const { io } = fakeIo(good);
+  const m1 = createRulesResolver('/x/rules.json', ApprovalStore.open(file, () => {}), io);
+  approveNow(m1);
+  const m2 = createRulesResolver('/x/rules.json', ApprovalStore.open(file, () => {}), io);
+  assert.equal(m2.state().count, 2); assert.equal(m2.state().pending, null); assert.equal(m2.state().approvals, 'ok');
+  assert.equal(m2.isLoginHost('sso.example.com', 'default'), true);
+});
+
+test('resolver: an unreadable approvals file at start means everything is pending again', () => {
+  const file = storeFile();
+  writeFileSync(file, '{broken');
+  const { io } = fakeIo(good);
+  const m = createRulesResolver('/x/rules.json', ApprovalStore.open(file, () => {}), io);
+  assert.equal(m.state().approvals, 'unreadable'); assert.equal(m.state().count, 0); assert.notEqual(m.state().pending, null);
+  assert.equal(m.isLoginHost('sso.example.com', 'default'), false);
+});
+
+test('resolver: an approved text whose hash does not match, or no longer parses, counts as never approved', () => {
+  const file = storeFile();
+  const s = ApprovalStore.open(file, () => {});
+  s.update((r) => ({ ...r, rules: { hash: 'sha256:0000000000000000', text: good } }));
+  const m1 = createRulesResolver('/x/rules.json', s, fakeIo(good).io);
+  assert.equal(m1.state().approvals, 'unreadable'); assert.equal(m1.state().count, 0); assert.notEqual(m1.state().pending, null);
+  assert.equal(m1.isLoginHost('sso.example.com', 'default'), false);
+  const s2 = ApprovalStore.open(storeFile(), () => {});
+  s2.update((r) => ({ ...r, rules: { hash: contentHash('{"version":2}'), text: '{"version":2}' } }));
+  const m2 = createRulesResolver('/x/rules.json', s2, fakeIo(null).io);
+  assert.equal(m2.state().approvals, 'unreadable'); assert.equal(m2.state().count, 0); assert.equal(m2.state().pending, null);
+});
+
+test('resolver: the approvals file deleted, corrupted or swapped for a symlink at run time never lowers what is approved', () => {
+  const file = storeFile();
+  const { io } = fakeIo(good);
+  const m = createRulesResolver('/x/rules.json', ApprovalStore.open(file, () => {}), io);
+  approveNow(m);
+  rmSync(file);
+  m.refresh();
+  assert.equal(m.state().count, 2); assert.equal(m.state().approvalsChanged, true); assert.equal(m.state().pending, null);
+  assert.equal(m.isLoginHost('sso.example.com', 'default'), true);
+  writeFileSync(file, 'garbage');
+  m.refresh();
+  assert.equal(m.state().count, 2); assert.equal(m.state().approvalsChanged, true);
+  rmSync(file); symlinkSync(file + '.elsewhere', file);
+  m.refresh();
+  assert.equal(m.state().count, 2); assert.equal(m.state().approvalsChanged, true);
+  assert.equal(m.resolve('x.example.com'), 'readonly');
 });
 
 test('resolver: an invalid host fails closed to readonly in resolve, and is not a login host', () => {
-  const m = createRulesResolver('/x/rules.json', fakeIo(null).io);
+  const m = resolverOf(fakeIo(null).io);
   assert.equal(m.resolve('a b'), 'readonly');
   assert.equal(m.resolve(''), 'readonly');
   assert.equal(m.resolve('evil.com/x'), 'readonly');
@@ -406,7 +564,9 @@ describe('groups', () => {
 
   test('resolver: groups and isLoginHost are per group', () => {
     const io: Io = { stat: () => ({ isFile: true, size: 10 }), read: () => JSON.stringify(GROUP_FILE) };
-    const m = createRulesResolver('/x/rules.json', io);
+    const m = resolverOf(io);
+    assert.equal(m.groupOf('admin.example.com').name, 'default');   // 批准前，组不生效
+    approveNow(m);
     assert.equal(m.groupOf('admin.example.com').name, 'admin');
     assert.equal(m.groupOf('other.example.com').name, 'default');
     assert.equal(m.group('admin')?.name, 'admin');
@@ -418,5 +578,123 @@ describe('groups', () => {
     assert.equal(m.isLoginHost('admin.example.com', 'admin'), false);   // 组的 hosts 不等于登录主机
     assert.equal(m.isLoginHost('sso.example.org', 'nope'), false);
     assert.equal(m.isLoginHost('a b', 'admin'), false);
+  });
+});
+
+// ---- 批准快照的差异（M2b） ----
+
+describe('pending summary', () => {
+  const H2 = 'b'.repeat(64);
+  const H3 = 'c'.repeat(64);
+  const adminGroup = (over: Obj = {}): Obj => ({
+    name: 'admin', hosts: ['admin.example.com'], loginHosts: ['sso.example.org'],
+    readPosts: [{ method: 'POST', url: 'https://admin.example.com/v1/search' }],
+    persistedQueries: [{ url: 'https://admin.example.com/graphql', hashes: [HASH] }],
+    logout: [{ url: 'https://admin.example.com/logout' }],
+    identity: { selector: '#tenant', expect: 'T' }, ...over,
+  });
+  const fileOf = (o: Obj): string => JSON.stringify({ version: 1, ...o });
+  // 先批准 base，再把文件改成 next，返回 next 相对 base 的待批说明。
+  function summaryOf(base: Obj, next: Obj | null): string[] {
+    const { f, io } = fakeIo(fileOf(base));
+    const m = resolverOf(io);
+    approveNow(m);
+    f.text = next === null ? null : fileOf(next);
+    m.refresh();
+    return m.pending()?.summary ?? [];
+  }
+
+  test('a readPost added to a group is listed first, as a relaxing line, before the tightening ones', () => {
+    const lines = summaryOf(
+      { rules: [{ match: 'app.example.com', mode: 'default' }], groups: [adminGroup()] },
+      { rules: [{ match: 'app.example.com', mode: 'readonly' }], groups: [adminGroup({ readPosts: [
+        { method: 'POST', url: 'https://admin.example.com/v1/search' }, { method: 'DELETE', url: 'https://admin.example.com/v1/items/*' }] })] });
+    assert.deepEqual(lines, ['+ 读型 POST admin：DELETE https://admin.example.com/v1/items/*', '~ 规则 app.example.com：默认→只读']);
+  });
+
+  test('persisted queries: new endpoint and added hashes count as relaxing, removed hashes as tightening', () => {
+    const base = { groups: [adminGroup()] };
+    assert.deepEqual(summaryOf(base, { groups: [adminGroup({ persistedQueries: [
+      { url: 'https://admin.example.com/graphql', hashes: [HASH, H2, H3] }, { url: 'https://admin.example.com/other', hashes: [H2, H3] }] })] }),
+    ['+ 持久化查询 admin：https://admin.example.com/graphql（+2 个哈希）', '+ 持久化查询 admin：https://admin.example.com/other（+2 个哈希）']);
+    assert.deepEqual(summaryOf(base, { groups: [adminGroup({ persistedQueries: [] })] }),
+      ['- 持久化查询 admin：https://admin.example.com/graphql（-1 个哈希）']);
+  });
+
+  test('login hosts, logout, identity, group hosts and rules each get their line, relaxing ones first', () => {
+    const base = {
+      rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'old.example.com', mode: 'readonly' }, { match: 'keep.example.com', mode: 'default' }],
+      loginHosts: ['sso.example.org'], groups: [adminGroup()],
+    };
+    const next = {
+      rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'keep.example.com', mode: 'readonly' }, { match: 'new.example.com', mode: 'readonly' }, { match: 'carve.example.com', mode: 'default' }],
+      loginHosts: ['sso.example.org', 'idp.example.org'],
+      groups: [adminGroup({ loginHosts: [], logout: [], identity: { selector: '#t2', expect: 'T' }, hosts: ['admin.example.com', 'extra.example.com'] })],
+    };
+    const lines = summaryOf(base, next);
+    const firstTightening = lines.findIndex((l) => ['- 登录主机', '~ 规则 keep', '+ 规则 new'].some((p) => l.startsWith(p)));
+    const lastRelaxing = Math.max(...['- 登出 admin', '~ 身份探针', '+ 顶层登录主机', '~ 主机', '- 规则 old', '+ 规则 carve'].map((p) => lines.findIndex((l) => l.startsWith(p))));
+    assert.ok(firstTightening > lastRelaxing, lines.join('\n'));
+    assert.equal(lines.length, 9);
+    for (const l of ['- 登出 admin：https://admin.example.com/logout', '~ 身份探针 admin', '+ 顶层登录主机：idp.example.org', '~ 主机 extra.example.com 从组 default 移到组 admin',
+      '- 规则 old.example.com（只读）', '+ 规则 carve.example.com（默认）', '- 登录主机 admin：sso.example.org', '~ 规则 keep.example.com：默认→只读', '+ 规则 new.example.com（只读）']) {
+      assert.ok(lines.includes(l), l);
+    }
+  });
+
+  test('a new group lists what it grants, then the group itself; a removed group is a relaxing line and its hosts move to default', () => {
+    assert.deepEqual(summaryOf({ rules: [] }, { groups: [adminGroup()] }), [
+      '+ 读型 POST admin：POST https://admin.example.com/v1/search',
+      '+ 持久化查询 admin：https://admin.example.com/graphql（+1 个哈希）',
+      '+ 登录主机 admin：sso.example.org',
+      '~ 身份探针 admin',
+      '~ 主机 admin.example.com 从组 default 移到组 admin',
+      '+ 登出 admin：https://admin.example.com/logout',
+      '+ 组 admin',
+    ]);
+    assert.deepEqual(summaryOf({ groups: [adminGroup()] }, { rules: [] }), ['- 组 admin', '~ 主机 admin.example.com 从组 admin 移到组 default']);
+    assert.deepEqual(summaryOf({ groups: [{ name: 'a', hosts: ['x.example.com'] }] }, { groups: [{ name: 'a', hosts: ['y.example.com'] }] }),
+      ['~ 主机 y.example.com 从组 default 移到组 a', '~ 主机 x.example.com 从组 a 移到组 default']);
+  });
+
+  test('moving a host from one group to another is one line', () => {
+    const two = (aHosts: string[], bHosts: string[]): Obj => ({ groups: [{ name: 'a', hosts: aHosts }, { name: 'b', hosts: bHosts }] });
+    assert.deepEqual(summaryOf(two(['x.example.com', 'y.example.com'], ['z.example.com']), two(['y.example.com'], ['z.example.com', 'x.example.com'])),
+      ['~ 主机 x.example.com 从组 a 移到组 b']);
+  });
+
+  test('a file that differs only in spelling says so; a deleted file is the single deletion line', () => {
+    assert.deepEqual(summaryOf({ rules: [{ match: 'a.example.com', mode: 'readonly' }] }, { rules: [{ match: 'a.example.com', mode: 'readonly' }], loginHosts: [] }),
+      ['规则文件内容变了，解析出来的规则没有差别']);
+    assert.deepEqual(summaryOf({ rules: [{ match: 'a.example.com', mode: 'readonly' }] }, null), ['规则文件被删了：所有规则失效']);
+  });
+
+  test('13 changes are too long for a dialog; 12 are not', () => {
+    const rules = (n: number): Obj[] => Array.from({ length: n }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' }));
+    for (const [n, tooLong] of [[12, false], [13, true]] as const) {
+      const { f, io } = fakeIo(fileOf({ rules: [] }));
+      const m = resolverOf(io);
+      approveNow(m);
+      f.text = fileOf({ rules: rules(n) }); m.refresh();
+      assert.equal(m.pending()?.summary.length, n);
+      assert.equal(m.pending()?.tooLong, tooLong, String(n));
+      assert.equal(m.state().pending?.tooLong, tooLong);
+    }
+  });
+
+  test('inspectRules reads the files itself: pending, approved, unreadable approvals', () => {
+    const { io } = fakeIo(good);
+    const file = storeFile();
+    const before = inspectRules('/x/rules.json', file, io);
+    assert.equal(before.pending, true); assert.equal(before.approvals, 'absent'); assert.equal(before.approvedCount, 0);
+    assert.match(before.hash ?? '', /^sha256:[0-9a-f]{16}$/);
+    assert.ok(before.summary.length > 0);
+    approveNow(createRulesResolver('/x/rules.json', ApprovalStore.open(file, () => {}), io));
+    const after = inspectRules('/x/rules.json', file, io);
+    assert.deepEqual([after.pending, after.approvals, after.approvedCount, after.summary], [false, 'ok', 2, []]);
+    writeFileSync(file, 'garbage');
+    const bad = inspectRules('/x/rules.json', file, io);
+    assert.deepEqual([bad.pending, bad.approvals, bad.approvedCount], [true, 'unreadable', 0]);
+    assert.equal(inspectRules('/x/rules.json', file, fakeIo('nope').io).pending, false);   // 文件有错：不算待批
   });
 });
