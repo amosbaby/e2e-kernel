@@ -81,6 +81,7 @@ export class Recorder {
   readonly hosts: { host: string; mode: Mode }[] = [];
   readonly modes: ModeChange[] = [];
   private blocked = 0;                                // 单调递增，供 read-only 的拦截计数用
+  private deniedBlocked = 0;                          // 其中原因是 denied 的（不允许的域名拦的，不是只读规则拦的）
   private seq = 0;
   private requestSeq = 0;
   // 按驱动给的请求 id 找回记录。摘要表和 requests 一起只留最近 MAX_REQUESTS 条；写和 writes 一样不删。
@@ -108,6 +109,11 @@ export class Recorder {
     return this.blocked;
   }
 
+  // 其中被「不允许的域名」拦下的（reason 为 denied）：step 的「只读模式」提示要把它们扣掉。
+  deniedEvents(): number {
+    return this.deniedBlocked;
+  }
+
   // 每个请求都进 requests；写方法或被拦的请求（不管方法）另进 writes。摘要的 id 由这里生成：它在脱敏的跳过键 id 下面，不能用外来的串。
   addRequest(req: RequestInfo, verdict: PolicyVerdict, ctx: { mode: Mode; targetMode: Mode }, at: Date): void {
     const summary: RequestSummary = {
@@ -128,7 +134,10 @@ export class Recorder {
       const write = toWriteRecord(req, verdict, ctx, at);
       this.writes.push(write);
       this.writeByRequest.set(req.id, write);
-      if (write.decision === 'blocked') this.blocked++;
+      if (write.decision === 'blocked') {
+        this.blocked++;
+        if (write.reason === 'denied') this.deniedBlocked++;
+      }
     }
   }
 

@@ -486,6 +486,7 @@ test('open and login on changed rules: denied is exit 2, a kernel started withou
 test('login prints the loginHosts hint when read-only rules blocked writes during the login, and nothing when none were blocked', async () => {
   const hinted = await loginWithBlockedWrites(2);
   assert.match(hinted, /登录过程中有 2 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules\.json 的 loginHosts/);
+  assert.match(hinted, /rules\.json 的 loginHosts；在不允许的域名上登录时，窗口里这个域名也按只读算/);   // deny 的登录窗口里写也是按只读拦的，文案不让人以为是别的规则
   assert.ok(!(await loginWithBlockedWrites(0)).includes('loginHosts'));
 });
 

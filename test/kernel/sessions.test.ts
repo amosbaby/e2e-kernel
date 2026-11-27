@@ -4206,7 +4206,7 @@ test('a page on a default host requesting a deny host is answered 403 whatever t
 
 test('a --readonly session whose page host turns deny gets 403 on every request, and the next step says so; denied beats the forced read-only (R9)', async () => {
   const { sm, fake, home, modes } = setupDeny(answeringDeny('只读'));
-  const { session, pageId } = await opened(sm, fake);
+  const { session } = await opened(sm, fake);
   await sm.close({ session });
   const ro = await sm.open({ url: 'http://localhost:5173/', readonly: true });
   const roPage = fake.openPages().at(-1)!;
@@ -4218,7 +4218,6 @@ test('a --readonly session whose page host turns deny gets 403 on every request,
   const st = await sm.step({ session: ro.session, ops: [{ op: 'snapshot' }] });
   assert.ok(st.notices.includes('页面所在的域名现在是「不允许」：所有请求被拦，请关掉会话'), st.notices.join('|'));
   assert.ok(st.notices.includes('规则文件有未批准的改动（只有新增或改严（只读、不允许）的规则条目已先生效，其余改动要等批准）'));
-  assert.equal(pageId === roPage, false);
   assert.deepEqual(blockedReasons((await sm.close({ session: ro.session })).runDir), ['denied']);
 });
 
@@ -4239,7 +4238,7 @@ test('remembered declarations for a deny target are not used (R21): a grant-cove
 
 test('a host that cannot be normalized is a usage error before any gate: no dialog, no page, also with the rules waiting for approval', async () => {
   const { sm, dialog, fake } = setupDeny(answeringDeny('只读'), { approveRules: false });
-  await assert.rejects(sm.open({ url: 'http://a.example.com../' }), (e: E2kError) => e.code === 'usage' && !e.message.includes('example.com'));
+  await assert.rejects(sm.open({ url: 'http://a.example.com../' }), (e: E2kError) => e.code === 'usage' && e.message === '这个地址的主机名不合法' && !e.message.includes('example.com'));
   assert.equal(dialog.requests.length, 0);
   assert.deepEqual(fake.openPages(), []); assert.deepEqual(sm.list(), []);
 });
@@ -4308,4 +4307,212 @@ test('while a session whose mode is denied, or a granted read-only one, is alive
   assert.equal(status(await fake.emitRequest({ ...UNATTRIBUTED, id: 'd1' } as never)), 403);
   await sm.close({ session: ro.session });
   assert.equal((await fake.emitRequest({ ...UNATTRIBUTED, id: 'd2' } as never)).action, 'continue');
+});
+
+// ---- 跳到 deny 主机、重定向冻结、在 deny 主机上登录（M3 任务 5） ----
+
+const DENIED_NAV = (host: string): string => `这个域名是「不允许」的，没经批准不能打开：${host}`;
+const DENY_FROZEN_ERROR = (e: unknown): boolean => e instanceof E2kError && e.code === 'needs-human'
+  && e.message === '页面经重定向进了不允许的域名，会话已冻结' && e.next === '关掉会话；要去这个域名，用 open 经人批准另开';
+const innerFrozen = (sm: SessionManager, id: string): { denied: boolean; group: string | null } | null => {
+  const f = (inner(sm, id) as unknown as { frozen: { denied: boolean; group: string | null } | null }).frozen;
+  return f === null ? null : { denied: f.denied, group: f.group };
+};
+
+test('a top-level navigation of a session page to a deny host is answered with a 403 page and recorded as denied; the session stays usable and nothing is counted as read-only', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const { session, pageId } = await opened(sm, fake);
+  const during = sm.step({ session, ops: [{ op: 'wait', for: { ms: 100 } }] });
+  await sleep(10);
+  const nav = await topNav(fake, pageId, DENY_URL);
+  assert.deepEqual([nav.action, status(nav), (nav as { contentType: string }).contentType], ['fulfill', 403, 'text/html; charset=utf-8']);
+  assert.equal(status(await fake.emitRequest({ pageId, url: 'http://127.0.0.1:5173/api', ...POST_JSON })), 403);   // 同一批里还有一条发往 deny 主机的写（R18）
+  const st = await during;
+  assert.equal(st.writesBlocked, 2);
+  assert.deepEqual(st.notices, [DENIED_NAV('127.0.0.1')]);   // 没有「本批被拦 N 条写（只读模式）」
+  assert.deepEqual(await topNav(fake, pageId, HOME_URL + 'next'), { action: 'continue' });   // 回默认主机照常可用
+  assert.equal(inner(sm, session).topHost, 'localhost');
+  assert.deepEqual((await sm.step({ session, ops: [{ op: 'snapshot' }] })).notices, []);   // 提示过就不重复
+  const res = readResult((await sm.close({ session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.method, w.host, w.reason, w.decision]), [['GET', '127.0.0.1', 'denied', 'blocked'], ['POST', '127.0.0.1', 'denied', 'blocked']]);
+  assert.ok(!res.hosts.some((h) => h.host === '127.0.0.1'), 'a refused navigation is not a host the session went to');
+});
+
+test('after a refused navigation the page sits on the 403 page of the deny host: that is not evidence of where the page is, so the session is not frozen, its mode stays default and it can navigate away', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const { session, pageId } = await opened(sm, fake);
+  assert.equal(status(await topNav(fake, pageId, DENY_URL)), 403);
+  assert.equal((await sm.step({ session, ops: [{ op: 'goto', url: DENY_URL }] })).exit, 0);   // 页面地址落在被拦过的 deny 地址上
+  assert.equal(innerFrozen(sm, session), null);
+  assert.equal(inner(sm, session).topHost, 'localhost');
+  assert.deepEqual(await topNav(fake, pageId, HOME_URL, 'GET', DENY_URL), { action: 'continue' });   // 发起页停在那张 403 页上：回默认主机不被拦
+  assert.equal((await fake.emitRequest({ pageId, url: HOME_URL + 'api', topUrl: HOME_URL, ...POST_JSON })).action, 'continue');
+  await sm.close({ session });
+});
+
+test('a navigation to the granted deny host itself is allowed (judged read-only), also from a popup of the session', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  assert.equal((await topNav(fake, r.pageId, DENY_URL + 'next')).action, 'continue');
+  const popup = fake.emitPopup(r.pageId, 'about:blank');
+  assert.equal((await topNav(fake, popup.id, DENY_URL + 'popup')).action, 'continue');
+  assert.equal(status(await topNav(fake, r.pageId, DENY_URL + 'save', 'POST')), 403);   // 授权的主机按只读：表单 POST 照拦
+  assert.deepEqual(blockedReasons((await sm.close({ session: r.session })).runDir), ['method']);
+});
+
+test('a session granted for deny host A that navigates top-level to another deny host B gets a 403 page with reason denied', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'), { rules: PAIR_RULES });
+  const r = await openDenied(sm, fake, { url: HOST_A });
+  const nav = await topNav(fake, r.pageId, `${HOST_B}x`);
+  assert.deepEqual([nav.action, status(nav), (nav as { contentType: string }).contentType], ['fulfill', 403, 'text/html; charset=utf-8']);
+  assert.equal(status(await topNav(fake, r.pageId, `${HOST_B}y`, 'POST')), 403);
+  assert.equal((await topNav(fake, r.pageId, `${HOST_A}ok`)).action, 'continue');
+  const st = await sm.step({ session: r.session, ops: [{ op: 'snapshot' }] });
+  assert.ok(st.notices.includes(DENIED_NAV('b.deny.example.com')), st.notices.join('|'));
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.host, w.reason]), [['b.deny.example.com', 'denied'], ['b.deny.example.com', 'denied']]);
+});
+
+test('a popup of the session navigating to a deny host is refused the same way (its opener is known)', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const { session, pageId } = await opened(sm, fake);
+  const popup = fake.emitPopup(pageId, 'about:blank');
+  assert.equal(status(await topNav(fake, popup.id, DENY_URL, 'POST')), 403);
+  assert.equal(status(await fake.emitRequest({ id: `g${++navSeq}`, pageId: 'p-early', openerPageId: pageId, method: 'GET', url: DENY_URL, topUrl: DENY_URL, isNavigation: true, topFrame: true })), 403);
+  const st = await sm.step({ session, ops: [{ op: 'snapshot' }] });
+  assert.ok(st.notices.includes(DENIED_NAV('127.0.0.1')));
+  assert.deepEqual(blockedReasons((await sm.close({ session })).runDir), ['denied', 'denied']);
+});
+
+test('the first navigation of an unattributable popup of an authorized deny session into the same deny host is blocked as unattributed with reason denied (fail closed)', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  const first = await fake.emitRequest({ id: 'pop1', pageId: null, openerPageId: null, method: 'GET', url: DENY_URL, topUrl: DENY_URL, isNavigation: true, topFrame: true });
+  assert.deepEqual([first.action, status(first)], ['fulfill', 403]);
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.writes.unattributed.map((w) => [w.id, w.decision, w.reason]), [['pop1', 'blocked', 'denied']]);
+});
+
+test('a redirect hop into a deny host freezes the session without clearing cookies: every request is refused as denied, step says needs-human, nothing is cleared on close either', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const { session, pageId } = await opened(sm, fake);
+  const other = await sm.open({ url: HOME_URL, name: 'same-instance' }); const otherPage = fake.openPages().at(-1)!;
+  fake.emitHop(pageId, DENY_URL + 'landing');
+  const sub = await fake.emitRequest({ pageId, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL });
+  const nav = await topNav(fake, pageId, HOME_URL + 'next');
+  assert.deepEqual([status(sub), status(nav)], [403, 403]);
+  assert.equal((nav as { contentType: string }).contentType, 'text/html; charset=utf-8');
+  assert.ok((nav as { body: string }).body.includes('会话已冻结：页面经重定向进了不允许的域名'));
+  const calls = pageCalls(fake, pageId);
+  await assert.rejects(sm.step({ session, ops: [{ op: 'snapshot' }] }), DENY_FROZEN_ERROR);
+  assert.equal(pageCalls(fake, pageId), calls);
+  assert.deepEqual(innerFrozen(sm, session), { denied: true, group: null });
+  assert.equal((await fake.emitRequest({ pageId: otherPage, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL })).action, 'continue');   // 同实例的另一个会话不受影响
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'default')), []);
+  const res = readResult((await sm.close({ session })).runDir);
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'default')), []);   // 收尾也不清
+  assert.ok(res.writes.blocked.length >= 1 && res.writes.blocked.every((w) => w.reason === 'denied'));
+  assert.ok(res.writes.blocked.some((w) => w.host === '127.0.0.1'));   // 那一跳
+  assert.equal(res.frozen?.host, '127.0.0.1');
+  await sm.close({ session: other.session });
+});
+
+test('a session frozen for another group that then hops into a deny host clears cookies only for the other-group host; the deny hop is recorded as denied and the freeze stays an other-group one', async () => {
+  const rules = { ...GROUP_RULES, rules: [...GROUP_RULES.rules, { match: 'x.deny.example.com', mode: 'deny' }] };
+  const { sm, fake } = await setupGroups(rules);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  fake.emitHop(pageId, B_URL + 'landing');
+  fake.emitHop(pageId, 'http://x.deny.example.com/landing');
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com']);
+  assert.deepEqual(innerFrozen(sm, a.session), { denied: false, group: 'b' });
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'snapshot' }] }), FROZEN_STEP_ERROR);
+  const closed = await sm.close({ session: a.session });
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')), ['b.example.com', 'b.example.com']);   // 收尾那次也只清 b
+  const res = readResult(closed.runDir);
+  assert.deepEqual(res.writes.blocked.filter((w) => w.method === 'GET').map((w) => [w.host, w.reason]), [['b.example.com', 'other-group'], ['x.deny.example.com', 'denied']]);
+  assert.deepEqual(res.frozen?.host, 'b.example.com');
+
+  const second = await sm.open({ url: A_URL, name: 'deny-first' }); const page2 = fake.openPages().at(-1)!;   // 反过来：先冻结在 deny，再跳进别的组，别的组的主机照清
+  fake.emitHop(page2, 'http://x.deny.example.com/landing');
+  fake.emitHop(page2, B_URL + 'later');
+  assert.deepEqual(innerFrozen(sm, second.session), { denied: true, group: null });
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'a')).slice(2), ['b.example.com']);
+  await assert.rejects(sm.step({ session: second.session, ops: [{ op: 'snapshot' }] }), DENY_FROZEN_ERROR);
+  await sm.close({ session: second.session });
+});
+
+test('a page address on a deny host seen after a step freezes the session (fallback for a hop the driver did not report); a request of the main page whose top page is there does too', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  fake.definePage(HOME_URL + 'bounce', { redirectTo: DENY_URL });
+  const a = await opened(sm, fake, 'by-step');
+  await assert.rejects(sm.step({ session: a.session, ops: [{ op: 'goto', url: HOME_URL + 'bounce' }] }), DENY_FROZEN_ERROR);
+  assert.equal(status(await fake.emitRequest({ pageId: a.pageId, method: 'GET', url: HOME_URL + 'app.js', topUrl: HOME_URL })), 403);
+  assert.deepEqual(fake.clearedHosts(instanceOf(fake, 'default')), []);
+  await sm.close({ session: a.session });
+  const b = await opened(sm, fake, 'by-request');
+  const r = await fake.emitRequest({ pageId: b.pageId, method: 'GET', url: HOME_URL + 'x', topUrl: DENY_URL + 'landed' });
+  assert.equal(status(r), 403);
+  await assert.rejects(sm.step({ session: b.session, ops: [{ op: 'snapshot' }] }), DENY_FROZEN_ERROR);
+  await sm.close({ session: b.session });
+});
+
+test('a hop to the granted deny host does not freeze; a hop to a different deny host under the same wildcard does', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'), { rules: PAIR_RULES });
+  const r = await openDenied(sm, fake, { url: HOST_A });
+  fake.emitHop(r.pageId, `${HOST_A}landing`);
+  assert.equal(innerFrozen(sm, r.session), null);
+  assert.equal((await sm.step({ session: r.session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  fake.emitHop(r.pageId, `${HOST_B}landing`);
+  assert.deepEqual(innerFrozen(sm, r.session), { denied: true, group: null });
+  await assert.rejects(sm.step({ session: r.session, ops: [{ op: 'snapshot' }] }), DENY_FROZEN_ERROR);
+  await sm.close({ session: r.session });
+});
+
+test('login on a deny host asks every time and its window treats the host as read-only: GET passes, POST is blocked and counted, a hop into a deny host does not freeze it', async () => {
+  const { sm, fake, dialog } = setupDeny(answeringDeny('登录'));
+  await assert.rejects(sm.loginBegin({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  const req = dialog.requests.find((d) => d.title.startsWith('e2k：在不允许的域名上登录'))!;
+  assert.match(req.title, /^e2k：在不允许的域名上登录（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['拒绝', '登录'], '拒绝', 120]);
+  assert.ok(req.lines.some((l) => l.includes('127.0.0.1')) && req.lines.some((l) => l.includes('profile default')));
+  assert.deepEqual(fake.openPages(), []);   // 没批准之前不开窗口
+  const { loginId } = await sm.loginBegin({ url: DENY_URL });
+  const pageId = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ id: 'l1', pageId, method: 'GET', url: DENY_URL + 'app.js', topUrl: DENY_URL })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ id: 'l2', pageId, url: DENY_URL + 'api', topUrl: DENY_URL, ...POST_JSON })), 403);
+  fake.emitHop(pageId, 'http://127.0.0.1:9/landing');   // 登录窗口不为 deny 冻结
+  assert.equal((await fake.emitRequest({ id: 'l3', pageId, method: 'GET', url: DENY_URL + 'again', topUrl: DENY_URL })).action, 'continue');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+  assert.deepEqual(fake.clearedHosts(0), []);
+  await assert.rejects(sm.loginBegin({ url: DENY_URL }), isCode('wait-approval'));   // 用掉了：再来一次又问
+  assert.equal(dialog.requests.filter((d) => d.title.startsWith('e2k：在不允许的域名上登录')).length, 2);
+});
+
+test('login on a deny host: a refusal is a usage error and nothing opens; an approval nobody used within 5 minutes is asked again; a login on another host is not asked', async () => {
+  let t = 1_000_000;
+  const deny = setupDeny(answeringDeny('拒绝'), { now: () => t });
+  await assert.rejects(deny.sm.loginBegin({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(deny.sm.loginBegin({ url: DENY_URL }), (e: E2kError) => e.code === 'usage' && /人拒绝了在这个不允许的域名上登录/.test(e.message));
+  assert.deepEqual(deny.fake.openPages(), []);
+  const { loginId } = await deny.sm.loginBegin({ url: HOME_URL });   // 别的主机：不弹 deny 登录框
+  await deny.sm.loginEnd({ loginId });
+  assert.equal(deny.dialog.requests.length, 1);
+  const ttl = setupDeny(answeringDeny('登录'), { now: () => t });
+  await assert.rejects(ttl.sm.loginBegin({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  t += 5 * 60_000 + 1;
+  await assert.rejects(ttl.sm.loginBegin({ url: DENY_URL }), isCode('wait-approval'));
+  assert.equal(ttl.dialog.requests.length, 2);
+});
+
+test('a login window on a default host that lands on a deny host treats the page there as read-only too (denied is read-only in login windows): a write from it is blocked, a read passes', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('登录'));
+  const { loginId } = await sm.loginBegin({ url: HOME_URL });
+  const pageId = fake.openPages().at(-1)!;
+  assert.deepEqual(await topNav(fake, pageId, DENY_URL, 'GET', HOME_URL), { action: 'continue' });   // 去 deny 主机的导航：登录窗口里不 403
+  assert.equal((await fake.emitRequest({ id: 'm1', pageId, method: 'GET', url: DENY_URL + 'x', topUrl: DENY_URL })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ id: 'm2', pageId, url: HOME_URL + 'api', topUrl: DENY_URL, ...POST_JSON })), 403);
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
 });

@@ -26,7 +26,7 @@ import type { ProfileRef } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import { DEFAULT_GROUP_NAME, normalizeHost } from './rules.ts';
-import { blockFrozen, blockOtherGroup, otherGroupMessage } from './write-policy.ts';
+import { blockDenied, blockFrozen, blockOtherGroup, deniedNavMessage, otherGroupMessage } from './write-policy.ts';
 import type { PolicyCtx, PolicyVerdict, WritePolicy } from './write-policy.ts';
 
 // 会话管理（设计 5.2、5.5、5.6）：实例的懒启动和复用、会话的开、执行、收尾、闲置超时、关停。
@@ -62,9 +62,11 @@ const IDENTITY_PROBE_MS = 5000;
 const MAX_INSTANCES = 4;
 
 // 冻结（设计 5.2）：会话（或登录页）经重定向进了别的组的域名之后，它所有页的所有请求（含 GET）一律 403，step 不再执行。
-// group 是第一次跨进去的那个组，判断不出归属时是 null（失败关闭：判断出错也冻结）；hosts 是跨进去的各跳主机（收尾时再清一次 cookie）；
+// 会话页经重定向进了没授权的不允许的域名（R4）同样冻结，只是不清 cookie：登录页不为 deny 冻结（R5）。
+// group 是第一次跨进去的那个组，判断不出归属时是 null（失败关闭：判断出错也冻结）；denied 是第一次冻结的原因（进了不允许的域名），之后不再变；
+// first 是第一跳的主机（写进报告，不管清不清 cookie）；hosts 是要清 cookie 的各跳主机（别的组的，收尾时再清一次；不允许的域名的主机不在里面）；
 // clearing 是还没完成的 clearCookies，step 抛错和收尾前等它们落定。
-interface Freeze { readonly group: string | null; readonly hosts: Set<string>; readonly clearing: Set<Promise<void>> }
+interface Freeze { readonly group: string | null; readonly denied: boolean; first: string | null; readonly hosts: Set<string>; readonly clearing: Set<Promise<void>> }
 
 // 被拦下的跨组导航的地址（去掉 #）：这些页面停在内核自己回的 403 页上，页面地址在别的组的域名上，但不是重定向带进去的，
 // 不能因为它冻结会话。只留最近 MAX_REFUSED 个。
@@ -91,6 +93,7 @@ interface Session {
   readonly group: string;
   // 跨组导航被拦的次数，和还没在 step 的 notices 里提示过的提示句（去重）。
   crossCount: number;
+  deniedCount: number;                       // 被拦的不允许的域名的顶层导航次数（也进 crossNotices 的提示；step 的「只读模式」提示不算它们）
   readonly crossNotices: Set<string>;
   readonly refused: Set<string>;             // 被拦下的跨组导航的地址（去掉 #），见 MAX_REFUSED
   frozen: Freeze | null;                     // 经重定向进了别的组的域名：整个会话冻结
@@ -184,6 +187,7 @@ type IdentityOutcome = 'ok' | 'mismatch' | 'unverified' | 'skipped';
 
 // 冻结的会话 step 不执行：要人关掉它，用目标组的 profile 另开。group 为 null 是判断不出归属（失败关闭）。
 function frozenError(f: Freeze): E2kError {
+  if (f.denied) return new E2kError('needs-human', '页面经重定向进了不允许的域名，会话已冻结', '关掉会话；要去这个域名，用 open 经人批准另开');
   return f.group === null
     ? new E2kError('needs-human', '页面经重定向去了判断不出归属的域名，会话已冻结', '关掉这个会话，重新开')
     : new E2kError('needs-human', `页面经重定向进了组 ${f.group} 的域名，会话已冻结`, `关掉这个会话，用 --profile ${f.group} 另开`);
@@ -289,7 +293,11 @@ export class SessionManager {
     const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
     const host = new URL(p.url).hostname;
     // 规范化不了的主机名（比如末尾两个点）是用法错误：要在任何闸门之前拒掉，否则 resolve 把它当只读、跳过 deny 闸门。报错不回显主机名。
-    normalizeHost(host);
+    try {
+      normalizeHost(host);
+    } catch {
+      throw new E2kError('usage', '这个地址的主机名不合法', '换成完整的 http(s) 地址');
+    }
     // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
@@ -487,11 +495,13 @@ export class SessionManager {
       focus = { token, pagesBefore: s.pagesOpened, loginOpenAtStart };
       const blockedBefore = s.recorder.blockedEvents();
       const crossBefore = s.crossCount;
+      const deniedBefore = s.recorder.deniedEvents();
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
         { keepGoing: p.keepGoing === true, aborted: () => s.gone || s.frozen !== null });
       // 口径：本批执行期间被拦下的本会话请求。执行结束之后才到的「重定向被拒」算进下一批；未归属的请求不算（它们不属于任何会话的记录）。
       const writesBlocked = s.recorder.blockedEvents() - blockedBefore;
       const crossBlocked = s.crossCount - crossBefore;   // 其中跨组导航被拦的：不是只读模式拦的，提示另说
+      const deniedBlocked = s.recorder.deniedEvents() - deniedBefore;   // 其中不允许的域名拦的（导航和请求）：同样不是只读模式拦的
       const tallies = tally(results);
       await this.syncTopHost(s);
       // 本批执行期间冻结了（点链接被重定向到别的组）：后面的操作已记未执行，这一批的结果在报告里，这里报错让人处理。
@@ -503,7 +513,7 @@ export class SessionManager {
       const wall = await loginWall(s.page, s.start.url);
       s.lastWall = wall.blocked;
       const notices: string[] = [];
-      if (writesBlocked - crossBlocked > 0) notices.push(`本批被拦 ${writesBlocked - crossBlocked} 条写（只读模式），详见报告`);
+      if (writesBlocked - crossBlocked - deniedBlocked > 0) notices.push(`本批被拦 ${writesBlocked - crossBlocked - deniedBlocked} 条写（只读模式），详见报告`);
       notices.push(...s.crossNotices);   // 还没提示过的跨组导航（含两次 step 之间发生的），提示一次就清掉
       s.crossNotices.clear();
       const rules = this.deps.modes.state();
@@ -844,6 +854,34 @@ export class SessionManager {
     }
   }
 
+  // 在不允许的域名上登录（设计 5.4、R5）：agent 也能发 login.begin，所以每次都要人点框（不记住，批准后 5 分钟没用掉作废，R20）。
+  // 起始主机不是 deny 返回 null；否则返回答复的键，由调用方在所有闸都过了以后 forget。键绑定框里显示的全部内容：主机和 profile。
+  // 框的批准键是「登录」，默认按钮是「拒绝」。批准后窗口里 denied 一律当只读（decideForLogin）。
+  private gateLoginDeny(rawHost: string, profile: string): string | null {
+    if (this.deps.modes.resolve(rawHost) !== 'denied') return null;
+    const { approvals } = this.deps;
+    const host = normalizeHost(rawHost);   // 解析成 denied 的主机一定规范化得了
+    const key = `deny-login:${sha256(JSON.stringify([host, profile]))}`;
+    const request: DialogRequest = {
+      title: 'e2k：在不允许的域名上登录',
+      lines: [`要在不允许的域名上打开登录窗口：${host}（profile ${profile}）`, '窗口里这个域名按只读算：写请求会被拦下。', '', '拒绝：不打开（默认）', '登录：打开登录窗口，由你来操作'],
+      buttons: ['拒绝', '登录'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
+    const asked = approvals.ask(key, 'deny', request, ['登录'], { ttlMs: DENY_TTL_MS });
+    switch (asked.status) {
+      case 'pending':
+        throw pendingError(asked.id, '在不允许的域名上登录');
+      case 'denied':
+        if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试');
+        throw new E2kError('usage', '人拒绝了在这个不允许的域名上登录', '内核重启前同一个请求不会再问');
+      case 'unavailable':
+        throw new E2kError('needs-human', `要在不允许的域名上登录但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
+      case 'approved':
+        if (asked.button === '登录') return key;
+        throw new E2kError('internal', '在不允许的域名上登录的答复对不上');   // 不放行
+    }
+  }
+
   private async beginLogin(p: LoginBeginParams): Promise<{ loginId: string }> {
     // profile 参数的写法先查：要在 gateRules 之前。
     const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
@@ -859,8 +897,11 @@ export class SessionManager {
       // 取不到主机：host 留空
     }
     const { ref } = this.pickProfile(host, arg);
-    this.gateLoginHost(host);
     const profile = profileKey(ref);
+    // 闸门全部同步：先问在不允许的域名上登录（R5），再问没列明的主机的模式；全过了才用掉 deny 的答复（R7），免得后一道抛错、重试时又被问。
+    const denyKey = this.gateLoginDeny(host, profile);
+    this.gateLoginHost(host);
+    if (denyKey !== null) this.deps.approvals.forget(denyKey);
     this.loginsOpening++;   // pin 之前加：登记进 logins 之前的整段窗口都算「正在开」；finally 里减，pin 抛错、启动失败、成功都减
     try {
       const slot = this.pin(profile);
@@ -1118,7 +1159,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
-        group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [], grant: o.grant, denyAllow: [],
+        group: o.group, crossCount: 0, deniedCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [], grant: o.grant, denyAllow: [],
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         pagesOpened: 0, identityConfigured: false, identityChecks: 0, identitySkipped: 0, identityMismatch: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
@@ -1355,7 +1396,7 @@ export class SessionManager {
     // 就一律 403（冻结的会话开出来的、认不出归属的弹窗也在内）；别的实例不受影响。
     const frozen = this.frozenOn(inst);
     if (frozen !== null) {
-      const verdict = blockFrozen(req, frozen.group);
+      const verdict = blockFrozen(req, frozen.group, frozen.denied);
       this.unattributed.push(toWriteRecord(req, verdict, { mode: 'default', targetMode: this.deps.modes.resolve(hostOf(req.url)) }, this.deps.now()));
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
       return verdict.decision;
@@ -1417,8 +1458,10 @@ export class SessionManager {
     let decision: Decision;
     if (exempt) decision = { action: 'continue' };
     else {
-      const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...this.groupTargets(login.group, hostOf(req.url), topHost)].map((h) => modes.resolve(h))];
-      const mode: Mode = all.includes('readonly') ? 'readonly' : all.includes('denied') ? 'denied' : 'default';
+      // 登录窗口里 denied 一律当 readonly（R5）：窗口由人操作，不 403、不冻结；先映射再取并。
+      const asReadonly = (m: Mode): Mode => (m === 'denied' ? 'readonly' : m);
+      const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...this.groupTargets(login.group, hostOf(req.url), topHost)].map((h) => modes.resolve(h))].map(asReadonly);
+      const mode: Mode = all.includes('readonly') ? 'readonly' : 'default';
       // 登录窗口里允许登出（好换账号），也没有放行声明（声明属于会话）：logout、declared 传空；读型 POST、持久化查询照目标主机所在组。
       const verdict = this.deps.policy.decide(req, this.policyCtx(mode, null, hostOf(req.url), false));
       decision = verdict.decision;
@@ -1490,42 +1533,54 @@ export class SessionManager {
     if (owner === undefined) return;
     let group: string | null = null;
     let host: string | null = null;
+    let denied = false;
     try {
       const u = new URL(e.url);
       if (u.protocol !== 'http:' && u.protocol !== 'https:') return;   // 重定向到别的协议进不了任何组的域名
       host = u.hostname;
-      const target = this.deps.modes.groupOf(host).name;
-      if (target === DEFAULT_GROUP_NAME || target === owner.group) return;
-      group = target;
+      // 没授权的不允许的域名（R4）：先于组的判断，只对会话页；登录窗口里 denied 当只读，不冻结（R5）。
+      if (s !== undefined && this.deps.modes.resolve(host) === 'denied' && !this.grantCovers(s, host, { nav: true })) denied = true;
+      else {
+        const target = this.deps.modes.groupOf(host).name;
+        if (target === DEFAULT_GROUP_NAME || target === owner.group) return;
+        group = target;
+      }
     } catch (err) {
       this.logFailure(null, '判断重定向的跳', err);
     }
-    if (s !== undefined) this.freezeSession(s, e.url, group, host);
+    if (s !== undefined) this.freezeSession(s, e.url, group, host, denied);
     else if (login !== undefined) this.freezeLogin(login, group, host);
   }
 
-  // 页面已提交的地址在别的组的域名上吗？是（或判断出错）就给出 { group, host }（出错时都是 null，失败关闭），否则 null。
-  // 被内核自己拦下的跨组导航停下的 403 页（refused）不算：那不是被重定向带进去的。
-  private otherGroupEvidence(owner: Session | Login, url: string): { group: string | null; host: string | null } | null {
+  // 页面已提交的地址在别的组的域名上、或（会话页）在没授权的不允许的域名上吗？是（或判断出错）就给出 { group, host, denied }
+  // （出错时 group、host 都是 null、denied 为 false，失败关闭），否则 null。登录窗口里 denied 当只读，没有 deny 的证据（R5）。
+  // 被内核自己拦下的导航停下的 403 页（refused）不算：那不是被重定向带进去的。
+  private otherGroupEvidence(owner: Session | Login, url: string): { group: string | null; host: string | null; denied: boolean } | null {
     let group: string;
     let host: string;
+    let denied: boolean;
     try {
       host = hostOf(url);
+      // 页面还在会话已经确认的顶层主机上（host === topHost）不算：那是规则后来改成了不允许，不是页面跑到了新的地方；
+      // 这种会话所有请求本来就被拦，step 会提示关掉它（sessionMode 为 denied）。
+      denied = 'page' in owner && host !== owner.topHost && this.deps.modes.resolve(host) === 'denied' && !this.grantCovers(owner, host, { nav: true });
       group = this.deps.modes.groupOf(host).name;
     } catch (err) {
       const { sessionId, prefix } = this.who(owner);
       this.logFailure(sessionId, `${prefix}判断页面地址`, err);
-      return { group: null, host: null };
+      return { group: null, host: null, denied: false };
     }
-    if (group === DEFAULT_GROUP_NAME || group === owner.group || owner.refused.has(withoutHash(url))) return null;
-    return { group, host };
+    if (owner.refused.has(withoutHash(url))) return null;
+    if (denied) return { group: null, host, denied: true };
+    if (group === DEFAULT_GROUP_NAME || group === owner.group) return null;
+    return { group, host, denied: false };
   }
 
   // 兜底：已提交的页面地址在别的组的域名上，说明重定向的跳事件漏掉了，同样冻结（已冻结的不再重复）。
   private freezeIfOtherGroup(s: Session, url: string): void {
     if (s.frozen !== null) return;
     const hit = this.otherGroupEvidence(s, url);
-    if (hit !== null) this.freezeSession(s, url, hit.group, hit.host);
+    if (hit !== null) this.freezeSession(s, url, hit.group, hit.host, hit.denied);
   }
 
   private freezeLoginIfOtherGroup(login: Login, url: string): void {
@@ -1545,22 +1600,26 @@ export class SessionManager {
   private blockFrozenLogin(login: Login, frozen: Freeze, req: RequestInfo): Decision {
     login.blocked++;
     login.crossBlocked++;
-    return blockFrozen(req, frozen.group).decision;
+    return blockFrozen(req, frozen.group, frozen.denied).decision;
   }
 
   // 报告里写的冻结主机：第一跳的主机，脱敏后再写；没有就是 null。
   private frozenHost(f: Freeze): string | null {
-    const first = f.hosts.values().next();
-    return first.done === true ? null : safely(() => redactText(first.value));
+    const first = f.first;
+    return first === null ? null : safely(() => redactText(first));
   }
 
-  // 冻结的共同部分：记下第一次跨进去的组，对这一跳的主机清 cookie（只在这个会话所在的实例上）。
-  private markFrozen(owner: Session | Login, group: string | null, host: string | null): Freeze {
-    const frozen: Freeze = owner.frozen ?? { group, hosts: new Set(), clearing: new Set() };
+  // 冻结的共同部分：记下第一次冻结的组和原因（之后不再变），对这一跳的主机清 cookie（只在这个会话所在的实例上）。
+  // 清不清按这一跳自己判：denied（这一跳进了不允许的域名）不清，那个主机可能本来就属于这个 profile 的组（R4），哪怕会话先是为别的组冻结的。
+  private markFrozen(owner: Session | Login, group: string | null, host: string | null, denied: boolean): Freeze {
+    const frozen: Freeze = owner.frozen ?? { group, denied, first: null, hosts: new Set(), clearing: new Set() };
     owner.frozen = frozen;
     if (host !== null && host !== '') {
-      frozen.hosts.add(host);
-      this.clearCookies(owner, frozen, host);
+      frozen.first ??= host;
+      if (!denied) {
+        frozen.hosts.add(host);
+        this.clearCookies(owner, frozen, host);
+      }
     }
     return frozen;
   }
@@ -1594,21 +1653,21 @@ export class SessionManager {
     }
   }
 
-  // 会话冻结：记一条被拦的 other-group（没有真请求，造一条导航的记录），日志一行。组、主机判断不出时 group、host 为 null。
-  private freezeSession(s: Session, url: string, group: string | null, host: string | null): void {
-    this.markFrozen(s, group, host);
+  // 会话冻结：记一条被拦的 other-group（这一跳进了不允许的域名时记 denied；没有真请求，造一条导航的记录），日志一行。组、主机判断不出时 group、host 为 null。
+  private freezeSession(s: Session, url: string, group: string | null, host: string | null, denied: boolean): void {
+    this.markFrozen(s, group, host, denied);
     const req: RequestInfo = {
       id: `hop${++this.hopSeq}`, pageId: null, openerPageId: null, method: 'GET', url, resourceType: 'document',
       isNavigation: true, topFrame: true, topUrl: url, initiatorUrl: null, contentType: null, body: null, fromLoginForm: null,
     };
-    const verdict: PolicyVerdict = { decision: { action: 'abort' }, reason: 'other-group', allowedBy: null };
+    const verdict: PolicyVerdict = { decision: { action: 'abort' }, reason: denied ? 'denied' : 'other-group', allowedBy: null };
     s.recorder.addRequest(req, verdict, { mode: this.sessionMode(s, []), targetMode: this.deps.modes.resolve(host ?? '') }, this.deps.now());
-    this.logLine(`会话 ${s.id}：页面经重定向进了${group === null ? '判断不出归属的' : `组 ${group} 的`}域名 ${safely(() => redactText(host ?? ''))}，已冻结`);
+    this.logLine(`会话 ${s.id}：页面经重定向进了${denied ? '不允许的' : group === null ? '判断不出归属的' : `组 ${group} 的`}域名 ${safely(() => redactText(host ?? ''))}，已冻结`);
   }
 
   // 登录页冻结：这一跳按一次被拦的跨组导航算（writesBlocked、crossGroupBlocked 各加一），日志一行。
   private freezeLogin(login: Login, group: string | null, host: string | null): void {
-    this.markFrozen(login, group, host);
+    this.markFrozen(login, group, host, false);
     login.blocked++;
     login.crossBlocked++;
     this.logLine(`登录 ${login.id}：页面经重定向进了${group === null ? '判断不出归属的' : `组 ${group} 的`}域名 ${safely(() => redactText(host ?? ''))}，已冻结`);
@@ -1616,7 +1675,7 @@ export class SessionManager {
 
   // 冻结之后的请求：一律 403，记进会话的记录（每个请求都进 requests，被拦的进 writes）。
   private blockFrozenRequest(s: Session, frozen: Freeze, req: RequestInfo): Decision {
-    const verdict = blockFrozen(req, frozen.group);
+    const verdict = blockFrozen(req, frozen.group, frozen.denied);
     s.recorder.addRequest(req, verdict, { mode: this.sessionMode(s, []), targetMode: this.deps.modes.resolve(hostOf(req.url)) }, this.deps.now());
     return verdict.decision;
   }
@@ -1647,13 +1706,24 @@ export class SessionManager {
         return cross.verdict.decision;
       }
     }
+    // 没授权的不允许的域名的顶层导航（主页面和能认出归属的弹窗，R4）：回 403 页，记 denied，下一次 step 提示一句，会话不停。
+    // 授权只认打开的那个主机（grantCovers 的 nav 口径，R2）。被拦的导航不改主机、待定主机，也不算「到过」的域名；认不出归属的弹窗走 decideRequest 的未归属分支。
+    if (req.isNavigation && req.topFrame && targetMode === 'denied' && !this.grantCovers(s, host, { nav: true })) {
+      const verdict = blockDenied(req);
+      s.recorder.addRequest(req, verdict, { mode: this.sessionMode(s, []), targetMode }, this.deps.now());
+      s.deniedCount++;
+      s.crossNotices.add(deniedNavMessage(safely(() => redactText(host))));
+      s.refused.add(withoutHash(req.url));   // 页面会停在这张 403 页上：之后看到页面在这个地址，不算被重定向带进去的，也不是页面真的在那个主机上
+      if (s.refused.size > MAX_REFUSED) s.refused.delete(s.refused.values().next().value as string);
+      return verdict.decision;
+    }
     // 兜底（重定向的跳事件漏掉时，比如弹窗的第一个导航认不出归属）：会话的页已提交的地址（顶层导航：发起页的地址；其他请求：请求所在的
     // 顶层地址）在别的组的域名上，就冻结，这个请求也不放行。
     const evidence = req.isNavigation && req.topFrame ? req.initiatorUrl : req.topUrl;
     if (evidence !== null) this.freezeIfOtherGroup(s, evidence);
     if (s.frozen !== null) return this.blockFrozenRequest(s, s.frozen, req);
     // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
-    if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
+    if (mainNav && req.initiatorUrl !== null && !this.onRefusedDeny(s, req.initiatorUrl)) this.converge(s, hostOf(req.initiatorUrl));
     // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
     // 目标主机是不允许的域名时也并进来（R18）：没授权的就是 denied，一律 403；授权覆盖的按只读判。
     // 顶层导航的主机（导航目标）走 nav:true：借用只放行子请求的目标，不放行去那里的顶层导航（R2）。
@@ -1667,8 +1737,19 @@ export class SessionManager {
     // 主机据此确定下来（重定向落地也在这里跟上）。被拦的导航什么都不改。
     if (mainNav) {
       if (verdict.decision.action === 'continue') s.pendingHosts.add(topHost);
-    } else if (isMain && req.topUrl !== null) this.converge(s, topHost);
+    } else if (isMain && req.topUrl !== null && !this.onRefusedDeny(s, req.topUrl)) this.converge(s, topHost);
     return verdict.decision;
+  }
+
+  // 这个地址是内核自己为被拦的不允许的域名导航回的 403 页吗：页面停在那里，但并不真的在那个主机上（比如那张页的 favicon 请求带着它的地址），
+  // 不能据此把会话的顶层主机改成 deny 主机，否则会话成了 denied，再也导航不出去。别的被拦的地址（跨组）照旧。
+  private onRefusedDeny(s: Session, url: string): boolean {
+    if (!s.refused.has(withoutHash(url))) return false;
+    try {
+      return this.deps.modes.resolve(hostOf(url)) === 'denied';
+    } catch {
+      return false;
+    }
   }
 
   // 授权覆盖这个主机吗（R2）：规范化后和 open 时批准的主机精确相等；nav 为 false（子请求的目标）时，借用的组里的主机也算。
@@ -1720,6 +1801,7 @@ export class SessionManager {
     try {
       const u = new URL(url);
       if (u.protocol === 'http:' || u.protocol === 'https:') {
+        if (this.onRefusedDeny(s, url)) return;   // 停在被拦的不允许的域名的 403 页上：不冻结，也不改顶层主机
         this.freezeIfOtherGroup(s, url);
         this.converge(s, u.hostname);
       }

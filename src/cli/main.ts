@@ -353,7 +353,7 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   // 跨组导航被拦的次数（writesBlocked 里含它们）：不是只读规则拦的，另给一句；老内核没有这个字段。
   const cross = isObject(ended) && typeof ended.crossGroupBlocked === 'number' ? ended.crossGroupBlocked : 0;
   if (blocked - cross > 0) {
-    ctx.io.out(`登录过程中有 ${blocked - cross} 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules.json 的 loginHosts`);
+    ctx.io.out(`登录过程中有 ${blocked - cross} 条写被只读规则拦下：身份提供方（SSO、SAML、OIDC）的主机可能没列进 rules.json 的 loginHosts；在不允许的域名上登录时，窗口里这个域名也按只读算`);
   }
   if (cross > 0) {
     ctx.io.out(`登录过程中有 ${cross} 次跳到别的组的导航被拦：这个登录窗口只能用本组的域名和 loginHosts 里的主机`);

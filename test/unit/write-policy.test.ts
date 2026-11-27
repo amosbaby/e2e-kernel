@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { RequestInfo } from '../../src/driver/types.ts';
-import { BLOCK_MESSAGE, DEFAULT_CTX, DENY_MESSAGE, allowAllPolicy, blockFrozen, blockOtherGroup, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
+import { BLOCK_MESSAGE, DEFAULT_CTX, DENY_MESSAGE, allowAllPolicy, blockFrozen, blockOtherGroup, deniedNavMessage, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
 import type { BlockReason, PolicyCtx } from '../../src/kernel/write-policy.ts';
 import { parseEndpoint } from '../../src/kernel/rules.ts';
 import type { Declaration } from '../../src/kernel/approval-store.ts';
@@ -247,6 +247,18 @@ test('a frozen session answers every request with a fixed 403 (HTML for navigati
     assert.ok(v.decision.action === 'fulfill' && v.decision.status === 403 && v.decision.contentType === 'application/json' && v.decision.body.includes('session frozen'));
   }
   assert.ok(frozenMessage(null).includes('判断不出归属'));
+});
+
+test('a session frozen by a redirect into a deny host answers like a frozen one but with reason denied and its own sentence; the denied-navigation notice names the host', () => {
+  const sentence = '会话已冻结：页面经重定向进了不允许的域名。请关掉这个会话；要去这个域名，用 open 经人批准另开。';
+  assert.equal(frozenMessage('b', true), sentence);
+  assert.equal(frozenMessage(null, true), sentence);
+  const nav = blockFrozen(req({ method: 'GET', isNavigation: true, topFrame: true }), null, true);
+  assert.equal(nav.reason, 'denied');
+  assert.deepEqual(nav.decision, { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${sentence}</p>` });
+  const sub = blockFrozen(req({ method: 'POST' }), null, true);
+  assert.ok(sub.reason === 'denied' && sub.decision.action === 'fulfill' && sub.decision.status === 403 && sub.decision.contentType === 'application/json');
+  assert.equal(deniedNavMessage('a.example.com'), '这个域名是「不允许」的，没经批准不能打开：a.example.com');
 });
 
 // ---- 组级白名单（M2b 任务 8） ----

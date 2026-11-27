@@ -71,19 +71,25 @@ export function blockOtherGroup(host: string, targetGroup: string, ownGroup: str
   return { decision: { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body }, reason: 'other-group', allowedBy: null };
 }
 
-// 会话已冻结（页面经重定向进了别的组的域名）：它所有页的所有请求，含 GET，一律 403，原因记 other-group。
-// 组名只含小写字母、数字、_、-，不用转义。
-// group 为 null 是判断不出归属（失败关闭）。
-export function frozenMessage(group: string | null): string {
+// 顶层导航去了没授权的不允许的域名：回 blockDenied 的 403 页，不放行；这句进 step 的 notices。host 是已脱敏的目标主机。
+export function deniedNavMessage(host: string): string {
+  return `这个域名是「不允许」的，没经批准不能打开：${host}`;
+}
+
+// 会话已冻结（页面经重定向进了别的组的域名，或没授权的不允许的域名）：它所有页的所有请求，含 GET，一律 403，
+// 原因记 other-group（denied 为 true 时记 denied）。组名只含小写字母、数字、_、-，不用转义。
+// group 为 null 是判断不出归属（失败关闭）；denied 为 true 时组名不用。
+export function frozenMessage(group: string | null, denied = false): string {
+  if (denied) return '会话已冻结：页面经重定向进了不允许的域名。请关掉这个会话；要去这个域名，用 open 经人批准另开。';
   return group === null ? '会话已冻结：页面经重定向去了判断不出归属的域名。请关掉这个会话，重新开。'
     : `会话已冻结：页面经重定向进了组 ${group} 的域名。请关掉这个会话，用 --profile ${group} 另开。`;
 }
 
-export function blockFrozen(req: RequestInfo, group: string | null): PolicyVerdict {
+export function blockFrozen(req: RequestInfo, group: string | null, denied = false): PolicyVerdict {
   const decision: Decision = req.isNavigation
-    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${frozenMessage(group)}</p>` }
-    : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: 'blocked by e2k: session frozen after a cross-group redirect' }) };
-  return { decision, reason: 'other-group', allowedBy: null };
+    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${frozenMessage(group, denied)}</p>` }
+    : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: denied ? 'blocked by e2k: session frozen after a redirect into a host not allowed' : 'blocked by e2k: session frozen after a cross-group redirect' }) };
+  return { decision, reason: denied ? 'denied' : 'other-group', allowedBy: null };
 }
 
 // 登出名单的匹配：拦截名单窄了是漏拦（失败开放），所以和放行名单（精确匹配）不同，按路径匹配：先去掉请求 URL 的 fragment 和查询串，
