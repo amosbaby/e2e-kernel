@@ -629,7 +629,7 @@ export class SessionManager {
   }
 
   // 登录前的弹框确认（设计 5.2「第一次登录问模式」）：主机没列明（已批准的规则、登录时选过、组、任何 loginHosts 都没有）就先问人：
-  // 取消 / 默认 / 只读，选择记进批准记录的 hostModes（不改 rules.json）。要在规则闸门之后、算 login.mode 之前，窗口也还没开。
+  // 不登录 / 默认 / 只读（按钮不叫「取消」：避免被 osascript 当成系统取消键，见 approval.ts 的 isUserCancel），选择记进批准记录的 hostModes（不改 rules.json）。要在规则闸门之后、算 login.mode 之前，窗口也还没开。
   // 答复（待批表的键 `login:` + 规范化主机）绑定框里显示的全部内容：框里只有这个主机和三个选项，所以键已经绑定了。
   // 各主机的键彼此独立，没有「基线」会变，所以用掉之后只 forget 自己，不作废别的 login: 答复。被拒的保留到内核重启，同类 60 秒冷却。
   // 规范化不了的主机（含取不到主机）不弹框，直接 usage：失败关闭。写盘失败时 needs-human 原样往上走，答复还留着，重试会再写一次。
@@ -656,8 +656,8 @@ export class SessionManager {
     const key = `login:${host}`;
     const request: DialogRequest = {
       title: 'e2k：在新域名上登录',
-      lines: [`要在 ${host} 上打开登录窗口。`, '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '取消：不打开'],
-      buttons: ['取消', '默认', '只读'], defaultButton: '取消', timeoutSec: APPROVAL_TIMEOUT_SEC,
+      lines: [`要在 ${host} 上打开登录窗口。`, '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '不登录：不打开'],
+      buttons: ['不登录', '默认', '只读'], defaultButton: '不登录', timeoutSec: APPROVAL_TIMEOUT_SEC,
     };
     const asked = approvals.ask(key, 'login', request, ['默认', '只读']);
     switch (asked.status) {

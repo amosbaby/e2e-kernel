@@ -70,6 +70,37 @@ test('osascriptDialog: anything but the exact shape is unavailable', async () =>
   }
 });
 
+// osascript 用户取消（点了被当作系统取消键的按钮，或按 Esc）：非 0 退出，stderr 里是 "User canceled. (-128)"。
+const canceled = (): Error => Object.assign(new Error('Command failed: osascript'), { code: 1, stderr: '0:130: execution error: User canceled. (-128)\n' });
+
+test('osascriptDialog: the user canceling (-128, "User canceled") counts as pressing the default button, not as a broken dialog', async () => {
+  const d = dialogWith(() => canceled());
+  assert.deepEqual(await d.dialog.show(req()), { kind: 'button', button: '不允许' });
+  const three = dialogWith(() => canceled());
+  assert.deepEqual(await three.dialog.show(req({ buttons: ['不登录', '默认', '只读'], defaultButton: '不登录' })), { kind: 'button', button: '不登录' });
+  // 只认 stderr 里的取消：别的非 0 退出、超时被杀、消息里碰巧有这几个字，仍是弹不出
+  for (const e of [
+    Object.assign(new Error('Command failed'), { code: 1, stderr: 'execution error: Application isn\'t running. (-600)\n' }),
+    Object.assign(new Error('User canceled. (-128)'), { code: 1 }),
+    Object.assign(new Error('timed out'), { killed: true, signal: 'SIGKILL', stderr: 'User canceled. (-128)' }),
+  ]) {
+    assert.equal((await dialogWith(() => e).dialog.show(req())).kind, 'unavailable');
+  }
+});
+
+test('Approvals + osascriptDialog: a canceled box is a refusal (default button), the dialog is not marked broken, and the next box is still shown', async () => {
+  let n = 0;
+  const exec: ExecFn = async () => { n++; if (n === 1) throw canceled(); return { stdout: 'button returned:允许, gave up:false\n' }; };
+  const a = new Approvals(osascriptDialog({ exec, managerName: async () => 'Aqua' }), () => {}, { now: () => 0 });
+  assert.equal(a.ask('k1', 'login', req(), ['允许']).status, 'pending');
+  await sleepTick(); await sleepTick();
+  assert.deepEqual(a.ask('k1', 'login', req(), ['允许']), { status: 'denied', cooling: false });
+  assert.equal(a.ask('k2', 'rules', req(), ['允许']).status, 'pending');   // 不同类：不受冷却影响，且没有被标成弹不出
+  await sleepTick(); await sleepTick();
+  assert.deepEqual(a.ask('k2', 'rules', req(), ['允许']), { status: 'approved', button: '允许' });
+  assert.equal(n, 2);
+});
+
 test('osascriptDialog: the same text without a trailing newline is accepted (only one newline is stripped, none is required)', async () => {
   const d = dialogWith(() => 'button returned:允许, gave up:false');
   assert.deepEqual(await d.dialog.show(req()), { kind: 'button', button: '允许' });
@@ -274,7 +305,7 @@ test('Approvals: forgetApproved drops approved answers that match, and keeps den
 test('Approvals: only the buttons the caller listed approve', async () => {
   const m = manualDialog();
   const a = new Approvals(m.dialog, () => {}, { now: clock().now });
-  const three = req({ buttons: ['取消', '默认', '只读'], defaultButton: '取消' });
+  const three = req({ buttons: ['不登录', '默认', '只读'], defaultButton: '不登录' });
   a.ask('k', 'login', three, ['默认', '只读']);
   await m.release({ kind: 'button', button: '只读' });
   assert.deepEqual(a.ask('k', 'login', three, ['默认', '只读']), { status: 'approved', button: '只读' });

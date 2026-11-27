@@ -3171,8 +3171,8 @@ test('login on a host nobody listed: 21, one three-button box that shows the hos
   assert.equal(dialog.requests.length, 1, 'the retry meets the same box');
   const req = dialog.requests[0]!;
   assert.match(req.title, /^e2k：在新域名上登录（请求 a-[0-9a-f]{6}）$/);
-  assert.deepEqual(req.lines, ['要在 app.example.com 上打开登录窗口。', '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '取消：不打开']);
-  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['取消', '默认', '只读'], '取消', 120]);
+  assert.deepEqual(req.lines, ['要在 app.example.com 上打开登录窗口。', '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '不登录：不打开']);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['不登录', '默认', '只读'], '不登录', 120]);
   assert.equal(openedPages(fake), 0);
   assert.deepEqual(store.get().hostModes, {});
 });
@@ -3212,7 +3212,7 @@ test('login answered "默认": the window opens, the choice is stored, writes pa
 });
 
 test('login cancelled: usage with nothing stored and no window; the same host stays refused without asking again; another host within a minute says it was refused just now', async () => {
-  const { sm, fake, dialog, store } = setupChoice(choosingMode('取消'));
+  const { sm, fake, dialog, store } = setupChoice(choosingMode('不登录'));
   await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
   await settleDialog();
   for (let i = 0; i < 2; i++) await assert.rejects(sm.loginBegin({ url: NEW_URL }), usageMatch(/人取消了这次登录/));

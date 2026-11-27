@@ -1234,7 +1234,7 @@ test('login on an unlisted host and nobody answers: it retries every 2 seconds f
 });
 
 test('login on an unlisted host: cancel is exit 2 and a kernel without dialogs is exit 22, both on the first retry; neither opens a window', async () => {
-  for (const [dialog, want, text] of [[fakeDialog(choosingMode('取消')), 2, /人取消了这次登录/], [noDialog, 22, /弹不出确认框/]] as const) {
+  for (const [dialog, want, text] of [[fakeDialog(choosingMode('不登录')), 2, /人取消了这次登录/], [noDialog, 22, /弹不出确认框/]] as const) {
     await withChoiceKernel(dialog, async (h, f) => {
       const t = io({ env: h.env, isTTY: true });
       assert.equal(await main(['login', NEW_LOGIN], t), want);

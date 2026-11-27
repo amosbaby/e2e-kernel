@@ -75,6 +75,12 @@ function parseResult(stdout: string, buttons: string[]): DialogResult {
   return buttons.includes(button) ? { kind: 'button', button } : { kind: 'unavailable', why: 'osascript 返回了未知的按钮' };
 }
 
+function isUserCancel(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return false;
+  const { stderr, killed } = e as { stderr?: unknown; killed?: unknown };
+  return killed !== true && typeof stderr === 'string' && /\(-128\)|User canceled/i.test(stderr);
+}
+
 export function osascriptDialog(o: { exec?: ExecFn; managerName?: () => Promise<string | null> } = {}): Dialog {
   const exec = o.exec ?? defaultExec;
   const managerName = o.managerName ?? defaultManagerName;
@@ -89,7 +95,11 @@ export function osascriptDialog(o: { exec?: ExecFn; managerName?: () => Promise<
       try {
         const { stdout } = await exec('osascript', args, { timeout: (r.timeoutSec + KILL_GRACE_SEC) * 1000 });
         return parseResult(stdout, r.buttons);
-      } catch {
+      } catch (e) {
+        // 人取消（点了被当作系统取消键的按钮，或按 Esc）：osascript 以 1 退出，stderr 里是「User canceled. (-128)」。
+        // 这是人的答复，不是弹不出：按「按了默认按钮」处理（所有批准框的默认按钮都是拒绝一类，ask 保证批准键不含默认按钮）。
+        // 只看 stderr 字段：错误消息里带着命令行参数（正文），正文里出现这几个字不能算取消；被杀（超时）的更不算。
+        if (isUserCancel(e)) return { kind: 'button', button: r.defaultButton };
         // 非 0 退出、超时被杀、找不到 osascript：原始错误里会带着命令行参数（正文），不往外传。
         return { kind: 'unavailable', why: 'osascript 没有正常结束' };
       }
