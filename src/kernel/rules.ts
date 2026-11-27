@@ -618,8 +618,8 @@ export function inspectRules(rulesFile: string, approvalsFile: string, io: Rules
 
 // 规则解析器。生效的是批准快照（ApprovalStore 里最后一次批准的那份规则）；规则文件只产生「待批」。
 // 每次 refresh 读文件和快照原文比：一样 = 无待批；不一样且解析得了 = 待批；改坏 = error，坏文件不进待批。
-// 待批期间 resolve 取「已批准」和「待批文件」里更严的（任一只读就只读），所以收紧立刻生效、放宽要等批准；
-// 组、白名单、loginHosts 只认已批准的。批准只认内存里留着的原文和哈希，不重读磁盘。
+// 待批期间 resolve 取「已批准」和「待批文件」里更严的（任一只读就只读），所以只有 rules 里新增或改成只读的条目立刻生效、放宽要等批准；
+// 组、白名单、loginHosts、logout、identity 只认已批准的（它们的改动哪怕是收紧也要等批准）。批准只认内存里留着的原文和哈希，不重读磁盘。
 export function createRulesResolver(file: string, store: ApprovalStore, io: RulesIo = defaultIo): ModeResolver {
   let snap = snapshotOf(store.get().rules);
   let approvals: ApprovalsStatus = snap.valid ? store.startupStatus : 'unreadable';

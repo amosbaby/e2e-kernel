@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Approvals, checkDialogText, noDialog, osascriptDialog, pendingError } from '../../src/kernel/approval.ts';
+import { Approvals, checkDialogText, defaultExec, noDialog, osascriptDialog, pendingError } from '../../src/kernel/approval.ts';
 import type { DialogRequest, DialogResult, ExecFn } from '../../src/kernel/approval.ts';
 import type { E2kError } from '../../src/shared/errors.ts';
 import { METHODS, exitCodeFor, parseRequest } from '../../src/shared/protocol.ts';
@@ -99,6 +99,30 @@ test('Approvals + osascriptDialog: a canceled box is a refusal (default button),
   await sleepTick(); await sleepTick();
   assert.deepEqual(a.ask('k2', 'rules', req(), ['允许']), { status: 'approved', button: '允许' });
   assert.equal(n, 2);
+});
+
+// 真的 defaultExec（不弹真框）：用 `sh -c` 代替 osascript，造出和真 osascript 一样的「stderr 有 -128、退出码 1」。
+// Node 的 execFile 回调式的 error 对象上没有 stderr，要 defaultExec 自己挂上；手工拼的 Error 看不出这个洞（终审复审发现）。
+const shExec = (script: string): ExecFn => (_file, _args, o) => defaultExec('sh', ['-c', script], o);
+
+test('osascriptDialog with the real defaultExec: a canceled box (-128 on stderr, exit 1) is the default button, the dialog is not marked broken, and the next box still shows; other stderr is unavailable', async () => {
+  const cancel = osascriptDialog({ exec: shExec('echo "0:130: execution error: User canceled. (-128)" >&2; exit 1'), managerName: async () => 'Aqua' });
+  assert.deepEqual(await cancel.show(req()), { kind: 'button', button: '不允许' });
+  assert.deepEqual(await cancel.show(req({ buttons: ['不登录', '默认', '只读'], defaultButton: '不登录' })), { kind: 'button', button: '不登录' }, 'asked again: still usable');
+  for (const script of ['echo "execution error: Application isn\'t running. (-600)" >&2; exit 1', 'exit 1', 'echo "User canceled. (-128)"; exit 1']) {   // 最后一条在 stdout，不是 stderr
+    const d = osascriptDialog({ exec: shExec(script), managerName: async () => 'Aqua' });
+    assert.equal((await d.show(req())).kind, 'unavailable', script);
+  }
+  // 经 Approvals：-128 是拒绝，且没有标 broken（之后另一类框照常弹、批准）
+  let n = 0;
+  const exec: ExecFn = (f, a, o) => (n++ === 0 ? shExec('echo "User canceled. (-128)" >&2; exit 1')(f, a, o) : Promise.resolve({ stdout: 'button returned:允许, gave up:false\n' }));
+  const a = new Approvals(osascriptDialog({ exec, managerName: async () => 'Aqua' }), () => {}, { now: () => 0 });
+  assert.equal(a.ask('k1', 'login', req(), ['允许']).status, 'pending');
+  for (let i = 0; i < 20 && a.stateOf('k1') !== 'denied'; i++) await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(a.ask('k1', 'login', req(), ['允许']), { status: 'denied', cooling: false });
+  assert.equal(a.ask('k2', 'rules', req(), ['允许']).status, 'pending');
+  for (let i = 0; i < 20 && a.stateOf('k2') !== 'approved'; i++) await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(a.ask('k2', 'rules', req(), ['允许']), { status: 'approved', button: '允许' });
 });
 
 test('osascriptDialog: the same text without a trailing newline is accepted (only one newline is stripped, none is required)', async () => {

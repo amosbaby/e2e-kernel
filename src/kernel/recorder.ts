@@ -25,7 +25,7 @@ export interface WriteRecord { id: string; at: string; method: string; url: stri
   // allowedBy：靠组级白名单（读型 POST、持久化查询、放行声明）放行的才有；其余放行、所有拦截都没有这个键。
   allowedBy?: AllowedBy }
 // 模式变更时间线（设计 5.2）：host 已脱敏；rulesHash 是已批准规则（快照）的摘要，没有是 null；
-// pendingRulesHash 是变化当时待批规则文件的摘要（它里面的收紧已经生效），没有待批是 null。
+// pendingRulesHash 是变化当时待批规则文件的摘要（它里面新增或改成只读的 rules 条目已经生效），没有待批是 null。
 export interface ModeChange { at: string; host: string; mode: Mode; reason: 'rule' | 'forced' | 'no-rule' | 'host-choice'; rulesHash: string | null; pendingRulesHash: string | null }
 
 const MAX_REQUESTS = 200;

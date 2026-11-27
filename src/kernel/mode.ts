@@ -8,7 +8,7 @@ export type RuleMode = 'readonly' | 'default';
 // 规则的当前状态。count、hash：当前**生效**的那份（人批准过的快照）；没有批准过为 0 条、hash 为 null。
 // error：规则文件现在改坏了（生效的仍是批准快照）。
 // pending：规则文件和批准快照不一致，等人批准（hash 是显示用的短哈希，null 表示文件被删了）；没有为 null。
-// 待批文件里的收紧同时已按「更严合并」生效，所以报告要同时记 hash（已批准的）和 pendingHash（待批的）。
+// 待批文件里新增或改成只读的 rules 条目同时已按「更严合并」生效（组、白名单、登出、身份的改动要等批准），所以报告要同时记 hash（已批准的）和 pendingHash（待批的）。
 // approvals：启动时批准记录的状态（读不了 = 现有规则全部重新批准）；approvalsChanged：运行中磁盘上的批准记录被外部改过
 // （只是提示，生效的仍是内存里最后一次批准）。
 export interface RulesState {

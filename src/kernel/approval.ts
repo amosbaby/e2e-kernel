@@ -51,8 +51,9 @@ const SCRIPT_LINES = [
 const RESULT_SHAPE = /^button returned:(.*), gave up:(true|false)$/;
 
 export const defaultExec: ExecFn =(file, args, o) => new Promise((resolve, reject) => {
-  execFile(file, args, { timeout: o.timeout, killSignal: 'SIGKILL', maxBuffer: 64 * 1024, encoding: 'utf8' }, (error, stdout) => {
-    if (error !== null) reject(error);
+  execFile(file, args, { timeout: o.timeout, killSignal: 'SIGKILL', maxBuffer: 64 * 1024, encoding: 'utf8' }, (error, stdout, stderr) => {
+    // 回调式 execFile 的 error 上没有 stderr：挂上它，osascript 的「用户取消」靠它认（isUserCancel 只看这个字段）。
+    if (error !== null) reject(Object.assign(error, { stderr }));
     else resolve({ stdout });
   });
 });
