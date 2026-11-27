@@ -2,8 +2,8 @@ import type { Mode } from '../shared/protocol.ts';
 import type { ApprovalsStatus } from './approval-store.ts';
 import type { Endpoint, Group } from './rules.ts';
 
-// 域名规则里能写的模式。'denied' 是 M3 的事，规则文件现在不收。
-export type RuleMode = 'readonly' | 'default';
+// 域名规则里能写的模式。'deny'（不允许）解析成会话模式 'denied'；登录时选的模式（hostModes）只有 default / readonly，不会有 deny。
+export type RuleMode = 'readonly' | 'default' | 'deny';
 
 // 规则的当前状态。count、hash：当前**生效**的那份（人批准过的快照）；没有批准过为 0 条、hash 为 null。
 // error：规则文件现在改坏了（生效的仍是批准快照）。
@@ -29,6 +29,7 @@ export interface ModeResolver {
   // 入口先规范化主机；规范化失败按 'readonly'（失败关闭）。用缓存，不碰文件。
   // 只认批准快照；规则文件有待批的改动时，取「已批准」和「待批文件」里更严的那份（待批是删文件则只看已批准的）。
   // 规则没命中（含待批里的只读）才看登录时选的模式（hostModes，精确主机）：它只管没列明的主机，压不过任何已批准的规则；都没有为 'default'。
+  // 规则是 deny 的主机返回 'denied'。
   resolve(host: string): Mode;
   // 命中的规则模式（没有规则命中时，是登录时选的模式），都没有（或主机不合格）为 null。
   ruleFor(host: string): RuleMode | null;
@@ -41,6 +42,10 @@ export interface ModeResolver {
   groupOf(host: string): Group;
   // 按名字取组；'default' 总有，没有这个名字为 null。
   group(name: string): Group | null;
+  // 这个组有没有主机落在 deny 规则下：组 hosts 的某个模式和某条 deny 规则（已批准的、或待批文件里的，取更严）的 match 有交集，
+  // 且交集上最具体的规则仍是 deny（被更具体的 default / readonly 规则完全盖住的不算）。拿不准算 true（失败关闭）。
+  // 只认已批准快照里的组；'default' 组、不存在的组为 false。
+  groupHasDeny(name: string): boolean;
   // 所有已批准组的 logout 接口并集（没编组的 default 组没有）。归不到任何会话的请求用它：不知道属于哪个组，就按所有组拦（多拦即失败关闭）。
   allLogout(): readonly Endpoint[];
   // 入口先规范化主机；失败为 false。只看 group 那个组的 loginHosts（'default' 组 = 顶层 loginHosts）；没有这个组为 false。
@@ -68,6 +73,7 @@ export const defaultOnlyResolver: ModeResolver = Object.freeze({
   group: (name: string): Group | null => (name === 'default' ? emptyDefaultGroup() : null),
   allLogout: (): readonly Endpoint[] => [],
   isLoginHost: (): boolean => false,
+  groupHasDeny: (): boolean => false,
   refresh: (): void => {},
   state: (): RulesState => ({ count: 0, hash: null, error: null, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false }),
   pending: (): PendingRules | null => null,

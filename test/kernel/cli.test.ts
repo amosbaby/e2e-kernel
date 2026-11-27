@@ -653,6 +653,50 @@ test('rule list prints one line per rule with its approval, the login hosts and 
   });
 });
 
+const DENY_RULES = JSON.stringify({ version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'deny' }] });
+
+test('rule list, rule diff and status show deny as 不允许 and --json keeps deny', async () => {
+  await withRules(DENY_RULES, async (h) => {
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    assert.match(t.outText(), /^app\.example\.com {2}不允许 {2}（未批准）$/m); assert.ok(!t.outText().includes('deny'));
+    assert.match(t.outText(), /^\*\.example\.com {2}readonly {2}（未批准）$/m);
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    assert.deepEqual((JSON.parse(j.outText()) as { rules: unknown[] }).rules, [{ match: '*.example.com', mode: 'readonly', approved: false }, { match: 'app.example.com', mode: 'deny', approved: false }]);
+    approveRulesFile(h.home);
+    const t2 = io({ env: h.env }); await main(['rule', 'list'], t2);
+    assert.match(t2.outText(), /^app\.example\.com {2}不允许 {2}（已批准）$/m);
+    // 把已批准的 deny 改成只读：放宽（排在前面），差异里是「不允许→只读」；--json 的行同样是中文文案
+    writeFileSync(h.home.rulesFile, DENY_RULES.replace('"deny"', '"readonly"'));
+    const d = io({ env: h.env }); assert.equal(await main(['rule', 'diff'], d), 0);
+    assert.deepEqual(d.outText().split('\n').slice(1), ['~ 规则 app.example.com：不允许→只读']);
+    // 改成 deny 的新条目：收紧
+    writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'deny' }, { match: 'n.example.com', mode: 'deny' }] }));
+    const d2 = io({ env: h.env }); await main(['rule', 'diff'], d2);
+    assert.deepEqual(d2.outText().split('\n').slice(1), ['+ 规则 n.example.com（不允许）']);
+    const dj = io({ env: h.env }); await main(['rule', 'diff', '--json'], dj);
+    assert.deepEqual((JSON.parse(dj.outText()) as { lines: string[] }).lines, ['+ 规则 n.example.com（不允许）']);
+    // status：生效的和待批的都按文案说；规则条数照常
+    const kk = await startKernel({ focus: noFocus, home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(approving) });
+    try {
+      const st = io({ env: h.env }); assert.equal(await main(['status'], st), 0);
+      assert.match(st.outText(), /^规则 2 条 sha256:/m);
+      assert.match(st.outText(), /^规则文件有未批准的改动：.*不允许.*rule diff 查看/m);
+      const sj = io({ env: h.env }); await main(['status', '--json'], sj);
+      assert.equal((JSON.parse(sj.outText()) as { rules: { count: number } }).rules.count, 2);
+    } finally { await kk.stop(); }
+  });
+});
+
+test("doctor's rules check counts deny rules like any other", async () => {
+  await withRules(DENY_RULES, async (h) => {
+    const c = (await doctorChecks(h.env)).checks.find((x) => x.name === 'rules');
+    assert.equal(c?.ok, true); assert.equal(c?.detail, '2 条，有未批准的改动（node bin/e2k.js rule diff 查看）');
+    approveRulesFile(h.home);
+    const d = (await doctorChecks(h.env)).checks.find((x) => x.name === 'rules');
+    assert.equal(d?.ok, true); assert.equal(d?.detail, '2 条，已批准');
+  });
+});
+
 test('rule list when the approvals file is unreadable: every rule is unapproved and it says so; a deleted rules.json with approved rules is a pending change', async () => {
   await withRules(GOOD_RULES, async (h) => {
     writeFileSync(h.home.approvalsFile, '{broken');

@@ -132,7 +132,7 @@ function rulesLines(rules: StatusResult['rules'] | undefined): string[] {
   return [
     rules.hash === null ? `规则 ${rules.count} 条` : `规则 ${rules.count} 条 ${inline(rules.hash)}`,
     ...(rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(rules.error)}`]),
-    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，只有新增或改成只读的规则条目已先生效（rule diff 查看）']),
+    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，只有新增或改成只读的规则条目已先生效，新增或改成不允许的也一样（rule diff 查看）']),
     ...(rules.approvals === 'unreadable' ? ['批准记录读不了：现有规则全部要重新批准'] : []),
     ...(rules.approvalsChanged === true ? ['批准记录文件被外部改过：运行中仍按内存里的批准，重启内核时以磁盘上的为准'] : []),
   ];
@@ -173,7 +173,7 @@ const APPROVED_TEXT = (ok: boolean): string => (ok ? '（已批准）' : '（未
 const PENDING_LINE = '有未批准的改动（rule diff 查看）';
 const UNREADABLE_LINE = '批准记录读不了：现有规则全部要重新批准';
 
-const MODE_TEXT: Record<string, string> = { readonly: '只读', default: '默认' };
+const MODE_TEXT: Record<string, string> = { readonly: '只读', default: '默认', deny: '不允许' };
 
 export function formatRuleList(r: RuleListResult): string {
   if (r.error !== null) return [`规则文件 ${inline(r.path)}`, inline(r.error)].join('\n');
@@ -185,7 +185,7 @@ export function formatRuleList(r: RuleListResult): string {
   if (r.hash === null) return [r.pending ? '没有 rules.json，但批准记录里还有规则，生效的仍是已批准的那份' : '没有 rules.json，所有域名都是默认模式', ...remembered, ...notes].join('\n');
   return [
     `规则文件 ${inline(r.path)}`,
-    ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode)}  ${APPROVED_TEXT(x.approved)}`)),
+    ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode === 'deny' ? MODE_TEXT.deny! : x.mode)}  ${APPROVED_TEXT(x.approved)}`)),
     `loginHosts  ${r.loginHosts.length === 0 ? '（无）' : r.loginHosts.map(inline).join(', ')}`,
     ...r.groups.map((g) => `组 ${inline(g.name)}  hosts ${g.hosts.map(inline).join(', ')}  loginHosts ${g.loginHosts.length === 0 ? '（无）' : g.loginHosts.map(inline).join(', ')}`
       + `  readPosts ${g.readPosts}  persistedQueries ${g.persistedQueries}  logout ${g.logout}  identity ${g.identity ? '有' : '无'}  ${APPROVED_TEXT(g.approved)}`),

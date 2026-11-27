@@ -733,6 +733,7 @@ function mutableRules(readonlyHosts: string[], loginHosts: string[] = []) {
     group: defaultOnlyResolver.group,
     allLogout: () => [],
     isLoginHost: (h) => loginHosts.includes(h),
+    groupHasDeny: () => false,
     refresh: () => { st.refreshes++; const p = st.pending; st.pending = null; p?.(); },
     state: () => ({ count: st.ro.size, hash: st.hash, error: st.error, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false }),
     pending: () => null,

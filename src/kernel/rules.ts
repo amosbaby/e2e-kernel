@@ -43,7 +43,10 @@ const GROUP_NAME = /^[a-z0-9_-]{1,32}$/;
 const WRITE_METHODS: readonly string[] = ['POST', 'PUT', 'PATCH', 'DELETE'];
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_PATTERN_LENGTH = 255;
-const RULE_MODES: readonly RuleMode[] = ['readonly', 'default'];
+const RULE_MODES: readonly RuleMode[] = ['readonly', 'default', 'deny'];
+
+// 规则模式的松紧：数字越大越严（denied > readonly > default）。更严合并、差异的松紧都按它比。
+export const STRICTNESS: Record<RuleMode, number> = { default: 0, readonly: 1, deny: 2 };
 
 function usage(message: string): E2kError {
   return new E2kError('usage', message);
@@ -123,7 +126,6 @@ export function parseRules(text: string): Rules {
   const seen = new Set<string>();
   const rules = list.map((item, i): Rule => {
     const o = plainObject(item, `rules[${i}]`, ['match', 'mode']);
-    if (o.mode === 'deny') throw usage(`rules[${i}].mode "deny" is not supported yet (planned for M3)`);
     const mode = oneOf(o.mode, `rules[${i}].mode`, RULE_MODES);
     const match = parsePattern(o.match, `rules[${i}].match`);
     if (seen.has(match)) throw usage(`rules[${i}].match repeats an earlier rule`);
@@ -466,7 +468,7 @@ function snapshotOf(approved: ApprovalRecord['rules']): Snapshot {
 
 // ---- 差异 ----
 
-const MODE_TEXT: Record<RuleMode, string> = { readonly: '只读', default: '默认' };
+const MODE_TEXT: Record<RuleMode, string> = { readonly: '只读', default: '默认', deny: '不允许' };
 
 function endpointKey(e: Endpoint): string {
   return `${e.method} ${e.origin}/${e.path.join('/')}`;
@@ -554,11 +556,11 @@ export function diffRules(a: Rules, b: Rules): string[] {
   const bRules = new Map(b.rules.map((r) => [r.match, r.mode]));
   for (const [match, mode] of bRules) {
     const was = aRules.get(match);
-    if (was === undefined) (mode === 'readonly' ? tighten : relax).push(`+ 规则 ${match}（${MODE_TEXT[mode]}）`);
-    else if (was !== mode) (mode === 'readonly' ? tighten : relax).push(`~ 规则 ${match}：${MODE_TEXT[was]}→${MODE_TEXT[mode]}`);
+    if (was === undefined) (STRICTNESS[mode] > 0 ? tighten : relax).push(`+ 规则 ${match}（${MODE_TEXT[mode]}）`);
+    else if (was !== mode) (STRICTNESS[mode] > STRICTNESS[was] ? tighten : relax).push(`~ 规则 ${match}：${MODE_TEXT[was]}→${MODE_TEXT[mode]}`);
   }
   for (const [match, mode] of aRules) {
-    if (!bRules.has(match)) (mode === 'readonly' ? relax : tighten).push(`- 规则 ${match}（${MODE_TEXT[mode]}）`);
+    if (!bRules.has(match)) (STRICTNESS[mode] > 0 ? relax : tighten).push(`- 规则 ${match}（${MODE_TEXT[mode]}）`);
   }
   return [...relax, ...tighten];
 }
@@ -616,9 +618,28 @@ export function inspectRules(rulesFile: string, approvalsFile: string, io: Rules
   return { ...base, pending: true, fileDeleted: c.text === null, hash: c.shortHash, summary: c.summary };
 }
 
+// 一份规则里，有没有 deny 规则落在这些主机写法（精确或 `*.` 通配）的某个主机上、且在那里是最具体的规则。
+// 精确主机：直接看它命中的规则。通配 G：精确 deny 规则落在 G 下就算；通配 deny 规则 D 与 G 有交集（后缀互为后缀）时，
+// 交集是后缀更长的那个通配；只有存在后缀更长（更具体）于 D 的非 deny 通配规则把整个交集盖住，才不算。
+function viewHasDeny(rules: readonly Rule[], patterns: readonly string[]): boolean {
+  const denies = rules.filter((r) => r.mode === 'deny');
+  if (denies.length === 0) return false;
+  return patterns.some((g) => {
+    if (!g.startsWith('*.')) return matchRule(rules, g)?.mode === 'deny';
+    const sg = g.slice(1);
+    return denies.some((d) => {
+      if (!d.match.startsWith('*.')) return !isIp(d.match) && d.match.endsWith(sg);
+      const sd = d.match.slice(1);
+      if (!sg.endsWith(sd) && !sd.endsWith(sg)) return false;
+      const inter = sg.length >= sd.length ? sg : sd;
+      return !rules.some((r) => r.mode !== 'deny' && r.match.startsWith('*.') && r.match.length - 1 > sd.length && inter.endsWith(r.match.slice(1)));
+    });
+  });
+}
+
 // 规则解析器。生效的是批准快照（ApprovalStore 里最后一次批准的那份规则）；规则文件只产生「待批」。
 // 每次 refresh 读文件和快照原文比：一样 = 无待批；不一样且解析得了 = 待批；改坏 = error，坏文件不进待批。
-// 待批期间 resolve 取「已批准」和「待批文件」里更严的（任一只读就只读），所以只有 rules 里新增或改成只读的条目立刻生效、放宽要等批准；
+// 待批期间 resolve 取「已批准」和「待批文件」里更严的（denied > readonly > default），所以只有 rules 里新增或改成只读 / 不允许的条目立刻生效、放宽要等批准；
 // 组、白名单、loginHosts、logout、identity 只认已批准的（它们的改动哪怕是收紧也要等批准）。批准只认内存里留着的原文和哈希，不重读磁盘。
 export function createRulesResolver(file: string, store: ApprovalStore, io: RulesIo = defaultIo): ModeResolver {
   let snap = snapshotOf(store.get().rules);
@@ -639,7 +660,9 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
   const effective = (host: string): RuleMode | null => {
     const a = matchRule(snap.rules.rules, host)?.mode ?? null;
     const p = pending?.rules == null ? null : matchRule(pending.rules.rules, host)?.mode ?? null;
-    return a === 'readonly' || p === 'readonly' ? 'readonly' : a;
+    // 待批的 default 不算（它是放宽，也不能盖住登录时选的模式）；只有只读 / 不允许才参与取严。
+    const tight = p !== null && STRICTNESS[p] > 0 ? p : null;
+    return tight !== null && (a === null || STRICTNESS[tight] > STRICTNESS[a]) ? tight : a;
   };
 
   // 登录时选的模式：精确的规范化主机；只在没有任何规则覆盖（含待批里的只读）时才轮到它。主机不合格时抛出。
@@ -675,6 +698,14 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     }
   };
 
+  // 组有没有主机落在 deny 规则下。已批准和待批文件各看一遍（和 effective 一样取更严：任一边判 deny 就算）。
+  const groupHasDeny = (name: string): boolean => {
+    if (name === DEFAULT_GROUP_NAME) return false;
+    const hosts = snap.rules.groups.find((g) => g.name === name)?.hosts;
+    if (hosts === undefined) return false;
+    return viewHasDeny(snap.rules.rules, hosts) || (pending?.rules != null && viewHasDeny(pending.rules.rules, hosts));
+  };
+
   const pendingView = (): PendingRules | null => pending === null ? null
     : { hash: pending.hash, baseHash: snap.text === null ? null : fullHash(snap.text), text: pending.text, summary: [...pending.summary], tooLong: summaryTooLong(pending.summary) };
 
@@ -682,7 +713,8 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
   return {
     resolve(host): Mode {
       try {
-        return modeOf(host) === 'readonly' ? 'readonly' : 'default';
+        const m = modeOf(host);
+        return m === 'deny' ? 'denied' : m === 'readonly' ? 'readonly' : 'default';
       } catch {
         return 'readonly';   // 失败关闭
       }
@@ -692,6 +724,7 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     isListed,
     groupOf: (host) => groupOf(snap.rules, host),
     group: (name) => (name === DEFAULT_GROUP_NAME ? defaultGroup(snap.rules) : snap.rules.groups.find((g) => g.name === name) ?? null),
+    groupHasDeny,
     allLogout: () => snap.rules.groups.flatMap((g) => g.logout),
     isLoginHost(host, group) {
       try {

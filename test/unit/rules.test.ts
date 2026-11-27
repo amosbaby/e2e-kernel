@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import type { ModeResolver } from '../../src/kernel/mode.ts';
-import { contentHash, createRulesResolver, groupOf, inspectRules, hostListed, matchEndpoint, matchRule, normalizeHost, parseEndpoint, parseRules } from '../../src/kernel/rules.ts';
+import { STRICTNESS, contentHash, createRulesResolver, groupOf, inspectRules, hostListed, matchEndpoint, matchRule, normalizeHost, parseEndpoint, parseRules } from '../../src/kernel/rules.ts';
 
 type Io = NonNullable<Parameters<typeof createRulesResolver>[2]>;
 
@@ -74,7 +74,7 @@ test('invalid patterns and files are config errors that do not echo the value', 
   }
   for (const bad of ['a.example.com:8443', '*.example.com:80', '[::1']) assert.throws(() => parseRules(JSON.stringify({ version: 1, rules: [{ match: bad, mode: 'readonly' }] })), { code: 'usage' }, bad);
   for (const bad of ['*', 'a.*.com']) assert.throws(() => parseRules(JSON.stringify({ version: 1, rules: [], loginHosts: [bad] })), { code: 'usage' });
-  assert.throws(() => parseRules('{"version":1,"rules":[{"match":"a.example.com","mode":"deny"}]}'), /M3/);
+  assert.deepEqual(parseRules('{"version":1,"rules":[{"match":"a.example.com","mode":"deny"}]}').rules, [{ match: 'a.example.com', mode: 'deny' }]);
   assert.throws(() => parseRules('{"version":1,"rules":[{"match":"a.example.com","mode":"bogus"}]}'), { code: 'usage' });
   assert.throws(() => parseRules('{"version":1,"rules":[{"match":"A.example.com","mode":"readonly"},{"match":"a.example.com.","mode":"default"}]}'), { code: 'usage' });
   assert.throws(() => parseRules('{"version":1,"rules":[],"loginHosts":["a.example.com","A.example.com."]}'), { code: 'usage' });
@@ -871,4 +871,178 @@ test('resolver: a stored choice is read live from the store, and a key such as _
     assert.equal(m.hostChoice(h), null, h);
     assert.equal(m.resolve(h), 'default', h);
   }
+});
+
+// ---- deny（不允许）：规则、更严合并、差异、groupHasDeny（M3 任务 1） ----
+
+const rulesFile = (rules: { match: string; mode: string }[], groups: Obj[] = []): string => JSON.stringify({ version: 1, rules, groups });
+
+test('STRICTNESS orders default < readonly < deny', () => {
+  assert.deepEqual(STRICTNESS, { default: 0, readonly: 1, deny: 2 });
+});
+
+test('parses deny rules and resolves them to denied', () => {
+  const { io } = fakeIo(rulesFile([{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'deny' }]));
+  const m = resolverOf(io);
+  approveNow(m);
+  assert.equal(m.resolve('app.example.com'), 'denied');
+  assert.equal(m.resolve('b.example.com'), 'readonly');
+  assert.equal(m.ruleFor('APP.example.com.'), 'deny');
+  assert.equal(m.resolve('APP.example.com.'), 'denied');
+  assert.equal(m.ruleFor('b.example.com'), 'readonly');
+  assert.equal(m.isListed('app.example.com'), true);
+  assert.equal(m.state().count, 2);
+});
+
+test('a wildcard deny loses to a more specific default rule, and a specific deny beats a wider readonly', () => {
+  const { io } = fakeIo(rulesFile([{ match: '*.example.com', mode: 'deny' }, { match: 'ok.example.com', mode: 'default' }]));
+  const m = resolverOf(io);
+  approveNow(m);
+  assert.equal(m.resolve('ok.example.com'), 'default');
+  assert.equal(m.ruleFor('ok.example.com'), 'default');
+  assert.equal(m.resolve('x.example.com'), 'denied');
+  assert.equal(m.resolve('a.b.example.com'), 'denied');
+  assert.equal(m.resolve('example.com'), 'default');
+  const { io: io2 } = fakeIo(rulesFile([{ match: '*.example.com', mode: 'readonly' }, { match: '*.prod.example.com', mode: 'deny' }, { match: 'web.prod.example.com', mode: 'readonly' }]));
+  const m2 = resolverOf(io2);
+  approveNow(m2);
+  assert.equal(m2.resolve('x.example.com'), 'readonly');
+  assert.equal(m2.resolve('api.prod.example.com'), 'denied');
+  assert.equal(m2.resolve('web.prod.example.com'), 'readonly');
+});
+
+test('a pending deny is in force at once; a pending relax from deny waits', () => {
+  const ro = rulesFile([{ match: 'app.example.com', mode: 'readonly' }]);
+  const deny = rulesFile([{ match: 'app.example.com', mode: 'deny' }]);
+  // 已批准只读，待批改成 deny：立刻 denied
+  const a = fakeIo(ro);
+  const m = resolverOf(a.io);
+  approveNow(m);
+  assert.equal(m.resolve('app.example.com'), 'readonly');
+  a.f.text = deny; m.refresh();
+  assert.equal(m.resolve('app.example.com'), 'denied');
+  assert.equal(m.ruleFor('app.example.com'), 'deny');
+  // 已批准 deny，待批改成只读：仍是 denied，批准后才放宽
+  const b = fakeIo(deny);
+  const n = resolverOf(b.io);
+  approveNow(n);
+  b.f.text = ro; n.refresh();
+  assert.equal(n.resolve('app.example.com'), 'denied');
+  assert.deepEqual(n.pending()?.summary, ['~ 规则 app.example.com：不允许→只读']);
+  approveNow(n);
+  assert.equal(n.resolve('app.example.com'), 'readonly');
+  // 已批准 deny，待批删文件：仍按已批准的
+  b.f.text = deny; n.refresh();
+  approveNow(n);
+  assert.equal(n.resolve('app.example.com'), 'denied');
+  b.f.text = null; n.refresh();
+  assert.equal(n.resolve('app.example.com'), 'denied');
+  // 已批准 deny，待批把它换成别的默认：仍 denied
+  b.f.text = rulesFile([{ match: 'app.example.com', mode: 'default' }]); n.refresh();
+  assert.equal(n.resolve('app.example.com'), 'denied');
+  // 已批准宽泛的 readonly，待批文件里更具体的 deny 立刻生效；已批准宽泛 deny，待批里更具体的 default 要等批准
+  const c = fakeIo(rulesFile([{ match: '*.example.com', mode: 'readonly' }]));
+  const p = resolverOf(c.io);
+  approveNow(p);
+  c.f.text = rulesFile([{ match: '*.example.com', mode: 'readonly' }, { match: 'app.example.com', mode: 'deny' }]); p.refresh();
+  assert.equal(p.resolve('app.example.com'), 'denied');
+  assert.equal(p.resolve('other.example.com'), 'readonly');
+  const d = fakeIo(rulesFile([{ match: '*.example.com', mode: 'deny' }]));
+  const q = resolverOf(d.io);
+  approveNow(q);
+  d.f.text = rulesFile([{ match: '*.example.com', mode: 'deny' }, { match: 'app.example.com', mode: 'default' }]); q.refresh();
+  assert.equal(q.resolve('app.example.com'), 'denied');
+  approveNow(q);
+  assert.equal(q.resolve('app.example.com'), 'default');
+});
+
+test('hostModes never yield deny: a stored login choice is only ever default or readonly', () => {
+  const { io } = fakeIo(null);
+  const store = newStore();
+  const m = resolverOf(io, store);
+  chooseNow(store, 'picked.example.com', 'readonly');
+  chooseNow(store, 'free.example.com', 'default');
+  for (const h of ['picked.example.com', 'free.example.com', 'none.example.com']) {
+    assert.notEqual(m.resolve(h), 'denied', h);
+    assert.notEqual(m.ruleFor(h), 'deny', h);
+    assert.notEqual(m.hostChoice(h), 'deny', h);
+  }
+});
+
+describe('deny in the pending summary', () => {
+  function summary(base: { match: string; mode: string }[], next: { match: string; mode: string }[] | null): string[] {
+    const { f, io } = fakeIo(rulesFile(base));
+    const m = resolverOf(io);
+    approveNow(m);
+    f.text = next === null ? null : rulesFile(next);
+    m.refresh();
+    return m.pending()?.summary ?? [];
+  }
+
+  test('the diff lists deny→readonly as relaxing and readonly→deny as tightening', () => {
+    const lines = summary(
+      [{ match: 'app.example.com', mode: 'deny' }, { match: 'api.example.com', mode: 'readonly' }],
+      [{ match: 'app.example.com', mode: 'readonly' }, { match: 'api.example.com', mode: 'deny' }, { match: 'x.example.com', mode: 'deny' }]);
+    assert.deepEqual(lines, ['~ 规则 app.example.com：不允许→只读', '~ 规则 api.example.com：只读→不允许', '+ 规则 x.example.com（不允许）']);
+  });
+
+  test('removing a deny rule is relaxing, and so is turning it into default; a new deny rule is tightening', () => {
+    assert.deepEqual(summary([{ match: 'a.example.com', mode: 'deny' }, { match: 'b.example.com', mode: 'readonly' }], [{ match: 'b.example.com', mode: 'deny' }]),
+      ['- 规则 a.example.com（不允许）', '~ 规则 b.example.com：只读→不允许']);
+    assert.deepEqual(summary([{ match: 'a.example.com', mode: 'deny' }, { match: 'z.example.com', mode: 'readonly' }], [{ match: 'a.example.com', mode: 'default' }, { match: 'z.example.com', mode: 'readonly' }, { match: 'n.example.com', mode: 'deny' }]),
+      ['~ 规则 a.example.com：不允许→默认', '+ 规则 n.example.com（不允许）']);
+  });
+});
+
+describe('groupHasDeny', () => {
+  const prod = { name: 'prod', hosts: ['*.prod.example.com'] };
+  const stage = { name: 'stage', hosts: ['stage.example.net'] };
+  function resolverFor(rules: { match: string; mode: string }[]): { m: ModeResolver; f: ReturnType<typeof fakeIo>['f'] } {
+    const { f, io } = fakeIo(rulesFile(rules, [prod, stage]));
+    const m = resolverOf(io);
+    approveNow(m);
+    return { m, f };
+  }
+
+  test('a deny rule that overlaps a host pattern of the group counts: more specific, identical, or wider', () => {
+    assert.equal(resolverFor([{ match: 'api.prod.example.com', mode: 'deny' }]).m.groupHasDeny('prod'), true);
+    assert.equal(resolverFor([{ match: '*.prod.example.com', mode: 'deny' }]).m.groupHasDeny('prod'), true);
+    assert.equal(resolverFor([{ match: '*.example.com', mode: 'deny' }]).m.groupHasDeny('prod'), true);
+    assert.equal(resolverFor([{ match: '*.deep.prod.example.com', mode: 'deny' }]).m.groupHasDeny('prod'), true);
+    assert.equal(resolverFor([{ match: 'stage.example.net', mode: 'deny' }]).m.groupHasDeny('stage'), true);
+    assert.equal(resolverFor([{ match: '*.example.net', mode: 'deny' }]).m.groupHasDeny('stage'), true);
+  });
+
+  test('no overlapping deny rule means false; default, unknown and rules of other kinds are false', () => {
+    const { m } = resolverFor([{ match: 'api.prod.example.com', mode: 'deny' }, { match: '*.other.example.org', mode: 'deny' }, { match: 'stage.example.net', mode: 'readonly' }]);
+    assert.equal(m.groupHasDeny('prod'), true);
+    assert.equal(m.groupHasDeny('stage'), false);
+    assert.equal(m.groupHasDeny('default'), false);
+    assert.equal(m.groupHasDeny('nope'), false);
+    assert.equal(resolverFor([{ match: '*.example.com', mode: 'readonly' }]).m.groupHasDeny('prod'), false);
+    assert.equal(resolverFor([{ match: 'prod.example.com', mode: 'deny' }]).m.groupHasDeny('prod'), false, 'the apex is not under *.prod.example.com');
+    assert.equal(resolverFor([{ match: 'evilprod.example.com', mode: 'deny' }]).m.groupHasDeny('prod'), false);
+  });
+
+  test('a deny that a more specific default or readonly rule covers completely does not count; a partial cover still does', () => {
+    assert.equal(resolverFor([{ match: '*.example.com', mode: 'deny' }, { match: '*.prod.example.com', mode: 'readonly' }]).m.groupHasDeny('prod'), false);
+    assert.equal(resolverFor([{ match: '*.example.com', mode: 'deny' }, { match: '*.prod.example.com', mode: 'default' }]).m.groupHasDeny('prod'), false);
+    assert.equal(resolverFor([{ match: '*.example.com', mode: 'deny' }, { match: '*.eu.prod.example.com', mode: 'default' }]).m.groupHasDeny('prod'), true);
+    assert.equal(resolverFor([{ match: '*.example.com', mode: 'deny' }, { match: 'a.prod.example.com', mode: 'default' }]).m.groupHasDeny('prod'), true);
+    assert.equal(resolverFor([{ match: '*.example.net', mode: 'deny' }, { match: 'stage.example.net', mode: 'default' }]).m.groupHasDeny('stage'), false);
+  });
+
+  test('a pending deny counts at once, a pending relax from deny does not lift it, and only approved groups are used', () => {
+    const { m, f } = resolverFor([{ match: '*.prod.example.com', mode: 'readonly' }]);
+    assert.equal(m.groupHasDeny('prod'), false);
+    f.text = rulesFile([{ match: '*.prod.example.com', mode: 'deny' }], [prod, stage]); m.refresh();
+    assert.equal(m.groupHasDeny('prod'), true);
+    approveNow(m);
+    f.text = rulesFile([{ match: '*.prod.example.com', mode: 'readonly' }], [prod, stage]); m.refresh();
+    assert.equal(m.groupHasDeny('prod'), true, 'waits for approval');
+    approveNow(m);
+    assert.equal(m.groupHasDeny('prod'), false);
+    f.text = rulesFile([{ match: 'x.new.example.net', mode: 'deny' }], [prod, stage, { name: 'fresh', hosts: ['*.new.example.net'] }]); m.refresh();
+    assert.equal(m.groupHasDeny('fresh'), false, 'a group that is only pending is not known yet');
+  });
 });
