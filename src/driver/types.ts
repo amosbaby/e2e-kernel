@@ -108,7 +108,8 @@ export interface Instance {
   onPageOpened(listener: (page: Page, openerId: string | null) => void): void;       // 弹窗和新标签页
   onNavigationHop(listener: (e: { pageId: string; url: string }) => void): void;     // 拦截：主 frame 导航被重定向之后的每一跳
   clearCookies(host: string): Promise<void>;                                         // 清掉这个主机自己的 cookie（见上面的约定）
-  openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page>;              // 页面：打开一个空白页，由内核再 goto；touch 只对这一页模拟触屏（不能模拟就抛错，不留页）
+  // 页面：打开一个空白页，由内核再 goto；touch 只对这一页模拟触屏（不能模拟就抛错，不留页）；foreground 只给登录窗口（要人来操作）：前台创建，缺省后台创建（不抢前台）
+  openPage(o: { viewport?: Viewport; touch?: boolean; foreground?: true }): Promise<Page>;
 }
 
 export interface Page {

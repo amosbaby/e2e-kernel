@@ -258,9 +258,9 @@ class FakeInstance implements Instance {
   readonly pageOpenedListeners: ((page: Page, openerId: string | null) => void)[] = [];
   readonly hopListeners: ((e: { pageId: string; url: string }) => void)[] = [];
   readonly clearedHosts: string[] = [];   // clearCookies 收到的主机，按调用顺序
-  private readonly openPageImpl: (o: { viewport?: Viewport }) => Promise<Page>;
+  private readonly openPageImpl: (o: { viewport?: Viewport; foreground?: true }) => Promise<Page>;
 
-  constructor(openPageImpl: (inst: FakeInstance, o: { viewport?: Viewport }) => Promise<Page>) {
+  constructor(openPageImpl: (inst: FakeInstance, o: { viewport?: Viewport; foreground?: true }) => Promise<Page>) {
     this.openPageImpl = (o) => openPageImpl(this, o);
   }
 
@@ -313,7 +313,7 @@ class FakeInstance implements Instance {
     this.clearedHosts.push(host);
   }
 
-  openPage(o: { viewport?: Viewport }): Promise<Page> {
+  openPage(o: { viewport?: Viewport; foreground?: true }): Promise<Page> {
     return this.openPageImpl(o);
   }
 }
@@ -466,7 +466,7 @@ export class FakeDriver implements Driver {
     return page;
   }
 
-  private async openPageIn(inst: FakeInstance, o: { viewport?: Viewport }): Promise<Page> {
+  private async openPageIn(inst: FakeInstance, o: { viewport?: Viewport; foreground?: true }): Promise<Page> {
     if (inst.closed) throw new DriverError('other', 'browser is closed');
     if (this.failOpenWith !== undefined) throw this.failOpenWith;
     const page = this.newPage(inst, null, o.viewport === undefined ? undefined : { ...o.viewport });

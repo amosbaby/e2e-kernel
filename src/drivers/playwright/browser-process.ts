@@ -60,6 +60,11 @@ export const BROWSER_SWITCHES: readonly string[] = [
 
 // 完整参数：开关 + 管道 + 不开启动窗口 + profile 目录。
 // 绝不能出现：--remote-debugging-port、--remote-debugging-address（会开 TCP 口）、不带 - 的参数（会被当成启动页，开窗口抢前台）。
+// Target.createTarget 的参数：会话页后台创建（不抢前台）；登录窗口要人来操作，前台创建（foreground）。
+export function createTargetParams(url: string, foreground: boolean): { url: string; background: boolean } {
+  return { url, background: !foreground };
+}
+
 export function browserArgs(userDataDir: string): string[] {
   return [...BROWSER_SWITCHES, '--remote-debugging-pipe', '--no-startup-window', `--user-data-dir=${userDataDir}`];
 }

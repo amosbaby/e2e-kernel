@@ -9,7 +9,7 @@ import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, 
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
-import { startBrowser } from './browser-process.ts';
+import { createTargetParams, startBrowser } from './browser-process.ts';
 import type { BrowserProcess } from './browser-process.ts';
 import { parseRoleTarget, stableCandidates } from './stable.ts';
 import type { ElementInfo } from './stable.ts';
@@ -851,14 +851,14 @@ class PlaywrightInstance implements Instance, Host {
     this.pageOpenedListeners.push(listener);
   }
 
-  // 开页：browser 级 Target.createTarget({ background: true })，不调 context.newPage()（它会让浏览器抢前台，docs/m0-findings.md §7.3）。
-  // 新页由 page 事件到达，按创建时的一次性随机标记认领（见 createBackgroundPage）：同时有弹窗或另一个 openPage 也不会认错。
-  async openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page> {
+  // 开页：browser 级 Target.createTarget（会话页 background: true，登录窗口 foreground: true 即 background: false），不调 context.newPage()（它会让浏览器抢前台，docs/m0-findings.md §7.3）。
+  // 新页由 page 事件到达，按创建时的一次性随机标记认领（见 createPage）：同时有弹窗或另一个 openPage 也不会认错。
+  async openPage(o: { viewport?: Viewport; touch?: boolean; foreground?: true }): Promise<Page> {
     if (this.closed) throw new DriverError('other', 'browser is closed');
     this.opening++;
     let own: PlaywrightPage;
     try {
-      const p = await this.createBackgroundPage();
+      const p = await this.createPage(o.foreground === true);
       this.deferred.delete(p);
       own = this.register(p, true) as PlaywrightPage;
     } catch (e) {
@@ -894,11 +894,11 @@ class PlaywrightInstance implements Instance, Host {
   // 不对候选页建 CDP 会话去问 targetId（会和触屏用例的会话计数冲突，且要给还在初始化的页附加会话）。
   // 认领之后马上用 history.replaceState 把地址改回干净的 about:blank：带 # 的地址会让第一次导航被 Playwright 当成「换了文档」，
   // 主 frame 的快照引用从此带 f 前缀（被当成 iframe 引用）；replaceState 是同文档导航，不动帧序号。
-  private async createBackgroundPage(): Promise<PwPage> {
+  private async createPage(foreground: boolean): Promise<PwPage> {
     const session = this.browserSession;
     if (session === undefined) throw new DriverError('other', 'browser is not attached');
     const marker = `about:blank#e2k-${randomBytes(16).toString('hex')}`;
-    const { targetId } = await session.send('Target.createTarget', { url: marker, background: true });
+    const { targetId } = await session.send('Target.createTarget', createTargetParams(marker, foreground));
     const deadline = Date.now() + OPEN_PAGE_TIMEOUT_MS;
     try {
       for (;;) {

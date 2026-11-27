@@ -87,7 +87,10 @@ test('the driver opens pages with Target.createTarget in the background and neve
   assert.deepEqual(driver.match(/\.newPage\s*\(/g), null);
   assert.deepEqual(driver.match(/launchPersistentContext|bringToFront/g), null);
   assert.match(driver, /Target\.createTarget/);
-  assert.match(driver, /background:\s*true/);
+  // 会话页后台、登录窗口前台：参数在 browser-process.ts 的 createTargetParams 里（background: !foreground），驱动从 openPage 的 foreground 传进去。
+  assert.match(driver, /createTargetParams\(marker,\s*foreground\)/);
+  assert.match(driver, /createPage\(o\.foreground === true\)/);
+  assert.match(code('src/drivers/playwright/browser-process.ts'), /background:\s*!foreground/);
 });
 
 test('nothing in src opens a TCP debugging port: the browser is controlled over a pipe only', () => {

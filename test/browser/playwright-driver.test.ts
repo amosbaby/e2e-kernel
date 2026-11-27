@@ -247,6 +247,20 @@ test('the browser is controlled over a pipe: one main process, --remote-debuggin
   assert.equal(listening.trim(), '');
 });
 
+test('openPage({ foreground: true }) (the login window) opens a usable page like any other, and is claimed next to background pages', { timeout: 60_000 }, async () => {
+  const front = await inst.openPage({ foreground: true });
+  const back = await inst.openPage({});
+  try {
+    assert.notEqual(front.id, back.id);
+    assert.equal(await front.evaluate('location.href'), 'about:blank');
+    await front.goto(server.origin + '/index.html');
+    assert.equal(await front.evaluate('location.pathname'), '/index.html');
+    assert.equal(await back.evaluate('location.href'), 'about:blank');
+  } finally {
+    await front.close().catch(() => {}); await back.close().catch(() => {});
+  }
+});
+
 test('openPage hands back the page it opened: two pages opened one after the other are different, blank pages', { timeout: 60_000 }, async () => {
   const a = await inst.openPage({});
   const b = await inst.openPage({});

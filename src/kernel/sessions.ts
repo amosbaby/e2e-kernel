@@ -724,7 +724,8 @@ export class SessionManager {
     // 取不到主机：resolve('') 会失败关闭成只读，登录里的写（loginHosts 之外）就都拦。
     const mode = this.deps.modes.resolve(host);
     try {
-      const page = await instance.openPage({});
+      // 登录要人来操作：窗口前台创建（会话页才后台）。
+      const page = await instance.openPage({ foreground: true });
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
       login = { id, instance, profile, group, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, crossBlocked: 0, frozen: null, refused: new Set(), requestIds: new Map() };
       this.logins.set(id, login);

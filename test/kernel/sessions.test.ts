@@ -109,6 +109,16 @@ test('open --touch asks the driver for a touch page and records start.touch; wit
   assert.equal(readResult(touch.runDir).start.touch, true);
 });
 
+test('the login window is opened in front (foreground), every session page in the background (no foreground flag)', async () => {
+  const { sm, fake } = setup();
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/' });
+  const s = await sm.open({ url: 'http://localhost:5173/', name: 'bg' });
+  const opens = fake.calls.filter((c) => c.method === 'openPage').map((c) => c.args[0]);
+  assert.deepEqual(opens, [{ foreground: true }, {}]);
+  await sm.close({ session: s.session });
+  await sm.loginEnd({ loginId }).catch(() => {});
+});
+
 test('open --touch fails cleanly when the driver cannot emulate touch: no session, no page, no run dir', async () => {
   const { sm, fake, home } = setup({ failOpenWith: new DriverError('other', 'touch emulation is not available') });
   await assert.rejects(sm.open({ url: 'http://localhost:5173/', name: 'nt', touch: true }), (e: E2kError) => e.code === 'action-failed');

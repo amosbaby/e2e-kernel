@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
-import { BROWSER_SWITCHES, browserArgs, pipeTransport, startBrowser } from '../../src/drivers/playwright/browser-process.ts';
+import { BROWSER_SWITCHES, browserArgs, createTargetParams, pipeTransport, startBrowser } from '../../src/drivers/playwright/browser-process.ts';
 
 // ---- 启动参数 ----
 
@@ -325,4 +325,11 @@ test('an unexpected exit resolves exited with the code; a failed spawn resolves 
   assert.equal(p2.hasExited(), true);
   await p2.terminate(10);
   assert.deepEqual(bad.signals, []);
+});
+
+// ---- 开页参数（终审 I-2）----
+
+test('createTargetParams: session pages are created in the background, the login window in front', () => {
+  assert.deepEqual(createTargetParams('about:blank#e2k-x', false), { url: 'about:blank#e2k-x', background: true });
+  assert.deepEqual(createTargetParams('about:blank#e2k-x', true), { url: 'about:blank#e2k-x', background: false });
 });
