@@ -30,6 +30,45 @@ test('browserArgs keeps the Playwright switches the profile and the page behavio
   assert.ok(disabled?.includes('HttpsUpgrades'), 'http 不被自动升级，请求才都走路由');
 });
 
+// 整表快照：与 Playwright 1.65.1 的 chromiumSwitches 复制版逐项相等。任何一项被加、减、改，这里就失败，
+// 逼着改的人回头对照 Playwright 的那份。升级 Playwright 时要对照新版本的 chromiumSwitches（见 browser-process.ts 的注释）再改这张表。
+test('BROWSER_SWITCHES equals the copied Playwright 1.65.1 table, item by item', () => {
+  assert.deepEqual([...BROWSER_SWITCHES], [
+    '--disable-field-trial-config',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-back-forward-cache',
+    '--disable-breakpad',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-component-update',
+    '--no-default-browser-check',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,'
+      + 'LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,AvoidCorsURLLoaderRestartOnRedirect,OptimizationHints,'
+      + 'NetworkTimeServiceQuerying,AimEnabled,PreconnectToSearch',
+    '--enable-features=CDPScreenshotNewSurface,SkipListAccountsWithoutGaiaCookies',
+    '--allow-pre-commit-input',
+    '--disable-hang-monitor',
+    '--disable-ipc-flooding-protection',
+    '--disable-popup-blocking',
+    '--disable-prompt-on-repost',
+    '--disable-renderer-backgrounding',
+    '--force-color-profile=srgb',
+    '--metrics-recording-only',
+    '--no-first-run',
+    '--password-store=basic',
+    '--use-mock-keychain',
+    '--no-service-autorun',
+    '--disable-search-engine-choice-screen',
+    '--unsafely-disable-devtools-self-xss-warnings',
+    '--enable-unsafe-swiftshader',
+    '--disable-infobars',
+    '--disable-sync',
+  ]);
+});
+
 test('browserArgs passes the profile directory as one argv element, whatever it contains', () => {
   const odd = '/tmp/a b;c$(x)\'"`\n/p';
   assert.ok(browserArgs(odd).includes(`--user-data-dir=${odd}`));
@@ -94,6 +133,56 @@ test('pipeTransport tells onclose after the messages that were already received'
   read.end();
   await tick();
   assert.deepEqual(order, ['message', 'message', 'close']);
+});
+
+test('pipeTransport treats JSON that is not a plain object (null, array, number, string) as a malformed message and closes', async () => {
+  for (const bad of ['null', '[1,2]', '3', '"x"', 'true']) {
+    const { write, read } = pipes();
+    const t = pipeTransport(write, read);
+    const got: object[] = [];
+    const reasons: (string | undefined)[] = [];
+    t.onmessage = (m) => { got.push(m); };
+    t.onclose = (r) => { reasons.push(r); };
+    read.write(`{"id":1}\0${bad}\0{"id":3}\0`);
+    await tick();
+    assert.deepEqual(got, [{ id: 1 }], bad);
+    assert.equal(reasons.length, 1, bad);
+    assert.match(reasons[0] ?? '', /malformed/, bad);
+  }
+});
+
+test('pipeTransport closes when one message grows past the limit without ending, and forgets what it had buffered', async () => {
+  const { write, read } = pipes();
+  const t = pipeTransport(write, read, 100);
+  const got: object[] = [];
+  const reasons: (string | undefined)[] = [];
+  t.onmessage = (m) => { got.push(m); };
+  t.onclose = (r) => { reasons.push(r); };
+  read.write('{"id":"' + 'a'.repeat(60));      // 半包，还没到 NUL
+  read.write('b'.repeat(60));                   // 累计 > 100：断开
+  await tick();
+  assert.equal(reasons.length, 1);
+  assert.match(reasons[0] ?? '', /too large/);
+  read.write('"}\0');                           // 断开之后到的东西不再派发
+  await tick();
+  assert.deepEqual(got, []);
+});
+
+test('pipeTransport does not count finished messages toward the limit: many large messages in a row are fine', async () => {
+  const { write, read } = pipes();
+  const t = pipeTransport(write, read, 100);
+  const got: object[] = [];
+  const reasons: (string | undefined)[] = [];
+  t.onmessage = (m) => { got.push(m); };
+  t.onclose = (r) => { reasons.push(r); };
+  const big = JSON.stringify({ id: 1, pad: 'x'.repeat(60) });   // 每条 ~74 字节，十条共 ~740 > 100
+  for (let i = 0; i < 10; i++) {
+    read.write(big.slice(0, 40));               // 半包留在缓冲里，再补完
+    read.write(big.slice(40) + '\0');
+  }
+  await tick();
+  assert.equal(got.length, 10);
+  assert.deepEqual(reasons, []);
 });
 
 test('pipeTransport reports onclose once when the browser side goes away, and send afterwards does nothing', async () => {

@@ -312,6 +312,31 @@ test('a noopener popup that appears while openPage is in flight still has its op
   }
 });
 
+// 审阅发现 I1：会话 A 的页 window.open('') 之后马上自己关掉，这个空白新窗口没有 opener（开启者已关），
+// 又恰好出现在另一次 openPage 的创建之后——靠「空白 + 无 opener」认领会把它认成 B 的主页面，A 的脚本还能在里面发请求。
+// 认领必须是确定性的：按这次创建的一次性标记，别人的窗口怎么出现都不会被认走。
+test('a blank window whose opener is gone is never taken for a page that openPage hands out', { timeout: 120_000 }, async () => {
+  const rounds = 12;
+  for (let i = 0; i < rounds; i++) {
+    opened = [];
+    const a = await inst.openPage({});
+    const popupName = `a-popup-${i}`;
+    await a.evaluate(`setTimeout(() => window.open('', '${popupName}'), 0); 1`);   // 窗口稍后出现：在 openPage 的创建之后
+    const b = inst.openPage({});
+    await sleep([5, 15, 30, 60][i % 4]!);
+    await a.close();                                              // 开启者没了：窗口的 opener() 变成 null
+    const mine = await b;
+    try {
+      assert.equal(await mine.evaluate('window.name'), '', `round ${i}: openPage handed out the window that A opened`);
+      assert.notEqual(mine.id, page.id);
+      assert.ok(!opened.some(([p]) => p.id === mine.id), `round ${i}: the page we got is also reported as someone else's popup`);
+    } finally {
+      await mine.close().catch(() => {});
+      for (const [p] of opened) await p.close().catch(() => {});
+    }
+  }
+});
+
 test('a page opened without a viewport gets the 1280x720 default (the browser itself has no fixed viewport)', { timeout: 60_000 }, async () => {
   const plain = await inst.openPage({});
   try {

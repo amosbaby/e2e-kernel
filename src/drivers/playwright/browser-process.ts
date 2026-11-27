@@ -74,35 +74,30 @@ export interface PipeTransport {
   close(): void;
 }
 
-// 单条消息的上限：截图的 base64 能到几十 MB，给到 256 MiB；超过当管道坏了，直接断开（失败关闭）。
+// 单条消息的上限：截图的 base64 能到几十 MB，给到 256 MiB；超过当管道坏了，直接断开（失败关闭）。已经收完的消息不累计。
 const MAX_MESSAGE_BYTES = 256 * 1024 * 1024;
 
-export function pipeTransport(write: Writable, read: Readable): PipeTransport {
+function isPlainObject(v: unknown): v is object {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+export function pipeTransport(write: Writable, read: Readable, maxMessageBytes: number = MAX_MESSAGE_BYTES): PipeTransport {
   let closed = false;
   let chunks: Buffer[] = [];
   let pending = 0;
 
-  // 一条消息一个事件循环任务（setImmediate）：Playwright 在处理上一条响应的 promise 续接里才登记 frame、建上下文，
-  // 浏览器一口气发来的「响应 + 紧跟的事件」如果在同一个同步循环里全派发，事件会赶在登记之前到，页面的主世界执行上下文就丢了
-  // （实测：新开页里 evaluate 一直挂着）。Playwright 自带的管道传输同样一条一任务；WebSocket 传输天然如此。
-  const queue: (() => void)[] = [];
-  let draining = false;
-  const drain = (): void => {
-    const next = queue.shift();
-    if (next === undefined) { draining = false; return; }
-    try { next(); } finally { setImmediate(drain); }
-  };
-  const later = (fn: () => void): void => {
-    queue.push(fn);
-    if (!draining) { draining = true; setImmediate(drain); }
-  };
-
+  // 一条消息一个事件循环任务（setImmediate）：Node 在每个 setImmediate 回调之间清微任务，所以一条消息的 promise 续接
+  // 一定先于下一条消息。Playwright 在处理上一条响应的续接里才登记 frame、建上下文，浏览器一口气发来的「响应 + 紧跟的事件」
+  // 如果在同一个同步循环里全派发，事件会赶在登记之前到，页面的主世界执行上下文就丢了（实测：新开页里 evaluate 一直挂着）。
+  // Playwright 自带的管道传输同样一条一任务；WebSocket 传输天然如此。setImmediate 按登记顺序先进先出，onclose 排在已收到的消息之后。
   const finish = (reason: string): void => {
     if (closed) return;
     closed = true;
+    chunks = [];
+    pending = 0;
     try { write.end(); } catch { /* 写端已经没了 */ }
     read.destroy();
-    later(() => { t.onclose?.(reason); });   // 排在已收到的消息之后
+    setImmediate(() => { t.onclose?.(reason); });
   };
 
   const t: PipeTransport = {
@@ -117,9 +112,11 @@ export function pipeTransport(write: Writable, read: Readable): PipeTransport {
     close() {
       if (closed) return;
       closed = true;
+      chunks = [];
+      pending = 0;
       try { write.end(); } catch { /* 写端已经没了 */ }
       read.destroy();
-      later(() => { t.onclose?.('closed'); });
+      setImmediate(() => { t.onclose?.('closed'); });
     },
   };
 
@@ -127,6 +124,7 @@ export function pipeTransport(write: Writable, read: Readable): PipeTransport {
   read.on('error', () => { finish('pipe read failed'); });
   read.on('close', () => { finish('pipe closed'); });
   read.on('data', (data: Buffer) => {
+    if (closed) return;
     let start = 0;
     for (;;) {
       const nul = data.indexOf(0, start);
@@ -137,19 +135,24 @@ export function pipeTransport(write: Writable, read: Readable): PipeTransport {
       pending = 0;
       start = nul + 1;
       if (text === '') continue;
-      let message: object;
+      let parsed: unknown;
       try {
-        message = JSON.parse(text) as object;
+        parsed = JSON.parse(text);
       } catch {
         finish('malformed message on the pipe');
         return;
       }
-      later(() => { t.onmessage?.(message); });
+      if (!isPlainObject(parsed)) {
+        finish('malformed message on the pipe');
+        return;
+      }
+      const message = parsed;
+      setImmediate(() => { t.onmessage?.(message); });
     }
     if (start < data.length) {
       chunks.push(data.subarray(start));
       pending += data.length - start;
-      if (pending > MAX_MESSAGE_BYTES) finish('message too large');
+      if (pending > maxMessageBytes) finish('message too large');
     }
   });
   return t;

@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
@@ -32,6 +33,7 @@ const CAPABILITIES: Capabilities = {
 const MAX_BODY_BYTES = 64 * 1024;
 const LAUNCH_TIMEOUT_MS = 30_000;       // 连上浏览器的上限
 const OPEN_PAGE_TIMEOUT_MS = 15_000;    // 等新开的页出现的上限
+const PAGE_READY_TIMEOUT_MS = 5000;     // 认领到的页，页内 evaluate 要多久内通
 const OPEN_PAGE_POLL_MS = 50;           // 页出现了但地址还没提交时，隔多久再看
 const BROWSER_CLOSE_TIMEOUT_MS = 5000;  // 优雅关闭（Browser.close）的上限；超了由 terminate 兜底
 // 页面的默认视口：launchPersistentContext 原来默认就是 1280x720；连接已有浏览器的默认 context 不带视口，这里补上，开页时设。
@@ -250,11 +252,6 @@ async function probePageForPasswordField(page: PwPage): Promise<PasswordProbe> {
   } finally {
     clearTimeout(timer);
   }
-}
-
-// 空白页的地址：Playwright 在页刚出现时可能给空串或 ':'，提交之后是 about:blank。
-function isBlankUrl(url: string): boolean {
-  return url === 'about:blank' || url === '' || url === ':';
 }
 
 // 统一写法 → Playwright 的 Locator：引用 → getByRef；role=…[name="…"] → getByRole（我们自己解析）；其余 → locator。
@@ -748,8 +745,6 @@ class PlaywrightInstance implements Instance, Host {
   private opening = 0;
   private readonly deferred = new Set<PwPage>();
   private readonly arrivals = new Set<() => void>();   // 在等「有新页出现」的 openPage
-  private readonly claimed = new WeakSet<PwPage>();   // 已被某次 openPage 认领、还没登记的页
-  private creating: Promise<unknown> = Promise.resolve();   // 创建和认领的串行队列（见 createBackgroundPage）
 
   readonly actionTimeoutMs: number;
 
@@ -857,7 +852,7 @@ class PlaywrightInstance implements Instance, Host {
   }
 
   // 开页：browser 级 Target.createTarget({ background: true })，不调 context.newPage()（它会让浏览器抢前台，docs/m0-findings.md §7.3）。
-  // 新页由 page 事件到达，按「新出现的空白页、没有开启者」认领（创建串行，见 createAndClaim）：同时有弹窗或另一个 openPage 也不会认错。
+  // 新页由 page 事件到达，按创建时的一次性随机标记认领（见 createBackgroundPage）：同时有弹窗或另一个 openPage 也不会认错。
   async openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page> {
     if (this.closed) throw new DriverError('other', 'browser is closed');
     this.opening++;
@@ -893,32 +888,26 @@ class PlaywrightInstance implements Instance, Host {
     return own;
   }
 
-  // 创建和认领串行：同一时刻只有一个 openPage 在等「自己的那一页」，新出现的空白页才不会认错。
-  private createBackgroundPage(): Promise<PwPage> {
-    const run = this.creating.then(() => this.createAndClaim(), () => this.createAndClaim());
-    this.creating = run.catch(() => {});
-    return run;
-  }
-
-  // 认领：createTarget 返回之后，等一个新出现的页（发出请求之前就有的页不算），它同时满足：没登记过、不是启动时的锚页、没被别的 openPage 认领过、
-  // 地址是空白页、没有开启者（页面开出的弹窗，哪怕带 noopener，Playwright 也给得出 opener()，实测：fixture popup-noopener，所以不会被当成自己的页）。
-  // 不对候选页建 CDP 会话去问 targetId：给还在初始化的页附加再断开会让它的 evaluate 卡死（实测）；
-  // 也不在起始地址上放标记：带 # 的起始地址会让第一次导航被 Playwright 当成「换了文档」，主 frame 的快照引用从此带 f 前缀（被当成 iframe 引用）。
-  private async createAndClaim(): Promise<PwPage> {
+  // 认领是确定性的：createTarget 的起始地址带一个这次创建专用的随机一次性标记（128 位，about:blank#e2k-<hex>），
+  // 只认 url() 恰好等于它的页。页面脚本不知道这个值，所以别的会话的页开出的窗口（哪怕空白、哪怕开启者已经关了）
+  // 怎么出现都不会被认走；随机值不进日志、报告，也不出这个函数。
+  // 不对候选页建 CDP 会话去问 targetId（会和触屏用例的会话计数冲突，且要给还在初始化的页附加会话）。
+  // 认领之后马上用 history.replaceState 把地址改回干净的 about:blank：带 # 的地址会让第一次导航被 Playwright 当成「换了文档」，
+  // 主 frame 的快照引用从此带 f 前缀（被当成 iframe 引用）；replaceState 是同文档导航，不动帧序号。
+  private async createBackgroundPage(): Promise<PwPage> {
     const session = this.browserSession;
     if (session === undefined) throw new DriverError('other', 'browser is not attached');
-    const before = new Set(this.context.pages());   // 创建之前就有的页都不是我们的（包括先到、还没登记的弹窗）
-    const { targetId } = await session.send('Target.createTarget', { url: 'about:blank', background: true });
+    const marker = `about:blank#e2k-${randomBytes(16).toString('hex')}`;
+    const { targetId } = await session.send('Target.createTarget', { url: marker, background: true });
     const deadline = Date.now() + OPEN_PAGE_TIMEOUT_MS;
     try {
       for (;;) {
         if (this.closed) throw new DriverError('other', 'browser is closed');
-        for (const cand of this.context.pages()) {
-          if (before.has(cand) || this.byPage.has(cand) || this.anchors.has(cand) || this.claimed.has(cand) || !isBlankUrl(cand.url())) continue;
-          if ((await cand.opener().catch(() => cand)) !== null) continue;
-          if (this.claimed.has(cand)) continue;   // opener() 的等待期间被别处认领了（不会发生：创建串行），保险
-          this.claimed.add(cand);
-          return cand;
+        const found = this.context.pages().find((cand) => !this.byPage.has(cand) && !this.anchors.has(cand) && cand.url() === marker);
+        if (found !== undefined) {
+          const cleaned = found.evaluate(`history.replaceState(null, '', 'about:blank')`).then(() => true, () => false);
+          if (!(await raceDeadline(cleaned, PAGE_READY_TIMEOUT_MS))) throw new DriverError('timeout', 'the new page did not become ready');
+          return found;
         }
         const left = deadline - Date.now();
         if (left <= 0) throw new DriverError('timeout', 'the new page did not appear');

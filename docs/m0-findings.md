@@ -174,7 +174,7 @@ after-restore-2: <应用 A>
 | A | `chromium.launchPersistentContext(dir, { headless: false, args: ['--no-startup-window'] })` | **启动一直不返回**（我们的 60 秒上限先到；Playwright 对持久化 context 追加 `about:blank` 启动参数，再加 `--no-startup-window` 就没有窗口可等，这是推断，没有进一步查）。没法用 |
 | B | node 直接 `spawn` 浏览器可执行文件 `--remote-debugging-pipe --no-startup-window --user-data-dir=…`，自己在管道上说 CDP，`Target.createTarget({background:true})` | 启动不抢，开页不抢 |
 | C | 同 B 但 `--remote-debugging-port=0`，`DevToolsActivePort` 读端口，`connectOverCDP` | 启动、连接、开页、click / fill / screenshot 都不抢（TCP 对照，没有采用） |
-| D | 同 B，但用 Playwright **公开**的 `chromium.connectOverCDP(transport)` 重载（`types.d.ts` 里的 `ConnectOverCDPTransport`：`send`、`close`、`onmessage`、`onclose`）把管道交给 Playwright | 三次（第 1 次是 B，第 2、3 次是 D）启动、连接、开页、click / fill / route / screenshot / goto 全部不抢；`browser.close()` 之后子进程退出码 0 |
+| D | 同 B，但用 Playwright **公开**的 `chromium.connectOverCDP(transport)` 重载（`types.d.ts` 里的 `ConnectOverCDPTransport`：`send`、`close`、`onmessage`、`onclose`）把管道交给 Playwright | 第 2、3 次各跑一次（共两次；第 1 次跑的是 B，同一做法、自写管道 CDP，没有 click 等步骤），启动、连接、开页、click / fill / route / screenshot / goto 全部不抢；`browser.close()` 之后子进程退出码 0 |
 
 ```text
 D 启动（spawn，管道）          耗时 5ms     结论: 不抢
