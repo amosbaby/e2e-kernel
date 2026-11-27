@@ -8,6 +8,7 @@ import { readCaseFile } from '../../src/cases/case.ts';
 import type { CaseFile, CaseStep } from '../../src/cases/case.ts';
 import { runCase } from '../../src/cases/run-case.ts';
 import type { RunOutcome } from '../../src/cases/run-case.ts';
+import { formatRun } from '../../src/cli/format.ts';
 import { main } from '../../src/cli/main.ts';
 import type { Io } from '../../src/cli/main.ts';
 import { saveCase } from '../../src/cli/commands.ts';
@@ -317,6 +318,25 @@ describe('runCase with a scripted kernel', () => {
     assert.deepEqual([r.exit, r.verdict], [20, 'undetermined']);
   });
 
+  test('an open whose identity probe is a mismatch sends no step: close undetermined because 身份探针不符, exit 22 (beats a login wall)', async () => {
+    for (const blocked of [null, 'login']) {
+      const s = scripted({ open: () => ({ ...openOk, identity: 'mismatch', blocked }) });
+      const r = await runCase(s.send, caseOf({ steps: clicks(3) }), { clock: fakeClock() });
+      assert.deepEqual(s.calls.map((c) => c.method), ['open', 'close'], String(blocked));
+      const v = s.of('close')[0]!.params.verdict as { value: string; because: string };
+      assert.deepEqual([v.value, v.because], ['undetermined', '身份探针不符']);
+      assert.deepEqual([r.exit, r.verdict, r.error?.code, r.because], [22, 'undetermined', 'needs-human', '身份探针不符']);
+      assert.equal(r.tallies?.notRun, 3);
+    }
+  });
+
+  test('the because written into close comes back on the outcome; a pass has none', async () => {
+    const pass = await runCase(scripted().send, caseOf(), { clock: fakeClock() });
+    assert.equal(pass.because, null);
+    const wall = await runCase(scripted({ open: () => ({ ...openOk, blocked: 'login' }) }).send, caseOf(), { clock: fakeClock() });
+    assert.match(wall.because ?? '', /撞到登录墙/);
+  });
+
   test('an error mid-run still closes the session with undetermined, and the error code is the exit code', async () => {
     const s = scripted({ step: (n, p) => { if (n === 2) throw new E2kError('needs-human', `要人处理 ${secret}`, '请人看一下'); return stepOk((p.ops as unknown[]).length); } });
     const r = await runCase(s.send, caseOf({ steps: clicks(120) }), { clock: fakeClock() });
@@ -554,6 +574,29 @@ describe('e2k run', () => {
       assert.equal(await main(['run', bad], f), 11);
       assert.match(f.outText(), /结论 fail/);
     });
+  });
+
+  test('run that hits a login wall exits 20 and tells the person to log in and rerun, with the because line', async () => {
+    await withRig({}, async (r) => {
+      const file = put(good({ steps: [click(1), { seq: 2, op: { op: 'goto', url: 'http://localhost:5173/wall' } }, click(3)] }));
+      const t = io(r.home.env, async () => r.fake);
+      assert.equal(await main(['run', file], t), 20, t.errText());
+      assert.match(t.outText(), /^撞到登录墙：请人运行 login 后重跑$/m);
+      assert.match(t.outText(), /^理由：撞到登录墙：第 1 批 step 返回登录墙/m);
+      const j = io(r.home.env, async () => r.fake);
+      assert.equal(await main(['run', file, '--json'], j), 20);
+      assert.match((JSON.parse(j.outText()) as { because: string }).because, /撞到登录墙/);
+    });
+  });
+
+  test('formatRun: the because line when there is one, the login line only on exit 20, nothing for an old result without because', () => {
+    const base = { session: SID, reportPath: '/r/report.html', verdict: 'undetermined' as const, skipped: 0, tallies: null, error: null };
+    const wall = formatRun({ ...base, because: '撞到登录墙：打开时就是登录页，一步都没有执行' }, 20);
+    assert.match(wall, /^理由：撞到登录墙：打开时就是登录页/m);
+    assert.match(wall, /^撞到登录墙：请人运行 login 后重跑$/m);
+    const pass = formatRun({ ...base, verdict: 'pass', because: null }, 0);
+    assert.ok(!pass.includes('理由') && !pass.includes('撞到登录墙'), pass);
+    assert.ok(!formatRun(base, 11).includes('理由'));
   });
 
   test('run with no file, two files or an unknown option is a usage error; run --name with a bad name is refused before open', async () => {

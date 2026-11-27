@@ -149,7 +149,7 @@ export async function runCaseFile(send: (method: Method, params: unknown) => Pro
   try {
     const outcome: RunOutcome = await runCase(send, readCaseFile(path), o);
     if (outcome.session === null && outcome.error !== null) return { exit: outcome.exit, error: outcome.error };
-    return { exit: outcome.exit, result: { session: outcome.session, reportPath: outcome.reportPath, verdict: outcome.verdict, skipped: outcome.skipped, tallies: outcome.tallies, error: outcome.error } };
+    return { exit: outcome.exit, result: { session: outcome.session, reportPath: outcome.reportPath, verdict: outcome.verdict, skipped: outcome.skipped, tallies: outcome.tallies, error: outcome.error, because: outcome.because } };
   } catch (e) {
     return toOutcome(e);
   }

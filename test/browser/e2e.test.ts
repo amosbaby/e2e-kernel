@@ -911,6 +911,7 @@ test('a link from a default page into the deny host is refused, nothing commits 
       { op: 'eval', js: 'location.origin' },
     ])).out);
     assert.ok(click.notices.some((n: string) => n.includes('这个域名是「不允许」的，没经批准不能打开')), JSON.stringify(click.notices));
+    assert.equal(click.results[3].outcome, 'ok', JSON.stringify(click.results[3]));
     const where = String(click.results[3].output);
     assert.ok(!where.includes('127.0.0.1'), `the page is not on the deny origin: ${where}`);   // 停在原地，或浏览器自己的错误页（源是 null）
     assert.equal(server.hits.slice(from).length, 0, 'no write reached the server');
@@ -1007,6 +1008,7 @@ test('the MCP shell over stdio: initialize, tools/list, open, step, close agains
   const lines: string[] = [];
   const waiting = new Map<number, (m: any) => void>();
   const messages: any[] = [];
+  const badLines: string[] = [];   // stdout 上不是 JSON 的行：在 data 回调里抛会变成未捕获异常，收集起来在断言里报
   let buf = '';
   let err = '';
   child.stdout.setEncoding('utf8').on('data', (d: string) => {
@@ -1015,7 +1017,13 @@ test('the MCP shell over stdio: initialize, tools/list, open, step, close agains
       const line = buf.slice(0, i);
       buf = buf.slice(i + 1);
       lines.push(line);
-      const m = JSON.parse(line);   // 不是 JSON 的行在这里就抛：stdout 不许有协议之外的东西
+      let m: any;
+      try {
+        m = JSON.parse(line);
+      } catch {
+        badLines.push(line);   // stdout 不许有协议之外的东西
+        continue;
+      }
       messages.push(m);
       waiting.get(m.id)?.(m);
     }
@@ -1086,6 +1094,7 @@ test('the MCP shell over stdio: initialize, tools/list, open, step, close agains
     child.stdin.end();   // 关掉标准输入：服务收尾退出
     assert.equal(await exited, 0, err);
     assert.equal(buf, '', 'no partial line left on stdout');
+    assert.deepEqual(badLines, [], 'every stdout line is JSON');
     assert.equal(lines.length, nextId, 'one stdout line per request, nothing else');
     assert.ok(messages.every((m) => m.jsonrpc === '2.0' && typeof m.id === 'number'), 'every stdout line is a protocol response');
   } finally {

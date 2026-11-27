@@ -132,12 +132,16 @@ export function formatSaveCase(r: SaveCaseResult): string {
 export interface RunResult {
   session: string | null; reportPath: string | null; verdict: VerdictValue | null; skipped: number; tallies: Tallies | null;
   error: { code: string; message: string; next?: string } | null;
+  because?: string | null;   // 老版本的结果没有
 }
 
-export function formatRun(r: RunResult): string {
+// exit 是 run 的退出码：20（撞到登录墙）时多一行告诉人怎么办。
+export function formatRun(r: RunResult, exit: number): string {
   const out = [`${r.session === null ? '重放' : `重放 ${inline(r.session)}`} ${r.error === null ? '已完成' : '中途出错，已尽力收尾'}`];
   out.push(`结论 ${r.verdict === null ? '未写入（收尾没成功）' : inline(r.verdict)}`);
   if (r.reportPath !== null) out.push(`报告 ${inline(r.reportPath)}`);
+  if (r.because != null) out.push(`理由：${firstLine(r.because)}`);
+  if (exit === 20) out.push('撞到登录墙：请人运行 login 后重跑');
   if (r.tallies !== null) out.push(tallyText(r.tallies));
   if (r.skipped > 0) out.push(`有 ${r.skipped} 步不能重放，已跳过，逐条见报告里的没做的事`);
   if (r.error !== null) {

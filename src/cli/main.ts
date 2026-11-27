@@ -354,7 +354,7 @@ async function runCmd(ctx: Ctx, args: string[]): Promise<number> {
     clock: clockOf(ctx),
     onWaiting: (id) => { ctx.io.err(id === null ? '请在弹出的对话框里选择' : `请在弹出的对话框里选择（请求 ${id}）`); },
   });
-  return settle<RunResult>(ctx, outcome, formatRun);
+  return settle<RunResult>(ctx, outcome, (r) => formatRun(r, outcome.exit));
 }
 
 async function run(ctx: Ctx, argv: string[]): Promise<number> {

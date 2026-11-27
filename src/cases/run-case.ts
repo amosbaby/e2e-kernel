@@ -29,6 +29,7 @@ export interface RunOutcome {
   skipped: number;                 // 不能重放、没有发给内核的步骤数
   tallies: Tallies | null;         // 各批 step 的合计，加上因停下而没发出去的步骤（算未执行）
   error: RunError | null;          // 中途出的错（退出码就是它的）；没出错为 null
+  because: string | null;          // 写进 close 的结论理由（不是 pass 时才有）；没开成会话为 null
 }
 
 interface Batch { ops: Op[]; allow: AllowItem[] }
@@ -120,9 +121,9 @@ function addTallies(a: Tallies, b: Tallies): Tallies {
   return { ok: a.ok + b.ok, match: a.match + b.match, mismatch: a.mismatch + b.mismatch, failed: a.failed + b.failed, notRun: a.notRun + b.notRun };
 }
 
-function readOpen(v: unknown): { session: string; blocked: boolean } {
+function readOpen(v: unknown): { session: string; blocked: boolean; identityMismatch: boolean } {
   if (!isObject(v) || typeof v.session !== 'string' || !SESSION_ID.test(v.session)) throw malformed();
-  return { session: v.session, blocked: v.blocked === 'login' };
+  return { session: v.session, blocked: v.blocked === 'login', identityMismatch: v.identity === 'mismatch' };
 }
 
 function readStep(v: unknown): { exit: 0 | 10 | 11 | 20; tallies: Tallies } {
@@ -141,14 +142,21 @@ function skipLines(steps: CaseStep[]): string[] {
   return [...lines.slice(0, MAX_NOT_DONE - 1), `另有 ${lines.length - (MAX_NOT_DONE - 1)} 步不能重放`];
 }
 
-type Stop = { kind: 'login'; batch: number } | { kind: 'error'; batch: number; error: E2kError } | null;
+type Stop = { kind: 'identity' } | { kind: 'login'; batch: number } | { kind: 'error'; batch: number; error: E2kError } | null;
+
+// open 回来身份探针不符：和 CLI open 同口径（22），一步都不发。
+const IDENTITY_MISMATCH: RunError = {
+  code: 'needs-human',
+  message: '身份探针不符：打开时页面上的账号或租户不是组配置里期望的那个，没有执行任何步骤',
+  next: '账号或租户可能被别的会话切走了；请人确认后重跑',
+};
 
 export async function runCase(send: (method: Method, params: unknown) => Promise<unknown>, c: CaseFile, o: RunOptions): Promise<RunOutcome> {
   let batches: Batch[];
   try {
     batches = planBatches(c);
   } catch (e) {
-    if (e instanceof E2kError) return { exit: exitCodeFor(e.code), session: null, reportPath: null, verdict: null, skipped: 0, tallies: null, error: toRunError(e) };
+    if (e instanceof E2kError) return { exit: exitCodeFor(e.code), session: null, reportPath: null, verdict: null, skipped: 0, tallies: null, error: toRunError(e), because: null };
     throw e;
   }
   const skipped = c.steps.filter((s) => s.skip !== undefined).length;
@@ -160,18 +168,19 @@ export async function runCase(send: (method: Method, params: unknown) => Promise
   if (c.open.readonly) openParams.readonly = true;
   if (c.open.allow.length > 0) openParams.allow = c.open.allow;
 
-  let opened: { session: string; blocked: boolean };
+  let opened: { session: string; blocked: boolean; identityMismatch: boolean };
   try {
     opened = readOpen(await sendRetrying(send, 'open', openParams, o));
   } catch (e) {
-    if (e instanceof E2kError) return { exit: exitCodeFor(e.code), session: null, reportPath: null, verdict: null, skipped, tallies: null, error: toRunError(e) };
+    if (e instanceof E2kError) return { exit: exitCodeFor(e.code), session: null, reportPath: null, verdict: null, skipped, tallies: null, error: toRunError(e), because: null };
     throw e;
   }
   const session = opened.session;
 
   let tallies: Tallies = { ok: 0, match: 0, mismatch: 0, failed: 0, notRun: 0 };
   let sent = 0;
-  let stop: Stop = opened.blocked ? { kind: 'login', batch: 0 } : null;
+  // 身份不符先于登录墙（22 优先于 20，同 CLI open）。
+  let stop: Stop = opened.identityMismatch ? { kind: 'identity' } : opened.blocked ? { kind: 'login', batch: 0 } : null;
   let thrown: unknown;
   let closed: { reportPath: string; exit: number } | null = null;
   let closeError: E2kError | null = null;
@@ -201,7 +210,9 @@ export async function runCase(send: (method: Method, params: unknown) => Promise
   tallies = { ...tallies, notRun: tallies.notRun + unsent };
 
   let because: string | undefined;
-  if (stop?.kind === 'error') {
+  if (stop?.kind === 'identity') {
+    because = '身份探针不符';
+  } else if (stop?.kind === 'error') {
     because = `重放在第 ${stop.batch} 批出错（${stop.error.code}），之后的 ${unsent} 步没有执行`;
   } else if (stop?.kind === 'login') {
     because = stop.batch === 0 ? '撞到登录墙：打开时就是登录页，一步都没有执行' : `撞到登录墙：第 ${stop.batch} 批 step 返回登录墙，之后的 ${unsent} 步没有执行`;
@@ -234,11 +245,14 @@ export async function runCase(send: (method: Method, params: unknown) => Promise
   if (thrown !== undefined) throw thrown;
 
   // 退出码：撞到登录墙 20 > 失败 11 > 不符 10 > 0；中途出错（不是 21 以外也一样）以那个错误的码为准；close 本身出错时以它的码为准。
-  let error: E2kError | null = null;
+  let error: RunError | null = null;
   let exit: number;
-  if (stop?.kind === 'error') {
-    error = stop.error;
-    exit = exitCodeFor(error.code);
+  if (stop?.kind === 'identity') {
+    error = IDENTITY_MISMATCH;
+    exit = exitCodeFor(IDENTITY_MISMATCH.code);
+  } else if (stop?.kind === 'error') {
+    error = toRunError(stop.error);
+    exit = exitCodeFor(stop.error.code);
   } else if (stop?.kind === 'login') {
     exit = 20;
   } else if (tallies.failed > 0 || tallies.notRun > 0) {
@@ -249,10 +263,10 @@ export async function runCase(send: (method: Method, params: unknown) => Promise
     exit = 0;
   }
   if (closeError !== null && error === null) {
-    error = closeError;
+    error = toRunError(closeError);
     exit = exitCodeFor(closeError.code);
   }
   // 结论是 pass 时内核发现记录自相矛盾（不该发生）：不能当通过。
   if (exit === 0 && closed !== null && closed.exit === 10) exit = 10;
-  return { exit, session, reportPath: closed?.reportPath ?? null, verdict: closed === null ? null : verdict, skipped, tallies, error: error === null ? null : toRunError(error) };
+  return { exit, session, reportPath: closed?.reportPath ?? null, verdict: closed === null ? null : verdict, skipped, tallies, error, because: because ?? null };
 }

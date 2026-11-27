@@ -22,6 +22,7 @@ export const MAX_CASE_BYTES = 1_000_000;
 const MAX_STEPS = 500;
 const MAX_PICKED_STEPS = 200;
 const MAX_CASE_ALLOW = 500;
+const MAX_CLAIM = 500;
 const MAX_FINDINGS = 20;
 const SEQ_RANGE = { min: 1, max: Number.MAX_SAFE_INTEGER };
 const PROFILE_KEY = /^[a-z0-9_-]{1,32}(\/[a-z0-9_-]{1,32})?$/;
@@ -164,7 +165,7 @@ export function parseCase(text: string): CaseFile {
   if (!Array.isArray(o.findings) || o.findings.length > MAX_FINDINGS) throw bad('findings');
   const findings = o.findings.map((f: unknown, i) => {
     const fo = exact(f, `findings[${i}]`, bad, ['claim']);
-    return { claim: guard(bad, `findings[${i}].claim`, () => str(fo.claim, 'claim', { min: 1, max: 500 })) };
+    return { claim: guard(bad, `findings[${i}].claim`, () => str(fo.claim, 'claim', { min: 1, max: MAX_CLAIM })) };
   });
   return { e2kCase: 1, name, source, open, steps, allow, findings, containsWrites: parseFlag(o.containsWrites, 'containsWrites') };
 }
@@ -285,6 +286,13 @@ function isDefaultPick(a: RecordedAction): boolean {
   return (DEFAULT_KEPT_OPS.has(op) && a.outcome === 'ok') || (op === 'assert' && (a.outcome === 'match' || a.outcome === 'mismatch'));
 }
 
+// 原会话的结论超过用例的上限（500 字）就截短，不让整份导出失败；不把代理对劈成两半。
+function clipClaim(claim: string): string {
+  if (claim.length <= MAX_CLAIM) return claim;
+  const cut = claim.slice(0, MAX_CLAIM);
+  return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
 export function buildCase(run: unknown, o: { steps?: number[]; name?: string }): CaseFile {
   const picked = pickedSteps(o.steps);
   if (!isObject(run)) throw refuse('记录的形状不对');
@@ -330,7 +338,7 @@ export function buildCase(run: unknown, o: { steps?: number[]; name?: string }):
   if (!Array.isArray(run.findings)) throw refuse('findings 的形状不对');
   const findings = run.findings.map((f: unknown) => {
     if (!isObject(f) || typeof f.claim !== 'string') throw refuse('findings 的形状不对');
-    return { claim: f.claim };
+    return { claim: clipClaim(f.claim) };
   });
 
   let chosen: RecordedAction[];

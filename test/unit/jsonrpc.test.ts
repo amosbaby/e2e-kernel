@@ -37,6 +37,14 @@ describe('serveJsonRpc', () => {
     assert.deepEqual(msgs[1], { jsonrpc: '2.0', id: 'x', result: {} });
   });
 
+  test('a message without an id whose method is not notifications/* is dropped: the handler is not called and nothing is answered', async () => {
+    const called: string[] = [];
+    const record: Handle = async (method) => { called.push(method); return {}; };
+    const { msgs } = await run([req({ method: 'tools/call', params: { name: 'open' } }), req({ method: 'echo' }), req({ method: 'notifications/initialized' }), req({ id: 1, method: 'echo' })], record);
+    assert.deepEqual(called, ['notifications/initialized', 'echo']);
+    assert.deepEqual(msgs.map((m) => m.id), [1]);
+  });
+
   test('notifications get no response, even when the handler fails; the next request still does', async () => {
     const { msgs } = await run([req({ method: 'echo' }), req({ method: 'boom' }), req({ method: 'nope' }), req({ id: 2, method: 'echo' })]);
     assert.equal(msgs.length, 1);
@@ -189,6 +197,14 @@ describe('the MCP handler over serveJsonRpc', () => {
     const { msgs } = await mcp([{ method: 'notifications/initialized' }, { method: 'notifications/cancelled', params: { requestId: 1 } }, { id: 9, method: 'ping' }]);
     assert.equal(msgs.length, 1);
     assert.deepEqual(msgs[0], { jsonrpc: '2.0', id: 9, result: {} });
+  });
+
+  test('a tools/call without an id is dropped: the kernel send is never called and nothing is answered', async () => {
+    const sent: string[] = [];
+    const handler = mcpHandler({ ...deps, send: async (method: string) => { sent.push(method); return {}; } } as never);
+    const { msgs } = await run([req({ method: 'tools/call', params: { name: 'status', arguments: {} } }), req({ id: 2, method: 'ping' })], handler);
+    assert.deepEqual(sent, []);
+    assert.deepEqual(msgs, [{ jsonrpc: '2.0', id: 2, result: {} }]);
   });
 
   test('tools/list works before initialize and lists the tools; an unknown method is -32601', async () => {

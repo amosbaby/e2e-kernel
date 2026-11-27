@@ -67,6 +67,8 @@ export function serveJsonRpc(
       return;
     }
     const isNotification = !hasId;
+    // 没有 id 的只当通知收：方法不是 notifications/ 开头的（比如没带 id 的 tools/call）直接丢掉，不执行、不回应。
+    if (isNotification && !m.method.startsWith('notifications/')) return;
     try {
       const result = await handle(m.method, m.params);
       if (isNotification) return;

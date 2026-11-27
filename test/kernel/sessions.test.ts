@@ -4204,7 +4204,7 @@ test('a page on a default host requesting a deny host is answered 403 whatever t
   assert.deepEqual(res.writes.allowed.map((w) => w.targetMode), ['readonly']);
 });
 
-test('a --readonly session whose page host turns deny gets 403 on every request, and the next step says so; denied beats the forced read-only (R9)', async () => {
+test('a --readonly session whose page host turns deny gets 403 on every request, and the next step runs nothing (22); denied beats the forced read-only (R9)', async () => {
   const { sm, fake, home, modes } = setupDeny(answeringDeny('只读'));
   const { session } = await opened(sm, fake);
   await sm.close({ session });
@@ -4215,10 +4215,32 @@ test('a --readonly session whose page host turns deny gets 403 on every request,
   writeFileSync(home.rulesFile, JSON.stringify({ ...DENY_RULES, rules: [...DENY_RULES.rules, { match: 'localhost', mode: 'deny' }] }));
   modes.refresh();   // 待批：新增的 deny 条目按更严合并立刻生效
   assert.equal(status(await fake.emitRequest({ pageId: roPage, method: 'GET', url: 'http://localhost:5173/api' })), 403);
-  const st = await sm.step({ session: ro.session, ops: [{ op: 'snapshot' }] });
-  assert.ok(st.notices.includes('页面所在的域名现在是「不允许」：所有请求被拦，请关掉会话'), st.notices.join('|'));
-  assert.ok(st.notices.includes('规则文件有未批准的改动（只有新增或改严（只读、不允许）的规则条目已先生效，其余改动要等批准）'));
-  assert.deepEqual(blockedReasons((await sm.close({ session: ro.session })).runDir), ['denied']);
+  const before = methodCount(fake, 'snapshot');
+  await assert.rejects(sm.step({ session: ro.session, ops: [{ op: 'snapshot' }] }),
+    (e: E2kError) => e.code === 'needs-human' && e.message === '页面所在的域名现在是「不允许」，这次没有执行任何操作' && e.next === '关掉会话');
+  assert.equal(methodCount(fake, 'snapshot'), before, 'no op ran');
+  // 会话仍可关；没执行的那一批不进记录
+  const runDir = (await sm.close({ session: ro.session })).runDir;
+  assert.deepEqual(blockedReasons(runDir), ['denied']);
+  assert.deepEqual(readResult(runDir).actions, []);
+});
+
+test('a default session whose page host turns deny mid-session: step runs nothing and asks no declaration dialog (22); a session approved for its deny host steps as before', async () => {
+  const { sm, fake, home, modes, dialog } = setupDeny(answeringDeny('只读'));
+  const g = await openDenied(sm, fake, { url: DENY_URL, name: 'granted' });
+  const { session } = await opened(sm, fake);
+  assert.equal((await sm.step({ session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  writeFileSync(home.rulesFile, JSON.stringify({ ...DENY_RULES, rules: [...DENY_RULES.rules, { match: 'localhost', mode: 'deny' }] }));
+  modes.refresh();
+  const asked = dialog.requests.length;
+  const before = fake.calls.length;
+  await assert.rejects(sm.step({ session, ops: [{ op: 'click', target: '#go' }], allow: [{ method: 'POST', url: 'http://localhost:5173/api/save' }] }),
+    (e: E2kError) => e.code === 'needs-human' && e.message === '页面所在的域名现在是「不允许」，这次没有执行任何操作' && e.next === '关掉会话');
+  assert.equal(dialog.requests.length, asked, 'no dialog for the declaration');
+  assert.ok(!fake.calls.slice(before).some((c) => c.method === 'click'), 'the click was not run');
+  await sm.close({ session });
+  // 授权覆盖的 deny 主机：照常执行
+  assert.equal((await sm.step({ session: g.session, ops: [{ op: 'snapshot' }] })).exit, 0);
 });
 
 test('remembered declarations for a deny target are not used (R21): a grant-covered target is judged read-only and the stored entry does not let the write through', async () => {

@@ -383,3 +383,13 @@ test('readCaseFile reads a case file, and refuses a symlink, a directory, a miss
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a claim over 500 characters is clipped to 500 instead of failing the export, without splitting a surrogate pair', () => {
+  const long = 'a'.repeat(600);
+  const c = buildCase(run({ findings: [{ claim: long, basis: 'b', verdict: 'pass' }, { claim: 'short', basis: 'b', verdict: 'fail' }] }), {});
+  assert.deepEqual(c.findings, [{ claim: 'a'.repeat(500) }, { claim: 'short' }]);
+  // 第 500 个代码单元正好是代理对的前半：去掉它，剩 499 个
+  const pair = buildCase(run({ findings: [{ claim: 'b'.repeat(499) + '\u{1F600}' + 'c' }] }), {});
+  assert.equal(pair.findings[0]!.claim, 'b'.repeat(499));
+  assert.doesNotThrow(() => parseCase(JSON.stringify(c)));
+});

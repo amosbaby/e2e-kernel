@@ -545,6 +545,10 @@ export class SessionManager {
         await Promise.all([...frozenNowOnProbe.clearing]);
         throw frozenError(frozenNowOnProbe);
       }
+      // 主页面所在的主机中途变成了没授权的不允许（规则改严）：所有请求都会被拦，这次不执行任何操作（含放行声明的批准框）。
+      if (this.deps.modes.resolve(s.topHost) === 'denied' && !this.grantCovers(s, s.topHost, { nav: true })) {
+        throw new E2kError('needs-human', '页面所在的域名现在是「不允许」，这次没有执行任何操作', '关掉会话');
+      }
       // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；探针之后到这里、再到开始执行之间没有 await。
       if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow, s.recorder.upcomingSeq());
       const loginOpenAtStart = this.loginActive();
