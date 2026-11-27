@@ -265,12 +265,13 @@ export class SessionManager {
   // 弹框在后台，这里同步返回：没批准就抛错，调用方等人点完再原样重试（重试靠内容键对上同一个框）。
   private gateRules(): void {
     const { modes, approvals } = this.deps;
-    let refreshed = false;
     for (;;) {
       const pending = modes.pending();
       if (pending === null) return;
       const short = modes.state().pendingHash ?? '文件被删了';   // 对外只露短哈希
-      const key = `rules:${pending.hash ?? 'deleted'}`;
+      // 键里有三样：已批准基线的完整哈希、待批的完整哈希。基线变了（别的批准落了盘）旧答案就对不上，
+      // 所以没用掉的旧批准不会在新基线上直接生效（比如改回一份早先批准过的文本，必须重新问）。
+      const key = `rules:${pending.baseHash ?? 'none'}:${pending.hash ?? 'deleted'}`;
       // 改动太多框里放不下：只给「拒绝」一个按钮，必然 denied，让人先看完整差异、拆开再改。
       const request: DialogRequest = pending.tooLong
         ? { title: 'e2k：域名规则改了', lines: [`规则文件改动太多，框里放不下（${short}）：`, '先运行 e2k rule diff 看完整差异，再拆成几次改。', '', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）'],
@@ -282,20 +283,23 @@ export class SessionManager {
         case 'pending':
           throw pendingError(asked.id, '域名规则的改动');
         case 'denied':
-          throw new E2kError('usage',
-            asked.cooling ? '刚被人拒过，过一会儿再试' : '人拒绝了这次规则改动；按上一次批准的规则，新的 open 和 login 也不开',
+          if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '把 rules.json 改回去或改成别的再试；内核重启前同一份改动不会再问');
+          if (pending.tooLong) {
+            throw new E2kError('usage', '规则改动太多，框里放不下，没有批准；按上一次批准的规则，新的 open 和 login 也不开',
+              '运行 e2k rule diff 看完整差异，再拆成几次改');
+          }
+          throw new E2kError('usage', '人拒绝了这次规则改动；按上一次批准的规则，新的 open 和 login 也不开',
             '把 rules.json 改回去或改成别的再试；内核重启前同一份改动不会再问');
         case 'unavailable':
           throw new E2kError('needs-human', `规则改了但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
         case 'approved': {
           // 写盘失败时 approvePending 抛 needs-human，原样往上走；这里不接。
           const done = modes.approvePending(pending.hash);
-          approvals.forget(key);
-          if (done) break;   // 回到循环顶：待批已清，返回
-          // 内存里待批的已经不是被批准的那份：重读一次再走一遍，还不行就当没批准。
-          if (refreshed) throw new E2kError('wait-approval', '规则文件又变了，要重新批准', '人点完以后，原样重试这条命令');
-          refreshed = true;
-          modes.refresh();
+          // 基线变了：这期间问过、批准了却没用掉的 rules: 答案一并作废（被拒的键保留）。
+          approvals.forgetApproved((k) => k.startsWith('rules:'));
+          // pending() 和 approvePending 之间没有 await，false 只能是内核自己的 bug；不放行。
+          if (!done) throw new E2kError('internal', '待批的规则在批准时对不上');
+          break;   // 回到循环顶：待批已清，返回
         }
       }
     }

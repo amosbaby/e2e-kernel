@@ -175,6 +175,14 @@ export class Approvals {
     this.entries.delete(key);
   }
 
+  // 把已经批准、还没被用掉的答案作废（键满足 match 的）：调用方换了新的基线之后，旧基线上的批准不该再留着。
+  // 被拒的键、还在弹或排队的不动：被拒的一直记到内核重启，是 Task 2 定的规则。
+  forgetApproved(match: (key: string) => boolean): void {
+    for (const [key, e] of [...this.entries]) {
+      if (e.state === 'approved' && match(key)) this.entries.delete(key);
+    }
+  }
+
   private shownRecently(t: number): number {
     this.shown = this.shown.filter((x) => t - x < RATE_WINDOW_MS);
     return this.shown.length;

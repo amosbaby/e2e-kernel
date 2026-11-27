@@ -262,16 +262,27 @@ async function loginBeginApproved(url: string): ReturnType<typeof call> {
 
 // 写好 rules.json 再跑 fn，无论成败都删掉，不影响后面按顺序跑的测试。删文件也是待批的改动：
 // 收尾时开一个探针会话把「删掉」批准掉，下一个测试从「没有规则」干净地开始。
+// 弹框额度是 10 分钟 6 个，每个 withRules 用 2 个（写入、删除）：现在三个有效规则的测试正好用满，再加要先看额度。
+// fn 失败时原错误优先：探针的失败只在 fn 成功时才抛，不盖掉 fn 的错误。
 async function withRules(rules: unknown, fn: () => Promise<void>): Promise<void> {
   writeFileSync(home.rulesFile, typeof rules === 'string' ? rules : JSON.stringify(rules));
+  let failed = false;
+  let failure: unknown;
   try {
     await fn();
-  } finally {
-    rmSync(home.rulesFile, { force: true });
+  } catch (e) {
+    failed = true;
+    failure = e;
+  }
+  rmSync(home.rulesFile, { force: true });
+  try {
     const probe = await openApproved(origin + '/index.html', '--name', 'rules-probe', '--json');
     assert.equal(probe.code, 0, probe.err);
     assert.equal((await e2k('close', JSON.parse(probe.out).session)).code, 0);
+  } catch (e) {
+    if (!failed) throw e;
   }
+  if (failed) throw failure;
 }
 
 const readonlyRules = (host: string, loginHosts: string[] = []): unknown => ({ version: 1, rules: [{ match: host, mode: 'readonly' }], loginHosts });

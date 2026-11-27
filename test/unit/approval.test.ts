@@ -253,6 +253,24 @@ test('Approvals: an approval stays until forget, then the same key is a new ques
   assert.equal(m.seen.length, 2);
 });
 
+test('Approvals: forgetApproved drops approved answers that match, and keeps denied and still-open ones', async () => {
+  const c = clock();
+  const m = manualDialog();
+  const a = new Approvals(m.dialog, () => {}, { now: c.now });
+  a.ask('rules:1', 'rules', req(), APPROVE);
+  await m.release({ kind: 'button', button: '允许' });
+  a.ask('rules:2', 'rules', req(), APPROVE);
+  await m.release({ kind: 'button', button: '不允许' });   // 被拒
+  c.advance(120_000);
+  a.ask('rules:3', 'rules', req(), APPROVE);               // 弹着，没答
+  a.ask('other', 'writes', req(), APPROVE);                // 排队，没答
+  await sleepTick();
+  a.forgetApproved((k) => k.startsWith('rules:'));
+  assert.equal(a.ask('rules:1', 'rules', req(), APPROVE).status, 'pending', 'the approved one is a new question again');
+  assert.deepEqual(a.ask('rules:2', 'rules', req(), APPROVE), { status: 'denied', cooling: false }, 'a refusal is kept');
+  assert.equal(a.ask('rules:3', 'rules', req(), APPROVE).status, 'pending');
+});
+
 test('Approvals: only the buttons the caller listed approve', async () => {
   const m = manualDialog();
   const a = new Approvals(m.dialog, () => {}, { now: clock().now });

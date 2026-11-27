@@ -20,7 +20,9 @@ export interface RulesState {
 
 // 待批的规则改动。text 是内存里留着的原文（批准时写的就是它，不重读磁盘），hash 是它的完整 sha256（64 位十六进制，待批的身份，approvePending 比的就是它；状态和报告里只露短哈希，64 位十六进制会被脱敏）；文件被删时两者都是 null。
 // summary 是和已批准内容逐字段比较的完整差异，放宽的排前面；超过 12 行 tooLong 为 true。
-export interface PendingRules { hash: string | null; text: string | null; summary: string[]; tooLong: boolean }
+// baseHash 是这份待批改动所基于的、当时已批准快照原文的完整 sha256（没有批准过为 null）：入口闸门把它和 hash 一起放进弹框键，
+// 基线一变，之前没用掉的批准就对不上新的请求。和 hash 一样只在内核内存里用，对外只显示短哈希。
+export interface PendingRules { hash: string | null; baseHash: string | null; text: string | null; summary: string[]; tooLong: boolean }
 
 // 按主机名（不带端口）定会话模式（设计 5.2）。
 export interface ModeResolver {

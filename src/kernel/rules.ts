@@ -634,7 +634,7 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
   };
 
   const pendingView = (): PendingRules | null => pending === null ? null
-    : { hash: pending.hash, text: pending.text, summary: [...pending.summary], tooLong: pending.summary.length > MAX_SUMMARY_LINES };
+    : { hash: pending.hash, baseHash: snap.text === null ? null : fullHash(snap.text), text: pending.text, summary: [...pending.summary], tooLong: pending.summary.length > MAX_SUMMARY_LINES };
 
   refresh();
   return {

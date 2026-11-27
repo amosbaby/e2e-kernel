@@ -1,5 +1,6 @@
 import { after, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -309,7 +310,8 @@ test('resolver: deleting the file is a pending change (hash null); the approved 
   f.text = null;
   m.refresh();
   assert.equal(m.state().count, 2); assert.deepEqual(m.state().pending, { hash: null, tooLong: false });
-  assert.deepEqual(m.pending(), { hash: null, text: null, summary: ['规则文件被删了：所有规则失效'], tooLong: false });
+  const baseHash = `sha256:${createHash('sha256').update(good, 'utf8').digest('hex')}`;   // 待批所基于的已批准文本的完整哈希（64 位）
+  assert.deepEqual(m.pending(), { hash: null, baseHash, text: null, summary: ['规则文件被删了：所有规则失效'], tooLong: false });
   assert.equal(m.resolve('x.example.com'), 'readonly');       // 只看已批准的
   assert.equal(m.isLoginHost('sso.example.com', 'default'), true);
   assert.equal(m.approvePending('sha256:0000000000000000'), false);
