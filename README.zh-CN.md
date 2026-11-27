@@ -9,7 +9,7 @@
 - **真实的有头浏览器**：由 Playwright 驱动的 Chromium，每个登录 profile 一个浏览器。
 - **你说只读就只读**：`rules.json` 把主机标成只读，在那里的写请求被拦下并记录。
 - **例外由人批准**：规则改动和声明要放行的写，都要等人在原生弹框里点一下。没有 `approve` 命令。
-- **要紧的域名可以设成不允许**：标成 `deny` 的主机，agent 不能自己打开，每次运行都要人批准（见 [Deny mode](docs/reference.md#deny-mode)）。
+- **要紧的域名可以设成不允许**：标成 `deny` 的主机（写在 `rules.json` 里，或人在新主机上第一次 `login` 时选），agent 不能自己打开，每次运行都要人批准（见 [Deny mode](docs/reference.md#deny-mode)）。
 - **存成用例，重跑**：`save-case` 把已 close 的会话导出成可重放的用例文件，`run` 不需要 agent 在场就能重跑（见 [Cases](docs/reference.md#cases)）。
 - **MCP 外壳**：`e2k mcp` 经标准输入输出提供同样的命令，给偏好 MCP 的 agent 用；没有登录、改规则和批准类工具（见 [MCP shell](docs/reference.md#mcp-shell)）。
 - **给人看的报告**：每个会话结束时生成 `report.html` 和 `result.json`，已脱敏。
@@ -43,6 +43,20 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by o
 ![被拦的写用 step --allow 声明，命令以 21 退出，人点「放行」后原样重跑就能通过；rules.json 改动在 open 和 login 时走同样的流程](docs/img/zh/approval-flow.svg)
 
 `open --readonly` 强制只读，或规则把会话所在主机标成 `readonly` 时，会话就是只读的。只有读请求能过（GET、HEAD、OPTIONS、严格的 GraphQL query），其余一律以 403 拦下并记录。验证确实需要一次写时，agent 用 `step --allow` 声明，由人批准。`rules.json` 改了也要人批准才生效。详见 [Read-only mode](docs/reference.md#read-only-mode)、[Allowing writes](docs/reference.md#allowing-writes-on-read-only-hosts)、[Domain rules](docs/reference.md#domain-rules)。
+
+## 不允许模式
+
+规则写成 `deny`（`{"match": "admin.example.com", "mode": "deny"}`），或人在没有规则覆盖的主机上第一次 `login` 时在两步弹框里选「不允许」，这个主机就是不允许的。打开它、在它上面登录、借用含它的组、声明要往它写，每次运行都要等人在弹框里点一下；批准 5 分钟内没用掉就作废，都不会被记住。没批准时，跳进这个主机的导航会被中止，发往它的请求回 403。覆盖不到的：WebSocket 和重定向的后续跳（Playwright 只路由首跳），所以它防的是走偏的 agent，不是沙箱。详见 [Deny mode](docs/reference.md#deny-mode)、[Known gaps](docs/reference.md#known-m1-gaps)。
+
+## 用例与 MCP 外壳
+
+```sh
+node bin/e2k.js save-case s-1a2b3c --out ~/cases/smoke.json   # close 之后；不能重放的步骤会标成跳过
+node bin/e2k.js run ~/cases/smoke.json                         # 重放，不需要 agent，写一份新报告
+claude mcp add e2k -- node <repo>/bin/e2k.js mcp               # 或让任何 MCP 客户端运行 `node <repo>/bin/e2k.js mcp`
+```
+
+用例文件包含起始地址、profile、视口、可重放的步骤和放行声明；它带站点信息，存到本仓库以外。MCP 外壳提供 `open`、`step`、`close`、`run`、`save_case`、`status`、`doctor`、`rule_list`；登录、改规则、批准仍由人来做。详见 [Cases](docs/reference.md#cases)、[MCP shell](docs/reference.md#mcp-shell)。
 
 ## 域名组与 profile
 
