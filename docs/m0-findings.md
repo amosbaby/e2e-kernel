@@ -148,6 +148,46 @@ after-restore-2: <应用 A>
 
 结论：启动和在运行中的实例里开新页都会抢焦点；事后按 bundle id 激活原前台应用能还回去。抢和还之间有一小段窗口（这里约 2 秒，实际可以更短），这段时间里用户的按键会落到浏览器上，所以只能缩短、不能消除。
 
+### 7.3 开会话不抢前台（M2b 任务 16，2026-11-27）
+
+7.1 的结论是启动和开页都抢前台，只能事后还。这一节找不抢的启动和开页方式。环境同 §1（Playwright 1.65.1 自带的 Chrome for Testing，Chromium 159）。判法：动作期间及之后 2.5 秒，每 100 毫秒用 `lsappinfo front` 取前台应用的 bundle id 和 pid；**本探针起的那个浏览器进程的 pid 出现在前台才算「抢」**，机器上别的会话的浏览器只当旁注（同一时间还有别的会话在跑浏览器，前台常被它们占着）。每格都是全新的实例和全新的 profile 目录；抢了就 `open -b` 还回去再进下一格。探针脚本不在仓库里，数据照实记在这里。
+
+**12b：`open -g` 启动，第一个页怎么开（整套跑 3 次，后两次最干净）**
+
+| 启动方式 | 第一个页 | 启动抢不抢 | 开页抢不抢 | 之后 click / fill / screenshot |
+| --- | --- | --- | --- | --- |
+| `open -g -n … --no-startup-window --remote-debugging-port` | browser 级 `Target.createTarget({url, background:true})` | 不抢 | **不抢** | 成功，不抢 |
+| 同上 | `context.newPage()` + `goto` | 不抢 | **抢** | 成功，不抢 |
+| `open -g -j -n …`（启动后隐藏） | `createTarget` background | 不抢 | **不抢**，实例仍隐藏 | 成功，不抢，仍隐藏 |
+| 同上 | `newPage()` + `goto` | 不抢 | **抢**，隐藏的实例变成可见 | 成功，不抢 |
+| 隐藏实例里页面自己 `window.open(…, 'popup,…')` | | | **抢**，实例变成可见 | |
+
+- 7.1 里「`-g` 也抢」是因为带了 `about:blank` 启动页（见下），不是 `-g` 无效：`--no-startup-window` 启动本身不抢。`-j`（隐藏）不需要。
+- `createTarget` 在一个没有任何窗口的实例里直接成功，不需要 `newWindow: true`。`context.newPage()` 每次都抢，隐藏的实例也一样。
+- 页面自己弹出的窗口（`window.open`、`target=_blank`）仍然抢，所以 7.1 的「抢了再还」继续留着。
+- 这轮的 click / fill / screenshot 在新开的页上都成功，读回正确，各 10 到 130 毫秒；上一轮在有窗口的实例里开后台标签页时 fill 超时、截图 8.6 秒，是另一种情形，没有做对照。
+
+**Step 0：不开调试端口的管道方案**（上面的 12b 用的是 TCP 调试端口：127.0.0.1 上的调试端口没有认证，本机任何进程都能连上并完全控制这个带登录态的浏览器；内核现在走管道，没有这个口子。所以先看管道能不能也不抢）。整套跑了 3 次（第 1 次 A、B、C，第 2、3 次只重跑 D），逐行判据同上：
+
+| 格 | 做法 | 结果 |
+| --- | --- | --- |
+| A | `chromium.launchPersistentContext(dir, { headless: false, args: ['--no-startup-window'] })` | **启动一直不返回**（我们的 60 秒上限先到；Playwright 对持久化 context 追加 `about:blank` 启动参数，再加 `--no-startup-window` 就没有窗口可等，这是推断，没有进一步查）。没法用 |
+| B | node 直接 `spawn` 浏览器可执行文件 `--remote-debugging-pipe --no-startup-window --user-data-dir=…`，自己在管道上说 CDP，`Target.createTarget({background:true})` | 启动不抢，开页不抢 |
+| C | 同 B 但 `--remote-debugging-port=0`，`DevToolsActivePort` 读端口，`connectOverCDP` | 启动、连接、开页、click / fill / screenshot 都不抢（TCP 对照，没有采用） |
+| D | 同 B，但用 Playwright **公开**的 `chromium.connectOverCDP(transport)` 重载（`types.d.ts` 里的 `ConnectOverCDPTransport`：`send`、`close`、`onmessage`、`onclose`）把管道交给 Playwright | 三次（第 1 次是 B，第 2、3 次是 D）启动、连接、开页、click / fill / route / screenshot / goto 全部不抢；`browser.close()` 之后子进程退出码 0 |
+
+```text
+D 启动（spawn，管道）          耗时 5ms     结论: 不抢
+D connectOverCDP(transport)   耗时 51ms    结论: 不抢     contexts=1 初始页数=0
+D 开页 createTarget(background) 耗时 667ms  结论: 不抢
+D click/fill/screenshot/route  耗时 336ms   结论: 不抢     click→clicked | fill→hello-pipe | screenshot bytes=26543 | goto ok
+D browser.close()              耗时 10ms    结论: 不抢     子进程 exitCode=0 signal=null
+```
+
+结论：**直接 `spawn` + `--remote-debugging-pipe` + `--no-startup-window`，经 `connectOverCDP(transport)` 接给 Playwright，再用 `Target.createTarget({ url: 'about:blank', background: true })` 开页**，启动和开页都不抢前台，也不开任何 TCP 端口。内核采用这个方案（`src/drivers/playwright/browser-process.ts`）；调试端口那条路没有用上。
+
+没变的：页面自己弹出的窗口仍抢；没测的：`createTarget` 开出的窗口在没有 `-j` 时显示在别的窗口后面还是前面（没有直接观察窗口）。
+
 ## 8. 人关窗口后
 
 用户自己跑的 `node scripts/m0/window-close.ts`，原样输出：

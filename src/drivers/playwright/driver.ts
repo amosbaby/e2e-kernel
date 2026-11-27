@@ -2,12 +2,14 @@ import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
-import type { APIResponse, BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
+import type { APIResponse, Browser, BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
 import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
+import { startBrowser } from './browser-process.ts';
+import type { BrowserProcess } from './browser-process.ts';
 import { parseRoleTarget, stableCandidates } from './stable.ts';
 import type { ElementInfo } from './stable.ts';
 
@@ -28,6 +30,18 @@ const CAPABILITIES: Capabilities = {
 };
 
 const MAX_BODY_BYTES = 64 * 1024;
+const LAUNCH_TIMEOUT_MS = 30_000;       // 连上浏览器的上限
+const OPEN_PAGE_TIMEOUT_MS = 15_000;    // 等新开的页出现的上限
+const OPEN_PAGE_POLL_MS = 50;           // 页出现了但地址还没提交时，隔多久再看
+const BROWSER_CLOSE_TIMEOUT_MS = 5000;  // 优雅关闭（Browser.close）的上限；超了由 terminate 兜底
+// 页面的默认视口：launchPersistentContext 原来默认就是 1280x720；连接已有浏览器的默认 context 不带视口，这里补上，开页时设。
+const DEFAULT_VIEWPORT: Viewport = { width: 1280, height: 720 };
+// serviceWorkers: 'block' 是 context 的创建选项，连接已有浏览器的默认 context 传不了；这是 Playwright 在 block 时装的那段初始化脚本
+// （pw 1.65.1 的 browserContext.ts），在所有页面、所有 frame 里让 register() 什么都不做。
+// docs/m0-findings.md §6 实测过效果：register() 本身 resolve，但没有注册生成。
+const BLOCK_SERVICE_WORKERS_SCRIPT = `
+if (self.ServiceWorkerContainer) ServiceWorkerContainer.prototype.register = async () => { console.warn('Service Worker registration blocked'); };
+`;
 const TOUCH_POINTS = 5;   // 触屏模拟报给页面的 maxTouchPoints
 const MAX_MESSAGE_CHARS = 300;
 // 失败诊断（DriverError.hints）：驱动只做保护性的截断，不脱敏也不截短（内核先脱敏、再截到 300），
@@ -167,6 +181,8 @@ export interface DriverOptions {
   onListenerError?: (e: unknown) => void;
   // 动作等目标出现、以及 Playwright 动作本身的超时（毫秒），默认 ACTION_TIMEOUT_MS。测试用来把「永远不出现」的等待缩短。
   actionTimeoutMs?: number;
+  // 浏览器可执行文件的路径；不给就用 Playwright 自带的 Chromium。内核从不传它，测试用来造「启动不了」的情形。
+  executablePath?: string;
 }
 
 // 密码类输入框的选择器：不要求可见，宁可多判成「有」，少记一条请求体。
@@ -234,6 +250,11 @@ async function probePageForPasswordField(page: PwPage): Promise<PasswordProbe> {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// 空白页的地址：Playwright 在页刚出现时可能给空串或 ':'，提交之后是 about:blank。
+function isBlankUrl(url: string): boolean {
+  return url === 'about:blank' || url === '' || url === ':';
 }
 
 // 统一写法 → Playwright 的 Locator：引用 → getByRef；role=…[name="…"] → getByRole（我们自己解析）；其余 → locator。
@@ -696,7 +717,10 @@ class PlaywrightPage implements Page {
 }
 
 class PlaywrightInstance implements Instance, Host {
+  private readonly browser: Browser;
   private readonly context: BrowserContext;
+  private readonly proc: BrowserProcess;                  // 自己 spawn 的浏览器进程：关闭、意外退出都由它结束，只碰这一个
+  private browserSession: CDPSession | undefined;         // browser 级的 CDP 会话：开页（Target.createTarget）和优雅关闭用
   private readonly counters: Counters;
   private readonly anchors: ReadonlySet<PwPage>;        // 启动时自带的空白页：窗口的锚，不算任何会话的页面
   private readonly byPage = new WeakMap<PwPage, PlaywrightPage>();
@@ -720,15 +744,20 @@ class PlaywrightInstance implements Instance, Host {
   private closed = false;
   private stopping: Promise<void> | undefined;
   // openPage 进行中的个数，和这期间 context 的 page 事件里先到的页：
-  // 事件比 newPage 的返回早，得等 newPage 返回才分得清哪一页是自己开的。
+  // 事件比 createTarget 的返回早，得等认出哪一页（按 targetId）是自己开的才能登记。
   private opening = 0;
   private readonly deferred = new Set<PwPage>();
+  private readonly arrivals = new Set<() => void>();   // 在等「有新页出现」的 openPage
+  private readonly claimed = new WeakSet<PwPage>();   // 已被某次 openPage 认领、还没登记的页
+  private creating: Promise<unknown> = Promise.resolve();   // 创建和认领的串行队列（见 createBackgroundPage）
 
   readonly actionTimeoutMs: number;
 
-  constructor(context: BrowserContext, counters: Counters, reportListenerError: (e: unknown) => void, actionTimeoutMs: number) {
+  constructor(browser: Browser, context: BrowserContext, proc: BrowserProcess, counters: Counters, reportListenerError: (e: unknown) => void, actionTimeoutMs: number) {
     this.actionTimeoutMs = actionTimeoutMs;
+    this.browser = browser;
     this.context = context;
+    this.proc = proc;
     this.counters = counters;
     this.reportListenerError = reportListenerError;
     this.anchors = new Set(context.pages());
@@ -736,10 +765,14 @@ class PlaywrightInstance implements Instance, Host {
 
   // 把事件和路由接上。launch 在返回实例之前调用。
   async attach(): Promise<void> {
+    this.browserSession = await this.browser.newBrowserCDPSession();
     this.context.on('close', () => this.handleClosed());
+    this.browser.on('disconnected', () => this.handleClosed());
+    void this.proc.exited.then(() => this.handleClosed());   // 浏览器进程没了（人按了 Cmd-Q、崩了）：管道断开通常先到，这里兜底
     this.context.on('page', (p) => {
       if (this.opening > 0) this.deferred.add(p);
       else this.register(p, false);
+      for (const wake of [...this.arrivals]) wake();
     });
     // 响应头一到就算这个请求有了结果：只发出去不读响应体的请求（信标式的 fetch）不会触发 requestfinished，
     // 页面一跳转还会被报成 requestfailed。所以以 response 事件为准，requestfinished 和 requestfailed 只补没有响应的情形。
@@ -752,6 +785,8 @@ class PlaywrightInstance implements Instance, Host {
     // SharedWorker 发出的请求不经 context.route（docs/m0-findings.md §9.9），所以在所有页面、所有 frame 里把构造函数删掉；
     // 要赶在路由之前装好，页面脚本才碰不到它。
     await this.context.addInitScript('try { delete globalThis.SharedWorker; } catch (e) {}');
+    // Service Worker 同样绕过路由：把注册禁掉（原来由 launchPersistentContext 的 serviceWorkers: 'block' 做）。
+    await this.context.addInitScript(BLOCK_SERVICE_WORKERS_SCRIPT);
     await this.context.route('**/*', (route) => this.handleRoute(route));
   }
 
@@ -763,14 +798,17 @@ class PlaywrightInstance implements Instance, Host {
     if (this.stopping === undefined) {
       this.stopping = (async () => {
         try {
-          await this.context.close();
+          // 先请浏览器自己退（会把 cookie 等落盘），再断管道；超时或失败都不要紧，terminate 会兜底。
+          await this.browserSession?.send('Browser.close', undefined, { timeout: BROWSER_CLOSE_TIMEOUT_MS }).catch(() => {});
+          await this.browser.close();
         } catch (e) {
           // 已经没了就算停成功；否则把失败交出去，并允许再试。
-          if (!this.closed) {
+          if (!this.closed && !this.proc.hasExited()) {
             this.stopping = undefined;
             throw mapError(e);
           }
         }
+        await this.proc.terminate();   // 只结束自己 spawn 的那个进程
         this.handleClosed();
       })();
     }
@@ -818,12 +856,14 @@ class PlaywrightInstance implements Instance, Host {
     this.pageOpenedListeners.push(listener);
   }
 
+  // 开页：browser 级 Target.createTarget({ background: true })，不调 context.newPage()（它会让浏览器抢前台，docs/m0-findings.md §7.3）。
+  // 新页由 page 事件到达，按「新出现的空白页、没有开启者」认领（创建串行，见 createAndClaim）：同时有弹窗或另一个 openPage 也不会认错。
   async openPage(o: { viewport?: Viewport; touch?: boolean }): Promise<Page> {
     if (this.closed) throw new DriverError('other', 'browser is closed');
     this.opening++;
     let own: PlaywrightPage;
     try {
-      const p = await this.context.newPage();
+      const p = await this.createBackgroundPage();
       this.deferred.delete(p);
       own = this.register(p, true) as PlaywrightPage;
     } catch (e) {
@@ -835,13 +875,12 @@ class PlaywrightInstance implements Instance, Host {
         this.deferred.clear();
       }
     }
-    if (o.viewport !== undefined) {
-      try {
-        await own.page.setViewportSize({ width: o.viewport.width, height: o.viewport.height });
-      } catch (e) {
-        await own.close().catch(() => {});
-        throw mapError(e);
-      }
+    const viewport = o.viewport ?? DEFAULT_VIEWPORT;
+    try {
+      await own.page.setViewportSize({ width: viewport.width, height: viewport.height });
+    } catch (e) {
+      await own.close().catch(() => {});
+      throw mapError(e);
     }
     if (o.touch === true) {
       try {
@@ -852,6 +891,47 @@ class PlaywrightInstance implements Instance, Host {
       }
     }
     return own;
+  }
+
+  // 创建和认领串行：同一时刻只有一个 openPage 在等「自己的那一页」，新出现的空白页才不会认错。
+  private createBackgroundPage(): Promise<PwPage> {
+    const run = this.creating.then(() => this.createAndClaim(), () => this.createAndClaim());
+    this.creating = run.catch(() => {});
+    return run;
+  }
+
+  // 认领：createTarget 返回之后，等一个新出现的页（发出请求之前就有的页不算），它同时满足：没登记过、不是启动时的锚页、没被别的 openPage 认领过、
+  // 地址是空白页、没有开启者（页面开出的弹窗，哪怕带 noopener，Playwright 也给得出 opener()，实测：fixture popup-noopener，所以不会被当成自己的页）。
+  // 不对候选页建 CDP 会话去问 targetId：给还在初始化的页附加再断开会让它的 evaluate 卡死（实测）；
+  // 也不在起始地址上放标记：带 # 的起始地址会让第一次导航被 Playwright 当成「换了文档」，主 frame 的快照引用从此带 f 前缀（被当成 iframe 引用）。
+  private async createAndClaim(): Promise<PwPage> {
+    const session = this.browserSession;
+    if (session === undefined) throw new DriverError('other', 'browser is not attached');
+    const before = new Set(this.context.pages());   // 创建之前就有的页都不是我们的（包括先到、还没登记的弹窗）
+    const { targetId } = await session.send('Target.createTarget', { url: 'about:blank', background: true });
+    const deadline = Date.now() + OPEN_PAGE_TIMEOUT_MS;
+    try {
+      for (;;) {
+        if (this.closed) throw new DriverError('other', 'browser is closed');
+        for (const cand of this.context.pages()) {
+          if (before.has(cand) || this.byPage.has(cand) || this.anchors.has(cand) || this.claimed.has(cand) || !isBlankUrl(cand.url())) continue;
+          if ((await cand.opener().catch(() => cand)) !== null) continue;
+          if (this.claimed.has(cand)) continue;   // opener() 的等待期间被别处认领了（不会发生：创建串行），保险
+          this.claimed.add(cand);
+          return cand;
+        }
+        const left = deadline - Date.now();
+        if (left <= 0) throw new DriverError('timeout', 'the new page did not appear');
+        await new Promise<void>((resolve) => {
+          const wake = (): void => { clearTimeout(timer); this.arrivals.delete(wake); resolve(); };
+          const timer = setTimeout(wake, Math.min(left, OPEN_PAGE_POLL_MS));
+          this.arrivals.add(wake);
+        });
+      }
+    } catch (e) {
+      await session.send('Target.closeTarget', { targetId }).catch(() => {});   // 开出来了但没认到：别留一个没人管的页
+      throw e;
+    }
   }
 
   reportError(e: unknown): void {
@@ -901,6 +981,8 @@ class PlaywrightInstance implements Instance, Host {
   private handleClosed(): void {
     if (this.closed) return;
     this.closed = true;
+    void this.proc.terminate();   // 管道断了但进程还在的情形：不留带登录态的浏览器
+    this.browserSession?.detach().catch(() => {});
     for (const w of [...this.open]) w.markClosed();
     for (const w of [...this.closing]) w.flushClosed();
     emit(this.reportListenerError, this.closedListeners);
@@ -1100,8 +1182,10 @@ class PlaywrightDriver implements Driver {
   private readonly counters: Counters = { page: 0, request: 0 };
   private readonly reportListenerError: (e: unknown) => void;
   private readonly actionTimeoutMs: number;
+  private readonly executablePath: string | undefined;
 
   constructor(opts: DriverOptions) {
+    this.executablePath = opts.executablePath;
     this.reportListenerError = opts.onListenerError ?? rethrowAsync;
     this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
   }
@@ -1120,22 +1204,41 @@ class PlaywrightDriver implements Driver {
   async launch(profile: { name: string; userDataDir: string }): Promise<Instance> {
     // 空串会被 Playwright 当成「用临时目录」，相对路径看当前目录：都不是调用方想要的。
     if (profile.userDataDir === '' || !isAbsolute(profile.userDataDir)) throw new DriverError('other', 'userDataDir must be an absolute path');
-    let context: BrowserContext;
+    // 浏览器由我们自己 spawn，管道通信（browser-process.ts）；信号归内核自己：关停时由内核停实例，不让 Playwright 或终端的信号直接打到浏览器。
+    let proc: BrowserProcess;
     try {
-      // 信号归内核自己：关停时由内核停实例；Playwright 自带的处理器会和它抢跑，第二次 SIGINT 还会直接 exit(130)。
-      context = await chromium.launchPersistentContext(profile.userDataDir, {
-        headless: false, serviceWorkers: 'block', handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
-      });
+      proc = startBrowser(this.executablePath ?? chromium.executablePath(), profile.userDataDir);
     } catch (e) {
       throw mapError(e);
     }
+    let browser: Browser;
+    try {
+      const connecting = chromium.connectOverCDP(proc.transport, { timeout: LAUNCH_TIMEOUT_MS });
+      connecting.catch(() => {});   // 先输了竞赛的那一边不报未处理的拒绝
+      const early = proc.exited.then((code): never => {
+        const spawnError = proc.spawnErrorCode();
+        throw new DriverError('other', spawnError !== null
+          ? `browser failed to start (${spawnError})`
+          : `browser exited during launch (exit code ${code === null ? 'none' : code}); is another browser already using this profile?`);
+      });
+      early.catch(() => {});
+      browser = await Promise.race([connecting, early]);
+    } catch (e) {
+      await proc.terminate();
+      throw mapError(e);
+    }
+    const context = browser.contexts()[0];
+    if (browser.contexts().length !== 1 || context === undefined) {
+      await proc.terminate();
+      throw new DriverError('other', 'unexpected browser contexts');
+    }
     context.setDefaultTimeout(this.actionTimeoutMs);
     context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-    const instance = new PlaywrightInstance(context, this.counters, this.reportListenerError, this.actionTimeoutMs);
+    const instance = new PlaywrightInstance(browser, context, proc, this.counters, this.reportListenerError, this.actionTimeoutMs);
     try {
       await instance.attach();
     } catch (e) {
-      await context.close().catch(() => {});
+      await proc.terminate();
       throw mapError(e);
     }
     return instance;

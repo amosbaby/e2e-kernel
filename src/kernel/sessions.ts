@@ -228,6 +228,9 @@ export class SessionManager {
   // 已经抽到 id、还没建成会话（或已放弃）的 open：id → 报告目录名。
   private readonly reserved = new Map<string, string>();
   private readonly logins = new Map<string, Login>();
+  // 正在开登录窗口、还没登记进 logins 的个数（login.begin 从选好 profile 起、到登记完或失败为止）：
+  // 这段窗口里别的 open / step 结束时，登录窗口马上就要出现，不能把前台还回去。
+  private loginsOpening = 0;
   // 内核级的「未归属的写」：归不到任何会话或登录页的写请求，只留最近 MAX_UNATTRIBUTED 条。
   private readonly unattributed: WriteRecord[] = [];
   // 每个 profile（key）一个浏览器实例，懒启动。
@@ -272,15 +275,20 @@ export class SessionManager {
     }
     // 浏览器启动和开页会抢前台：启动之前先记下用户在用的应用，开完再还（失败时也还：浏览器可能已经起来抢过了）。
     // 开始或结束时任一刻有登录窗口开着就不还：那是人要操作的窗口。
-    const loginOpenAtStart = this.logins.size > 0;
+    const loginOpenAtStart = this.loginActive();
     const token = await this.safeCapture();
     const slot = this.pin(profile);
     try {
       return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile, group: ref.group, borrowed });
     } finally {
       this.unpin(slot);
-      if (!loginOpenAtStart && this.logins.size === 0) await this.safeRestore(token);
+      if (!loginOpenAtStart && !this.loginActive()) await this.safeRestore(token);
     }
+  }
+
+  // 有登录窗口开着，或正在开：这时不还前台（那是人要操作的窗口）。
+  private loginActive(): boolean {
+    return this.logins.size > 0 || this.loginsOpening > 0;
   }
 
   // 焦点管家按约定不抛错；这里再兜一层，管家（或测试里的假管家）抛了也只记日志，不影响 open / step 的结果。
@@ -349,7 +357,7 @@ export class SessionManager {
       }
       // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；探针之后到这里、再到开始执行之间没有 await。
       if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow);
-      const loginOpenAtStart = this.logins.size > 0;
+      const loginOpenAtStart = this.loginActive();
       const token = await this.safeCapture();
       focus = { token, pagesBefore: s.pagesOpened, loginOpenAtStart };
       const blockedBefore = s.recorder.blockedEvents();
@@ -381,7 +389,7 @@ export class SessionManager {
       return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
     } finally {
       // 成功、抛错都走到这里；会话仍是 stepping，restore 期间 close 和别的 step 都是 busy。safeRestore 不抛，不改变 step 的结果或错误。
-      if (focus !== undefined && s.pagesOpened > focus.pagesBefore && !focus.loginOpenAtStart && this.logins.size === 0) await this.safeRestore(focus.token);
+      if (focus !== undefined && s.pagesOpened > focus.pagesBefore && !focus.loginOpenAtStart && !this.loginActive()) await this.safeRestore(focus.token);
       // 执行期间会话可能已经被关停收尾，那就不再计时。
       if (s.state === 'stepping') {
         s.state = 'idle';
@@ -688,11 +696,16 @@ export class SessionManager {
     const { ref } = this.pickProfile(host, arg);
     this.gateLoginHost(host);
     const profile = profileKey(ref);
-    const slot = this.pin(profile);
+    this.loginsOpening++;   // pin 之前加：登记进 logins 之前的整段窗口都算「正在开」；finally 里减，pin 抛错、启动失败、成功都减
     try {
-      return await this.loginOn(await this.acquireInstance(profile, slot), p, { profile, group: ref.group });
+      const slot = this.pin(profile);
+      try {
+        return await this.loginOn(await this.acquireInstance(profile, slot), p, { profile, group: ref.group });
+      } finally {
+        this.unpin(slot);
+      }
     } finally {
-      this.unpin(slot);
+      this.loginsOpening--;
     }
   }
 

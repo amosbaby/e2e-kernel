@@ -67,9 +67,32 @@ test('only src/drivers/playwright imports playwright or playwright-core', () => 
   assert.deepEqual(importsOf([{ path: 'stable.ts', text: readFileSync('src/drivers/playwright/stable.ts', 'utf8') }], 'playwright'), []);
 });
 
-test('src uses neither page-exposed functions nor bringToFront, and child_process only where the kernel talks to the desktop', () => {
+test('src uses neither page-exposed functions nor bringToFront, and child_process only where the kernel talks to the desktop or the driver starts its own browser', () => {
   const src = readSources('src');
   for (const needle of ['exposeFunction', 'exposeBinding', 'bringToFront']) assert.deepEqual(mentions(src, needle), [], needle);
-  // 弹确认框要起 osascript（src/kernel/approval.ts）；别的文件不得起子进程。
-  assert.deepEqual(mentions(src, 'child_process'), ['src/kernel/approval.ts']);
+  // 弹确认框要起 osascript（src/kernel/approval.ts）；驱动自己 spawn 浏览器（src/drivers/playwright/browser-process.ts，管道通信）；别的文件不得起子进程。
+  assert.deepEqual(mentions(src, 'child_process').sort(), ['src/drivers/playwright/browser-process.ts', 'src/kernel/approval.ts']);
+});
+
+// 去掉行注释再查：说明文字里可以提这些名字，代码里不行。只认行首或空白后面的 //（字符串里的 http:// 和 '**/*' 不受影响）。
+function stripLineComments(text: string): string {
+  return text.replace(/(^|\s)\/\/.*$/gm, '$1');
+}
+function code(path: string): string {
+  return stripLineComments(readFileSync(path, 'utf8'));
+}
+
+test('the driver opens pages with Target.createTarget in the background and never calls newPage (it makes the browser take the foreground)', () => {
+  const driver = code('src/drivers/playwright/driver.ts');
+  assert.deepEqual(driver.match(/\.newPage\s*\(/g), null);
+  assert.deepEqual(driver.match(/launchPersistentContext|bringToFront/g), null);
+  assert.match(driver, /Target\.createTarget/);
+  assert.match(driver, /background:\s*true/);
+});
+
+test('nothing in src opens a TCP debugging port: the browser is controlled over a pipe only', () => {
+  for (const f of readSources('src')) {
+    assert.doesNotMatch(stripLineComments(f.text), /remote-debugging-port|remote-debugging-address|--remote-allow-origins|DevToolsActivePort/, f.path);
+  }
+  assert.match(code('src/drivers/playwright/browser-process.ts'), /--remote-debugging-pipe/);
 });

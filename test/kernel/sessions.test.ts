@@ -3477,6 +3477,78 @@ test('focus: a step that opens a page while a login window is open (at its start
   assert.deepEqual(f2.calls, ['capture']);
 });
 
+// 让下一次 openPage 卡住，直到放行：模拟「登录窗口正在开、还没登记进 logins」的那段窗口。blocked() 说明已经卡在里面了。
+function gateNextOpenPage(fake: FakeDriver): { hold: () => () => void; blocked: () => boolean } {
+  let gate: Promise<void> | null = null;
+  let blocked = false;
+  const launch = fake.launch.bind(fake);
+  fake.launch = async (profile) => {
+    const inst = await launch(profile);
+    const openPage = inst.openPage.bind(inst);
+    inst.openPage = async (o) => {
+      const g = gate;
+      if (g !== null) { gate = null; blocked = true; await g; }
+      return openPage(o);
+    };
+    return inst;
+  };
+  return { hold: () => { let release!: () => void; gate = new Promise<void>((r) => { release = r; }); return release; }, blocked: () => blocked };
+}
+
+test('focus: an open that ends while a login window is still being started (not yet registered) does not restore', async () => {
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus });
+  const gate = gateNextOpenPage(fake);
+  await sm.open({ url: 'http://localhost:5173/' });
+  focus.calls.length = 0;
+  const release = gate.hold();
+  const begin = sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  try {
+    await until(() => gate.blocked());
+    await sm.open({ url: 'http://localhost:5173/' });
+    assert.deepEqual(focus.calls, ['capture'], '登录窗口马上要出现：不把前台还回去');
+  } finally {
+    release();   // 断言失败也要放行，免得清理时一直等着这个登录
+  }
+  const { loginId } = await begin;
+  await sm.loginEnd({ loginId });
+  // 计数回到零：之后的 open 照常还。
+  focus.calls.length = 0;
+  await sm.open({ url: 'http://localhost:5173/' });
+  assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
+});
+
+test('focus: a login that fails to start, or is rejected before it starts, leaves no "login in progress" behind', async () => {
+  const focus = fakeFocus('com.example.app');
+  const { sm } = setup({ focus });
+  await assert.rejects(sm.loginBegin({ url: 'http://localhost:5173/login-down' }));          // goto 失败：启动中途抛错
+  await assert.rejects(sm.loginBegin({ url: 'http://localhost:5173/login.html', profile: 'nope' }), (e: E2kError) => e.code === 'usage');
+  focus.calls.length = 0;
+  await sm.open({ url: 'http://localhost:5173/' });
+  assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
+});
+
+test('focus: a step that opens a page while a login window is still being started does not restore', async () => {
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus });
+  const gate = gateNextOpenPage(fake);
+  const { session, pageId } = await opened(sm, fake);
+  focus.calls.length = 0;
+  const step = runningStep(sm, focus, session);
+  await until(() => focus.calls.length === 1);
+  const release = gate.hold();
+  const begin = sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  try {
+    await until(() => gate.blocked());
+    fake.emitPopup(pageId, 'http://localhost:5173/popup');
+    assert.equal((await step).exit, 0);
+    assert.deepEqual(focus.calls, ['capture'], '登录窗口马上要出现：不把前台还回去');
+  } finally {
+    release();
+  }
+  await sm.loginEnd(await begin);
+});
+
 test('focus: a step rejected as busy neither captures nor restores', async () => {
   const focus = fakeFocus();
   const { sm, fake } = setup({ focus });

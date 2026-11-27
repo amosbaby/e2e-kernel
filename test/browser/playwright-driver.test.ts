@@ -1,6 +1,6 @@
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +22,7 @@ const driver = createPlaywrightDriver({ actionTimeoutMs: ACTION_WAIT_MS });
 const tmpDirs: string[] = [];
 let server: FixtureServer;
 let inst: Instance;
+let mainDir = '';
 let page: Page;
 let seen: RequestInfo[] = [];
 let opened: [Page, string | null][] = [];
@@ -86,7 +87,8 @@ function jpegSize(file: string): { width: number; height: number } {
 
 before(async () => {
   server = await startFixtureServer();
-  inst = await driver.launch({ name: 'default', userDataDir: makeTmp('e2k-pw-') });
+  mainDir = makeTmp('e2k-pw-');
+  inst = await driver.launch({ name: 'default', userDataDir: mainDir });
   inst.setRequestHandler(r => { seen.push(r); return decide(r); });
   inst.onPageOpened((p, openerId) => { opened.push([p, openerId]); });
   inst.onNavigationHop((e) => { hops.push(e); });
@@ -198,6 +200,199 @@ process.exit(0);
   const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 45_000 });
   const { before, after } = JSON.parse(out.trim().split('\n').pop() ?? '{}') as { before: number[]; after: number[] };
   assert.deepEqual(after, before);
+});
+
+// ---- 浏览器进程：管道控制、不开调试端口、只结束自己起的进程、开页不抢前台（任务 16，docs/m0-findings.md §7.3）----
+
+// 命令行里带这个 profile 目录的所有进程（主进程和它的子进程）。目录是测试自己建的唯一目录，不会匹配到别的浏览器。
+function processesOf(dir: string): { pid: number; main: boolean; command: string }[] {
+  const out = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const needle = `--user-data-dir=${dir}`;
+  const found: { pid: number; main: boolean; command: string }[] = [];
+  for (const line of out.split('\n')) {
+    const at = line.indexOf(needle);
+    if (at < 0 || (line[at + needle.length] ?? ' ') !== ' ') continue;
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (m === null) continue;
+    found.push({ pid: Number(m[1]), main: !m[2]!.includes(' --type='), command: m[2]! });
+  }
+  return found;
+}
+
+async function untilGone(dir: string, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (processesOf(dir).length > 0) {
+    if (Date.now() > deadline) assert.fail(`processes of ${dir} still running: ${processesOf(dir).map((p) => p.pid).join(',')}`);
+    await sleep(100);
+  }
+}
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+test('the browser is controlled over a pipe: one main process, --remote-debugging-pipe, no debugging port, nothing listening on TCP', { timeout: 60_000 }, () => {
+  const procs = processesOf(mainDir);
+  const mains = procs.filter((p) => p.main && !p.command.includes('crashpad'));
+  assert.equal(mains.length, 1);
+  assert.match(mains[0]!.command, / --remote-debugging-pipe( |$)/);
+  assert.match(mains[0]!.command, / --no-startup-window( |$)/);
+  for (const p of procs) assert.doesNotMatch(p.command, /remote-debugging-(port|address)/);
+  assert.equal(existsSync(join(mainDir, 'DevToolsActivePort')), false, 'that file only exists when a debugging port is open');
+  // 浏览器这一棵进程里没有任何 TCP 监听（系统工具 lsof；没有监听时 lsof 退出码是 1）。
+  let listening = '';
+  try {
+    listening = execFileSync('lsof', ['-nP', '-a', '-p', procs.map((p) => p.pid).join(','), '-iTCP', '-sTCP:LISTEN'], { encoding: 'utf8' });
+  } catch { /* 没有匹配的监听：退出码非零，listening 保持空 */ }
+  assert.equal(listening.trim(), '');
+});
+
+test('openPage hands back the page it opened: two pages opened one after the other are different, blank pages', { timeout: 60_000 }, async () => {
+  const a = await inst.openPage({});
+  const b = await inst.openPage({});
+  try {
+    assert.notEqual(a.id, b.id);
+    await a.evaluate(`window.name = 'page-a'; 1`);
+    await b.evaluate(`window.name = 'page-b'; 1`);
+    assert.equal(await a.evaluate('window.name'), 'page-a');
+    assert.equal(await b.evaluate('window.name'), 'page-b');
+    assert.equal(await a.evaluate('location.href'), 'about:blank');
+  } finally {
+    await a.close().catch(() => {}); await b.close().catch(() => {});
+  }
+});
+
+test('concurrent openPage calls each get their own page that can run page scripts at once, and none of them is reported as a popup', { timeout: 60_000 }, async () => {
+  // 几轮：管道传输要是不按「一条消息一个任务」派发，新页的主世界上下文会随机丢掉（evaluate 一直挂着），一轮碰不碰得上是概率；多轮把它压得很低。
+  for (let round = 0; round < 3; round++) {
+    const pages = await Promise.all([0, 1, 2, 3].map(() => inst.openPage({})));
+    try {
+      assert.equal(new Set(pages.map((p) => p.id)).size, 4);
+      await Promise.all(pages.map((p, i) => p.evaluate(`window.name = 'own-${i}'; 1`)));
+      assert.deepEqual(await Promise.all(pages.map((p) => p.evaluate('window.name'))), ['own-0', 'own-1', 'own-2', 'own-3']);
+      await settle();
+      assert.equal(opened.length, 0, 'pages we opened ourselves are not announced as opened by someone else');
+    } finally {
+      for (const p of pages) await p.close().catch(() => {});
+    }
+  }
+});
+
+test('a popup that appears while openPage is in flight is still reported with its opener, and the pages we opened are not mistaken for it', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/popup.html');
+  const own = Promise.all([inst.openPage({}), inst.openPage({})]);
+  const click = page.click('#open-popup');
+  const mine = await own;
+  await click;
+  try {
+    await until(() => opened.length === 1);
+    const [popup, openerId] = opened[0]!;
+    assert.equal(openerId, page.id);
+    assert.ok(!mine.some((p) => p.id === popup.id));
+    assert.equal(new Set([...mine.map((p) => p.id), popup.id, page.id]).size, 4);
+  } finally {
+    for (const p of mine) await p.close().catch(() => {});
+  }
+});
+
+test('a noopener popup that appears while openPage is in flight still has its opener, and the pages we opened are not mistaken for it', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/popup-noopener.html');
+  const own = Promise.all([inst.openPage({}), inst.openPage({})]);
+  const click = page.click('#open');
+  const mine = await own;
+  await click;
+  try {
+    await until(() => opened.length === 1);
+    const [popup, openerId] = opened[0]!;
+    assert.equal(openerId, page.id, 'Playwright gives a noopener popup its opener too, so it is never a candidate for our own page');
+    assert.ok(!mine.some((p) => p.id === popup.id));
+    assert.equal(new Set([...mine.map((p) => p.id), popup.id, page.id]).size, 4);
+  } finally {
+    for (const p of mine) await p.close().catch(() => {});
+  }
+});
+
+test('a page opened without a viewport gets the 1280x720 default (the browser itself has no fixed viewport)', { timeout: 60_000 }, async () => {
+  const plain = await inst.openPage({});
+  try {
+    assert.deepEqual(await plain.evaluate('[window.innerWidth, window.innerHeight]'), [1280, 720]);
+  } finally {
+    await plain.close().catch(() => {});
+  }
+});
+
+test('stop() ends the browser process it started, all of it, and leaves other browsers alone', { timeout: 60_000 }, async () => {
+  const dir = makeTmp('e2k-own-');
+  const own = await driver.launch({ name: 'own', userDataDir: dir });
+  await own.openPage({});
+  const ownPids = processesOf(dir).map((p) => p.pid);
+  const mainBefore = processesOf(mainDir).map((p) => p.pid).sort();
+  assert.ok(ownPids.length >= 2, 'a main process and at least one helper');
+  await own.stop();
+  await untilGone(dir);
+  assert.deepEqual(processesOf(mainDir).map((p) => p.pid).sort(), mainBefore, 'the other instance is untouched');
+  assert.ok(mainBefore.every(alive));
+  assert.equal((await inst.health()).ok, true);
+});
+
+test('a browser that is killed from outside leaves no process of its profile behind, and onClosed fires once', { timeout: 60_000 }, async () => {
+  const dir = makeTmp('e2k-killed-');
+  const victim = await driver.launch({ name: 'victim', userDataDir: dir });
+  let closed = 0; victim.onClosed(() => closed++);
+  const main = processesOf(dir).find((p) => p.main && !p.command.includes('crashpad'));
+  assert.ok(main);
+  process.kill(main.pid, 'SIGKILL');
+  await until(() => closed === 1);
+  await untilGone(dir);
+  await settle();
+  assert.equal(closed, 1);
+  assert.equal((await victim.health()).ok, false);
+});
+
+test('when the kernel process dies without cleaning up, the pipe closes and the browser exits: no orphan keeps the profile open', { timeout: 90_000 }, async () => {
+  const dir = makeTmp('e2k-orphan-');
+  const child = spawn(process.execPath, ['test/support/launch-and-wait.ts', dir], { stdio: ['ignore', 'pipe', 'inherit'] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let text = '';
+      child.stdout.on('data', (d: Buffer) => { text += d.toString(); if (text.includes('ready')) resolve(); });
+      child.once('exit', () => reject(new Error('the child exited before it was ready')));
+    });
+    assert.ok(processesOf(dir).length > 0, 'the browser is running while its owner is');
+    child.kill('SIGKILL');   // 没有任何收尾机会
+    await untilGone(dir, 30_000);
+  } finally {
+    child.kill('SIGKILL');
+    try { execFileSync('pkill', ['-9', '-f', `--user-data-dir=${dir}`], { stdio: 'ignore' }); } catch { /* 没有残留：pkill 退出码非零 */ }
+  }
+});
+
+test('profile data is flushed when the instance stops: a cookie with an expiry is there after relaunching the same profile', { timeout: 90_000 }, async () => {
+  const dir = makeTmp('e2k-persist-');
+  const first = await driver.launch({ name: 'persist', userDataDir: dir });
+  first.setRequestHandler(() => ({ action: 'continue' }));
+  const p1 = await first.openPage({});
+  await p1.goto(server.origin + '/index.html');
+  await p1.evaluate(`document.cookie = 'e2k_kept=yes; max-age=3600; path=/'; 1`);
+  await first.stop();
+  await untilGone(dir);
+  const second = await driver.launch({ name: 'persist', userDataDir: dir });
+  second.setRequestHandler(() => ({ action: 'continue' }));
+  try {
+    const p2 = await second.openPage({});
+    await p2.goto(server.origin + '/index.html');
+    assert.match(String(await p2.evaluate('document.cookie')), /e2k_kept=yes/);
+  } finally {
+    await second.stop();
+  }
+});
+
+test('launch reports a browser that cannot be started as a DriverError without a path in the message, and leaves nothing running', { timeout: 60_000 }, async () => {
+  const missing = join(makeTmp('e2k-nobrowser-'), 'no-such-browser');
+  const dir = makeTmp('e2k-nolaunch-');
+  await assert.rejects(createPlaywrightDriver({ executablePath: missing }).launch({ name: 'x', userDataDir: dir }), (e: unknown) =>
+    e instanceof DriverError && e.kind === 'other' && /browser failed to start \(ENOENT\)/.test(e.message) && !e.message.includes(missing));
+  assert.deepEqual(processesOf(dir), []);
 });
 
 test('the launched browser is headed', { timeout: 60_000 }, async () => {
