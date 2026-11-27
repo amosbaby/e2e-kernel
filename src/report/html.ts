@@ -106,7 +106,7 @@ function writeItem(w: WriteRecord): string {
   const body = w.bodyOmitted ? '<br>请求体未记录（发出它的页面有密码框，或判断不出）'
     : w.body === null ? '' : `<br>请求体 <code>${pageBody(w.body)}</code>`;
   // 放行依据：只有靠组级白名单放行的写才有；报告也可能从磁盘上读回来，不认识的值落到「未知」。
-  const by = w.allowedBy === undefined ? '' : ` 放行依据 ${escapeHtml(ALLOWED_BY_TEXT[w.allowedBy] ?? '未知')}`;
+  const by = w.allowedBy === undefined ? '' : ` 放行依据 ${escapeHtml(Object.hasOwn(ALLOWED_BY_TEXT, w.allowedBy) ? ALLOWED_BY_TEXT[w.allowedBy] : '未知')}`;
   return `<li><code>${page(w.method)} ${pageUrl(w.url)}</code> 时间 ${own(w.at)} 状态码 ${own(status)}${by}${flag}${body}</li>`;
 }
 

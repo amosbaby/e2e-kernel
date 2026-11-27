@@ -657,6 +657,7 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     ruleFor,
     groupOf: (host) => groupOf(snap.rules, host),
     group: (name) => (name === DEFAULT_GROUP_NAME ? defaultGroup(snap.rules) : snap.rules.groups.find((g) => g.name === name) ?? null),
+    allLogout: () => snap.rules.groups.flatMap((g) => g.logout),
     isLoginHost(host, group) {
       try {
         const logins = group === DEFAULT_GROUP_NAME ? snap.rules.loginHosts : snap.rules.groups.find((g) => g.name === group)?.loginHosts;

@@ -1,6 +1,6 @@
 import type { Mode } from '../shared/protocol.ts';
 import type { ApprovalsStatus } from './approval-store.ts';
-import type { Group } from './rules.ts';
+import type { Endpoint, Group } from './rules.ts';
 
 // 域名规则里能写的模式。'denied' 是 M3 的事，规则文件现在不收。
 export type RuleMode = 'readonly' | 'default';
@@ -35,6 +35,8 @@ export interface ModeResolver {
   groupOf(host: string): Group;
   // 按名字取组；'default' 总有，没有这个名字为 null。
   group(name: string): Group | null;
+  // 所有已批准组的 logout 接口并集（没编组的 default 组没有）。归不到任何会话的请求用它：不知道属于哪个组，就按所有组拦（多拦即失败关闭）。
+  allLogout(): readonly Endpoint[];
   // 入口先规范化主机；失败为 false。只看 group 那个组的 loginHosts（'default' 组 = 顶层 loginHosts）；没有这个组为 false。
   isLoginHost(host: string, group: string): boolean;
   // 读规则文件和它的批准状态：和已批准的快照一样 = 无待批；不一样且解析得了 = 待批；改坏 = error（坏文件不进待批）。
@@ -56,6 +58,7 @@ export const defaultOnlyResolver: ModeResolver = Object.freeze({
   ruleFor: (): RuleMode | null => null,
   groupOf: emptyDefaultGroup,
   group: (name: string): Group | null => (name === 'default' ? emptyDefaultGroup() : null),
+  allLogout: (): readonly Endpoint[] => [],
   isLoginHost: (): boolean => false,
   refresh: (): void => {},
   state: (): RulesState => ({ count: 0, hash: null, error: null, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false }),

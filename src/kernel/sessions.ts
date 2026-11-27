@@ -906,8 +906,9 @@ export class SessionManager {
     // 请求所在页自己的顶层主机只读也算（模式跟着页面走），不用等有只读会话。
     const anyReadonly = [...this.sessions.values()].some((x) => this.sessionMode(x, []) === 'readonly')
       || this.deps.modes.resolve(hostOf(req.topUrl ?? req.url)) === 'readonly';
-    // 未归属的请求不属于任何组：只带目标主机所在组的登出接口（只读时命中就拦）；白名单里的写一概不放行。
-    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly, logout: this.deps.modes.groupOf(hostOf(req.url)).logout });
+    // 未归属的请求不属于任何组：带所有已批准组的登出接口的并集（只读时命中就拦；groupOf 看不到写在 loginHosts 上的登出，也不知道它该算哪个组）；
+    // 白名单里的写一概不放行。
+    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly, logout: this.deps.modes.allLogout() });
     if (isWrite(req.method) || verdict.reason !== null) {
       const targetMode = this.deps.modes.resolve(hostOf(req.url));
       this.unattributed.push(toWriteRecord(req, verdict, { mode: anyReadonly ? 'readonly' : 'default', targetMode }, this.deps.now()));

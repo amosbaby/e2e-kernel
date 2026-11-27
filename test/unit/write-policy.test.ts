@@ -330,12 +330,20 @@ test('a logout hit is blocked first, whatever the method, body or other whitelis
   blocked(policy.decide(req({ method: 'HEAD', url: 'http://app.example.com/logout' }), ctx), 'logout');
   blocked(policy.decide(req({ method: 'POST', url: `${API}/auth/logout`, contentType: JSON_CT, body: '{}' }), ctx), 'logout');
   blocked(policy.decide(pqPost(pqBody(HASH_A)), ctx), 'logout');
-  assert.deepEqual(policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout?next=/' }), ctx).reason, null);   // 带查询串不匹配：当普通读
+  blocked(policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout?next=/' }), ctx), 'logout');   // 登出按路径匹配，忽略查询串
 });
 
-test('a logout url with a query string does not match, so a GET passes as any read', () => {
-  const ctx = ctxOf({ logout: [ep('*', 'http://app.example.com/logout')] });
-  assert.deepEqual(policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout?x=1' }), ctx), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+test('a logout matches by path: query string, fragment and one trailing slash are ignored, in either direction; other paths and origins do not match', () => {
+  const ctx = ctxOf({ logout: [ep('*', 'http://app.example.com/logout'), ep('POST', 'http://app.example.com/session/end/')] });
+  const hit = (method: string, url: string) => policy.decide(req({ method, url }), ctx);
+  for (const url of ['http://app.example.com/logout?x=1', 'http://app.example.com/logout?returnTo=%2Fa&y=2', 'http://app.example.com/logout/', 'http://app.example.com/logout/?x=1',
+    'http://app.example.com/logout#f', 'http://app.example.com/logout?x=1#f', 'http://app.example.com/logout?']) blocked(hit('GET', url), 'logout');
+  blocked(hit('POST', 'http://app.example.com/session/end'), 'logout');     // 名单里写了结尾斜杠，请求没有
+  blocked(hit('POST', 'http://app.example.com/session/end/?a=b'), 'logout');
+  for (const url of ['http://app.example.com/logout/x', 'http://app.example.com/logoutx', 'http://app.example.com//logout', 'http://app.example.com/a/logout', 'http://other.example.com/logout?x=1', 'https://app.example.com/logout?x=1']) {
+    assert.equal(hit('GET', url).reason, null, url);
+  }
+  assert.equal(hit('GET', 'http://app.example.com/session/end').reason, null);   // 方法不对（名单里是 POST）
 });
 
 test('logout rules do not matter in the default mode', () => {
@@ -383,8 +391,8 @@ test('a declaration without an operation covers the address but not a mutation o
 
 test('a declaration with an operation covers non-mutation requests only when they name it too; a bad declaration matches nothing', () => {
   const ctx = ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')] });
-  allowedAs(policy.decide(pqPost(pqBody(HASH_B, { operationName: 'Save' })), ctx), 'declared');
-  blocked(policy.decide(pqPost(pqBody(HASH_B, { operationName: 'Other' })), ctx), 'persisted-query');
+  allowedAs(policy.decide(pqPost(j({ operationName: 'Save', variables: { a: 1 } })), ctx), 'declared');
+  blocked(policy.decide(pqPost(j({ operationName: 'Other', variables: { a: 1 } })), ctx), 'method');
   const bad = ctxOf({ declared: [decl('GET', `${API}/graphql`, null), decl('POST', 'not a url', null), decl('POST', `${API}/graphql?x=1`, null)] });
   blocked(policy.decide(pqPost(j({ a: 1 })), bad), 'method');
 });
@@ -393,4 +401,32 @@ test('whitelisted allows never come from the strict-query path and carry allowed
   const strict = policy.decide(post(j({ query: '{a}' })), ctxOf());
   assert.deepEqual([strict.reason, strict.allowedBy], [null, null]);
   assert.equal(policy.decide(req(), ctxOf()).allowedBy, null);
+});
+
+// ---- 修复轮 1 ----
+
+test('a hash-only persisted query is never covered by a declaration, with or without an operation; only the persistedQueries whitelist lets it through', () => {
+  const body = pqBody(HASH_B, { operationName: 'Save' });
+  blocked(policy.decide(pqPost(body), ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')] })), 'persisted-query');
+  blocked(policy.decide(pqPost(body), ctxOf({ declared: [decl('POST', `${API}/graphql`, null)] })), 'persisted-query');
+  blocked(policy.decide(pqPost(j({ operationName: 'Save', extensions: { persistedQuery: { version: 1, sha256Hash: HASH_B } } })), ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')] })), 'persisted-query');
+  allowedAs(policy.decide(pqPost(pqBody(HASH_A, { operationName: 'Save' })), ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')], persisted: pqCtx.persisted })), 'persisted-query');
+});
+
+test('read-POST: a body whose GraphQL kind is unknown is not a read-post (truncated Apollo-style mutation, multipart upload), while ordinary bodies still are', () => {
+  const verdict = (r: RequestInfo) => policy.decide(r, readPostCtx);
+  // 驱动在 64 KB 处截断：query 键还没出现，键序 operationName, variables, query
+  const truncated = `{"operationName":"M","variables":{"pad":"${'x'.repeat(70 * 1024)}"},"query":"mutation M{a}"}`.slice(0, 64 * 1024);
+  assert.ok(Buffer.byteLength(truncated) >= 64 * 1024);
+  blocked(verdict(searchPost(truncated)), 'method');
+  blocked(verdict(searchPost(truncated, { url: `${API}/v1/t1/search` , contentType: 'text/plain' })), 'method');
+  const multipart = '--b\r\nContent-Disposition: form-data; name="operations"\r\n\r\n{"query":"mutation{a}"}\r\n--b--\r\n';
+  const mp = { contentType: 'multipart/form-data; boundary=b' };
+  blocked(verdict(searchPost(multipart, mp)), 'method');
+  const gqlCtx = ctxOf({ readPosts: [ep('POST', `${API}/graphql`)] });
+  blocked(policy.decide(pqPost(multipart, mp), gqlCtx), 'method');                              // /graphql 路径：kind 是 unknown，也拦
+  blocked(policy.decide(pqPost(j({ term: 'x' })), gqlCtx), 'method');
+  allowedAs(verdict(searchPost(j({ term: 'x' }))), 'read-post');
+  allowedAs(verdict(searchPost('term=x', { contentType: 'application/x-www-form-urlencoded' })), 'read-post');
+  allowedAs(verdict(searchPost('--b\r\nContent-Disposition: form-data; name="file"\r\n\r\nabc\r\n--b--\r\n', mp)), 'read-post');
 });

@@ -765,3 +765,10 @@ test('pruneRuns on a missing directory removes nothing and rejects a bad keep', 
   assert.deepEqual(pruneRuns(join(tmp, 'nope'), 20, new Set()), []);
   assert.throws(() => pruneRuns(tmp, -1, new Set()));
 });
+
+test('an allowedBy value that is a key of Object.prototype is shown as unknown, not looked up on the prototype chain', () => {
+  for (const v of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    const r = buildResult(input({ writes: [write('POST', 'http://x.example.com/a', 200, { allowedBy: v as never })] }));
+    assert.ok(section(renderReport(r), 'writes').includes('放行依据 未知'), v);
+  }
+});

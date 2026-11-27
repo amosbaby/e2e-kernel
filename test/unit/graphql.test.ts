@@ -487,3 +487,25 @@ test('hasRepeatedKey compares decoded keys per object and ignores string values 
   assert.equal(hasRepeatedKey('{"a":"\\"a\\":1"}'), false);
   assert.equal(hasRepeatedKey('{"a" : 1 , "a" : 1}'), true);
 });
+
+// ---- 修复轮 1 ----
+
+test('looksGraphql: a body at the 64 KB cap (maybe truncated), any JSON-looking body that does not parse, and a GraphQL multipart upload all count', () => {
+  const big = `{"operationName":"M","variables":{"pad":"${'x'.repeat(70 * 1024)}"},"query":"mutation M{a}"}`.slice(0, 64 * 1024);
+  assert.equal(looksGraphql(big), true);
+  assert.equal(looksGraphql(JSON.stringify({ term: 'x'.repeat(64 * 1024) })), true);        // 到了上限：可能被截断，一律算
+  assert.equal(looksGraphql('{"term":"x'), true);                                          // 解析不了，没有 query 一词也算
+  assert.equal(looksGraphql('[{"a":1},'), true);
+  assert.equal(looksGraphql('--b\r\nContent-Disposition: form-data; name="operations"\r\n\r\n{"query":"{a}"}\r\n--b--'), true);
+  assert.equal(looksGraphql('--b\r\nContent-Disposition: form-data; name="file"\r\n\r\nabc\r\n--b--'), false);
+  assert.equal(looksGraphql('term=x'), false);
+  assert.equal(looksGraphql('{"term":"x"}'), false);
+});
+
+test('persistedHashes refuses content types that only look like application/json', () => {
+  const body = JSON.stringify(pq(H1));
+  for (const ct of ['application/vnd.api+json', 'application/jsonx', 'application/json , text/plain', 'application/json,text/plain', 'text/application/json', 'application/json5']) {
+    assert.equal(persistedHashes('POST', body, ct), null, ct);
+  }
+  assert.deepEqual(persistedHashes('POST', body, 'APPLICATION/JSON ; charset=utf-8'), [H1]);
+});

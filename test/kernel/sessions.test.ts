@@ -715,6 +715,7 @@ function mutableRules(readonlyHosts: string[], loginHosts: string[] = []) {
     ruleFor: (h) => (isRo(h) ? 'readonly' : null),
     groupOf: defaultOnlyResolver.groupOf,
     group: defaultOnlyResolver.group,
+    allLogout: () => [],
     isLoginHost: (h) => loginHosts.includes(h),
     refresh: () => { st.refreshes++; const p = st.pending; st.pending = null; p?.(); },
     state: () => ({ count: st.ro.size, hash: st.hash, error: st.error, pending: null, pendingHash: null, approvals: 'absent', approvalsChanged: false }),
@@ -2388,7 +2389,8 @@ test('whitelist, group choice: only the target host\'s group counts for read-POS
   assert.ok(isFulfill403(await send('POST', 'http://sso.example.org/v1/t1/search', '{"term":"x"}')));            // 没编组的主机没有白名单
   assert.ok(isFulfill403(await send('GET', 'http://sso.example.org/logout')));                                   // 会话组 a 的登出（主机是它的 loginHost，不在 hosts 里）
   assert.ok(isFulfill403(await send('GET', 'http://b.example.com/logout')));                                     // 目标组 b 的登出
-  assert.equal((await send('GET', 'http://sso.example.org/logout?next=1')).action, 'continue');                 // 带查询串不匹配：当普通读
+  assert.ok(isFulfill403(await send('GET', 'http://sso.example.org/logout?next=1')));                           // 登出按路径匹配：带查询串、结尾斜杠也拦
+  assert.ok(isFulfill403(await send('GET', 'http://sso.example.org/logout/')));
   assert.equal((await send('GET', 'http://b.example.com/other')).action, 'continue');
   await sm.close({ session: a.session });
   // 组 b 的会话往组 a 的接口发读型 POST：用目标主机所在的组 a 的白名单（会话组 b 没有）；b 自己的登出照拦，a 的登出主机（没编组）不归 b 管
@@ -2471,11 +2473,13 @@ test('whitelist, unattributed requests: a logout of the target host\'s group is 
     fake.emitRequest({ id: `wl${++navSeq}`, pageId: null, method, url, topUrl: null, body, contentType: body === null ? null : 'application/json' }, ia);
   assert.ok(isFulfill403(await orphan('GET', 'http://a.example.com/logout')));
   assert.ok(isFulfill403(await orphan('GET', 'http://b.example.com/logout')));
+  assert.ok(isFulfill403(await orphan('GET', 'http://sso.example.org/logout')));                                 // 组 a 的登出写在它的 loginHost 上：groupOf 看不到，要用所有组的并集
+  assert.ok(isFulfill403(await orphan('GET', 'http://sso.example.org/logout?returnTo=%2F')));
   assert.equal((await orphan('GET', 'http://a.example.com/profile')).action, 'continue');
   assert.ok(isFulfill403(await orphan('POST', API_SEARCH, '{"term":"x"}')));                                    // 读型 POST 白名单不管未归属请求
   assert.ok(isFulfill403(await orphan('POST', API_GRAPHQL, wlPq(WL_HASH))));
   const res = readResult((await sm.close({ session: a.session })).runDir);
-  assert.deepEqual(res.writes.unattributed.map((w) => [w.method, w.reason]), [['GET', 'logout'], ['GET', 'logout'], ['POST', 'unattributed'], ['POST', 'unattributed']]);
+  assert.deepEqual(res.writes.unattributed.map((w) => [w.method, w.reason]), [['GET', 'logout'], ['GET', 'logout'], ['GET', 'logout'], ['GET', 'logout'], ['POST', 'unattributed'], ['POST', 'unattributed']]);
 });
 
 test('whitelist: every whitelisted allow is sent without following redirects (the driver is told), and a refused 3xx first hop turns the record into a blocked redirected-write without allowedBy', async () => {

@@ -407,16 +407,18 @@ export function persistedHashes(method: string, body: string | null, contentType
 }
 
 // 体看起来像 GraphQL 请求：JSON（单个或数组）的任一项有 query 键（不分大小写，不管值是什么类型），或 extensions（不分大小写）里有
-// persistedQuery 键（不分大小写）。长得像 JSON 却解析不了（比如被截断）时，只要出现 query 这个词（不分大小写，含 persistedQuery）就算。
-// 读型 POST 白名单靠它挡住「借非 GraphQL 接口的地址发 GraphQL」；拿不准一律算（宁可多拦）。
+// persistedQuery 键（不分大小写）。拿不准的一律算（宁可多拦）：体到了 64 KB（驱动在这里截断，query 可能还没出现，比如键序
+// operationName、variables、query）；长得像 JSON（`{`/`[` 开头）却解析不了；GraphQL 的 multipart 上传（有 `name="operations"` 字段）。
+// 读型 POST 白名单靠它挡住「借非 GraphQL 接口的地址发 GraphQL」。
 export function looksGraphql(body: string | null): boolean {
   if (body === null) return false;
+  if (Buffer.byteLength(body, 'utf8') >= MAX_BODY_BYTES) return true;
   let value: unknown;
   try {
     value = JSON.parse(body);
   } catch {
     const head = body.trimStart()[0];
-    return (head === '{' || head === '[') && /query/i.test(body);
+    return head === '{' || head === '[' || /name\s*=\s*"?operations"?/i.test(body);
   }
   const items = Array.isArray(value) ? value : [value];
   return items.some((o) => isRecord(o) && Object.keys(o).some((k) => {

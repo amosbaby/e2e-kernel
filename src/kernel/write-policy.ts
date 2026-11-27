@@ -77,12 +77,23 @@ export function blockFrozen(req: RequestInfo, group: string | null): PolicyVerdi
 
 const DECLARABLE_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE'] as const;
 
+// 登出名单的匹配：拦截名单窄了是漏拦（失败开放），所以和放行名单（精确匹配）不同，按路径匹配：先去掉请求 URL 的 fragment 和查询串，
+// 路径结尾的单个 `/` 视为等同（名单写 /logout 命中 /logout/，写 /logout/ 命中 /logout）。主机、协议、端口、方法仍要一致。
+function logoutHit(list: readonly Endpoint[], req: RequestInfo): boolean {
+  const url = req.url;
+  const cut = [url.indexOf('#'), url.indexOf('?')].filter((i) => i >= 0);
+  const bare = cut.length === 0 ? url : url.slice(0, Math.min(...cut));
+  const variants = [bare, bare.endsWith('/') ? bare.slice(0, -1) : `${bare}/`];
+  return list.some((e) => variants.some((u) => matchEndpoint(e, req.method, u)));
+}
+
 const anyMatch = (list: readonly Endpoint[], req: RequestInfo): boolean => list.some((e) => matchEndpoint(e, req.method, req.url));
 
 // 放行声明命中：方法和 URL 命中（URL 按接口写法匹配，带查询串的请求不会命中）；带 operation 的，请求体每一项的 operationName 都要等于它。
-// 不带 operation 的声明只放行「这个地址上的写」：mutation 不归它（调用方已先判过），只带哈希的持久化查询也不归它（文档看不到）。
+// 不带 operation 的声明只放行「这个地址上的写」：mutation 不归它（调用方已先判过）。只带哈希的持久化查询不归任何声明（带不带 operation 都一样）。
 // 声明读不懂就当没命中（失败关闭）。mutationOnly：只认带 operation 的声明。
 function declaredHit(req: RequestInfo, declared: readonly Declaration[], mutationOnly: boolean): boolean {
+  if (isPersistedOnly(req.body)) return false;   // 只带哈希的持久化查询：文档看不到，operationName 是客户端自报的，任何声明都不覆盖
   return declared.some((d) => {
     if (mutationOnly && d.operation === null) return false;
     try {
@@ -91,7 +102,7 @@ function declaredHit(req: RequestInfo, declared: readonly Declaration[], mutatio
     } catch {
       return false;
     }
-    return d.operation === null ? !isPersistedOnly(req.body) : operationsAre(req.body, d.operation);
+    return d.operation === null ? true : operationsAre(req.body, d.operation);
   });
 }
 
@@ -100,7 +111,7 @@ function declaredHit(req: RequestInfo, declared: readonly Declaration[], mutatio
 // ④ 命中读型 POST 且体不像 GraphQL → 放行；⑤ 持久化查询：体形状严格、URL 命中某个接口、哈希全在它的白名单里 → 放行；
 // ⑥ 命中放行声明 → 放行；⑦ M2a 其余：持久化查询拦、严格 query 放行、其余拦 method。
 function decideReadonly(req: RequestInfo, ctx: PolicyCtx): PolicyVerdict {
-  if (anyMatch(ctx.logout, req)) return block(req, 'logout');
+  if (logoutHit(ctx.logout, req)) return block(req, 'logout');
   if (isSafeMethod(req.method) && req.body === null) {
     return isMutationLikeUrl(req.url) ? block(req, 'graphql-mutation') : PASS;
   }
@@ -109,7 +120,8 @@ function decideReadonly(req: RequestInfo, ctx: PolicyCtx): PolicyVerdict {
   }
   // application/graphql 的体是一份文档，不是 JSON：也算 GraphQL。
   const isDoc = (req.contentType ?? '').split(';')[0]!.trim().toLowerCase() === 'application/graphql';
-  if (anyMatch(ctx.readPosts, req) && !looksGraphql(req.body) && !isDoc) return allow('read-post');
+  // graphqlKind 是 unknown（截断的体、multipart 上传、/graphql 路径上的怪体……）也不当读型 POST：拿不准是不是 GraphQL，就当它是。
+  if (anyMatch(ctx.readPosts, req) && !looksGraphql(req.body) && !isDoc && graphqlKind(req.body, req.contentType, req.url) === null) return allow('read-post');
   const hashes = persistedHashes(req.method, req.body, req.contentType);
   if (hashes !== null && ctx.persisted.some((p) => matchEndpoint(p.endpoint, req.method, req.url) && hashes.every((h) => p.hashes.includes(h)))) {
     return allow('persisted-query');
@@ -128,7 +140,7 @@ export const policy: WritePolicy = Object.freeze({
   },
   decideUnattributed(req: RequestInfo, ctx: { anyReadonly: boolean; logout: readonly Endpoint[] }): PolicyVerdict {
     if (!ctx.anyReadonly) return PASS;
-    if (anyMatch(ctx.logout, req)) return block(req, 'logout');
+    if (logoutHit(ctx.logout, req)) return block(req, 'logout');
     if (isSafeMethod(req.method)) return PASS;
     return block({ ...req, isNavigation: false }, 'unattributed');
   },
