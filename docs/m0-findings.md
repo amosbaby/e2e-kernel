@@ -262,6 +262,8 @@ M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里
 
 三种情况退出码都是 0，只能靠解析 `stdout` 区分；8 秒对人太短（第一次就没来得及点）。按钮名不叫 Cancel，所以没有 `-128` 那条错误路径。
 
+内核的真实实现（2026-11-27，M2b）：`dialog-probe.ts` 改成调 `src/kernel/approval.ts` 的 `osascriptDialog()`，脚本固定为 `on run argv`，正文、标题、按钮名、秒数全走 argv，超时 60 s。人在场点「允许」：返回 `{"kind":"button","button":"允许"}`，约 8.0 s，进程退出码 0。说明 argv 传参（含 `--` 分隔）和对返回串的精确解析在真机上是通的。
+
 还没测：`choose from list` 多选清单；弹框是否抢焦点（对批准框本来就是想要的）。
 
 ## 10. 复测
