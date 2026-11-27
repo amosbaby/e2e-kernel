@@ -1650,3 +1650,21 @@ test('clearCookies removes the cookies of that host only: the other host name ke
   assert.equal(await cookieOf(server.origin), '');
   await inst.clearCookies('no-such-host.example.com');                                                               // 没有 cookie 的主机：不报错
 });
+
+test('clearCookies also removes a cookie set with a Domain attribute for that host (domain ".host"), and leaves other hosts and a parent domain alone', { timeout: 60_000 }, async () => {
+  // 测试里直接往 context 种 cookie（Instance 没有这个接口；页面脚本给 localhost 设 Domain 会被浏览器拒掉）。
+  const context = (inst as unknown as { context: { addCookies(c: unknown[]): Promise<void>; cookies(): Promise<{ name: string }[]> } }).context;
+  await context.addCookies([
+    { name: 'dot_host', value: '1', domain: '.sub.example.test', path: '/' },       // 以 .主机 的形式带 Domain 属性
+    { name: 'host_only', value: '1', domain: 'sub.example.test', path: '/' },
+    { name: 'parent', value: '1', domain: '.example.test', path: '/' },             // 上级域：同站点别的主机共用
+    { name: 'sibling', value: '1', domain: 'other.example.test', path: '/' },
+    { name: 'lookalike', value: '1', domain: 'xsub.example.test', path: '/' },      // 后缀相同但不是这个主机
+  ]);
+  const names = async (): Promise<string[]> => (await context.cookies()).map((c) => c.name).filter((n) => ['dot_host', 'host_only', 'parent', 'sibling', 'lookalike'].includes(n)).sort();
+  assert.deepEqual(await names(), ['dot_host', 'host_only', 'lookalike', 'parent', 'sibling']);
+  await inst.clearCookies('sub.example.test');
+  assert.deepEqual(await names(), ['lookalike', 'parent', 'sibling']);
+  await inst.clearCookies('xsub.example.test'); await inst.clearCookies('other.example.test'); await inst.clearCookies('example.test');
+  assert.deepEqual(await names(), []);
+});

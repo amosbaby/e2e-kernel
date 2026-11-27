@@ -490,7 +490,7 @@ test('a click that is redirected into another group freezes the session: step ex
     assert.ok((click.out + click.err).includes('--profile b'), 'the next step names the profile to use');
     const again = await run(JSON.stringify([{ op: 'snapshot' }]), 'step', open.session, '--stdin');
     assert.equal(again.code, 22, 'a frozen session does nothing');
-    assert.equal(server.hits.slice(from).length, 0);
+    assert.equal(server.hits.slice(from).length, 0, 'the fixture server saw no write (it only records writes): this proves nothing else about the frozen session');
     const close = JSON.parse((await run(undefined, 'close', open.session, '--verdict', 'undetermined', '--because', 'e2e probe', '--json')).out);
     const result = JSON.parse(readFileSync(close.resultPath, 'utf8'));
     assert.ok(result.writes.blocked.some((w: any) => w.reason === 'other-group' && w.host === 'localhost'), JSON.stringify(result.writes.blocked));
