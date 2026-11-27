@@ -102,7 +102,7 @@ function evalRedacted(v: unknown): string {
   return safely(() => redactText(redactBody(text, 'application/json', Number.POSITIVE_INFINITY) ?? REDACTED));
 }
 
-// 源码只记哈希：'sha256:' + 十六进制前 16 位（不加盐，见 README 的 Threat model）。16 位够短，不会被 HEX 规则（32 位以上）吃掉。
+// 源码只记哈希：'sha256:' + 十六进制前 16 位（不加盐，见 docs/reference.md 的 Threat model）。16 位够短，不会被 HEX 规则（32 位以上）吃掉。
 function sourceHash(js: string): string {
   return `sha256:${createHash('sha256').update(js).digest('hex').slice(0, 16)}`;
 }

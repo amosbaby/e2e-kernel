@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="444" viewBox="0 0 880 444" role="img" aria-labelledby="title desc">
+<title id="title">Domain groups and browser profiles</title>
+<desc id="desc">rules.json groups map hosts to profiles. Each profile is its own Chrome with its own user data directory. A slot runs another browser for the same group. Navigating into another group is refused or freezes the session.</desc>
+<style>
+  .bg { fill: #ffffff; stroke: #d0d7de; }
+  .t { fill: #1f2328; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Helvetica, Arial, sans-serif; }
+  .m { fill: #59636e; }
+  .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .b { font-weight: 600; }
+  .box { fill: #f6f8fa; stroke: #d0d7de; }
+  .blue { fill: #ddf4ff; stroke: #0969da; }
+  .green { fill: #dafbe1; stroke: #1a7f37; }
+  .yellow { fill: #fff8c5; stroke: #9a6700; }
+  .red { fill: #ffebe9; stroke: #cf222e; }
+  .purple { fill: #fbefff; stroke: #8250df; }
+  .gray { fill: #f6f8fa; stroke: #818b98; }
+  .edge { stroke: #59636e; fill: none; }
+  .head { fill: #59636e; }
+  .dash { stroke-dasharray: 5 4; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; stroke: #30363d; }
+    .t { fill: #e6edf3; }
+    .m { fill: #9198a1; }
+    .box { fill: #161b22; stroke: #3d444d; }
+    .blue { fill: #0c2d6b; stroke: #4493f8; }
+    .green { fill: #04260f; stroke: #3fb950; }
+    .yellow { fill: #3b2e00; stroke: #d29922; }
+    .red { fill: #42080b; stroke: #f85149; }
+    .purple { fill: #2e1a4f; stroke: #ab7df8; }
+    .gray { fill: #161b22; stroke: #9198a1; }
+    .edge { stroke: #9198a1; }
+    .head { fill: #9198a1; }
+  }
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="879" height="443" rx="12"/>
+<text class="t b" x="32" y="44.0" font-size="20" text-anchor="start">Each domain group logs in with its own profile</text><rect class="box dash" x="24" y="64" width="250" height="250" rx="10" stroke-width="1.2"/><text class="t m code" x="40" y="88.0" font-size="13" text-anchor="start">rules.json</text><rect class="blue" x="40" y="100" width="218" height="92" rx="8" stroke-width="1.5"/>
+<text class="t b" x="149" y="130.3" font-size="15" text-anchor="middle">group "admin"</text>
+<text class="t code" x="149" y="151.3" font-size="13" text-anchor="middle">admin.example.com</text>
+<text class="t code" x="149" y="172.3" font-size="13" text-anchor="middle">api.example.com</text><rect class="gray" x="40" y="206" width="218" height="92" rx="8" stroke-width="1.5"/>
+<text class="t b" x="149" y="236.3" font-size="15" text-anchor="middle">default group</text>
+<text class="t m" x="149" y="257.3" font-size="15" text-anchor="middle">every other host</text>
+<text class="t code" x="149" y="278.3" font-size="13" text-anchor="middle">localhost:3000</text><rect class="blue" x="404" y="82" width="232" height="64" rx="8" stroke-width="1.5"/>
+<text class="t code" x="520" y="108.8" font-size="15" text-anchor="middle">profiles/admin/</text>
+<text class="t m" x="520" y="129.8" font-size="15" text-anchor="middle">Chrome #1 · own cookies</text><rect class="blue" x="404" y="160" width="232" height="64" rx="8" stroke-width="1.5"/>
+<text class="t code" x="520" y="186.8" font-size="15" text-anchor="middle">profiles/admin@2/</text>
+<text class="t m" x="520" y="207.8" font-size="15" text-anchor="middle">Chrome #2 · slot 2</text><rect class="gray" x="404" y="250" width="232" height="64" rx="8" stroke-width="1.5"/>
+<text class="t code" x="520" y="276.8" font-size="15" text-anchor="middle">profiles/default/</text>
+<text class="t m" x="520" y="297.8" font-size="15" text-anchor="middle">Chrome #3</text><path class="edge" d="M258,136 L402,112" stroke-width="1.6" marker-end="url(#arrow)"/><path class="edge dash" d="M258,156 L402,190" stroke-width="1.6" marker-end="url(#arrow)"/><path class="edge" d="M258,256 L402,282" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="box" x="660" y="82" width="196" height="232" rx="8" stroke-width="1.2"/><text class="t b" x="758" y="140.0" font-size="40" text-anchor="middle">4</text><text class="t m" x="758" y="176.0" font-size="13" text-anchor="middle">browsers at most</text><text class="t b" x="758" y="236.0" font-size="28" text-anchor="middle">403</text><text class="t m" x="758" y="266.0" font-size="13" text-anchor="middle">into another group</text><text class="t m" x="32" y="350.0" font-size="13" text-anchor="start">At most 4 browsers at once; an idle one is stopped first.</text><text class="t m" x="32" y="374.0" font-size="13" text-anchor="start">A page navigating into another group gets a 403; a redirect into one freezes the session (exit 22).</text><text class="t m" x="32" y="398.0" font-size="13" text-anchor="start">Identity probe: the group's identity.selector must show the expected tenant, or step exits 22.</text><text class="t m" x="32" y="422.0" font-size="13" text-anchor="start">A host in no group can borrow a group's login with --profile admin (no slot); its account is not checked.</text>
+</svg>

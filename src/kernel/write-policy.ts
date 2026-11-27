@@ -34,7 +34,7 @@ export const BLOCK_MESSAGE = 'blocked by e2k read-only mode';
 const PASS: PolicyVerdict = Object.freeze({ decision: Object.freeze({ action: 'continue' as const }), reason: null, allowedBy: null });
 const PASS_NO_REDIRECT: PolicyVerdict = Object.freeze({ decision: Object.freeze({ action: 'continue' as const, followRedirects: false as const }), reason: null, allowedBy: null });
 
-// 白名单放行：一律不跟重定向（写不能被 307/308 带到没判过的地方；跨源的保证见 README Known gaps）。
+// 白名单放行：一律不跟重定向（写不能被 307/308 带到没判过的地方；跨源的保证见 docs/reference.md Known M1 gaps）。
 function allow(allowedBy: AllowedBy): PolicyVerdict {
   return Object.freeze({ decision: Object.freeze({ action: 'continue' as const, followRedirects: false as const }), reason: null, allowedBy });
 }

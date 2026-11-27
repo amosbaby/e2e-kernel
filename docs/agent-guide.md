@@ -1,6 +1,6 @@
 # e2k 给 agent 的使用说明
 
-这份说明只管「怎么用」，让你第一次读就能上手。完整参数、安全边界和已知限制见 [README](../README.md)，设计见 [design.md](design.md)。字段规则以代码为准（`src/shared/ops.ts`、`src/shared/protocol.ts`、`src/cli/main.ts`）。
+这份说明只管「怎么用」，让你第一次读就能上手。完整参数、安全边界和已知限制见 [reference.md](reference.md)，设计见 [design.md](design.md)。字段规则以代码为准（`src/shared/ops.ts`、`src/shared/protocol.ts`、`src/cli/main.ts`）。
 
 ## 何时用 e2k
 

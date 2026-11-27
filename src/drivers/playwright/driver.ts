@@ -1111,7 +1111,7 @@ class PlaywrightInstance implements Instance, Host {
         case 'continue':
           // 只有同源的请求走 route.fetch：跨源的请求经它发会绕过浏览器的 CORS 和 SameSite（route.fetch 不看 SameSite 一律附上
           // cookie，fulfill 还会替没有 ACAO 的响应补上 CORS 头），所以跨源的照常 continue，由浏览器自己发；
-          // 代价是它的 307 / 308 后续跳路由看不到（README Known gaps）。
+          // 代价是它的 307 / 308 后续跳路由看不到（docs/reference.md Known M1 gaps）。
           if (decision.followRedirects === false && isSameOrigin(request)) await this.sendWithoutRedirects(route);
           else await route.continue();
           break;

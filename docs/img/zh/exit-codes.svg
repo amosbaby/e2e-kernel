@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="448" viewBox="0 0 880 448" role="img" aria-labelledby="title desc">
+<title id="title">e2k 退出码</title>
+<desc id="desc">e2k 的退出码及下一步：0 正常，10 断言不符，11 动作失败，20 遇到登录墙，21 等人在弹框里批准，22 需要人处理，2 用法错误，1 内部错误。</desc>
+<style>
+  .bg { fill: #ffffff; stroke: #d0d7de; }
+  .t { fill: #1f2328; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Helvetica, Arial, sans-serif; }
+  .m { fill: #59636e; }
+  .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .b { font-weight: 600; }
+  .box { fill: #f6f8fa; stroke: #d0d7de; }
+  .blue { fill: #ddf4ff; stroke: #0969da; }
+  .green { fill: #dafbe1; stroke: #1a7f37; }
+  .yellow { fill: #fff8c5; stroke: #9a6700; }
+  .red { fill: #ffebe9; stroke: #cf222e; }
+  .purple { fill: #fbefff; stroke: #8250df; }
+  .gray { fill: #f6f8fa; stroke: #818b98; }
+  .edge { stroke: #59636e; fill: none; }
+  .head { fill: #59636e; }
+  .dash { stroke-dasharray: 5 4; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; stroke: #30363d; }
+    .t { fill: #e6edf3; }
+    .m { fill: #9198a1; }
+    .box { fill: #161b22; stroke: #3d444d; }
+    .blue { fill: #0c2d6b; stroke: #4493f8; }
+    .green { fill: #04260f; stroke: #3fb950; }
+    .yellow { fill: #3b2e00; stroke: #d29922; }
+    .red { fill: #42080b; stroke: #f85149; }
+    .purple { fill: #2e1a4f; stroke: #ab7df8; }
+    .gray { fill: #161b22; stroke: #9198a1; }
+    .edge { stroke: #9198a1; }
+    .head { fill: #9198a1; }
+  }
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="879" height="447" rx="12"/>
+<text class="t b" x="32" y="44.0" font-size="20" text-anchor="start">退出码：发生了什么，接下来做什么</text><rect class="box" x="28" y="70" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="green" x="38" y="82" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="70" y="117.0" font-size="24" text-anchor="middle">0</text><text class="t b" x="118" y="102.0" font-size="16" text-anchor="start">一切正常</text><text class="t m" x="118" y="126.0" font-size="13" text-anchor="start">没有断言不符、没有动作失败、没有登录墙</text><rect class="box" x="448" y="70" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="yellow" x="458" y="82" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="490" y="117.0" font-size="24" text-anchor="middle">10</text><text class="t b" x="538" y="102.0" font-size="16" text-anchor="start">断言不符</text><text class="t m" x="538" y="126.0" font-size="13" text-anchor="start">页面和预期不一样</text><rect class="box" x="28" y="158" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="red" x="38" y="170" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="70" y="205.0" font-size="24" text-anchor="middle">11</text><text class="t b" x="118" y="190.0" font-size="16" text-anchor="start">动作失败</text><text class="t m" x="118" y="214.0" font-size="13" text-anchor="start">看 hints，改 target，再跑 step</text><rect class="box" x="448" y="158" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="blue" x="458" y="170" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="490" y="205.0" font-size="24" text-anchor="middle">20</text><text class="t b" x="538" y="190.0" font-size="16" text-anchor="start">遇到登录墙</text><text class="t m" x="538" y="214.0" font-size="13" text-anchor="start">请人运行 login &lt;起始地址&gt;</text><rect class="box" x="28" y="246" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="purple" x="38" y="258" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="70" y="293.0" font-size="24" text-anchor="middle">21</text><text class="t b" x="118" y="278.0" font-size="16" text-anchor="start">等人在弹框里批准</text><text class="t m" x="118" y="302.0" font-size="13" text-anchor="start">人点完后，原样重跑同一条命令</text><rect class="box" x="448" y="246" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="red" x="458" y="258" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="490" y="293.0" font-size="24" text-anchor="middle">22</text><text class="t b" x="538" y="278.0" font-size="16" text-anchor="start">需要人处理</text><text class="t m" x="538" y="302.0" font-size="13" text-anchor="start">内核没在跑、状态目录、身份不符、会话冻结</text><rect class="box" x="28" y="334" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="gray" x="38" y="346" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="70" y="381.0" font-size="24" text-anchor="middle">2</text><text class="t b" x="118" y="366.0" font-size="16" text-anchor="start">用法错误</text><text class="t m" x="118" y="390.0" font-size="13" text-anchor="start">参数错、会话不存在、内核忙、被拒绝</text><rect class="box" x="448" y="334" width="404" height="76" rx="8" stroke-width="1.2"/><rect class="gray" x="458" y="346" width="64" height="52" rx="6" stroke-width="1.5"/><text class="t code b" x="490" y="381.0" font-size="24" text-anchor="middle">1</text><text class="t b" x="538" y="366.0" font-size="16" text-anchor="start">内部错误</text><text class="t m" x="538" y="390.0" font-size="13" text-anchor="start">看 kernel.log</text><text class="t m" x="32" y="432.0" font-size="13" text-anchor="start">step 的优先级：20 高于 11 高于 10。</text>
+</svg>

@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" role="img" aria-labelledby="title desc">
+<title id="title">只读模式与人工批准</title>
+<desc id="desc">只读主机上的写请求被拦。agent 用 step --allow 声明，命令以 21 退出并弹框问人；人点「放行」后，原样重跑同一条命令就能通过。rules.json 改动在 open 和 login 时也走同样的流程。</desc>
+<style>
+  .bg { fill: #ffffff; stroke: #d0d7de; }
+  .t { fill: #1f2328; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Helvetica, Arial, sans-serif; }
+  .m { fill: #59636e; }
+  .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .b { font-weight: 600; }
+  .box { fill: #f6f8fa; stroke: #d0d7de; }
+  .blue { fill: #ddf4ff; stroke: #0969da; }
+  .green { fill: #dafbe1; stroke: #1a7f37; }
+  .yellow { fill: #fff8c5; stroke: #9a6700; }
+  .red { fill: #ffebe9; stroke: #cf222e; }
+  .purple { fill: #fbefff; stroke: #8250df; }
+  .gray { fill: #f6f8fa; stroke: #818b98; }
+  .edge { stroke: #59636e; fill: none; }
+  .head { fill: #59636e; }
+  .dash { stroke-dasharray: 5 4; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; stroke: #30363d; }
+    .t { fill: #e6edf3; }
+    .m { fill: #9198a1; }
+    .box { fill: #161b22; stroke: #3d444d; }
+    .blue { fill: #0c2d6b; stroke: #4493f8; }
+    .green { fill: #04260f; stroke: #3fb950; }
+    .yellow { fill: #3b2e00; stroke: #d29922; }
+    .red { fill: #42080b; stroke: #f85149; }
+    .purple { fill: #2e1a4f; stroke: #ab7df8; }
+    .gray { fill: #161b22; stroke: #9198a1; }
+    .edge { stroke: #9198a1; }
+    .head { fill: #9198a1; }
+  }
+</style>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="bg" x="0.5" y="0.5" width="879" height="439" rx="12"/>
+<text class="t b" x="32" y="44.0" font-size="20" text-anchor="start">默认只读，例外由人在弹框里批准</text><text class="t b" x="32" y="80.0" font-size="14" text-anchor="start">被规则拦下的写请求</text><rect class="red" x="28" y="92" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="101" y="123.3" font-size="14" text-anchor="middle">step：页面发出</text>
+<text class="t code" x="101" y="142.9" font-size="14" text-anchor="middle">POST /v1/items</text>
+<text class="t m" x="101" y="162.5" font-size="14" text-anchor="middle">→ 403，已记录</text><path class="edge" d="M174,138 L196,138" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="box" x="198" y="92" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="271" y="123.3" font-size="14" text-anchor="middle">step … --allow</text>
+<text class="t code" x="271" y="142.9" font-size="14" text-anchor="middle">POST /v1/items</text>
+<text class="t m" x="271" y="162.5" font-size="14" text-anchor="middle">声明这次写</text><path class="edge" d="M344,138 L366,138" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="purple" x="368" y="92" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="441" y="123.3" font-size="14" text-anchor="middle">退出码 21</text>
+<text class="t m" x="441" y="142.9" font-size="14" text-anchor="middle">弹框</text>
+<text class="t" x="441" y="162.5" font-size="14" text-anchor="middle">e2k：放行写请求</text><path class="edge" d="M514,138 L536,138" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="yellow" x="538" y="92" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="611" y="133.1" font-size="14" text-anchor="middle">人点</text>
+<text class="t b" x="611" y="152.7" font-size="14" text-anchor="middle">放行</text><path class="edge" d="M684,138 L706,138" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="green" x="708" y="92" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="781" y="123.3" font-size="14" text-anchor="middle">原样重跑</text>
+<text class="t m" x="781" y="142.9" font-size="14" text-anchor="middle">同一条命令</text>
+<text class="t m" x="781" y="162.5" font-size="14" text-anchor="middle">→ 这批操作执行</text><text class="t b" x="32" y="238.0" font-size="14" text-anchor="start">rules.json 改了</text><rect class="box" x="28" y="250" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="101" y="291.1" font-size="14" text-anchor="middle">rules.json 被改</text>
+<text class="t m" x="101" y="310.7" font-size="14" text-anchor="middle">（由人维护）</text><path class="edge" d="M174,296 L196,296" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="box" x="198" y="250" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="271" y="291.1" font-size="14" text-anchor="middle">open / login</text>
+<text class="t m" x="271" y="310.7" font-size="14" text-anchor="middle">返回退出码 21</text><path class="edge" d="M344,296 L366,296" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="purple" x="368" y="250" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="441" y="281.3" font-size="14" text-anchor="middle">退出码 21</text>
+<text class="t m" x="441" y="300.9" font-size="14" text-anchor="middle">弹框</text>
+<text class="t" x="441" y="320.5" font-size="14" text-anchor="middle">e2k：域名规则改了</text><path class="edge" d="M514,296 L536,296" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="yellow" x="538" y="250" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="611" y="291.1" font-size="14" text-anchor="middle">人点</text>
+<text class="t b" x="611" y="310.7" font-size="14" text-anchor="middle">批准</text><path class="edge" d="M684,296 L706,296" stroke-width="1.6" marker-end="url(#arrow)"/><rect class="green" x="708" y="250" width="146" height="92" rx="8" stroke-width="1.5"/>
+<text class="t" x="781" y="281.3" font-size="14" text-anchor="middle">原样重跑</text>
+<text class="t m" x="781" y="300.9" font-size="14" text-anchor="middle">同一条命令</text>
+<text class="t m" x="781" y="320.5" font-size="14" text-anchor="middle">→ 新规则生效</text><text class="t m" x="611" y="202.0" font-size="12" text-anchor="middle">拒绝 → 退出码 2</text><text class="t m" x="611" y="360.0" font-size="12" text-anchor="middle">拒绝 → 退出码 2</text><text class="t m" x="32" y="396.0" font-size="13" text-anchor="start">批准之前，只有新增或改成只读的 rules 条目立即生效。</text><text class="t m" x="32" y="420.0" font-size="13" text-anchor="start">没有 approve 命令，也没有自动批准的开关；start --no-dialogs 让所有待批请求都以 22 结束。</text>
+</svg>

@@ -21,6 +21,8 @@ const ALLOWED_EMAIL_SUFFIXES: readonly string[] = ['.example.com', '.example.org
 const MAX_BUFFER = 64 * 1024 * 1024;
 const HISTORY_MAX_BUFFER = 512 * 1024 * 1024;
 const LOCK_FILE_HOSTS: readonly string[] = ['registry.npmjs.org'];
+// A standalone SVG file must declare the SVG namespace (an address on www.w3.org), or it does not render as an image.
+const SVG_FILE_HOSTS: readonly string[] = ['www.w3.org'];
 
 export function loadWords(path: string): Word[] {
   let text: string;
@@ -195,7 +197,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, root: string,
       out(`skipped-binary ${file}`);
       continue;
     }
-    const extraHosts = file === 'package-lock.json' ? LOCK_FILE_HOSTS : [];
+    const extraHosts = file === 'package-lock.json' ? LOCK_FILE_HOSTS : file.endsWith('.svg') ? SVG_FILE_HOSTS : [];
     hits.push(...scanText(file, buf.toString('utf8'), words, { allowEmails, extraHosts }));
     scanned++;
   }
@@ -209,7 +211,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, root: string,
       hits.push(...scanText('<git-log>', git(root, ['log', '--all', '--format=%B']), words, { allowEmails }));
       if (argv.includes('--history')) {
         const history = git(root, ['log', '--all', '-p', '--format=%H'], HISTORY_MAX_BUFFER);
-        hits.push(...scanText('<git-history>', history, words, { allowEmails, extraHosts: LOCK_FILE_HOSTS }));
+        hits.push(...scanText('<git-history>', history, words, { allowEmails, extraHosts: [...LOCK_FILE_HOSTS, ...SVG_FILE_HOSTS] }));
       }
     } catch {
       out('读取 git 提交记录失败');

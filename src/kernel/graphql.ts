@@ -104,7 +104,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // 一个 JSON 对象（单个操作）。不是 GraphQL 形状给 null。
 // `query` 键不分大小写匹配：只有唯一一个、而且恰好是小写 `query` 的键才按普通情形处理；
 // 多于一个、或唯一的键不是小写，都对每个字符串值各扫一遍，有 mutation 就是 mutation，否则 unknown。
-// （同一个键重复出现时 JSON.parse 取最后一个，前面的读不到：这只是报告分组的边界，README 写明了；拦截不靠它，isStrictQuery 看到重复的 query 键就不放行。）
+// （同一个键重复出现时 JSON.parse 取最后一个，前面的读不到：这只是报告分组的边界，docs/reference.md 写明了；拦截不靠它，isStrictQuery 看到重复的 query 键就不放行。）
 function ofOperation(o: Record<string, unknown>): GraphqlKind | null {
   const keys = Object.keys(o).filter((k) => k.toLowerCase() === 'query');
   if (keys.length === 1 && keys[0] === 'query') return typeof o.query === 'string' ? scanDocument(o.query) : 'unknown';

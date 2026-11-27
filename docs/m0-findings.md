@@ -214,7 +214,7 @@ context-close: not-fired
 
 Playwright 文档写明，路由 handler 只对重定向链的第一个 URL 调用（`playwright-core/types/types.d.ts` 里 `route` 的说明）。实测（`test/browser/playwright-driver.test.ts`「a redirect target is not shown to the handler」）：页面 `fetch` POST 一个返回 307 的地址，307 的目标是写端点；驱动的 `seen` 里只有第一跳，fixture 服务收到了后续跳的写请求。
 
-结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；README Known gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定）。
+结论：重定向的后续跳不经 handler，因此也不经写策略，也不进记录。这是现状，本轮只加测试记录、不改行为；docs/reference.md Known M1 gaps 里有同一条。后续要堵，需在网络层处理，例如 handler 里 `route.fetch({ maxRedirects: 0 })` 拿首跳响应、遇 3xx 不跟随再 `fulfill`（M2 再定）。
 
 M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里 `followRedirects: false` 的几条）：驱动对放行且带 `followRedirects: false` 的请求走 `route.fetch({ maxRedirects: 0 })`。
 - `maxRedirects: 0` **不抛错**，返回 3xx 响应本身（307 带 `location`）。驱动据此先通知 `redirectRefused`、再 `route.abort()`；服务端只收到首跳一次，目标地址一次也没收到，页面的 `fetch` 被拒。1.65.1 下 `maxRedirects: 0` 不会抛错（内部映射成 -1），所以驱动不按错误消息里的 `redirect` 字样判断：消息的 Call log 带完整 URL 和 referer，`redirect_uri=` 之类会被误报。`fetch` 抛任何错都只是中止请求，由随后的 `requestfailed` 通知一次（status 为 null，没有 `redirectRefused`）。
@@ -225,7 +225,7 @@ M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里
 - 跨源不能走这条路：`route.fetch` 按 URL 附上 context 里所有匹配的 cookie（不看 SameSite，也不看页面 `fetch` 的 credentials 模式），`fulfill({ response })` 在请求带 `Origin`、跨源且响应没有 `access-control-allow-origin` 时还会自动补 `access-control-allow-origin: <origin>` 和 `access-control-allow-credentials: true`。实测（页面在 `127.0.0.1`，目标在 `localhost`，目标主机上有 SameSite=Strict 的 cookie）：经 `route.fetch` 发出的请求带着这个 cookie，浏览器自己发的不带。所以驱动只对同源请求用 `route.fetch`，跨源的 `route.continue()`。
 - `route.fetch` 的响应要 `dispose()`，否则响应体留在 context 里直到关闭；驱动在 `fulfill` 或中止之后都会 dispose。
 
-结论：四条在 1.65.1 下都做得到，不需要降级。代价：这样发出的请求由 Node 代发，不信任系统额外安装的根证书（README Known gaps）。
+结论：四条在 1.65.1 下都做得到，不需要降级。代价：这样发出的请求由 Node 代发，不信任系统额外安装的根证书（docs/reference.md Known M1 gaps）。
 
 ## 9.6 写请求时探测密码框
 
@@ -281,7 +281,7 @@ M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里
 - 能堵的办法（已实测）：`addInitScript(() => { delete globalThis.SharedWorker })`。页面里 `new SharedWorker()` 抛错，服务端一条也没收到，路由也看不到 `/sw.js`。
 - 探针按上面的结论断言，结果不一致时退出码为 1：Playwright 或 Chromium 升级后行为变了，就要重做本节。
 
-结论：默认模式下 SharedWorker 的写不经路由，也不进记录，这是 M1 已有的缺口（README Known gaps 里有同一条）。Dedicated Worker 已覆盖，归属也能拿到。**M2a 起驱动在所有页面删掉 `SharedWorker`**（`attach` 里在 `context.route` 之前装的 init script `delete globalThis.SharedWorker`），让只读上下文里没有这条旁路。驱动测试（`test/browser/playwright-driver.test.ts`）在带驱动路由的真实 Chromium 里实测了五处，`typeof SharedWorker` 都是 `'undefined'`：顶层页面（`new SharedWorker()` 抛错，等 1 秒服务端也没收到 SharedWorker 的 POST）、带 `src` 的同源 iframe、脚本同步建出的 `about:blank` iframe、`window.open('')` 同步返回的窗口、Dedicated Worker（本来就没有，钉住）。所以 `Capabilities` 记 `sharedWorkers: 'covered'`；驱动若做不到这一点，应记 `'not-covered'`，报告的覆盖说明会据此提示。
+结论：默认模式下 SharedWorker 的写不经路由，也不进记录，这是 M1 已有的缺口（docs/reference.md Known M1 gaps 里有同一条）。Dedicated Worker 已覆盖，归属也能拿到。**M2a 起驱动在所有页面删掉 `SharedWorker`**（`attach` 里在 `context.route` 之前装的 init script `delete globalThis.SharedWorker`），让只读上下文里没有这条旁路。驱动测试（`test/browser/playwright-driver.test.ts`）在带驱动路由的真实 Chromium 里实测了五处，`typeof SharedWorker` 都是 `'undefined'`：顶层页面（`new SharedWorker()` 抛错，等 1 秒服务端也没收到 SharedWorker 的 POST）、带 `src` 的同源 iframe、脚本同步建出的 `about:blank` iframe、`window.open('')` 同步返回的窗口、Dedicated Worker（本来就没有，钉住）。所以 `Capabilities` 记 `sharedWorkers: 'covered'`；驱动若做不到这一点，应记 `'not-covered'`，报告的覆盖说明会据此提示。
 
 ## 9.10 原生对话框
 

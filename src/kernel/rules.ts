@@ -7,7 +7,7 @@ import { readApprovals } from './approval-store.ts';
 import type { ApprovalRecord, ApprovalStore, ApprovalsStatus, Declaration } from './approval-store.ts';
 import type { ModeResolver, PendingRules, RuleMode, RulesState } from './mode.ts';
 
-// $E2K_HOME/rules.json：哪些主机默认只读、哪些是登录主机（设计 5.2）。格式见 README。
+// $E2K_HOME/rules.json：哪些主机默认只读、哪些是登录主机（设计 5.2）。格式见 docs/reference.md。
 export interface Rule { match: string; mode: RuleMode }
 
 // 接口写法（域名组里的读型 POST、持久化查询、登出）：方法 + 来源 + 路径段。`path` 按 `/` 切开，'*' 是任意一段（非空）。
