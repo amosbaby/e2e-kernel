@@ -1376,6 +1376,22 @@ test('an unattributed page on a read-only host is read-only even with no read-on
   assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://example.com/api', topUrl: 'http://example.org/' })).action, 'continue');   // 页面在默认主机上
 });
 
+test('an unattributed request to or on a denied host is blocked with reason denied, any method; a plain unattributed request is unaffected', async () => {
+  const modes: ModeResolver = { ...defaultOnlyResolver, resolve: (h: string): Mode => (h === 'deny.example.com' ? 'denied' : 'default') };
+  const { sm, fake } = setup({ modes, policy });
+  const { session } = await opened(sm, fake);
+  const target = await fake.emitRequest({ id: 'u1', pageId: null, method: 'GET', url: 'http://deny.example.com/x', topUrl: null });
+  assert.equal(target.action, 'fulfill'); assert.equal((target as { status: number }).status, 403);
+  const onTop = await fake.emitRequest({ id: 'u2', pageId: null, method: 'GET', url: 'http://localhost:5173/api', topUrl: 'http://deny.example.com/' });
+  assert.equal(onTop.action, 'fulfill'); assert.equal((onTop as { status: number }).status, 403);
+  assert.deepEqual(await fake.emitRequest({ id: 'u3', pageId: null, method: 'GET', url: 'http://localhost:5173/api', topUrl: null }), { action: 'continue' });
+  assert.deepEqual(await fake.emitRequest({ id: 'u4', pageId: null, method: 'POST', url: 'http://localhost:5173/api', topUrl: null }), { action: 'continue' });
+  const res = readResult((await sm.close({ session })).runDir);
+  assert.deepEqual(res.writes.unattributed.filter((w) => w.reason === 'denied').map((w) => [w.id, w.decision, w.mode, w.targetMode]),
+    [['u1', 'blocked', 'denied', 'denied'], ['u2', 'blocked', 'denied', 'default']]);
+  assert.ok(res.writes.blockedSummary.some((r) => r.reason === 'denied' && r.unattributed));
+});
+
 // ---- 登录窗口过写策略（loginHosts 之外） ----
 // 请求形状照真驱动：顶层导航 isNavigation + topFrame，topUrl 是导航目标；其余请求的 topUrl 是所在页的地址。
 

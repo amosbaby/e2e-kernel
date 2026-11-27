@@ -9,7 +9,7 @@ import type { Endpoint, PersistedSet } from './rules.ts';
 // 写策略（设计 5.3）。只读模式里只放行读（GET/HEAD/OPTIONS）、严格的 GraphQL query，和组级白名单里的写（读型 POST、持久化查询、
 // 经批准的放行声明）；其余一律拦，拿不准的也拦（失败关闭）。登出先于一切：命中就拦。
 // reason 只给报告分组用，放行时是 null；allowedBy 是白名单放行的依据，其余放行和所有拦截都是 null。
-export type BlockReason = 'method' | 'graphql-mutation' | 'persisted-query' | 'redirected-write' | 'unattributed' | 'other-group' | 'logout';
+export type BlockReason = 'method' | 'graphql-mutation' | 'persisted-query' | 'redirected-write' | 'unattributed' | 'other-group' | 'logout' | 'denied';
 export type AllowedBy = 'read-post' | 'persisted-query' | 'declared';
 export interface PolicyVerdict { decision: Decision; reason: BlockReason | null; allowedBy: AllowedBy | null }
 
@@ -26,10 +26,12 @@ export const DEFAULT_CTX: PolicyCtx = Object.freeze({ mode: 'default', logout: O
 export interface WritePolicy {
   decide(req: RequestInfo, ctx: PolicyCtx): PolicyVerdict;                                                   // 属于某个会话的页发出的请求
   // 归不到任何会话或登录页的请求；logout 是请求目标主机所在组的登出接口（只读时命中就拦）。不放行任何白名单里的写。
-  decideUnattributed(req: RequestInfo, ctx: { anyReadonly: boolean; logout: readonly Endpoint[] }): PolicyVerdict;
+  // denied：请求的顶层页或目标主机是不允许的域名（不看授权，认不出归属就失败关闭）：不分方法一律 403，先于 anyReadonly 和登出名单。
+  decideUnattributed(req: RequestInfo, ctx: { anyReadonly: boolean; logout: readonly Endpoint[]; denied: boolean }): PolicyVerdict;
 }
 
 export const BLOCK_MESSAGE = 'blocked by e2k read-only mode';
+export const DENY_MESSAGE = 'blocked by e2k: host not allowed';
 
 const PASS: PolicyVerdict = Object.freeze({ decision: Object.freeze({ action: 'continue' as const }), reason: null, allowedBy: null });
 const PASS_NO_REDIRECT: PolicyVerdict = Object.freeze({ decision: Object.freeze({ action: 'continue' as const, followRedirects: false as const }), reason: null, allowedBy: null });
@@ -47,6 +49,14 @@ function block(req: RequestInfo, reason: BlockReason): PolicyVerdict {
     ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${BLOCK_MESSAGE}</p>` }
     : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: BLOCK_MESSAGE }) };
   return { decision, reason, allowedBy: null };
+}
+
+// 不允许的域名（denied）：任何方法一律 403，子资源回 JSON，导航回一张页面；原因 denied。
+export function blockDenied(req: RequestInfo): PolicyVerdict {
+  const decision: Decision = req.isNavigation
+    ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${DENY_MESSAGE}</p>` }
+    : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: DENY_MESSAGE }) };
+  return { decision, reason: 'denied', allowedBy: null };
 }
 
 // 跨组导航的提示（组名只含小写字母、数字、_、-）：写进 403 页面，也进 step 的 notices。
@@ -135,9 +145,11 @@ export const policy: WritePolicy = Object.freeze({
   decide(req: RequestInfo, ctx: PolicyCtx): PolicyVerdict {
     if (ctx.mode === 'default') return PASS;
     if (ctx.mode === 'readonly') return decideReadonly(req, ctx);
-    return { decision: { action: 'abort' }, reason: 'method', allowedBy: null };   // denied 和不认识的模式
+    if (ctx.mode === 'denied') return blockDenied(req);
+    return { decision: { action: 'abort' }, reason: 'method', allowedBy: null };   // 不认识的模式
   },
-  decideUnattributed(req: RequestInfo, ctx: { anyReadonly: boolean; logout: readonly Endpoint[] }): PolicyVerdict {
+  decideUnattributed(req: RequestInfo, ctx: { anyReadonly: boolean; logout: readonly Endpoint[]; denied: boolean }): PolicyVerdict {
+    if (ctx.denied) return blockDenied(req);
     if (!ctx.anyReadonly) return PASS;
     if (logoutHit(ctx.logout, req)) return block(req, 'logout');
     // 与会话路径的只读判定同口径（decideReadonly ②③）：安全方法也要无体、URL 不像 mutation 才放行，否则弹窗里的 GET ?query=mutation{…} 会带着 cookie 写。

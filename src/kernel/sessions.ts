@@ -1269,16 +1269,19 @@ export class SessionManager {
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
       return verdict.decision;
     }
-    // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）：有任一只读会话活着就按「只读」拦写。
+    // 归不到任何会话或登录页（pageId 为 null，或是人手开的标签页之类）：有任一只读（或不允许）会话活着就按「只读」拦写。
     // 请求所在页自己的顶层主机只读也算（模式跟着页面走），不用等有只读会话。
-    const anyReadonly = [...this.sessions.values()].some((x) => this.sessionMode(x, []) === 'readonly')
+    // denied：顶层页或请求目标是不允许的域名就一律拦（R18）。认不出会话，授权不看，失败关闭：授权过的会话里页面开的弹窗，
+    // 它的第一个导航也走到这里，照拦。
+    const denied = this.deps.modes.resolve(hostOf(req.topUrl ?? req.url)) === 'denied' || this.deps.modes.resolve(hostOf(req.url)) === 'denied';
+    const anyReadonly = [...this.sessions.values()].some((x) => { const m = this.sessionMode(x, []); return m === 'readonly' || m === 'denied'; })
       || this.deps.modes.resolve(hostOf(req.topUrl ?? req.url)) === 'readonly';
     // 未归属的请求不属于任何组：带所有已批准组的登出接口的并集（只读时命中就拦；groupOf 看不到写在 loginHosts 上的登出，也不知道它该算哪个组）；
     // 白名单里的写一概不放行。
-    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly, logout: this.deps.modes.allLogout() });
+    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly, logout: this.deps.modes.allLogout(), denied });
     if (isWrite(req.method) || verdict.reason !== null) {
       const targetMode = this.deps.modes.resolve(hostOf(req.url));
-      this.unattributed.push(toWriteRecord(req, verdict, { mode: anyReadonly ? 'readonly' : 'default', targetMode }, this.deps.now()));
+      this.unattributed.push(toWriteRecord(req, verdict, { mode: denied ? 'denied' : anyReadonly ? 'readonly' : 'default', targetMode }, this.deps.now()));
       if (this.unattributed.length > MAX_UNATTRIBUTED) this.unattributed.shift();
     }
     return verdict.decision;

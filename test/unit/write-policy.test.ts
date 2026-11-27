@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { RequestInfo } from '../../src/driver/types.ts';
-import { BLOCK_MESSAGE, DEFAULT_CTX, allowAllPolicy, blockFrozen, blockOtherGroup, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
+import { BLOCK_MESSAGE, DEFAULT_CTX, DENY_MESSAGE, allowAllPolicy, blockFrozen, blockOtherGroup, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
 import type { BlockReason, PolicyCtx } from '../../src/kernel/write-policy.ts';
 import { parseEndpoint } from '../../src/kernel/rules.ts';
 import type { Declaration } from '../../src/kernel/approval-store.ts';
@@ -94,25 +94,24 @@ test('a navigation is answered with an HTML page, a subresource with JSON', () =
   blocked(ro(post('a=1', 'application/x-www-form-urlencoded')), 'method');
 });
 
-test('default mode lets everything through; denied and unknown modes abort', () => {
+test('default mode lets everything through; unknown modes abort', () => {
   for (const method of ['GET', 'POST', 'DELETE']) {
     assert.deepEqual(policy.decide(req({ method, body: 'x' }), { ...DEFAULT_CTX, mode: 'default' }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   }
-  assert.deepEqual(policy.decide(req(), { ...DEFAULT_CTX, mode: 'denied' }), { decision: { action: 'abort' }, reason: 'method', allowedBy: null });
   assert.deepEqual(policy.decide(req(), { ...DEFAULT_CTX, mode: 'bogus' as never }), { decision: { action: 'abort' }, reason: 'method', allowedBy: null });
 });
 
 test('unattributed requests are only blocked when some session is read-only, and only writes', () => {
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: false, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'head' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'OPTIONS' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [] }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'purge' }), { anyReadonly: true, logout: [] }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: false, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET' }), { anyReadonly: true, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'head' }), { anyReadonly: true, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'OPTIONS' }), { anyReadonly: true, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [], denied: false }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'purge' }), { anyReadonly: true, logout: [], denied: false }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
 });
 
 test('unattributed requests get the same read-only check as session requests: a safe method with a mutation-like URL or with a body is blocked', () => {
-  const un = (r: RequestInfo) => policy.decideUnattributed(r, { anyReadonly: true, logout: [] });
+  const un = (r: RequestInfo) => policy.decideUnattributed(r, { anyReadonly: true, logout: [], denied: false });
   const mutationUrl = 'https://api.example.com/graphql?query=mutation%7BdeleteAll%7D';
   assert.deepEqual(un(req({ method: 'GET', url: mutationUrl })), { decision: BLOCK_JSON, reason: 'graphql-mutation', allowedBy: null });
   assert.deepEqual(un(req({ method: 'HEAD', url: mutationUrl })), { decision: BLOCK_JSON, reason: 'graphql-mutation', allowedBy: null });
@@ -126,12 +125,51 @@ test('unattributed requests get the same read-only check as session requests: a 
   for (const r of [req({ method: 'GET' }), req({ method: 'HEAD' }), req({ method: 'OPTIONS' }), req({ method: 'GET', url: 'http://localhost/api?page=2&q=hello' })]) {
     assert.deepEqual(un(r), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   }
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET', url: mutationUrl }), { anyReadonly: false, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET', url: mutationUrl }), { anyReadonly: false, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+});
+
+const DENY_JSON = { action: 'fulfill', status: 403, contentType: 'application/json', body: `{"error":"${DENY_MESSAGE}"}` };
+const DENY_HTML = { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${DENY_MESSAGE}</p>` };
+
+test('the deny message is fixed', () => {
+  assert.equal(DENY_MESSAGE, 'blocked by e2k: host not allowed');
+});
+
+test('denied mode blocks every request with 403 and reason denied', () => {
+  const declared: Declaration[] = [{ method: 'POST', url: 'http://localhost/api/save', operation: null }];
+  const dn = (r: RequestInfo, ctx: Partial<PolicyCtx> = {}) => policy.decide(r, { ...DEFAULT_CTX, mode: 'denied', ...ctx });
+  for (const r of [req({ method: 'GET' }), req({ method: 'HEAD' }), req({ method: 'OPTIONS' }), req({ method: 'POST', body: 'a=1', contentType: 'application/x-www-form-urlencoded' }),
+    post(j({ query: 'query { viewer { id } }' }))]) {
+    assert.deepEqual(dn(r), { decision: DENY_JSON, reason: 'denied', allowedBy: null }, r.method);
+  }
+  // 命中放行声明的写也拦：denied 先于一切
+  const hit = req({ method: 'POST', url: 'http://localhost/api/save', contentType: JSON_CT, body: '{}' });
+  assert.deepEqual(dn(hit, { declared }), { decision: DENY_JSON, reason: 'denied', allowedBy: null });
+  // 导航回含同一句的 403 页
+  assert.deepEqual(dn(req({ method: 'GET', isNavigation: true, topFrame: true })), { decision: DENY_HTML, reason: 'denied', allowedBy: null });
+  assert.ok(DENY_HTML.body.includes('blocked by e2k: host not allowed') && DENY_JSON.body.includes('blocked by e2k: host not allowed'));
+  // 不认识的模式仍是 abort（失败关闭）
+  assert.deepEqual(policy.decide(req(), { ...DEFAULT_CTX, mode: 'bogus' as never }), { decision: { action: 'abort' }, reason: 'method', allowedBy: null });
+});
+
+test('an unattributed request with denied set is blocked whatever the method', () => {
+  for (const anyReadonly of [false, true]) {
+    for (const method of ['GET', 'HEAD', 'OPTIONS', 'POST']) {
+      assert.deepEqual(policy.decideUnattributed(req({ method }), { anyReadonly, logout: [], denied: true }), { decision: DENY_JSON, reason: 'denied', allowedBy: null }, `${method} ${anyReadonly}`);
+    }
+  }
+  // 未归属的导航也回 403 页，同一句话
+  assert.deepEqual(policy.decideUnattributed(req({ isNavigation: true, topFrame: true }), { anyReadonly: false, logout: [], denied: true }), { decision: DENY_HTML, reason: 'denied', allowedBy: null });
+  // denied 先于登出名单
+  const logout = [ep('*', 'http://localhost/logout')];
+  assert.equal(policy.decideUnattributed(req({ url: 'http://localhost/logout' }), { anyReadonly: true, logout, denied: true }).reason, 'denied');
+  // denied 为 false 时和以前一致
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET' }), { anyReadonly: false, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
 });
 
 test('allowAllPolicy allows everything and is frozen', () => {
   assert.deepEqual(allowAllPolicy.decide(req({ method: 'POST' }), { ...DEFAULT_CTX, mode: 'readonly' }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
-  assert.deepEqual(allowAllPolicy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(allowAllPolicy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [], denied: false }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   assert.ok(Object.isFrozen(allowAllPolicy));
 });
 
@@ -164,7 +202,7 @@ test('a repeated query key or an extra key in the body is blocked', () => {
 });
 
 test('an unattributed block answers with JSON even for a navigation', () => {
-  const v = policy.decideUnattributed(req({ method: 'POST', isNavigation: true, topFrame: true }), { anyReadonly: true, logout: [] });
+  const v = policy.decideUnattributed(req({ method: 'POST', isNavigation: true, topFrame: true }), { anyReadonly: true, logout: [], denied: false });
   assert.deepEqual(v, { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
 });
 
@@ -372,11 +410,11 @@ test('logout rules do not matter in the default mode', () => {
 
 test('an unattributed logout is blocked while something is read-only; nothing else is whitelisted for unattributed requests', () => {
   const logout = [ep('*', 'http://app.example.com/logout')];
-  const nav = policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/logout', isNavigation: true, topFrame: true }), { anyReadonly: true, logout });
+  const nav = policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/logout', isNavigation: true, topFrame: true }), { anyReadonly: true, logout, denied: false });
   assert.deepEqual([nav.decision, nav.reason, nav.allowedBy], [BLOCK_HTML, 'logout', null]);
-  assert.equal(policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/logout' }), { anyReadonly: false, logout }).reason, null);
-  assert.equal(policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/other' }), { anyReadonly: true, logout }).reason, null);
-  assert.equal(policy.decideUnattributed(searchPost(j({ term: 'x' })), { anyReadonly: true, logout }).reason, 'unattributed');
+  assert.equal(policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/logout' }), { anyReadonly: false, logout, denied: false }).reason, null);
+  assert.equal(policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/other' }), { anyReadonly: true, logout, denied: false }).reason, null);
+  assert.equal(policy.decideUnattributed(searchPost(j({ term: 'x' })), { anyReadonly: true, logout, denied: false }).reason, 'unattributed');
 });
 
 const decl = (method: string, url: string, operation: string | null): Declaration => ({ method, url, operation });

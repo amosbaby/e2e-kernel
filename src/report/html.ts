@@ -30,8 +30,9 @@ const MODE_REASON_TEXT: Record<ModeChange['reason'], string> = {
 };
 const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
   'method': '非读方法', 'graphql-mutation': 'GraphQL mutation', 'persisted-query': '持久化查询',
-  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'other-group': '跨组导航', 'logout': '登出', 'unknown': '原因不明',
+  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'other-group': '跨组导航', 'logout': '登出', 'denied': '不允许的域名', 'unknown': '原因不明',
 };
+const TARGET_MODE_TEXT: Record<string, string> = { denied: '不允许' };   // 其余模式（readonly）原样显示
 const ALLOWED_BY_TEXT: Record<NonNullable<WriteRecord['allowedBy']>, string> = {
   'read-post': '读型 POST 白名单', 'persisted-query': '持久化查询白名单', 'declared': '放行声明',
 };
@@ -111,7 +112,7 @@ function stepRow(a: ActionRecord): string {
 
 function writeItem(w: WriteRecord): string {
   const status = w.failed ? '失败' : w.status === null ? '无状态码' : String(w.status);
-  const flag = w.targetMode === 'default' ? '' : ` <strong class="flag">非默认模式域名（${own(w.targetMode)}）</strong>`;
+  const flag = w.targetMode === 'default' ? '' : ` <strong class="flag">非默认模式域名（${Object.hasOwn(TARGET_MODE_TEXT, w.targetMode) ? escapeHtml(TARGET_MODE_TEXT[w.targetMode]!) : own(w.targetMode)}）</strong>`;
   const body = w.bodyOmitted ? '<br>请求体未记录（发出它的页面有密码框，或判断不出）'
     : w.body === null ? '' : `<br>请求体 <code>${pageBody(w.body)}</code>`;
   // 放行依据：只有靠组级白名单放行的写才有；报告也可能从磁盘上读回来，不认识的值落到「未知」。

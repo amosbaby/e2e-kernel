@@ -191,6 +191,19 @@ test('writes to a non-default mode host are marked', () => {
   assert.equal(html.match(/非默认模式域名/g)?.length, 1);
 });
 
+test('a blocked write with reason denied is shown as 不允许的域名 and counted in blockedSummary', () => {
+  const r = buildResult(input({ writes: [blockedWrite('GET', 'http://d.example.com/x', 'denied', { mode: 'denied', targetMode: 'denied' })] }));
+  assert.deepEqual(r.writes.blockedSummary, [{ host: 'd.example.com', method: 'GET', reason: 'denied', count: 1, unattributed: false }]);
+  const sec = section(renderReport(r), 'blocked-writes');
+  assert.ok(sec.includes('不允许的域名') && !sec.includes('原因不明'), sec);
+});
+
+test('an allowed write whose targetMode is denied is marked 不允许 in the writes list', () => {
+  const html = renderReport(buildResult(input({ writes: [write('POST', 'http://localhost/a', 200, { targetMode: 'denied' as Mode })] })));
+  assert.ok(html.includes('非默认模式域名（不允许）'));
+  assert.ok(!html.includes('非默认模式域名（denied）'));
+});
+
 test('coverage notes and next', () => {
   const r = buildResult(input({ webSockets: 2, driver: driverWith({ nativeFormSubmit: 'not-covered' }) }));
   assert.ok(r.coverage.notes.includes('有 WebSocket 连接，不受写策略管'));
