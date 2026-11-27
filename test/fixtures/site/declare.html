@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Declared Writes</title>
+</head>
+<body>
+<!-- 四个按钮各向一个路径发一次 POST（路径各不相同，服务端按路径数）；结果写进 #out，形如 read:200。 -->
+<button id="read">read</button>
+<button id="other">other</button>
+<button id="declared">declared</button>
+<button id="denied">denied</button>
+<p id="out"></p>
+<script>
+  const out = document.getElementById('out');
+  for (const [id, path] of [['read', '/api/read-posts'], ['other', '/api/other'], ['declared', '/api/declared'], ['denied', '/api/denied']]) {
+    document.getElementById(id).addEventListener('click', async () => {
+      const status = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"term":"x"}' }).then((r) => r.status, () => 'err');
+      out.textContent += id + ':' + status + ' ';
+    });
+  }
+</script>
+</body>
+</html>

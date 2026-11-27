@@ -11,7 +11,9 @@ import { call } from '../../src/shared/client.ts';
 import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { approving, choosingMode, fakeDialog } from '../support/fake-dialog.ts';
+import { approving, choosingMode, denying, fakeDialog } from '../support/fake-dialog.ts';
+import type { FakeDialog } from '../support/fake-dialog.ts';
+import type { DialogRequest, DialogResult } from '../../src/kernel/approval.ts';
 import { noFocus } from '../../src/kernel/focus.ts';
 
 // 端到端验收：真浏览器（有头 Chromium）、真 fixture 服务、测试进程内的内核，CLI 走 bin/e2k.js 子进程。
@@ -541,6 +543,219 @@ test('login on an unlisted host answered read-only: the window\'s own writes are
   } finally {
     await k.stop();
     own.cleanup();
+  }
+});
+
+// ---- 域名组、批准、身份探针（M2b）：每条要弹框的用例起自己的内核和 home ----
+// 共用内核每 10 分钟只有 6 个弹框的额度，已被前面的规则测试用满；下面每个内核各用各的额度（每条用例开头注明用了几个）。
+// 批准一律走真路径：21 → 假对话框作答 → 原样重试；测试从不直接写 approvals.json。
+
+interface Own { h: typeof home; k: KernelHandle; d: FakeDialog; run: (input: string | undefined, ...args: string[]) => Promise<Run>; stop: () => Promise<void> }
+
+async function startOwn(rules: unknown, script?: (r: DialogRequest) => DialogResult | Promise<DialogResult>): Promise<Own> {
+  const tmpOwn = makeTmpHome();
+  writeFileSync(tmpOwn.home.rulesFile, JSON.stringify(rules));
+  const d = fakeDialog(script);
+  const k = await startKernel({ focus: noFocus, home: tmpOwn.home, driver: createPlaywrightDriver(), dialog: d });
+  return {
+    h: tmpOwn.home, k, d,
+    run: (input, ...args) => e2kAt(tmpOwn.home, input, ...args),
+    stop: async () => { try { await k.stop(); } finally { tmpOwn.cleanup(); } },
+  };
+}
+
+// 第一次 open 要批准：内核得 21，等假对话框作答，原样重试。
+async function openOwn(o: Own, ...args: string[]): Promise<any> {
+  const gate = await o.run(undefined, 'open', ...args, '--json');
+  assert.equal(gate.code, 21, `the first open asks for an approval: ${gate.out}${gate.err}`);
+  await settle();
+  const r = await o.run(undefined, 'open', ...args, '--json');
+  assert.equal(r.code, 0, r.out + r.err);
+  return JSON.parse(r.out);
+}
+
+async function stepOwn(o: Own, session: string, ops: unknown[], ...extra: string[]): Promise<Run> {
+  return o.run(JSON.stringify(ops), 'step', session, '--stdin', '--json', ...extra);
+}
+
+async function closeOwn(o: Own, session: string): Promise<any> {
+  const close = JSON.parse((await o.run(undefined, 'close', session, '--verdict', 'undetermined', '--because', 'e2e probe', '--json')).out);
+  return JSON.parse(readFileSync(close.resultPath, 'utf8'));
+}
+
+const twoGroups = { version: 1, rules: [], loginHosts: [], groups: [{ name: 'a', hosts: ['127.0.0.1'] }, { name: 'b', hosts: ['localhost'] }] };
+
+// 弹框数：1（规则）。这一条之外，「经 302 进别组」已由上面那条冻结用例覆盖（Task 7）：这里是点链接直接去别组的域名，没有重定向。
+test('a link straight into another group is answered with a 403 and the group to use; the session stays usable and result.json records other-group', { timeout: 180_000 }, async () => {
+  const o = await startOwn(twoGroups, approving);
+  try {
+    const open = await openOwn(o, origin + '/cross-link.html');
+    assert.equal(open.profile, 'a');
+    const from = server.hits.length;
+    const click = JSON.parse((await stepOwn(o, open.session, [{ op: 'click', target: '#go' }, { op: 'assert', kind: 'text', target: 'body', cmp: 'contains', expected: '这个域名属于组 b' }])).out);
+    assert.equal(click.exit, 0, 'the refused navigation is answered, not a failure: the 403 page is what the browser shows');
+    assert.ok(click.notices.some((n: string) => n.includes('这个域名属于组 b，当前 profile 是组 a 的。请用 --profile b 另开会话。')), JSON.stringify(click.notices));
+    assert.equal(click.writesBlocked, 1, 'the refused navigation counts as a blocked request');
+    const again = await stepOwn(o, open.session, [{ op: 'snapshot' }]);
+    assert.equal(again.code, 0, 'a refused hop is not a redirect: the session is not frozen');
+    assert.equal(server.hits.slice(from).length, 0, 'no write reached the server');
+    const result = await closeOwn(o, open.session);
+    const blocked: any[] = result.writes.blocked;
+    assert.ok(blocked.some((w) => w.reason === 'other-group' && w.host === 'localhost' && w.decision === 'blocked'), JSON.stringify(blocked));
+    assert.ok(blocked.every((w) => w.reason === 'other-group'));
+    assert.ok(!result.hosts.some((h: any) => h.host === 'localhost'), 'the refused host does not count as visited');
+    assert.equal(o.d.requests.length, 1, 'one dialog: the rules');
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则）。
+test('--profile a/t1 makes the profile directory a@t1 (0700) and status lists it after default', { timeout: 180_000 }, async () => {
+  const o = await startOwn(twoGroups, approving);
+  try {
+    const open = await openOwn(o, origin + '/index.html', '--profile', 'a/t1');
+    assert.equal(open.profile, 'a@t1');
+    const dir = join(o.h.profilesDir, 'a@t1');
+    assert.equal(statSync(dir).mode & 0o777, 0o700);
+    assert.ok(!existsSync(join(o.h.profilesDir, 'a')), 'the plain group profile was not created');
+    const status = JSON.parse((await o.run(undefined, 'status', '--json')).out);
+    assert.deepEqual(status.profiles.map((p: any) => p.name), ['default', 'a@t1']);
+    assert.equal(status.profiles[1].state, 'launched');
+    assert.match((await o.run(undefined, 'status')).out, /profile a@t1 /);
+    assert.equal((await o.run(undefined, 'close', open.session)).code, 0);
+    assert.equal(o.d.requests.length, 1, 'one dialog: the rules');
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则，被拒）。
+test('a refused rules change is a usage error, nothing opens, and the same change is not asked again', { timeout: 180_000 }, async () => {
+  const o = await startOwn({ version: 1, rules: [{ match: '127.0.0.1', mode: 'readonly' }], loginHosts: [] }, denying);
+  try {
+    const gate = await o.run(undefined, 'open', origin + '/ro.html');
+    assert.equal(gate.code, 21);
+    await settle();
+    const denied = await o.run(undefined, 'open', origin + '/ro.html');
+    assert.equal(denied.code, 2, denied.out + denied.err);
+    assert.ok((denied.out + denied.err).includes('人拒绝了这次规则改动'), denied.out + denied.err);
+    const third = await o.run(undefined, 'open', origin + '/ro.html');
+    assert.equal(third.code, 2, 'asking again changes nothing');
+    assert.equal(o.d.requests.length, 1, 'the same change is not shown a second time');
+    assert.deepEqual(JSON.parse((await o.run(undefined, 'status', '--json')).out).sessions, [], 'no page was ever opened');
+    const list = JSON.parse((await o.run(undefined, 'rule', 'list', '--json')).out);
+    assert.equal(list.approved, false);
+    assert.equal(list.pending, true, 'the file stays unapproved');
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则，弹不出）。fakeDialog() 缺省回 unavailable。
+test('a rules change whose dialog cannot be shown ends in exit 22 and stays 22', { timeout: 180_000 }, async () => {
+  const o = await startOwn({ version: 1, rules: [{ match: '127.0.0.1', mode: 'readonly' }], loginHosts: [] });
+  try {
+    const gate = await o.run(undefined, 'open', origin + '/ro.html');
+    assert.equal(gate.code, 21);
+    await settle();
+    const unavailable = await o.run(undefined, 'open', origin + '/ro.html');
+    assert.equal(unavailable.code, 22, unavailable.out + unavailable.err);
+    assert.ok((unavailable.out + unavailable.err).includes('弹不出批准框'), unavailable.out + unavailable.err);
+    assert.equal((await o.run(undefined, 'open', origin + '/ro.html')).code, 22, 'a dialog that cannot be shown does not come back by retrying');
+    assert.equal(o.d.requests.length, 1);
+    assert.deepEqual(JSON.parse((await o.run(undefined, 'status', '--json')).out).sessions, []);
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：3（规则批准、放行声明批准、另一条放行声明被拒）。
+test('group a is read-only with a readPosts endpoint: that POST arrives, any other is blocked, and step --allow needs 21, an approval and a retry (a refused one never arrives)', { timeout: 180_000 }, async () => {
+  const rules = {
+    version: 1, rules: [{ match: '127.0.0.1', mode: 'readonly' }], loginHosts: [],
+    groups: [{ name: 'a', hosts: ['127.0.0.1'], readPosts: [{ method: 'POST', url: origin + '/api/read-posts' }] }],
+  };
+  // 规则框按「批准」，放行框按「放行」（approving 只认「批准」键，放行框里没有，会按「拒绝」）
+  const allowing = (r: DialogRequest): DialogResult => (r.buttons.includes('放行') ? { kind: 'button', button: '放行' } : approving(r));
+  let answer: (r: DialogRequest) => DialogResult = allowing;
+  const o = await startOwn(rules, (r) => answer(r));
+  const hitsOf = (path: string): number => server.hits.filter((h) => h.path === path).length;
+  try {
+    const open = await openOwn(o, origin + '/declare.html');
+    assert.equal(open.mode, 'readonly');
+    const first = JSON.parse((await stepOwn(o, open.session, [
+      { op: 'click', target: '#read' }, { op: 'wait', for: { text: 'read:200' } },
+      { op: 'click', target: '#other' }, { op: 'wait', for: { text: 'other:403' } },
+    ])).out);
+    assert.equal(first.exit, 0);
+    await settle();
+    assert.equal(hitsOf('/api/read-posts'), 1, 'the readPosts endpoint got its POST');
+    assert.equal(hitsOf('/api/other'), 0, 'every other POST was blocked');
+
+    // 放行声明：第一次 21 且一个操作都不执行
+    const allow = JSON.stringify([{ method: 'POST', url: origin + '/api/declared' }]);
+    const clickDeclared = [{ op: 'click', target: '#declared' }, { op: 'wait', for: { text: 'declared:200' } }];
+    const gate = await stepOwn(o, open.session, clickDeclared, '--allow', allow);
+    assert.equal(gate.code, 21, gate.out + gate.err);
+    await settle();
+    assert.equal(hitsOf('/api/declared'), 0, 'nothing ran while the approval was pending');
+    const ok = await stepOwn(o, open.session, clickDeclared, '--allow', allow);   // 假对话框回了「放行」：原样重试
+    assert.equal(ok.code, 0, ok.out + ok.err);
+    await settle();
+    assert.equal(hitsOf('/api/declared'), 1, 'the approved declaration let the POST through');
+    const shown = o.d.requests[1]!;
+    assert.equal(shown.title.startsWith('e2k：放行写请求'), true);
+    assert.ok(shown.lines.some((l) => l.includes(`POST ${origin}/api/declared`)), 'the dialog shows the normalised method and URL');
+
+    // 另一条声明被人拒：重试是 usage，点击没有执行
+    answer = denying;
+    const denyAllow = JSON.stringify([{ method: 'POST', url: origin + '/api/denied' }]);
+    const clickDenied = [{ op: 'click', target: '#denied' }, { op: 'wait', for: { text: 'denied:' } }];
+    assert.equal((await stepOwn(o, open.session, clickDenied, '--allow', denyAllow)).code, 21);
+    await settle();
+    const refused = await stepOwn(o, open.session, clickDenied, '--allow', denyAllow);
+    assert.equal(refused.code, 2, refused.out + refused.err);
+    assert.ok((refused.out + refused.err).includes('人拒绝了这些放行声明'));
+    await settle();
+    assert.equal(hitsOf('/api/denied'), 0, 'a refused declaration lets nothing through');
+
+    const result = await closeOwn(o, open.session);
+    assert.deepEqual(result.declarations.map((d: any) => [d.method, d.url.slice(-13), d.approved]), [['POST', '/api/declared', 'dialog']]);
+    assert.equal(o.d.requests.length, 3, 'three dialogs: rules, declaration, refused declaration');
+  } finally {
+    await o.stop();
+  }
+});
+
+// 弹框数：1（规则）。
+test('an identity probe that does not match: open still hands the page over, the next step exits 22 and its click never reaches the server; a matching page is the control', { timeout: 180_000 }, async () => {
+  const rules = { version: 1, rules: [], loginHosts: [], groups: [{ name: 'a', hosts: ['127.0.0.1'], identity: { selector: '#who', expect: 'Test Tenant' } }] };
+  const o = await startOwn(rules, approving);
+  const fired = (): number => server.hits.filter((h) => h.path === '/api/identity-fired').length;
+  const click = [{ op: 'click', target: '#fire' }];
+  try {
+    // 对照：身份对得上，step 的点击照常发出去（默认模式，写都放行）
+    const good = await openOwn(o, origin + '/identity.html?who=Test%20Tenant');
+    assert.equal(good.identity, 'ok');
+    assert.equal((await stepOwn(o, good.session, click)).code, 0);
+    await until('the control click to arrive', () => fired() === 1);
+    assert.equal((await o.run(undefined, 'close', good.session)).code, 0);
+
+    const bad = JSON.parse((await o.run(undefined, 'open', origin + '/identity.html?who=Other%20Tenant', '--json')).out);
+    assert.equal(bad.identity, 'mismatch', 'open reports the mismatch so a person sees it');
+    const step = await stepOwn(o, bad.session, click);
+    assert.equal(step.code, 22, step.out + step.err);
+    assert.ok((step.out + step.err).includes('身份探针不符'), step.out + step.err);
+    await settle();
+    assert.equal(fired(), 1, 'the click of the refused step never reached the server (only the control hit is there)');
+    assert.equal((await stepOwn(o, bad.session, [{ op: 'snapshot' }])).code, 22, 'the session keeps refusing');
+    const result = await closeOwn(o, bad.session);
+    assert.equal(result.identity.mismatch, true);
+    assert.deepEqual(result.actions.map((a: any) => a.op.op), [], 'no operation of a refused step is on record');
+    assert.equal(o.d.requests.length, 1, 'one dialog: the rules');
+  } finally {
+    await o.stop();
   }
 });
 

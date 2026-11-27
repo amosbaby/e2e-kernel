@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Identity</title>
+</head>
+<body>
+<!-- 身份元素的文字取自查询串 ?who=（缺省 none）；按钮向 /api/identity-fired 发一次 POST，用来看「身份不符时 step 里的点击没发出去」。 -->
+<span id="who"></span>
+<button id="fire">fire</button>
+<script>
+  document.getElementById('who').textContent = new URLSearchParams(location.search).get('who') ?? 'none';
+  document.getElementById('fire').addEventListener('click', () => {
+    fetch('/api/identity-fired', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"term":"x"}' });
+  });
+</script>
+</body>
+</html>

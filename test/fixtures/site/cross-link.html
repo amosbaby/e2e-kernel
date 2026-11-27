@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture Cross-group Link</title>
+</head>
+<body>
+<!-- 点链接直接去另一个主机名（不经重定向）；用来测「顶层导航去了别的组的域名」被内核拦成 403。 -->
+<a id="go" href="{{ALT_ORIGIN}}/index.html">go</a>
+</body>
+</html>
