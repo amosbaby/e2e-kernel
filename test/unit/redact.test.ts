@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { REDACTED, isSensitiveKey, redactBody, redactDeep, redactText, redactUrl } from '../../src/shared/redact.ts';
+import { REDACTED, isSensitiveKey, redactBody, redactDeep, redactSelector, redactText, redactUrl } from '../../src/shared/redact.ts';
 
 // token 形态的串都在运行时拼，不写成字面量。
 const jwt = 'eyJ' + 'a'.repeat(21) + '.' + 'b'.repeat(24) + '.' + 'c'.repeat(24);
@@ -88,6 +88,130 @@ test('redactText: more token and url shapes', () => {
   assert.equal(redactText('note: a=1; b=2'), 'note: a=1; b=2');      // 不是整行 cookie 形态（第一段名字里有空白）
 });
 
+test('redactText: `name: value` mid-line, quoted names, numbers, entity quotes and encoded values', () => {
+  const S = 'Zq9xK';
+  const leaks = [
+    `login failed, password: ${S}, retry`,
+    `note password:${S}`,
+    `{"password": 12345678, "pin": 1}`,
+    `{"pin": 1, "token": 98765}`,
+    `{'password': '${S}'}`,
+    `{'token':'${S}'}`,
+    `token=&quot;${S}&quot;`,
+    `password=&#34;${S}&#34; x`,
+    `token=\\"${S}\\"`,
+    `?next=%252Ftoken%253D${S}`,
+    `q=%2526token%253D${S}`,
+    `?next=%2Ftoken%3D${S}`,
+    `a?b=1&next=%2Fcb%3Fpassword%3D${S}#x`,
+    `msg Authorization: Bearer ${S}`,
+  ];
+  for (const s of leaks) {
+    const out = redactText(s);
+    assert.ok(!out.includes(S) && !out.includes('12345678') && !out.includes('98765'), `${s} -> ${out}`);
+    assert.equal(redactText(out), out, `idempotent: ${s}`);
+  }
+  assert.equal(redactText('login failed, password: hunter, retry'), `login failed, password: ${REDACTED}, retry`);
+  assert.equal(redactText(`{"pin": 1, "token": 98765}`), `{"pin": 1, "token": ${REDACTED}}`);
+  assert.equal(redactText(`token=&quot;${S}&quot; next`), `token=&quot;${REDACTED}&quot; next`);
+  assert.equal(redactText('msg Authorization: Bearer abc'), `msg Authorization: Bearer ${REDACTED}`);
+  // 不敏感的不动：时间、端口、普通的 `名字: 值`、没编码秘密的编码值。
+  for (const s of ['at 12:30 ok', 'localhost:8080', 'note: a=1; b=2', 'status: done, user: x', '?next=%2Fhome%3Fa%3D1', 'a=%41%42']) {
+    assert.equal(redactText(s), s, s);
+  }
+  // 选择器里 `名字:伪类` 不是键值对；冒号后有空白才算。
+  for (const s of ['#auth:hover', 'input.password:focus', '[name=token]:visible']) assert.equal(redactSelector(s), s, s);
+  assert.equal(redactSelector('text=password: abc'), `text=password: ${REDACTED}`);
+});
+
+test('redactText: review follow-ups for `name: value`, quotes and encoded values', () => {
+  const S = 'Zq9xK';
+  const leaks = [
+    `x token: &quot;${S}&quot;`,
+    `x password: \\"${S}\\"`,
+    `token=\\'\\'${S}`,
+    `token=\\'a\\'${S}`,
+    `token='a'${S}`,
+    `xa=${S}; token:=y`,
+    `next=/cb?ret=token%3D${S}`,
+    `a=x%20y?n=c%3D1%3B%20b%3D${S}`,
+    `a=x?n=cookie%3A%20%2C${S}`,
+    `?next=%25252Ftoken%25253D${S}`,
+    `token=&#x22;${S}&#x22;`,
+    `?next=%ZZ%2Ftoken%3D${S}`,
+    `?n=a%3D${S}AbCdEf0123456789AbCdEf012345`,
+    `a=%2Fcb%3Ftoken%3Dx?token="${S}"`,
+    `d=%22?pw="${S}"`,
+    `a=%2Fx%3Fk%3D1?password="${S}" tail`,
+    `a=%2Fcb%3Ftoken%3Dx,token="${S}"`,
+    `a=%2Fcb%3Ftoken%3D?token=&quot;${S}&quot;`,
+    `a=%2Fcb%3Ftoken%3D?token=\\"${S}\\"`,
+    `a=%2F?token='${S} x'`,
+    `x token:123456789:AAEhBP0av28${S}`,
+    `x password:654321/${S}`,
+    `x config.password:${S}`,
+    `x #password:${S}`,
+    `x password: "${S}`,
+    `x token: &quot;${S}`,
+    `x password: "pa"${S}`,
+    `token='a';password="${S}"`,
+    `token="a",password="${S}"`,
+    `cfg(token="a",password="${S}")`,
+    `token="a";sid="${S}"`,
+    `token=&quot;&quot;token="${S}"`,
+    `token=&quot;a&quot;password=&quot;${S}&quot;`,
+  ];
+  for (const s of leaks) {
+    const out = redactText(s);
+    assert.ok(!out.includes(S), `${s} -> ${out}`);
+    assert.equal(redactText(out), out, `idempotent: ${s}`);
+  }
+  assert.equal(redactText(`x token: &quot;${S}&quot; y`), `x token: &quot;${REDACTED}&quot; y`);
+  assert.equal(redactText('a token: x"y'), `a token: ${REDACTED}"y`);
+  assert.equal(redactText('a token: x;y'), `a token: ${REDACTED};y`);
+  for (const q of ['&quot;', '&#34;', '&#x22;', '&#X22;', '&apos;', '&#39;', '&#x27;', '&#X27;', '\\"', "\\'"]) {
+    assert.equal(redactText(`token=${q}${S}${q} x`), `token=${q}${REDACTED}${q} x`, q);
+  }
+  assert.equal(redactSelector('form pw:checked'), 'form pw:checked');
+  assert.ok(!redactUrl(`https://h.example.com/p?next=/cb?ret=token%3D${S}`).includes(S));
+  for (const ct of ['text/plain', 'application/x-www-form-urlencoded']) {
+    assert.ok(!redactBody(`redirect=%2Fcb%3Ftoken%3D"${S}"`, ct)!.includes(S), ct);
+    assert.ok(!redactBody(`x=token%3D#${S}`, ct)!.includes(S), ct);
+  }
+  assert.ok(!redactUrl(`https://h.example.com/p?#t=TOKEN%3D#${S}`).includes(S));
+  assert.equal(redactText(`x token:99999:${S}`), `x token:${REDACTED}`);   // 超过 65535 不是端口
+  // 明显不该换的：没闭合的引号（多半是外面一段引号文本的结束引号）、host:port、自由文本里的 CSS 伪类。
+  for (const s of ['label "Password: " then x', 'dial tcp auth-service:50051: refused', '.password:focus {', 'a.token:hover{color:red}']) {
+    assert.equal(redactText(s), s, s);
+  }
+  assert.equal(redactText('connect auth:8080/health ok'), 'connect auth:8080/health ok');
+  for (const s of ['label:has-text("Password: ") >> input', 'internal:label="Password: "i', 'role=textbox[name="Password: "]']) {
+    assert.equal(redactSelector(s), s, s);
+  }
+});
+
+test('redactUrl: a token after another `=`, and values encoded more than once', () => {
+  const tok = 'Zq9xKAbCdEf0123456789AbCdEf0123456789xY';
+  assert.equal(redactUrl(`https://h.example.com/a?a=b=${tok}`), `https://h.example.com/a?a=${REDACTED}`);
+  assert.equal(redactUrl('https://h.example.com/a?next=%252Fcb%253Ftoken%253DZq9xK'), `https://h.example.com/a?next=${REDACTED}`);
+  assert.equal(redactUrl('https://h.example.com/a?next=%2Fhome'), 'https://h.example.com/a?next=%2Fhome');
+});
+
+test('redactText new rules stay fast on adversarial input', () => {
+  const inputs = ['password: '.repeat(30000), 'password:'.repeat(30000), 'a: '.repeat(30000), 'a' + ' '.repeat(1e5) + ':',
+    '"password": "'.repeat(30000), "password: '" + 'a'.repeat(1e5), 'token=&quot;'.repeat(30000), 'token=&quot;' + 'a'.repeat(1e5),
+    'token=\\"'.repeat(30000), '?a=%41'.repeat(30000), 'x;a=%41'.repeat(30000), '?a=%41?a=%41'.repeat(15000), 'a=' + '%2525'.repeat(30000),
+    '?a=' + '%41'.repeat(50000), '-'.repeat(1e5) + ': x', ('a'.repeat(70) + ':').repeat(2000),
+    "token='';pw='';".repeat(20000), 'token="a",'.repeat(30000), 'a=%2Ftoken%3Dx?token="a"'.repeat(10000)];
+  // 每个输入单独限时：平方级退化在这些长度下要十几秒以上，机器忙时正常输入也可能接近 1 秒。
+  for (const s of inputs) {
+    const start = performance.now();
+    redactText(s);
+    const ms = performance.now() - start;
+    assert.ok(ms < 3000, `${JSON.stringify(s.slice(0, 20))}… took ${ms.toFixed(0)}ms`);
+  }
+});
+
 test('redactText stays fast on adversarial input', () => {
   const inputs = ['eyJ'.repeat(20000), 'a'.repeat(60000) + '!', '?'.repeat(30000) + '=', '&a'.repeat(30000),
     '://'.repeat(20000), '://a:' + 'b:'.repeat(30000), 'Bearer '.repeat(10000), ('A1b-'.repeat(10) + '.').repeat(5000),
@@ -120,7 +244,7 @@ test('redactUrl: fragment-only, encoded names, unparseable, user name only', () 
 test('redactBody: sniffing, invalid json, quotes, truncation size', () => {
   assert.equal(redactBody('{"password":"p3"}', 'text/plain;charset=UTF-8'), '{"password":"[REDACTED]"}');
   assert.ok(!redactBody('password=p4&x=1', null)!.includes('p4'));
-  assert.equal(redactBody('{"password": broken', 'application/json'), '{"password": broken');
+  assert.equal(redactBody('{"password": broken', 'application/json'), '{"password": [REDACTED]');   // 无效 JSON 走自由文本，`名字: 值` 也换
   assert.equal(redactBody('[1,"ok"]', 'application/vnd.api+json'), '[1,"ok"]');
   assert.equal(redactBody('abc', 'text/plain', 2), 'ab…[truncated 3]');
   assert.equal(redactBody('', 'text/plain'), '');
@@ -279,4 +403,223 @@ test('sensitive header lines: non-ascii, symbol-only, line separators, underscor
   assert.equal(redactText('api_key: v1'), 'api_key: [REDACTED]');
   assert.equal(redactText('client_secret: v1\nok: 1'), 'client_secret: [REDACTED]\nok: 1');
   assert.equal(redactText('Authorization: Bearer [REDACTED]'), 'Authorization: Bearer [REDACTED]');
+});
+
+test('redactSelector: an unquoted attribute value ends at its closing bracket, so the rest of the selector survives', () => {
+  assert.equal(redactSelector('[data-auth=primary][type=button]'), `[data-auth=${REDACTED}][type=button]`);
+  assert.equal(redactSelector('div[data-token-state=ready] > span'), `div[data-token-state=${REDACTED}] > span`);
+  assert.equal(redactSelector('[data-auth="primary"][type=button]'), `[data-auth=${REDACTED}][type=button]`);
+  assert.equal(redactSelector('input[type=password]'), 'input[type=password]');
+  assert.equal(redactSelector(`text=${jwt}`), `text=${REDACTED}`);
+  // 值里成对的方括号算值的一部分：已脱敏的结果再过一遍不变，`[REDACTED]` 后面藏的东西也一起换掉。
+  for (const sel of ['[data-auth=primary][type=button]', '[token=a[b]c]', '[token=[REDACTED]tail][x=1]']) {
+    const once = redactSelector(sel);
+    assert.equal(redactSelector(once), once, sel);
+  }
+  assert.equal(redactSelector('[token=[REDACTED]tail][x=1]'), `[token=${REDACTED}][x=1]`);
+  // CSS 转义：反斜杠连同下一个字符算进值，`\\]` 不结束值。
+  assert.equal(redactSelector('[data-token=ab\\]cd][x=1]'), `[data-token=${REDACTED}][x=1]`);
+  assert.equal(redactSelector('[token=a\\[b][x=1]'), `[token=${REDACTED}][x=1]`);
+  assert.equal(redactSelector('[token=a\\'), `[token=${REDACTED}`);
+  for (const esc of [' ', '"', '#', '&', '<', '>']) assert.equal(redactSelector(`[data-token=ab\\${esc}cd][x=1]`), `[data-token=${REDACTED}][x=1]`, esc);
+  assert.equal(redactSelector(redactSelector('[data-token=ab\\]cd][x=1]')), `[data-token=${REDACTED}][x=1]`);
+  // 找不到配对的 `]`：换到串尾（失败关闭）。
+  assert.equal(redactSelector('[token=a[b'), `[token=${REDACTED}`);
+  // `=` 两边有空白、CSS 运算符、引号混在值里、值里有空白：都换到配对的 `]`。
+  const cases: Array<[string, string]> = [
+    ['[data-token = secret][x=1]', `[data-token = ${REDACTED}][x=1]`],
+    ['[ data-token=secret ][x=1]', `[ data-token=${REDACTED}][x=1]`],
+    ['[data-token^=abc][x=1]', `[data-token^=${REDACTED}][x=1]`],
+    ['[data-token *= "abc"][x=1]', `[data-token *= ${REDACTED}][x=1]`],
+    ['[data-token|=abc i][x=1]', `[data-token|=${REDACTED}][x=1]`],
+    ['[token="ab"cd][x=1]', `[token=${REDACTED}][x=1]`],
+    ['[token="a]b"][x=1]', `[token=${REDACTED}][x=1]`],
+    ["[token='a]b'][x=1]", `[token=${REDACTED}][x=1]`],
+    ['[token=ab cd][x=1]', `[token=${REDACTED}][x=1]`],
+  ];
+  for (const [sel, want] of cases) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // 精确匹配的敏感名加运算符（名字不能把运算符吞进去）。
+  assert.equal(redactSelector('[pw^=secret][x=1]'), `[pw^=${REDACTED}][x=1]`);
+  assert.equal(redactSelector('[sid |= abc][x=1]'), `[sid |= ${REDACTED}][x=1]`);
+  // 不紧跟 `[` 的 `名字=`：换到串尾，不在 `]` 处停下（失败关闭）。
+  for (const sel of ['[ a]token=abc]def', '#x token=ab]cd', 'a[href="/cb?token=abc]def"]', 'div;token=ab]cd ef', 'text=x&token=ab]cd', 'token=ab]cd']) {
+    const out = redactSelector(sel);
+    assert.ok(out.endsWith(REDACTED) && !out.includes('cd') && !out.includes('def'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out);
+  }
+  assert.equal(redactSelector('#x token=abc >> div[x=1]'), `#x token=${REDACTED}`);
+  // 名字里的 CSS 转义、命名空间前缀、XPath 的 `@`、`-`/`_` 分段里的精确敏感名：先还原名字再判断。
+  const named: Array<[string, string]> = [
+    ['[t\\oken=secret][x=1]', `[t\\oken=${REDACTED}][x=1]`],
+    ['[\\74oken=secret][x=1]', `[\\74oken=${REDACTED}][x=1]`],
+    ['[\\74 oken=secret][x=1]', `[\\74 oken=${REDACTED}][x=1]`],
+    ['[\\000074oken = secret][x=1]', `[\\000074oken = ${REDACTED}][x=1]`],
+    ['[\\000070ass=secret][x=1]', `[\\000070ass=${REDACTED}][x=1]`],
+    ['[token| =secret][x=1]', `[token| =${REDACTED}][x=1]`],
+    ['[\\apikey =secret][x=1]', `[\\apikey =${REDACTED}][x=1]`],
+    ['[a\\[pw = secret][x=1]', `[a\\[pw = ${REDACTED}][x=1]`],
+    ['[a\\[pw^=secret][x=1]', `[a\\[pw^=${REDACTED}][x=1]`],
+    ['\\[a\\[ pw = secret][x=1]', `\\[a\\[ pw = ${REDACTED}][x=1]`],
+    ['[ns|pw=secret][x=1]', `[ns|pw=${REDACTED}][x=1]`],
+    ['[*|pw^=secret][x=1]', `[*|pw^=${REDACTED}][x=1]`],
+    ['[|sid=secret][x=1]', `[|sid=${REDACTED}][x=1]`],
+    ['[data-pw=secret][x=1]', `[data-pw=${REDACTED}][x=1]`],
+    ['[data_pass="secret"][x=1]', `[data_pass=${REDACTED}][x=1]`],
+    ['xpath=//input[@pw = "secret"]', `xpath=//input[@pw = ${REDACTED}]`],
+  ];
+  for (const [sel, want] of named) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // CSS 注释当空白；XPath 的 `!=`、`@前缀:名字`；`.`、`:` 也是分段符。
+  const more: Array<[string, string]> = [
+    ['[pw/**/=secret][x=1]', `[pw/**/=${REDACTED}][x=1]`],
+    ['[/* c */pw /* c */= secret][x=1]', `[/* c */pw /* c */= ${REDACTED}][x=1]`],
+    ['xpath=//input[@ns:pw="secret"]', `xpath=//input[@ns:pw=${REDACTED}]`],
+    ['xpath=//input[@pw!="secret"]', `xpath=//input[@pw!=${REDACTED}]`],
+    ['[data.pw=secret][x=1]', `[data.pw=${REDACTED}][x=1]`],
+  ];
+  for (const [sel, want] of more) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // 敏感名后面的注释没闭合：从名字结尾换到串尾（失败关闭）。
+  assert.equal(redactSelector('[pw/* =secret][x=1]'), `[pw${REDACTED}`);
+  // 认注释不能比不认注释时漏得多：开头注释没闭合、注释里的 `[`、名字中间的注释、前缀里非法的 `%`、值里注释中的 `]`。
+  for (const sel of [
+    '[/*-pw =secret', '[/*sessionid =secret', '[x=1][/*/data-pw $= "secret" ]',
+    '[/* [pw = secret] */ x]', '[pw /* [token = secret] */ = secret]',
+    '[x/**/-pw = secret]', '[&/**/data_pass ^= secret]',
+    '[%|p%77=secret', '[x%|p%61ss=secret][a=1]', '[%|%61pi_key=secret]', '[a%|%61pi-key=secret]', '[data%2epw=secret]',
+    '[pw=/*]*/secret]',
+  ]) {
+    const out = redactSelector(sel);
+    assert.ok(!out.includes('secret'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out, `idempotent: ${sel}`);
+  }
+  assert.equal(redactSelector('xpath=//input[@pw !="secret"]'), `xpath=//input[@pw !=${REDACTED}]`);
+  // 无效但可能出现的写法：`]` 紧贴下一个 `名字=`；注释把敏感名从中间切开。
+  for (const sel of ['[token]=secret', 'pw]=secret', '[pw]x=secret', 'pass]word=secret', '[a=1]pw]x=secret', 'pw]^=secret', '[a]token]=secret', '[pw=1]sessionid=secret', '[@pw=]sessionid=secret', '[x=1]token=secret', '[t/*x*/oken=secret]', '[t/*x*/oken = secret][a=1]', 't/*x*/oken=secret', '[p/**/w=secret]',
+    '[t/*x*/oken /**/=secret]', '[ t/*x*/oken /*y*/=secret]', '[p/* a b */w=secret]', '[/**/ p/**/w =secret]', '[pw]x=a][b="secret"]']) {
+    const out = redactSelector(sel);
+    assert.ok(!out.includes('secret'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out, `idempotent: ${sel}`);
+  }
+  // 敏感值在 `]` 处结束、但 `]` 后面的字符不可能接在属性选择器后面：值里那个 `]` 是值的一部分，换到串尾。
+  // 运算符和 `=` 之间有空白、括号外名字和 `=` 之间有空白，也算。
+  const tail: Array<[string, string]> = [
+    ['[token=/a]b/]', `[token=${REDACTED}`],
+    ['[data-token=a]b][x=1]', `[data-token=${REDACTED}`],
+    ['[pw="a"]b"secret"]', `[pw=${REDACTED}`],
+    ['[pw ^ =secret][x=1]', `[pw ^ =${REDACTED}][x=1]`],
+    ['xpath=//input[@pw ! = "secret"]', `xpath=//input[@pw ! = ${REDACTED}]`],
+    ['text=password = secret', `text=password = ${REDACTED}`],
+    ['#x pw =secret >> div', `#x pw =${REDACTED}`],
+    ['pw] =secret', `pw] =${REDACTED}`],
+    ['[pw=a]"secret"]', `[pw=${REDACTED}`],
+    ['[pw ^ /**/ =secret]', `[pw ^ /**/ =${REDACTED}]`],
+    ['[pw $/*=secret', `[pw $${REDACTED}`],
+    ['#x pw /**/ =secret', `#x pw /**/ =${REDACTED}`],
+    ['text=password /* c */= secret', `text=password /* c */= ${REDACTED}`],
+    ['[pw ^ ^=secret][x=1]', `[pw ^ ^=${REDACTED}][x=1]`],
+    ['[pw ~|=secret][x=1]', `[pw ~|=${REDACTED}][x=1]`],
+    ['#x t/*x*/oken=a] secret', `#x t/*x*/oken=${REDACTED}`],
+    ['#x */pw=secret] secret', `#x */pw=${REDACTED}`],
+    ['text=/* a */pw=secret] secret', `text=/* a */pw=${REDACTED}`],
+    ['div a*/pw!=a] secret', `div a*/pw!=${REDACTED}`],
+    ['text=x /*pw*/= secret', `text=x /*pw*/= ${REDACTED}`],
+    ['[a /*x pw*/=secret]', `[a /*x pw*/=${REDACTED}`],
+    ['#x a /* token*/=secret; b', `#x a /* token*/=${REDACTED}`],
+    ['[/* a */ b */pw=1][y=1]', `[/* a */ b */pw=${REDACTED}`],
+    ['[/* q */ x */ pw = 1] secret', `[/* q */ x */ pw = ${REDACTED}`],
+    ['[/* c pw=1] secret', `[/* c pw=${REDACTED}`],
+    ['a>]token =secret', `a>]token =${REDACTED}`],
+    ['a>]token=secret', `a>]token=${REDACTED}`],
+  ];
+  for (const [sel, want] of tail) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // `]` 后面是合法的接续字符时，值照旧在 `]` 处结束。
+  const keepTail: Array<[string, string]> = [
+    ['[data-token=x]:visible', `[data-token=${REDACTED}]:visible`],
+    ['//input[@pw="x"]/..', `//input[@pw=${REDACTED}]/..`],
+    ['//a[b[@pw=1]]/c', `//a[b[@pw=${REDACTED}]]/c`],
+    ['[pw=x] >> text=a', `[pw=${REDACTED}] >> text=a`],
+    ['a[pw=x].b#c+d~e,f', `a[pw=${REDACTED}].b#c+d~e,f`],
+    [':is([pw=x])', `:is([pw=${REDACTED}])`],
+    ...['#', '>', '+', '~', ','].map((c): [string, string] => [`[pw=x]${c}a`, `[pw=${REDACTED}]${c}a`]),
+    ['[/* c */ pw /* c */= x][y=1]', `[/* c */ pw /* c */= ${REDACTED}][y=1]`],
+    ['[/* a */ /* b */pw /* c */ = x][y=1]', `[/* a */ /* b */pw /* c */ = ${REDACTED}][y=1]`],
+    ['[ /* c */pw = x][y=1]', `[ /* c */pw = ${REDACTED}][y=1]`],
+    ['[/* a */ /* b */ /* c */pw = x][y=1]', `[/* a */ /* b */ /* c */pw = ${REDACTED}][y=1]`],
+    ['//a[@pw="x"]|//b', `//a[@pw=${REDACTED}]|//b`],
+  ];
+  for (const [sel, want] of keepTail) assert.equal(redactSelector(sel), want, sel);
+  for (const sel of ['[type ^ =x]', 'text=Sign in = ok', '[x=1]>a', 'div[a="1"]:has-text("x")','[a=1][b=2]', '[title="a/* b */c"]', '[data-x/**/=1]']) assert.equal(redactSelector(sel), sel);
+  // 路径或文字里按分段认出的精确敏感名：换到串尾。
+  for (const sel of ['[href="/cb/pw=secret"][x=1]', 'text=data-pw=secret >> div']) {
+    const out = redactSelector(sel);
+    assert.ok(out.endsWith(REDACTED) && !out.includes('secret'), `${sel} -> ${out}`);
+  }
+  // 含 `; ` 的选择器（会碰到自由文本的 cookie 行规则）也要幂等。
+  for (const sel of ['[token=x]; s=', '[a=1]; [token=x]; b=2', 'text=a=1; token=b']) {
+    const once = redactSelector(sel);
+    assert.equal(redactSelector(once), once, sel);
+    assert.ok(!once.includes('token=x') && !once.includes('token=b'), `${sel} -> ${once}`);
+  }
+  // 引号里、或紧跟 `=` 的 `名字=`（`text=token=…`、可访问名里的 `token=…`）：换到串尾。
+  for (const sel of ['role=textbox[name="token=abc"]', 'text="token=abc"', "text='token=abc'", ':has-text("token=abc")', 'text=token=abc >> div']) {
+    const out = redactSelector(sel);
+    assert.ok(out.endsWith(REDACTED) && !out.includes('abc'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out);
+  }
+  // 不敏感的照旧（含转义名、引号里的 `名字=`）。
+  for (const sel of ['[d\\61ta-x=1][y=2]', '[data-x="a=b"]', 'role=button[name="Author=me"]', '[data-passage=1]', 'text="Sign in"', 'a[href="/cb/path=1"]', '[a/**/=1][b=2]']) {
+    assert.equal(redactSelector(sel), sel);
+  }
+  // 引号没闭合：换到串尾（失败关闭）。
+  assert.equal(redactSelector('[token=ab"cd][x=1]'), `[token=${REDACTED}`);
+  assert.equal(redactSelector('[data-token = "abc][x=1]'), `[data-token = ${REDACTED}`);
+  // 名字不敏感的照旧。
+  assert.equal(redactSelector('[type = "password"][x=1]'), '[type = "password"][x=1]');
+  assert.equal(redactSelector('role=button[name = "Submit order"]'), 'role=button[name = "Submit order"]');
+  // 自由文本不受影响：`]` 不结束值。
+  assert.equal(redactText('[data-auth=primary][type=button]'), `[data-auth=${REDACTED}`);
+});
+
+test('redactDeep selectorKeys: strings under those keys (also nested, also in arrays) use the selector rule', () => {
+  const v = { target: '[data-auth=a][b=c]', mask: ['[data-auth=a][b=c]'], other: '[data-auth=a][b=c]', t: { given: '[data-auth=a][b=c]' },
+    given: { note: '[data-auth=a][b=c]' } };
+  const out = redactDeep(v, { selectorKeys: ['target', 'mask', 'given'] });
+  // 只看字符串所在的键（数组沿用键）：选择器键下面的对象里，别的键照常按自由文本处理。
+  assert.deepEqual(out, { target: `[data-auth=${REDACTED}][b=c]`, mask: [`[data-auth=${REDACTED}][b=c]`], other: `[data-auth=${REDACTED}`,
+    t: { given: `[data-auth=${REDACTED}][b=c]` }, given: { note: `[data-auth=${REDACTED}` } });
+  assert.equal(redactDeep({ target: 'Ab1'.repeat(14) }, { selectorKeys: ['target'] }).target, REDACTED);
+});
+
+test('redactSelector stays fast on adversarial input', () => {
+  const inputs = ['[token=' + '['.repeat(1e5), '[token=['.repeat(30000), '[token=]'.repeat(30000), '[a=['.repeat(30000),
+    '[token=' + '[]'.repeat(50000), '[token=' + ']'.repeat(1e5), '[token=a'.repeat(30000) + ']', '[token=' + '\\'.repeat(1e5), '[token=\\'.repeat(30000),
+    '[' + 'a'.repeat(1e5), '[a '.repeat(30000), '[ '.repeat(30000), '[a^'.repeat(30000), '[token = "'.repeat(30000),
+    '[token="' + '\\'.repeat(1e5), '[token = ['.repeat(30000), '[token="' + ']'.repeat(1e5), "[a='".repeat(30000),
+    '[' + '\\1'.repeat(50000), '[' + '\\111111'.repeat(30000), '[\\'.repeat(30000), '"a='.repeat(30000), "'a=".repeat(30000),
+    '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5),
+    '[a /*'.repeat(30000), '[a /* '.repeat(30000) + '*/', '/*'.repeat(50000), '[pw/*'.repeat(30000), '[a/**/'.repeat(30000), 'a=1; '.repeat(30000),
+    ']a'.repeat(20000), ']a='.repeat(10000), '[t/*'.repeat(30000), '[a/*'.repeat(30000), 't/*x*/'.repeat(10000) + '=', '[' + 't/*x*/'.repeat(10000) + '=x]',
+    '[a ^ '.repeat(30000), 'pw '.repeat(30000), '[pw=x]b'.repeat(30000), 'a ='.repeat(30000),
+    'x /*'.repeat(30000), 'x /* x'.repeat(30000), 'x /**/ '.repeat(30000),
+    '/**/ '.repeat(30000), '/**/'.repeat(30000), '/* x */ '.repeat(30000), '/* a*/ '.repeat(30000), '\t/*|"*/ '.repeat(30000),
+    '*/ /*pw,^x'.repeat(20000), ',*/\t/*^'.repeat(20000), 'x|\t/*/\t;)a*/'.repeat(15000),
+    '^ /*[ /**/ *'.repeat(20000), ' ^ /*[ /**/ *'.repeat(20000), ' /**/ */*)[/* "'.repeat(20000), '!/* |[, /**/'.repeat(20000), '[ ^ /*[*/ ^ '.repeat(20000), '[a' + ' /* [ */'.repeat(30000), '[a' + ' /*[*/'.repeat(30000), 'a' + ' /**/'.repeat(30000), 'pw' + ' /*x*/'.repeat(30000), 'x' + '\t/**/\t'.repeat(30000), '[a ^ ^ '.repeat(30000), '[pw ^'.repeat(30000) + '^'.repeat(30000)];
+  // 每个输入单独限时：平方级退化在这些长度下要十几秒以上；机器很忙（load 50）时正常输入也可能接近 1 秒，所以每个上限 3 秒、不用总预算。
+  for (const s of inputs) {
+    const start = performance.now();
+    redactSelector(s);
+    const ms = performance.now() - start;
+    assert.ok(ms < 3000, `${JSON.stringify(s.slice(0, 20))}… took ${ms.toFixed(0)}ms`);
+  }
 });

@@ -6,7 +6,7 @@ import { READ_OPS } from '../shared/ops.ts';
 import type { Op, Viewport } from '../shared/ops.ts';
 import { tally } from '../shared/protocol.ts';
 import type { ConflictReason, Finding, Mode, Supersede, Tallies, Verdict } from '../shared/protocol.ts';
-import { redactText, safely } from '../shared/redact.ts';
+import { redactSelector, safely } from '../shared/redact.ts';
 
 // 一场会话的结果（设计 5.3「留痕」）。字段名不得是脱敏意义上的敏感键（名字里不能带 auth、token 一类的片段）：
 // 否则 writeRun 的脱敏会把整个值换掉。
@@ -100,7 +100,7 @@ function isNonAction(op: Op['op']): boolean {
 }
 
 function targetText(a: ActionRecord): string | null {
-  return a.target === undefined ? null : safely(() => redactText(a.target!.given));
+  return a.target === undefined ? null : safely(() => redactSelector(a.target!.given));
 }
 
 // 对着记录校验 agent 声明的「谁取代谁」，并补上两边的操作名和目标（不信 agent 给的）。不合格抛 usage，不回显任何给定的值。

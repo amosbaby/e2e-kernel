@@ -2,13 +2,13 @@ import type { ActionRecord, WriteRecord } from '../kernel/recorder.ts';
 import { escapeHtml } from '../shared/escape.ts';
 import { conflictText } from '../shared/protocol.ts';
 import type { Outcome, VerdictValue } from '../shared/protocol.ts';
-import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
+import { REDACTED, redactBody, redactSelector, redactText, redactUrl, safely } from '../shared/redact.ts';
 import type { BlockedSummaryRow, ClosedBy, DeclarationRecord, RunResult, SupersededEntry } from './result.ts';
 import type { ModeChange } from '../kernel/recorder.ts';
 
 // 报告页（设计 5.3）。纯函数，不含脚本，不引外部资源。
 // 页面内容的处理顺序固定：先脱敏、再截断、最后 escapeHtml。脱敏出错时给固定标记，绝不输出原值。
-// 内核自己的值（会话名、选择器、路径、操作名）不脱敏，只 escapeHtml。
+// 内核自己的值（会话名、路径、操作名）不脱敏，只 escapeHtml。选择器在 store.ts 的 sanitize 里已经按选择器规则脱敏过，这里再过一遍并转义。
 
 const CSP = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'";
 const SHOT_PATH = /^shots\/\d{2,}(-[a-z0-9][a-z0-9-]{0,39})?\.(jpg|png)$/;
@@ -47,6 +47,11 @@ function clip(s: string, max: number): string {
 // 页面内容：脱敏 → 截断 → 转义。非字符串进 redactText 会抛错，同样落到固定标记。
 function page(v: unknown, max = DISPLAY_MAX): string {
   return escapeHtml(clip(safely(() => redactText(v as string)), max));
+}
+
+// 选择器：同样脱敏 → 截断 → 转义，只是按选择器的规则（`[名字=值]` 不吞掉后面的选择器）。
+function pageSelector(v: unknown): string {
+  return escapeHtml(clip(safely(() => redactSelector(v as string)), DISPLAY_MAX));
 }
 
 function pageUrl(v: unknown): string {
@@ -144,7 +149,7 @@ function writesSection(r: RunResult): string {
 
 // profile：key 是 `组` 或 `组@槽`；借用别的组的登录时注明。
 function profileBlock(r: RunResult): string {
-  return `<div id="mode-profile"><h3>profile</h3><p>profile ${own(r.start.profile)}${r.start.borrowed === true ? '（借用）' : ''}</p></div>`;
+  return `<div id="mode-profile"><h3>profile</h3><p>profile ${page(r.start.profile)}${r.start.borrowed === true ? '（借用）' : ''}</p></div>`;
 }
 
 // 放行声明：字段按页面内容处理（脱敏、转义），不认识的批准方式落到「未知」。
@@ -162,7 +167,7 @@ function declarationsBlock(r: RunResult): string {
 function identityBlock(r: RunResult): string {
   const id = r.identity;
   if (id === null || id === undefined || typeof id !== 'object' || Array.isArray(id)) return '';
-  const counts = `<p>组 ${own(id.group)}：核对 ${own(id.checks)} 次，跳过 ${own(id.skipped)} 次（登录墙、页面不在本组的主机上、借用时不核对）</p>`;
+  const counts = `<p>组 ${page(id.group)}：核对 ${own(id.checks)} 次，跳过 ${own(id.skipped)} 次（登录墙、页面不在本组的主机上、借用时不核对）</p>`;
   return '<div id="identity"><h3>身份探针</h3>'
     + (id.mismatch === true ? '<p id="identity-mismatch" class="flag">身份不符：页面上的账号或租户不是组配置里期望的那个，这场会话在不符之后没有执行任何操作</p>' : '<p>未发现不符</p>')
     + `${counts}</div>`;
@@ -226,7 +231,7 @@ function recoveries(r: RunResult): SupersededEntry[] {
 }
 
 function opWithTarget(seq: unknown, op: unknown, target: unknown): string {
-  return `序号 ${own(seq)} ${own(op)}${typeof target === 'string' ? ` <code>${page(target)}</code>` : ''}`;
+  return `序号 ${own(seq)} ${own(op)}${typeof target === 'string' ? ` <code>${pageSelector(target)}</code>` : ''}`;
 }
 
 function recoveredItem(e: SupersededEntry, sharedBy: number): string {

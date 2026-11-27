@@ -29,8 +29,8 @@ export function exitCodeFor(code: ErrorCode): number {
 
 // 脱敏时值是字符串就原样保留的键（传给 redactDeep 的 skipKeys）。这些键下的值都是内核自己产生的标识和路径，
 // 或调用方给定的标识；来自页面的字符串不得放在这些键下面。
-// 已知的边界：target、given、selector 的值是 agent 写的或内核生成的选择器，里面可能带页面上的文字
-// （data-testid、id、可访问名）。为了能重放，它们必须原样保留。
+// target、given、selector 的值是 agent 写的或内核生成的选择器，里面可能带页面上的文字
+// （data-testid、id、可访问名）。给 agent 的回应里原样保留，便于重放；落盘时（report/store.ts）不在跳过之列，照常脱敏。
 // 不收 host：主机名照常过脱敏。
 export const KERNEL_SKIP_KEYS: readonly string[] = Object.freeze([
   'session', 'name', 'id', 'loginId', 'home', 'runDir', 'reportPath', 'resultPath', 'shot', 'target', 'given', 'selector',
