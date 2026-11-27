@@ -12,7 +12,7 @@
 
 ## 最小流程：open、step、close
 
-内核要先在运行，CLI 不会替你启动它；退出码 22 且提示「内核没在跑」时，让人运行 `node bin/e2k.js start`（前台运行，可放后台），任务允许时也可自己放到后台启动。
+内核要先在运行，CLI 不会替你启动；退出码 22 且提示「内核没在跑」时，让人运行 `node bin/e2k.js start`（前台运行，可放后台），任务允许时可自己放到后台启动。
 
 ```sh
 node bin/e2k.js open http://localhost:3000/ --name smoke
@@ -26,7 +26,7 @@ node bin/e2k.js step s-1a2b3c '[{"op":"click","target":"e7"},{"op":"assert","kin
 
 `step` 的第二个参数是 JSON 数组，一次最多 50 个操作、最多 1,000,000 字节；操作里有引号或批量很大时改用标准输入：`echo '[…]' | node bin/e2k.js step s-1a2b3c --stdin`。
 
-最后用 `close` 收尾并写报告（参数见下文），如 `node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by one"`。一个操作数组的例子（纯 JSON，可直接当 `step` 的参数）：
+最后用 `close` 收尾并写报告（参数见下文），如 `node bin/e2k.js close s-1a2b3c --verdict pass --because "the item list grew by one"`。操作数组的例子（纯 JSON，可直接当 `step` 的参数）：
 
 ```json
 [
@@ -111,7 +111,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 - `--superseded` 先对照内核的记录：`failed` 必须是失败或未执行的操作（断言不符永远不能被取代），`by` 必须是之后完成或符合的操作，同一个 `failed` 不能出现两次。不合格是 usage 错误（2），会话仍开着，改好再 `close`。
 - 内核只标记一种矛盾：结论是 `pass`，但记录里还有断言不符、没被取代的动作失败或未执行、`--not-done` 里有条目、或某条发现自己的 verdict 是 `fail`。这会报为冲突，原因在输出和 `result.json` 的 `conflicts` 里。别靠隐瞒避开，如实写 `--not-done` 和 `--findings`，该 `undetermined` 就写 `undetermined`。
 - `close` 的退出码只有 0 和 10（只看断言不符）。
-- 会话空闲 15 分钟、内核停止、浏览器或页面没了，报告也会自动写出，但没有你的结论，请自己 `close`。
+- 会话空闲 15 分钟、内核停止、浏览器或页面没了，报告也会自动写出，但没有结论，请自己 `close`。
 
 ## 退出码
 
@@ -133,7 +133,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 20 是启发式提示，不是故障：会话仍在运行，记录原样保留。
 
 1. 停下，不要尝试填密码，也不要用 `press` 逐键输入或 `eval` 给输入框赋值去绕开。
-2. 告诉人：需要在专用 profile 里登录，请在终端运行 `node bin/e2k.js login <起始 URL>`，登录后按回车。没列进规则的主机，人第一次登录会弹框选「默认 / 只读」，`login` 最多等 120 秒；不要替人选。
+2. 告诉人：需要在专用 profile 里登录，请在终端运行 `node bin/e2k.js login <起始 URL>`，登录后按回车。主机没列进规则时，人会先在两步弹框里选「默认 / 只读 / 不允许」，`login` 每步最多等 120 秒；不要替人选。
 3. 人登录完，再 `open` 一个新会话继续（cookie 留在 profile 里）。页面本来就该有密码框（如改密码页）时，20 可以忽略。
 
 ## 只读模式
