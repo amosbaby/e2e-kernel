@@ -1572,3 +1572,33 @@ test('touch: closing a touch page detaches its CDP session exactly once, and a p
     assert.equal(detached, 1);
   });
 });
+
+// 每个 profile 一个实例：两个持久化 context 同时跑，请求各归各的实例、页面 id 不重复、关一个不影响另一个。
+test('two persistent instances run side by side: requests are attributed to their own instance, page ids differ, closing one leaves the other alive', { timeout: 120_000 }, async () => {
+  const a = await driver.launch({ name: 'admin', userDataDir: makeTmp('e2k-pw-a-') });
+  const b = await driver.launch({ name: 'admin@t1', userDataDir: makeTmp('e2k-pw-b-') });
+  try {
+    const seenA: RequestInfo[] = []; const seenB: RequestInfo[] = [];
+    const closed = { a: 0, b: 0 };
+    a.setRequestHandler((r) => { seenA.push(r); return { action: 'continue' }; });
+    b.setRequestHandler((r) => { seenB.push(r); return { action: 'continue' }; });
+    a.onClosed(() => { closed.a++; }); b.onClosed(() => { closed.b++; });
+    const pa = await a.openPage({}); const pb = await b.openPage({});
+    assert.notEqual(pa.id, pb.id);
+    await pa.goto(server.origin + '/index.html'); await pb.goto(server.origin + '/index.html');
+    await pa.evaluate(`fetch('/api/ids?who=a', { method: 'POST', body: 'a=1' }).catch(() => {}); 1`);
+    await pb.evaluate(`fetch('/api/ids?who=b', { method: 'POST', body: 'b=1' }).catch(() => {}); 1`);
+    await until(() => seenA.some((r) => r.url.includes('who=a')) && seenB.some((r) => r.url.includes('who=b')));
+    assert.ok(!seenA.some((r) => r.url.includes('who=b')) && !seenB.some((r) => r.url.includes('who=a')));
+    assert.ok(seenA.every((r) => r.pageId === pa.id) && seenB.every((r) => r.pageId === pb.id));
+    const ids = [...seenA, ...seenB].map((r) => r.id);
+    assert.equal(new Set(ids).size, ids.length, 'request ids are unique across instances');
+    await a.stop();
+    await until(() => closed.a === 1);
+    assert.equal(closed.b, 0);
+    assert.equal((await b.health()).ok, true);
+    assert.equal(await pb.evaluate('1 + 1'), 2);
+  } finally {
+    await a.stop().catch(() => {}); await b.stop().catch(() => {});
+  }
+});

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
@@ -141,6 +141,25 @@ test('serves status; socket and pid file are 0600 inside a 0700 home', async () 
   assert.equal(statSync(home.root).mode & 0o777, 0o700); assert.equal(statSync(home.socket).mode & 0o777, 0o600);
   assert.equal(statSync(home.pidFile).mode & 0o777, 0o600);
   assert.equal(readFileSync(home.pidFile, 'utf8').trim(), String(process.pid));
+});
+
+test('status lists every profile: default first, then the real directories under profiles, nothing created and no link followed', async () => {
+  mkdirSync(home.profilesDir, { recursive: true, mode: 0o700 });
+  for (const n of ['zeta', 'admin@t1', 'admin']) mkdirSync(join(home.profilesDir, n), { mode: 0o700 });
+  mkdirSync(join(home.profilesDir, 'Bad Name'), { mode: 0o700 });
+  symlinkSync(home.root, join(home.profilesDir, 'linked'));
+  writeFileSync(join(home.profilesDir, 'admin.login.json'), JSON.stringify({ schema: 1, at: '2026-11-26T08:09:10.000Z', host: 'app.example.com' }));
+  const r = await call(home, 'status', {});
+  assert.ok(r.ok); const s = r.result as StatusResult;
+  assert.deepEqual(s.profiles, [
+    { name: 'default', state: 'missing', lastLogin: null },
+    { name: 'admin', state: 'never-launched', lastLogin: { at: '2026-11-26T08:09:10.000Z', host: 'app.example.com' } },
+    { name: 'admin@t1', state: 'never-launched', lastLogin: null },
+    { name: 'zeta', state: 'never-launched', lastLogin: null },
+  ]);
+  assert.equal(s.instance, 'stopped');
+  assert.ok(!existsSync(join(home.profilesDir, 'default')));
+  assert.deepEqual(keysOf(r).filter(isSensitiveKey), []);
 });
 
 test('status reports pid, driver and sessions, and no key in it is a sensitive key', async () => {

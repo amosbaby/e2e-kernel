@@ -19,7 +19,7 @@ import { pendingError } from './approval.ts';
 import type { Approvals, DialogRequest } from './approval.ts';
 import type { ApprovalStore } from './approval-store.ts';
 import type { ModeResolver } from './mode.ts';
-import { DEFAULT_PROFILE, recordLogin } from './profiles.ts';
+import { DEFAULT_PROFILE, prepareProfileDir, recordLogin } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
@@ -37,6 +37,8 @@ export interface SessionDeps {
 const DEFAULT_NAME = 'session';
 const APPROVAL_TIMEOUT_SEC = 120;
 const MAX_UNATTRIBUTED = 200;
+// 同时在跑（含正在启动）的浏览器实例上限：每个 profile 一个实例，每个实例是一整个有头浏览器。
+const MAX_INSTANCES = 4;
 
 // opening：页面已登记、首屏还没读完，对外当作不存在；closing：收尾中，再来的 step、close 都是 busy。
 type State = 'opening' | 'idle' | 'stepping' | 'closing';
@@ -49,7 +51,7 @@ interface Session {
   readonly runDir: string;
   readonly startedAt: Date;
   readonly instance: Instance;               // 会话的页所在的实例
-  readonly start: { url: string; viewport: Viewport | null; touch: boolean; profile: string };
+  readonly start: { url: string; viewport: Viewport | null; touch: boolean; profile: string };   // profile 存 key（`组` 或 `组@槽`）
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
   readonly recorder: Recorder;
@@ -72,6 +74,7 @@ interface Session {
 interface Login {
   readonly id: string;
   readonly instance: Instance;
+  readonly profile: string;                  // 登录用的 profile（key）：人按回车结束时，登录记录记到它名下
   readonly host: string;                     // 起始地址的主机（URL.hostname），人按回车结束时记进登录记录
   readonly mode: Mode;                       // resolve(起始主机)：起点只读，登录里的写就都按只读
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
@@ -83,6 +86,9 @@ interface Login {
 
 // 登录页所在的主机：committed 是已提交的证据，pending 是放行了、但还不确定会不会提交的顶层导航目标。
 interface LoginPlace { committed: string; readonly pending: Set<string> }
+
+// 一个 profile 的实例槽：已在跑的实例，和正在启动（或正在检查健康）的那一次。两者都没有的槽要摘掉。
+interface InstanceSlot { instance?: Instance; acquiring?: Promise<Instance> }
 
 const KNOWN_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 
@@ -154,8 +160,8 @@ export class SessionManager {
   private readonly logins = new Map<string, Login>();
   // 内核级的「未归属的写」：归不到任何会话或登录页的写请求，只留最近 MAX_UNATTRIBUTED 条。
   private readonly unattributed: WriteRecord[] = [];
-  private instance: Instance | undefined;
-  private acquiring: Promise<Instance> | undefined;
+  // 每个 profile（key）一个浏览器实例，懒启动。
+  private readonly slots = new Map<string, InstanceSlot>();
   // 关停是终态：一旦开始，不再接受任何调用，也不再启动浏览器。
   private stopping = false;
   private stopped: Promise<void> | undefined;
@@ -170,7 +176,8 @@ export class SessionManager {
     return this.track(() => this.openSession(p));
   }
 
-  private async openSession(p: OpenParams): Promise<OpenResult> {
+  // profile 是 profile key；协议里还没有选 profile 的参数，调用方都用 default（选 profile 是后面的任务）。
+  private async openSession(p: OpenParams, profile: string = DEFAULT_PROFILE): Promise<OpenResult> {
     const host = new URL(p.url).hostname;
     // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
     this.deps.modes.refresh();
@@ -184,7 +191,7 @@ export class SessionManager {
     if (mode === 'readonly' && !this.deps.driver.capabilities.networkInterception) {
       throw new E2kError('internal', '这个驱动不能拦网络请求，不能以只读方式打开');
     }
-    const instance = await this.acquireInstance();
+    const instance = await this.acquireInstance(profile);
     if (this.stopping) throw stopping();
 
     const name = p.name ?? DEFAULT_NAME;
@@ -198,7 +205,7 @@ export class SessionManager {
       ensurePrivateDir(nameDir);
       const runDir = resolveInside(nameDir, dirName);
       ensurePrivateDir(runDir);
-      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced });
+      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced, profile });
     } finally {
       this.reserved.delete(id);
     }
@@ -310,12 +317,12 @@ export class SessionManager {
     return this.track(() => this.beginLogin(p));
   }
 
-  private async beginLogin(p: { url: string }): Promise<{ loginId: string }> {
+  private async beginLogin(p: { url: string }, profile: string = DEFAULT_PROFILE): Promise<{ loginId: string }> {
     // 规则先刷新一遍：文件有错就不开登录页（和 open 一致）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
     this.gateRules();
-    const instance = await this.acquireInstance();
+    const instance = await this.acquireInstance(profile);
     if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;
     while (this.logins.has(id)) id = `l-${randomHex()}`;
@@ -331,7 +338,7 @@ export class SessionManager {
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, requestIds: new Map() };
+      login = { id, instance, profile, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, requestIds: new Map() };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -353,15 +360,16 @@ export class SessionManager {
     await this.endLogin(login);
     // 登录记录只用来给 doctor 和 status 看：写不了就记日志，不影响这次 login 结束。
     try {
-      recordLogin(this.deps.home, DEFAULT_PROFILE, this.deps.now(), login.host);
+      recordLogin(this.deps.home, login.profile, this.deps.now(), login.host);
     } catch (e) {
       this.logFailure(null, `写登录记录`, e);
     }
     return { writesBlocked: login.blocked };
   }
 
+  // 任一实例在跑就是 running。
   instanceState(): 'stopped' | 'running' {
-    return this.instance === undefined ? 'stopped' : 'running';
+    return [...this.slots.values()].some((x) => x.instance !== undefined) ? 'running' : 'stopped';
   }
 
   // 关停是终态，可以重复调用（返回同一个结果）。先等还在进行的 open、loginBegin 落定：它们看到关停后清理并拒绝，
@@ -384,11 +392,12 @@ export class SessionManager {
     }
     await Promise.all(pending);
     for (const login of [...this.logins.values()]) await this.endLogin(login);
-    if (this.acquiring !== undefined) await this.acquiring.catch(() => undefined);
-    const inst = this.instance;
+    // 还在启动的实例等它落定，再把所有实例一起停。
+    for (const x of [...this.slots.values()]) if (x.acquiring !== undefined) await x.acquiring.catch(() => undefined);
+    const live = [...this.slots.values()].flatMap((x) => (x.instance === undefined ? [] : [x.instance]));
     // 先摘掉再停：stop() 触发的 onClosed 是自己引起的，不算浏览器没了。
-    this.instance = undefined;
-    if (inst !== undefined) await this.stopQuietly(inst);
+    this.slots.clear();
+    await Promise.all(live.map((inst) => this.stopQuietly(inst)));
   }
 
   // 记下还没有结果的调用，关停时等它们落定。
@@ -402,29 +411,49 @@ export class SessionManager {
 
   // ---- 实例 ----
 
-  // 冷启动串行化：正在启动（或正在检查健康）时再来的调用等同一个结果，不 launch 第二次。
-  private acquireInstance(): Promise<Instance> {
-    this.acquiring ??= this.ensureInstance().finally(() => { this.acquiring = undefined; });
-    return this.acquiring;
+  // 每个 profile 一个实例，按 key 懒启动。冷启动串行化：同一个 key 正在启动（或正在检查健康）时再来的调用等同一个结果，
+  // 不 launch 第二次。同时在跑（含正在启动）的实例最多 MAX_INSTANCES 个，要启动第 5 个就 busy。上限在这里同步判断，
+  // 所以并发的几个新 key 不会一起越过它。
+  private acquireInstance(key: string): Promise<Instance> {
+    const slot = this.slots.get(key) ?? {};
+    if (slot.acquiring !== undefined) return slot.acquiring;
+    if (slot.instance === undefined) {
+      let others = 0;
+      for (const [k, x] of this.slots) if (k !== key && (x.instance !== undefined || x.acquiring !== undefined)) others++;
+      if (others >= MAX_INSTANCES) {
+        return Promise.reject(new E2kError('busy', '同时开着的 profile 太多，先关掉一些会话', '关掉一些会话，等它们的浏览器停了再开新的 profile'));
+      }
+    }
+    this.slots.set(key, slot);
+    slot.acquiring = this.ensureInstance(key, slot).finally(() => {
+      slot.acquiring = undefined;
+      this.dropIfEmpty(key, slot);
+    });
+    return slot.acquiring;
   }
 
-  private async ensureInstance(): Promise<Instance> {
-    const current = this.instance;
+  // 槽里没有实例也没有正在启动的：摘掉，不让空槽占着表（上限只数有实例或正在启动的，这里是清理）。
+  private dropIfEmpty(key: string, slot: InstanceSlot): void {
+    if (slot.instance === undefined && slot.acquiring === undefined && this.slots.get(key) === slot) this.slots.delete(key);
+  }
+
+  private async ensureInstance(key: string, slot: InstanceSlot): Promise<Instance> {
+    const current = slot.instance;
     if (current !== undefined) {
       if (await this.healthy(current)) return current;
-      this.instance = undefined;
+      slot.instance = undefined;
       await this.stopQuietly(current);
     }
     if (this.stopping) throw stopping();
-    const profileDir = resolveInside(this.deps.home.profilesDir, DEFAULT_PROFILE);
-    ensurePrivateDir(this.deps.home.profilesDir);
-    ensurePrivateDir(profileDir);
-    const inst = await this.deps.driver.launch({ name: DEFAULT_PROFILE, userDataDir: profileDir });
+    // 名字、目录类型、权限、不逃出 profiles 的检查都在启动之前：不对就不启动浏览器。
+    const profileDir = prepareProfileDir(this.deps.home, key);
+    const inst = await this.deps.driver.launch({ name: key, userDataDir: profileDir });
+    // 回调都挂在这个实例上：别的实例的事不会走到这里，这个实例的事也不会碰别的实例的会话。
     inst.setRequestHandler((r) => this.onRequest(r));
     inst.onRequestDone((e) => { this.onRequestDone(e); });
     inst.onPageOpened((page, openerId) => { this.onPageOpened(page, openerId); });
     inst.onClosed(() => { this.browserGone(inst); });
-    this.instance = inst;
+    slot.instance = inst;
     return inst;
   }
 
@@ -458,7 +487,7 @@ export class SessionManager {
   }
 
   private async openPage(instance: Instance, p: OpenParams, o: { id: string; name: string; nameDir: string; dirName: string;
-    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean }): Promise<OpenResult> {
+    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean; profile: string }): Promise<OpenResult> {
     let page: Page | undefined;
     let registered = false;
     try {
@@ -466,7 +495,7 @@ export class SessionManager {
       if (this.stopping) throw stopping();
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
-        start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: DEFAULT_PROFILE },
+        start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile },
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
@@ -607,9 +636,13 @@ export class SessionManager {
   }
 
   // 实例没了：被关、崩了，或者自己停掉的（停之前会话都已经在收尾，这里不会再出一份）。
-  // 这个实例上还在用的会话各出一份 browser-gone 报告；它的登录页表清空。可以重入：已在收尾的会话跳过。
+  // 只收尾这个实例上还在用的会话（各出一份 browser-gone 报告）和它的登录页；别的实例不受影响。可以重入：已在收尾的会话跳过。
   private browserGone(inst: Instance): void {
-    if (this.instance === inst) this.instance = undefined;
+    for (const [key, x] of this.slots) {
+      if (x.instance !== inst) continue;
+      x.instance = undefined;
+      this.dropIfEmpty(key, x);
+    }
     for (const s of [...this.sessions.values()]) {
       if (s.instance !== inst || !this.isActive(s)) continue;
       this.finish(s, 'browser-gone').catch((e: unknown) => { this.logFailure(s.id, '浏览器关闭后收尾', e); });

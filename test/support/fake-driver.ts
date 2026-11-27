@@ -40,6 +40,7 @@ interface Host {
 class FakePage implements Page {
   readonly id: string;
   readonly openerId: string | null;
+  readonly owner: FakeInstance;   // 这一页所属的实例：请求、弹窗都发到它那里
   url = 'about:blank';
   closed = false;
   viewport: Viewport | undefined;
@@ -48,8 +49,9 @@ class FakePage implements Page {
   private readonly closedListeners: (() => void)[] = [];
   private readonly host: Host;
 
-  constructor(host: Host, id: string, openerId: string | null, viewport: Viewport | undefined) {
+  constructor(host: Host, owner: FakeInstance, id: string, openerId: string | null, viewport: Viewport | undefined) {
     this.host = host;
+    this.owner = owner;
     this.id = id;
     this.openerId = openerId;
     this.viewport = viewport;
@@ -292,8 +294,8 @@ export class FakeDriver implements Driver {
   readonly capabilities: Capabilities;
   readonly calls: Call[] = [];
   readonly noRedirectIds: string[] = [];   // handler 回了 continue 且带 followRedirects: false 的请求 id
-  launches = 0;
-  lastProfile: { name: string; userDataDir: string } | null = null;
+  // 每次 launch 收到的 profile，按启动顺序；下标就是 closeInstance 的参数。
+  readonly launched: { name: string; userDataDir: string }[] = [];
 
   private readonly pageSpecs: Record<string, FakePageSpec>;
   private readonly checks: Check[];
@@ -303,7 +305,9 @@ export class FakeDriver implements Driver {
   private pageSeq = 0;
   private requestSeq = 0;
   private readonly pages: FakePage[] = [];
-  private current: FakeInstance | undefined;
+  private readonly instances: FakeInstance[] = [];
+  // 请求 id → 它发出时所在的实例：emitRequestDone 发回同一个实例。
+  private readonly requestOwners = new Map<string, FakeInstance>();
   private readonly host: Host;
 
   constructor(o: { capabilities?: Partial<Capabilities>; pages?: Record<string, FakePageSpec>; checks?: Check[];
@@ -324,21 +328,26 @@ export class FakeDriver implements Driver {
     return this.checks.map((c) => ({ ...c }));
   }
 
+  get launches(): number {
+    return this.launched.length;
+  }
+
   async launch(profile: { name: string; userDataDir: string }): Promise<Instance> {
     await sleep(this.launchDelayMs);
-    this.launches++;
-    this.lastProfile = { ...profile };
-    this.current = new FakeInstance((inst, o) => this.openPageIn(inst, o));
-    return this.current;
+    this.launched.push({ ...profile });
+    const inst = new FakeInstance((i, o) => this.openPageIn(i, o));
+    this.instances.push(inst);
+    return inst;
   }
 
   openPages(): string[] {
     return this.pages.filter((p) => !p.closed).map((p) => p.id);
   }
 
-  async emitRequest(r: { pageId: string | null; method: string; url: string } & Partial<RequestInfo>): Promise<Decision> {
-    const inst = this.running();
+  // 请求发到发出它的页所属的实例；pageId 为 null 时发到 instanceIndex 指的实例，不给就是最近启动的那个。
+  async emitRequest(r: { pageId: string | null; method: string; url: string } & Partial<RequestInfo>, instanceIndex?: number): Promise<Decision> {
     const page = r.pageId === null ? undefined : this.pages.find((p) => p.id === r.pageId);
+    const inst = page?.owner ?? this.running(instanceIndex);
     const info: RequestInfo = {
       id: `r${++this.requestSeq}`, openerPageId: page?.openerId ?? null, resourceType: 'fetch', isNavigation: false,
       topFrame: true, topUrl: page?.url ?? null, initiatorUrl: null, contentType: null, body: null, fromLoginForm: false, ...r,
@@ -347,6 +356,7 @@ export class FakeDriver implements Driver {
     if (r.initiatorUrl === undefined) {
       info.initiatorUrl = info.isNavigation && info.topFrame ? (page !== undefined && /^https?:/i.test(page.url) ? page.url : null) : info.topUrl;
     }
+    this.requestOwners.set(info.id, inst);
     if (inst.requestHandler === undefined) return { action: 'abort' };
     try {
       const decision = await inst.requestHandler(info);
@@ -360,11 +370,12 @@ export class FakeDriver implements Driver {
   // 真驱动在重定向首跳被拒时发 { status: 首跳状态, failed: true, redirectRefused: true }。
   emitRequestDone(id: string, status: number | null, opts: { failed?: boolean; redirectRefused?: true } = {}): void {
     const e = { id, status, failed: opts.failed ?? opts.redirectRefused === true, ...(opts.redirectRefused === true ? { redirectRefused: true as const } : {}) };
-    for (const l of this.running().requestDoneListeners) l(e);
+    for (const l of (this.requestOwners.get(id) ?? this.running()).requestDoneListeners) l(e);
   }
 
   emitPopup(openerId: string, url: string): Page {
-    const inst = this.running();
+    const opener = this.pages.find((p) => p.id === openerId);
+    const inst = opener?.owner ?? this.running();
     const page = this.newPage(inst, openerId, undefined);
     page.load(url, this.host.specFor(url));
     for (const l of inst.pageOpenedListeners) l(page, openerId);
@@ -379,18 +390,25 @@ export class FakeDriver implements Driver {
     page.fireClosed();
   }
 
-  // 模拟浏览器整个没了。
+  // 模拟最近启动的那个浏览器整个没了。
   closeBrowser(): void {
-    this.current?.shutdown();
+    this.instances.at(-1)?.shutdown();
   }
 
-  private running(): FakeInstance {
-    if (this.current === undefined || this.current.closed) throw new Error('fake driver: no running instance');
-    return this.current;
+  // 模拟第 index 个启动的浏览器（见 launched）整个没了：只影响它自己的页面。
+  closeInstance(index: number): void {
+    this.instances[index]?.shutdown();
+  }
+
+  // 没给下标就是最近启动的那个；它没了就报错。
+  private running(index?: number): FakeInstance {
+    const inst = index === undefined ? this.instances.at(-1) : this.instances[index];
+    if (inst === undefined || inst.closed) throw new Error('fake driver: no running instance');
+    return inst;
   }
 
   private newPage(inst: FakeInstance, openerId: string | null, viewport: Viewport | undefined): FakePage {
-    const page = new FakePage(this.host, `p${++this.pageSeq}`, openerId, viewport);
+    const page = new FakePage(this.host, inst, `p${++this.pageSeq}`, openerId, viewport);
     this.pages.push(page);
     inst.pages.push(page);
     return page;

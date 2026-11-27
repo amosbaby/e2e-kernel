@@ -211,17 +211,17 @@ test('fill, read, text, location, console, eval and screenshot', async () => {
   }
 });
 
-test('launch options: delay, profile, capabilities, checks and failOpenWith', async () => {
+test('launch options: delay, launched profiles, capabilities, checks and failOpenWith', async () => {
   const boom = new Error('cannot open');
   const d = new FakeDriver({ capabilities: { networkInterception: false }, checks: [{ name: 'x', ok: false, detail: 'd' }], failOpenWith: boom, launchDelayMs: 40 });
   assert.equal(d.capabilities.networkInterception, false);
   assert.equal(typeof d.capabilities.selectorDialect, 'string');
   assert.deepEqual(await d.selfCheck(), [{ name: 'x', ok: false, detail: 'd' }]);
-  assert.equal(d.lastProfile, null);
+  assert.deepEqual(d.launched, []);
   const t0 = performance.now();
   const inst = await d.launch({ name: 'p', userDataDir: '/tmp/e2k-fake-profile' });
   assert.ok(performance.now() - t0 >= 35);
-  assert.deepEqual(d.lastProfile, { name: 'p', userDataDir: '/tmp/e2k-fake-profile' });
+  assert.deepEqual(d.launched, [{ name: 'p', userDataDir: '/tmp/e2k-fake-profile' }]);
   assert.equal((await inst.health()).ok, true);
   await assert.rejects(inst.openPage({}), (e) => e === boom);
 });
@@ -259,4 +259,45 @@ test('instance.stop() sets the closed state, then fires page and instance onClos
   assert.deepEqual(order, ['page', 'instance', 'health:false']);
   assert.equal((await inst.health()).ok, false);
   await assert.rejects(page.snapshot({}), (e: DriverError) => e.kind === 'other');
+});
+
+// 多实例：每个 launch 是独立的浏览器；页面、请求、弹窗都归它自己的实例，关一个不影响另一个。
+test('two instances run side by side: requests, popups and request-done stay with the owning instance; closeInstance closes only one', async () => {
+  const d = new FakeDriver({ pages: { 'http://localhost/a': {} } });
+  const a = await d.launch({ name: 'admin', userDataDir: '/tmp/e2k-fake/admin' });
+  const b = await d.launch({ name: 'admin@t1', userDataDir: '/tmp/e2k-fake/admin@t1' });
+  assert.deepEqual(d.launched, [{ name: 'admin', userDataDir: '/tmp/e2k-fake/admin' }, { name: 'admin@t1', userDataDir: '/tmp/e2k-fake/admin@t1' }]);
+  assert.equal(d.launches, 2);
+  const seen: string[] = [];
+  const done: string[] = [];
+  const popups: string[] = [];
+  for (const [tag, inst] of [['a', a], ['b', b]] as const) {
+    inst.setRequestHandler((r) => { seen.push(`${tag}:${r.id}`); return { action: 'continue' }; });
+    inst.onRequestDone((e) => { done.push(`${tag}:${e.id}`); });
+    inst.onPageOpened((p) => { popups.push(`${tag}:${p.id}`); });
+  }
+  const pa = await a.openPage({});
+  const pb = await b.openPage({});
+  assert.notEqual(pa.id, pb.id);
+  await d.emitRequest({ pageId: pa.id, method: 'GET', url: 'http://localhost/a' });
+  await d.emitRequest({ pageId: pb.id, method: 'GET', url: 'http://localhost/a' });
+  await d.emitRequest({ pageId: null, method: 'GET', url: 'http://localhost/a' }, 0);
+  assert.deepEqual(seen, ['a:r1', 'b:r2', 'a:r3']);
+  d.emitRequestDone('r2', 200);
+  d.emitRequestDone('r1', 200);
+  assert.deepEqual(done, ['b:r2', 'a:r1']);
+  const popA = d.emitPopup(pa.id, 'http://localhost/a');
+  const popB = d.emitPopup(pb.id, 'http://localhost/a');
+  assert.deepEqual(popups, [`a:${popA.id}`, `b:${popB.id}`]);
+  assert.equal(new Set([pa.id, pb.id, popA.id, popB.id]).size, 4);
+  let aClosed = 0, bClosed = 0, paClosed = 0, pbClosed = 0;
+  a.onClosed(() => aClosed++); b.onClosed(() => bClosed++); pa.onClosed(() => paClosed++); pb.onClosed(() => pbClosed++);
+  d.closeInstance(0);
+  assert.deepEqual([aClosed, bClosed, paClosed, pbClosed], [1, 0, 1, 0]);
+  assert.equal((await a.health()).ok, false); assert.equal((await b.health()).ok, true);
+  assert.deepEqual(d.openPages(), [pb.id, popB.id]);
+  await assert.rejects(d.emitRequest({ pageId: null, method: 'GET', url: 'http://localhost/a' }, 0), /no running instance/);
+  assert.deepEqual(await d.emitRequest({ pageId: pb.id, method: 'GET', url: 'http://localhost/a' }), { action: 'continue' });
+  d.closeBrowser();                                    // 最近启动的是第二个
+  assert.equal((await b.health()).ok, false);
 });

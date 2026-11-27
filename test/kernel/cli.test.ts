@@ -1,7 +1,7 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
@@ -516,6 +516,34 @@ test('doctor: a profile that only holds browser files still says nobody logged i
   } finally { h.cleanup(); }
 });
 
+test('doctor: one profile check per profile (default first), including slots, and a linked directory is not listed', async () => {
+  const h = makeTmpHome();
+  try {
+    for (const n of ['admin', 'admin@t1']) mkdirSync(join(h.home.profilesDir, n), { recursive: true, mode: 0o700 });
+    symlinkSync(h.home.root, join(h.home.profilesDir, 'linked'));
+    writeFileSync(join(h.home.profilesDir, 'admin@t1' + '.login.json'), JSON.stringify({ schema: 1, at: '2026-11-26T08:09:10.000Z', host: 'app.example.com' }));
+    const { checks } = await doctorChecks(h.env);
+    assert.deepEqual(checks.filter((c) => c.name.startsWith('profile-')).map((c) => [c.name, c.ok]),
+      [['profile-default', true], ['profile-admin', true], ['profile-admin@t1', true]]);
+    const slot = checks.find((c) => c.name === 'profile-admin@t1');
+    assert.match(slot?.detail ?? '', /^profiles\/admin@t1 没启动过；最近一次 login 2026-11-26T08:09:10.000Z app.example.com$/);
+    assert.deepEqual(readdirSync(h.home.profilesDir).sort(), ['admin', 'admin@t1', 'admin@t1' + '.login.json', 'linked']);
+  } finally { h.cleanup(); }
+});
+
+test('doctor: a profile directory others can enter fails only that profile\'s check', async () => {
+  const h = makeTmpHome();
+  try {
+    mkdirSync(join(h.home.profilesDir, 'admin'), { recursive: true, mode: 0o755 }); chmodSync(join(h.home.profilesDir, 'admin'), 0o755);
+    mkdirSync(join(h.home.profilesDir, 'other'), { mode: 0o700 });
+    const { code, checks } = await doctorChecks(h.env);
+    assert.deepEqual(checks.filter((c) => c.name.startsWith('profile-')).map((c) => [c.name, c.ok]),
+      [['profile-default', true], ['profile-admin', false], ['profile-other', true]]);
+    assert.equal(code, 22);
+    assert.equal(statSync(join(h.home.profilesDir, 'admin')).mode & 0o777, 0o755);
+  } finally { h.cleanup(); }
+});
+
 test('doctor: the host from the login record is redacted before it is printed', async () => {
   const h = makeTmpHome();
   try {
@@ -720,6 +748,16 @@ test('a token-shaped key in a bad rules file is redacted in rule list (text and 
     const dj = await doctorChecks(h.env);
     assert.ok(!JSON.stringify(dj.checks).includes(label));
   });
+});
+
+test('status text prints one line per profile, slots included; "running" means any instance is up', () => {
+  const st = { version: '0.1.0', pid: 1, home: '/x', driver: { name: 'fake', capabilities: { networkInterception: true, crossProcessIframes: 'yes', nativeFormSubmit: 'yes', selectorDialect: 'playwright' } },
+    instance: 'running', sessions: [], profiles: [{ name: 'default', state: 'missing', lastLogin: null },
+      { name: 'admin@t1', state: 'launched', lastLogin: { at: '2026-11-26T08:09:10.000Z', host: 'app.example.com' } }] } as unknown as StatusResult;
+  const out = formatStatus(st);
+  assert.match(out, /^浏览器 在运行$/m);
+  assert.match(out, /^profile default 目录还不存在，最近一次 login 无$/m);
+  assert.match(out, /^profile admin@t1 用过，最近一次 login 2026-11-26T08:09:10\.000Z app\.example\.com$/m);
 });
 
 test('status from an older kernel (no rules field) still formats', () => {

@@ -5,7 +5,7 @@ import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
 import { redactText, safely } from '../shared/redact.ts';
 import { PROFILE_STATE_TEXT, lastLoginText } from './format.ts';
-import { DEFAULT_PROFILE, profileInfo } from '../kernel/profiles.ts';
+import { DEFAULT_PROFILE, listProfiles } from '../kernel/profiles.ts';
 import { inspectRules } from '../kernel/rules.ts';
 import { E2kError } from '../shared/errors.ts';
 import { assertSocketPathFits, ensurePrivateDir } from '../shared/paths.ts';
@@ -70,21 +70,30 @@ function exists(path: string): boolean {
   }
 }
 
-// profile 的状态和最近一次 login。只查不建；「没 login 过」不算失败：fresh home 上这一项是 ok。
+// 每个 profile 的状态和最近一次 login（default 一定列，其余是 profiles 下的真目录）。只查不建；「没 login 过」不算失败：fresh home 上这一项是 ok。
 // ok 只在 profiles 目录或 profile 目录已存在、却不满足状态目录的权限规则时为 false。
-function profileCheck(home: Home): Check {
-  const name = `profile-${DEFAULT_PROFILE}`;
-  const profileDir = join(home.profilesDir, DEFAULT_PROFILE);
-  try {
-    for (const dir of [home.profilesDir, profileDir]) if (exists(dir)) ensurePrivateDir(dir);   // 已存在：只检查，不改
-  } catch (e) {
-    return failed(name, e);
+function profileChecks(home: Home): Check[] {
+  const base = exists(home.profilesDir);
+  if (base) {
+    try {
+      ensurePrivateDir(home.profilesDir);   // 已存在：只检查，不改
+    } catch (e) {
+      return [failed(`profile-${DEFAULT_PROFILE}`, e)];
+    }
   }
-  const info = profileInfo(home, DEFAULT_PROFILE);
-  const login = info.lastLogin === null
-    ? '从没用 login 登录过（会话窗口里手动登录不会记在这里）'
-    : `最近一次 login ${lastLoginText(info)}`;
-  return { name, ok: true, detail: `profiles/${DEFAULT_PROFILE} ${PROFILE_STATE_TEXT[info.state]}；${login}` };
+  return listProfiles(home).map((info): Check => {
+    const name = `profile-${info.name}`;
+    try {
+      const dir = join(home.profilesDir, info.name);
+      if (exists(dir)) ensurePrivateDir(dir);
+    } catch (e) {
+      return failed(name, e);
+    }
+    const login = info.lastLogin === null
+      ? '从没用 login 登录过（会话窗口里手动登录不会记在这里）'
+      : `最近一次 login ${lastLoginText(info)}`;
+    return { name, ok: true, detail: `profiles/${info.name} ${PROFILE_STATE_TEXT[info.state]}；${login}` };
+  });
 }
 
 // 域名规则：自己读规则文件和批准记录，不要内核在跑。没有文件不算失败；文件有错 open 会被拒绝，批准记录读不了
@@ -132,7 +141,7 @@ export async function runDoctor(home: Home, driver: Driver, selfCmd = 'e2k'): Pr
     platformCheck(),
     homeCheck(home),
     socketCheck(home),
-    profileCheck(home),
+    ...profileChecks(home),
     rulesCheck(home, selfCmd),
     ...await driver.selfCheck(),
     ...await kernelChecks(home, selfCmd),

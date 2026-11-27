@@ -116,7 +116,7 @@ test('the default profile is launched lazily and once, even for concurrent opens
   const { sm, fake, home } = setup({ launchDelayMs: 50 });
   assert.equal(sm.instanceState(), 'stopped');
   const [a, b] = await Promise.all([sm.open({ url: 'http://localhost:5173/a' }), sm.open({ url: 'http://localhost:5173/b' })]);
-  assert.equal(fake.launches, 1); assert.equal(fake.lastProfile!.userDataDir, join(home.profilesDir, 'default'));
+  assert.equal(fake.launches, 1); assert.deepEqual(fake.launched, [{ name: 'default', userDataDir: join(home.profilesDir, 'default') }]);
   assert.equal(sm.list().length, 2); assert.notEqual(a.session, b.session);
 });
 
@@ -1495,4 +1495,203 @@ test('login: a popup of a read-only page with no initiator address starts from i
   const popup = fake.emitPopup(loginPageId, 'about:blank');
   assert.equal((await nav(c, popup.id, 'POST', 'http://example.org/post', null)).action, 'fulfill');
   assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+});
+
+// ---- 每个 profile 一个浏览器实例（M2b 任务 5） ----
+// 协议里还不能选 profile（Task 6）：这里用内部入口在指定 key 的实例上开会话、开登录页。
+
+interface OnProfile {
+  open(profile: string, p: { url: string; name?: string }): Promise<{ session: string; runDir: string }>;
+  loginBegin(profile: string, p: { url: string }): Promise<{ loginId: string }>;
+}
+
+function onProfile(sm: SessionManager): OnProfile {
+  const i = sm as unknown as {
+    track<T>(run: () => Promise<T>): Promise<T>;
+    openSession(p: { url: string; name?: string }, profile: string): Promise<{ session: string; runDir: string }>;
+    beginLogin(p: { url: string }, profile: string): Promise<{ loginId: string }>;
+  };
+  return {
+    open: (profile, p) => i.track(() => i.openSession(p, profile)),
+    loginBegin: (profile, p) => i.track(() => i.beginLogin(p, profile)),
+  };
+}
+
+const HOME_URL = 'http://localhost:5173/';
+const isBusyProfiles = (e: unknown): boolean => e instanceof E2kError && e.code === 'busy' && e.message === '同时开着的 profile 太多，先关掉一些会话';
+
+// 记下驱动启动过的每个实例，测试里好直接问它们的状态。
+function trackLaunched(fake: FakeDriver): { health(i: number): Promise<boolean>; count(): number } {
+  const insts: Awaited<ReturnType<FakeDriver['launch']>>[] = [];
+  const orig = fake.launch.bind(fake);
+  fake.launch = async (p) => { const inst = await orig(p); insts.push(inst); return inst; };
+  return { health: async (i) => (await insts[i]!.health()).ok, count: () => insts.length };
+}
+
+test('each profile key gets its own instance, launched lazily and once even for concurrent opens, in profiles/<key>', async () => {
+  const { sm, fake, home } = setup({ launchDelayMs: 30 });
+  const p = onProfile(sm);
+  const [a1, a2, t1] = await Promise.all([p.open('admin', { url: HOME_URL }), p.open('admin', { url: HOME_URL }), p.open('admin@t1', { url: HOME_URL })]);
+  assert.deepEqual(fake.launched, [
+    { name: 'admin', userDataDir: join(home.profilesDir, 'admin') },
+    { name: 'admin@t1', userDataDir: join(home.profilesDir, 'admin@t1') },
+  ]);
+  assert.equal(sm.instanceState(), 'running'); assert.equal(sm.list().length, 3);
+  assert.equal(statSync(join(home.profilesDir, 'admin@t1')).mode & 0o777, 0o700);
+  await sm.open({ url: HOME_URL });                                                       // 协议入口仍用 default：第三个实例
+  assert.equal(fake.launches, 3); assert.equal(fake.launched[2]?.name, 'default');
+  for (const s of [a1, a2, t1]) await sm.close({ session: s.session });
+  assert.deepEqual([a1, a2, t1].map((s) => readResult(s.runDir).start.profile), ['admin', 'admin', 'admin@t1']);
+  await p.open('admin', { url: HOME_URL });                                               // 实例还在，复用
+  assert.equal(fake.launches, 3);
+});
+
+test('one instance going away ends only its own sessions and login pages; the others keep working and loginEnd records to its own profile', async () => {
+  const { sm, fake, home } = setup();
+  const p = onProfile(sm);
+  const a = await p.open('admin', { url: HOME_URL, name: 'on-a' });
+  const b = await p.open('admin@t1', { url: HOME_URL, name: 'on-b' });
+  const pageA = fake.openPages().at(-2)!; const pageB = fake.openPages().at(-1)!;
+  const loginA = await p.loginBegin('admin', { url: LOGIN_URL });
+  const loginB = await p.loginBegin('admin@t1', { url: LOGIN_URL });
+  fake.closeInstance(0);
+  await until(() => existsSync(join(a.runDir, 'result.json')));
+  await sleep(30);
+  assert.equal(readResult(a.runDir).closedBy, 'browser-gone');
+  assert.equal(readdirSync(join(home.runsDir, 'on-a')).length, 1);                        // 只出一份
+  assert.deepEqual(sm.list().map((s) => s.session), [b.session]);                         // B 的会话还在
+  assert.ok(!existsSync(join(b.runDir, 'result.json')));
+  assert.equal((await sm.step({ session: b.session, ops: [{ op: 'snapshot' }] })).results[0]?.outcome, 'ok');
+  assert.ok(fake.openPages().includes(pageB) && !fake.openPages().includes(pageA));
+  await assert.rejects(sm.loginEnd({ loginId: loginA.loginId }), (e: E2kError) => e.code === 'not-found');   // A 的登录页没了
+  assert.deepEqual(await sm.loginEnd({ loginId: loginB.loginId }), { writesBlocked: 0 });                     // B 的登录页还在
+  assert.equal(profileInfo(home, 'admin@t1').lastLogin?.host, 'localhost');
+  assert.equal(profileInfo(home, 'admin').lastLogin, null); assert.equal(profileInfo(home, 'default').lastLogin, null);
+  assert.ok(existsSync(join(home.profilesDir, 'admin@t1' + '.login.json')));
+  assert.equal((await sm.close({ session: b.session })).exit, 0);
+  await p.open('admin', { url: HOME_URL });                                               // A 的 key 可以重新启动
+  assert.equal(fake.launches, 3);
+});
+
+test('a page closing on one instance whose browser is healthy ends only that session (page-gone); a dead browser is told apart per instance', async () => {
+  const { sm, fake } = setup();
+  const p = onProfile(sm);
+  const a = await p.open('admin', { url: HOME_URL }); const b = await p.open('other', { url: HOME_URL });
+  const pageA = fake.openPages().at(-2)!;
+  fake.closePage(pageA);
+  await until(() => existsSync(join(a.runDir, 'result.json')));
+  assert.equal(readResult(a.runDir).closedBy, 'page-gone');
+  assert.deepEqual(sm.list().map((s) => s.session), [b.session]);
+});
+
+test('the fifth profile is busy; reusing a running profile and failed starts do not count; closing a browser frees a slot', async () => {
+  const { sm, fake } = setup();
+  const p = onProfile(sm);
+  for (const k of ['k1', 'k2', 'k3', 'k4']) await p.open(k, { url: HOME_URL });
+  await assert.rejects(p.open('k5', { url: HOME_URL }), isBusyProfiles);
+  await assert.rejects(p.loginBegin('k5', { url: LOGIN_URL }), isBusyProfiles);
+  await assert.rejects(sm.open({ url: HOME_URL }), isBusyProfiles);                       // default 也算一个
+  assert.equal(fake.launches, 4);
+  assert.equal(sm.list().length, 4);
+  await p.open('k1', { url: HOME_URL });                                                  // 已经在跑的 profile 不占新名额
+  assert.equal(fake.launches, 4); assert.equal(sm.list().length, 5);
+  fake.closeInstance(1);                                                                  // k2 的浏览器没了，它的一个会话跟着没了
+  await until(() => sm.list().length === 4);
+  await p.open('k5', { url: HOME_URL });
+  assert.equal(fake.launches, 5);
+});
+
+test('concurrent starts of different new profiles cannot both pass the limit', async () => {
+  const { sm, fake } = setup({ launchDelayMs: 30 });
+  const p = onProfile(sm);
+  const r = await Promise.allSettled(['k1', 'k2', 'k3', 'k4', 'k5', 'k6'].map((k) => p.open(k, { url: HOME_URL })));
+  assert.deepEqual(r.map((x) => x.status), ['fulfilled', 'fulfilled', 'fulfilled', 'fulfilled', 'rejected', 'rejected']);
+  for (const x of r.slice(4)) assert.ok(isBusyProfiles((x as PromiseRejectedResult).reason));
+  assert.equal(fake.launches, 4);
+});
+
+test('a profile directory that is a symbolic link or a file is needs-human: nothing is launched, no page, no run dir, and it does not use up a slot', async () => {
+  const { sm, fake, home } = setup();
+  const p = onProfile(sm);
+  mkdirSync(home.profilesDir, { mode: 0o700 });
+  const outside = join(home.root, 'outside');
+  mkdirSync(outside);
+  const isWrongDir = (e: unknown): boolean => e instanceof E2kError && e.code === 'needs-human' && e.message === 'profile 目录不对';
+  symlinkSync(outside, join(home.profilesDir, 'linked'));
+  symlinkSync(join(home.profilesDir, 'missing-target'), join(home.profilesDir, 'dangling'));
+  writeFileSync(join(home.profilesDir, 'afile'), 'x');
+  for (const k of ['linked', 'dangling', 'afile', 'linked', 'dangling', 'afile']) {                 // 失败的启动多于上限也不占名额
+    await assert.rejects(p.open(k, { url: HOME_URL, name: 'refused' }), isWrongDir, k);
+  }
+  await assert.rejects(p.loginBegin('linked', { url: LOGIN_URL }), isWrongDir);
+  assert.equal(fake.launches, 0); assert.deepEqual(fake.openPages(), []); assert.equal(sm.instanceState(), 'stopped'); assert.deepEqual(sm.list(), []);
+  assert.deepEqual(readdirSync(outside), []);
+  assert.ok(!existsSync(join(home.runsDir, 'refused')));
+  for (const k of ['k1', 'k2', 'k3', 'k4']) await p.open(k, { url: HOME_URL });
+  assert.equal(fake.launches, 4);
+  // 目录换成符号链接后：已经在跑的实例不受影响，但它没了以后再启动就被拒绝。
+  fake.closeInstance(0);
+  await until(() => sm.list().length === 3);
+  rmSync(join(home.profilesDir, 'k1'), { recursive: true });
+  symlinkSync(outside, join(home.profilesDir, 'k1'));
+  await assert.rejects(p.open('k1', { url: HOME_URL }), isWrongDir);
+  assert.equal(fake.launches, 4); assert.deepEqual(readdirSync(outside), []);
+});
+
+test('a profile key that is not a plain name never reaches the driver', async () => {
+  const { sm, fake, home } = setup();
+  const p = onProfile(sm);
+  for (const k of ['../x', 'a/b', 'Admin', '', 'a@b@c', 'a'.repeat(33), '..', '/etc']) {
+    await assert.rejects(p.open(k, { url: HOME_URL }), (e: E2kError) => e.code === 'usage', JSON.stringify(k));
+    await assert.rejects(p.loginBegin(k, { url: LOGIN_URL }), (e: E2kError) => e.code === 'usage', JSON.stringify(k));
+  }
+  assert.equal(fake.launches, 0); assert.equal(sm.instanceState(), 'stopped');
+  assert.ok(!existsSync(join(dirname(home.profilesDir), 'x')));
+});
+
+test('shutdown stops every instance, and waits for ones that are still starting', async () => {
+  const { sm, fake } = setup({ launchDelayMs: 40 });
+  const seen = trackLaunched(fake);
+  const p = onProfile(sm);
+  await Promise.all([p.open('k1', { url: HOME_URL }), p.open('k2', { url: HOME_URL })]);
+  const starting = [p.open('k3', { url: HOME_URL }), p.loginBegin('k4', { url: LOGIN_URL })];
+  const settled = Promise.allSettled(starting);
+  await sleep(10);                                                                        // k3、k4 还在启动
+  await sm.shutdown();
+  for (const r of await settled) assert.ok(r.status === 'rejected' && (r.reason as E2kError).message === '内核正在关停');
+  assert.equal(seen.count(), 4);
+  for (let i = 0; i < 4; i++) assert.equal(await seen.health(i), false, `instance ${i}`);
+  assert.equal(sm.instanceState(), 'stopped'); assert.deepEqual(fake.openPages(), []);
+  await assert.rejects(p.open('k5', { url: HOME_URL }), (e: E2kError) => e.message === '内核正在关停');
+  assert.equal(fake.launches, 4);
+});
+
+test('the rules gate comes before any instance start or page for any profile', async () => {
+  const { dialog } = holdingDialog();
+  const { sm, fake } = setupGate(dialog);
+  const p = onProfile(sm);
+  await assert.rejects(p.open('admin', { url: RO }), isCode('wait-approval'));
+  await assert.rejects(p.loginBegin('admin@t1', { url: LOGIN_URL }), isCode('wait-approval'));
+  assert.equal(fake.launches, 0); assert.deepEqual(fake.openPages(), []); assert.equal(sm.instanceState(), 'stopped');
+});
+
+test('requests from each instance land in their own session record, and a popup joins its opener\'s session', async () => {
+  const { sm, fake } = setup({ policy });
+  const p = onProfile(sm);
+  const a = await p.open('admin', { url: HOME_URL, name: 'ra' }); const b = await p.open('admin@t1', { url: HOME_URL, name: 'rb' });
+  const [pageA, pageB] = fake.openPages().slice(-2) as [string, string];
+  const post = (id: string, pageId: string) => fake.emitRequest({ id, pageId, method: 'POST', url: 'http://localhost:5173/api', body: '{}', contentType: 'application/json' });
+  assert.equal((await post('qa', pageA)).action, 'continue');
+  assert.equal((await post('qb1', pageB)).action, 'continue');
+  const popB = fake.emitPopup(pageB, HOME_URL);
+  assert.equal((await post('qpop', popB.id)).action, 'continue');
+  assert.equal((await post('qb2', pageB)).action, 'continue');
+  fake.emitRequestDone('qb1', 200);
+  fake.emitRequestDone('qa', 201);
+  const ra = readResult((await sm.close({ session: a.session })).runDir); const rb = readResult((await sm.close({ session: b.session })).runDir);
+  assert.deepEqual([ra.start.profile, rb.start.profile], ['admin', 'admin@t1']);
+  assert.deepEqual(ra.writes.allowed.map((w) => [w.id, w.status]), [['qa', 201]]);
+  assert.deepEqual(rb.writes.allowed.map((w) => [w.id, w.status]), [['qb1', 200], ['qpop', null], ['qb2', null]]);
+  assert.deepEqual([ra.writes.unattributed, rb.writes.unattributed], [[], []]);
+  assert.deepEqual(fake.openPages(), []);
 });

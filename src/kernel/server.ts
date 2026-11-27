@@ -17,7 +17,7 @@ import type { Dialog } from './approval.ts';
 import type { RulesState } from './mode.ts';
 import { ApprovalStore } from './approval-store.ts';
 import { createRulesResolver } from './rules.ts';
-import { DEFAULT_PROFILE, profileInfo } from './profiles.ts';
+import { listProfiles } from './profiles.ts';
 import type { ProfileInfo } from './profiles.ts';
 import { SessionManager } from './sessions.ts';
 import { policy } from './write-policy.ts';
@@ -277,7 +277,7 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
     return {
       version, pid: process.pid, home: home.root, driver: { name: driver.name, capabilities: { ...driver.capabilities } },
       instance: sessions.instanceState(), sessions: sessions.list(),
-      profiles: [profileInfo(home, DEFAULT_PROFILE)], rules: modes.state(),
+      profiles: listProfiles(home), rules: modes.state(),
     };
   };
 
