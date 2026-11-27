@@ -11,7 +11,7 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/op
 
 export interface FakeElement { text?: string; visible?: boolean; css?: Record<string, string>; count?: number;
   password?: boolean; kind?: Described['kind']; stable?: Stable | null; failWith?: 'not-found' | 'timeout' | 'other'; describeFails?: number;
-  hints?: string[]; waitFails?: boolean; readFails?: boolean; readHangs?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时；readFails：read/text 这个目标抛 DriverError；readHangs：read/text 这个目标永不落定
+  hints?: string[]; waitFails?: boolean; readFails?: boolean; readHangs?: boolean; readDelayMs?: number; readCrash?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时；readFails：read/text 这个目标抛 DriverError；readHangs：read/text 这个目标永不落定；readDelayMs：read/text 先睡这么久再返回；readCrash：read/text 抛非 DriverError（TypeError）
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
   console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other';
   redirectTo?: string;   // goto 这个地址时页面落到另一个地址（用那个地址的规格），模拟重定向
@@ -92,6 +92,8 @@ class FakePage implements Page {
   // readHangs：永不落定（测探针的超时）；readFails：抛 DriverError（测失败关闭）。
   private async readGuard(el: FakeElement): Promise<void> {
     if (el.readHangs === true) await new Promise<void>(() => {});
+    if (el.readDelayMs !== undefined) await sleep(el.readDelayMs);
+    if (el.readCrash === true) throw new TypeError('fake crash');
     if (el.readFails === true) throw new DriverError('other', 'read failed');
   }
 

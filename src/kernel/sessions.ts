@@ -147,8 +147,9 @@ function busy(): E2kError {
 }
 
 // 消息里只有组名和规则里写的期望文字，不含页面上读到的任何内容。
+const IDENTITY_NEXT = '账号或租户可能被别的会话切走了；请人确认后关掉这个会话重开';
 function identityMismatchError(m: { group: string; expect: string }): E2kError {
-  return new E2kError('needs-human', `身份探针不符：组 ${m.group} 期望「${m.expect}」，页面上不是`, '账号或租户可能被别的会话切走了；请人确认后关掉这个会话重开');
+  return new E2kError('needs-human', `身份探针不符：组 ${m.group} 期望「${m.expect}」，页面上不是`, IDENTITY_NEXT);
 }
 
 // 冻结的会话 step 不执行：要人关掉它，用目标组的 profile 另开。group 为 null 是判断不出归属（失败关闭）。
@@ -357,8 +358,8 @@ export class SessionManager {
   }
 
   // 身份探针（设计 5.2）。身份每次从批准快照里会话所在组现取，不缓存；组没配身份返回 null、什么都不记。
-  // 前提：主页面的主机属于会话的组（借用、停在身份提供方 / loginHosts 上都不满足）且页面上没有登录墙，否则 skipped。
-  // 比较：`css=选择器` 恰好匹配 1 个、文字 trim 后等于期望才是 ok；其余是 mismatch。驱动抛 DriverError、整体超时都按 mismatch（失败关闭）；
+  // 前提：主页面的主机属于会话的组（借用、停在身份提供方 / loginHosts 上都不满足），否则 skipped。
+  // 比较：`css=选择器` 恰好匹配 1 个、文字 trim 后等于期望才是 ok；其余是 mismatch；匹配 0 个且页面上有可见的密码框（疑似登录页）时是 skipped。驱动抛 DriverError、整体超时都按 mismatch（失败关闭）；
   // 别的异常照常往上抛。页面已关（会话在收尾）时读不到不算不符。读到的文字只在这里比较，不进任何消息、记录、日志。
   private async probeIdentity(s: Session): Promise<'ok' | 'mismatch' | 'skipped' | null> {
     const identity = this.deps.modes.group(s.group)?.identity ?? null;
@@ -400,9 +401,12 @@ export class SessionManager {
       return 'skipped';
     }
     if (this.deps.modes.groupOf(host).name !== s.group) return 'skipped';
-    if ((await loginWall(s.page, s.start.url)).blocked !== null) return 'skipped';
     const target = `css=${selector}`;   // parseIdentity 已拒掉引用、引擎前缀、>>、role、XPath：驱动的 locate 里只会走 css 引擎
-    if ((await s.page.read({ kind: 'count', target })) !== 1) return 'mismatch';
+    const n = await s.page.read({ kind: 'count', target });
+    // 先数再看密码框：登录墙检查只是给人的提示，不是安全判断（后台设置页常有掩码显示密钥的密码框），不能拿它关掉探针。
+    // 页面上有密码框时：恰好 1 个照常比较，≥2 个不符，0 个才跳过（可能真的是登录页，身份元素不在）。
+    if (n === 0) return (await loginWall(s.page, s.start.url)).blocked !== null ? 'skipped' : 'mismatch';
+    if (n !== 1) return 'mismatch';
     return (await s.page.text({ target })).trim() === expect ? 'ok' : 'mismatch';
   }
 
@@ -881,9 +885,11 @@ export class SessionManager {
       s.url = safely(() => redactUrl(loc.url));
       s.state = 'idle';
       this.restartIdle(s);
+      // 首屏不符：next 放 step 的错误里那句下一步（--json 里也看得到）；同时在登录墙上时仍以登录提示为准（blocked 是 login，next 要对得上它）。
+      const next = identity === 'mismatch' && wall.blocked === null ? IDENTITY_NEXT : wall.next;
       return {
         session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: this.sessionMode(s, []), runDir: s.runDir,
-        snapshot: cappedSnapshot(snapshot), ...wall, profile: o.profile, borrowed: o.borrowed, identity,
+        snapshot: cappedSnapshot(snapshot), ...wall, next, profile: o.profile, borrowed: o.borrowed, identity,
       };
     } catch (e) {
       // 先清理（关页、删空的报告目录、撤销登记），会话不建立；再把驱动的错误换成 action-failed，别的原样抛。

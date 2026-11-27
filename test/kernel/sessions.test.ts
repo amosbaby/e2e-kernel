@@ -2897,6 +2897,8 @@ test('identity probe: another name is a mismatch at open (the session is still r
   const { sm, fake, logs } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
   const r = await sm.open({ url: ID_A });
   assert.equal(r.identity, 'mismatch');
+  assert.equal(r.next, '账号或租户可能被别的会话切走了；请人确认后关掉这个会话重开');   // --json 里也能看到下一步
+  assert.ok(!(r.next ?? '').includes(OTHER_TEXT));
   const before = snapshots(fake);
   const reads = methodCount(fake, 'read');
   const bad = (e: unknown): boolean => {
@@ -2946,6 +2948,19 @@ test('identity probe: the count is read before the text, and the text is not rea
 test('identity probe: a driver error while reading is a mismatch (fail closed); an unrelated error is not swallowed', async () => {
   const { sm } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readFails: true } } } });
   assert.equal((await sm.open({ url: ID_A })).identity, 'mismatch');
+  const crash = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readCrash: true } } } });
+  await assert.rejects(crash.sm.open({ url: ID_A }), TypeError);   // 不是 DriverError：原样抛，不变成不符，也不留会话
+  assert.deepEqual(crash.sm.list(), []);
+});
+
+test('identity probe: a failure that is not a driver error at a step is thrown as it is, the session is back to idle and nothing is remembered as a mismatch', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: TENANT } });
+  const r = await sm.open({ url: ID_A });
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, { text: 'Test Tenant', count: 1, readCrash: true });
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), TypeError);
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, TENANT[ID_EL]);
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity?.mismatch, false);
 });
 
 test('identity probe: a probe that never settles is cut off after the configured time and counts as a mismatch', async () => {
@@ -2956,16 +2971,35 @@ test('identity probe: a probe that never settles is cut off after the configured
   assert.ok(Date.now() - t0 < 1500);
 });
 
-test('identity probe: on a login wall, on an identity provider host, and on a borrowed page it is skipped: no element is read, the session carries on', async () => {
+test('identity probe: a password field on the page does not switch the probe off: the match is counted first, one match is compared (ok or mismatch), two are a mismatch, none is skipped', async () => {
+  const wall = (el: FakePageSpec['elements']): FakePageSpec => ({ passwordField: true, elements: el });
+  const { sm } = await setupIdent({
+    'http://a.example.com/ok': wall(TENANT), 'http://a.example.com/other': wall({ [ID_EL]: { text: OTHER_TEXT, count: 1 } }),
+    'http://a.example.com/two': wall({ [ID_EL]: { text: 'Test Tenant', count: 2 } }), 'http://a.example.com/none': wall({}),
+  });
+  const probe = async (path: string) => { const r = await sm.open({ url: `http://a.example.com/${path}`, name: path }); return { r, id: r.identity }; };
+  assert.equal((await probe('ok')).id, 'ok');
+  assert.equal((await probe('other')).id, 'mismatch');
+  assert.equal((await probe('two')).id, 'mismatch');
+  const none = await probe('none');
+  assert.equal(none.id, 'skipped');
+  assert.equal(none.r.blocked, 'login');
+  assert.equal((await sm.step({ session: none.r.session, ops: SNAP })).results[0]?.outcome, 'ok');   // 跳过时 step 照常
+  // 密码框 + 租户被切走：step 停下，不执行
+  const sw = await sm.open({ url: 'http://a.example.com/ok', name: 'sw' });
+  const { fake } = { fake: (sm as unknown as { deps: { driver: FakeDriver } }).deps.driver };
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, { text: OTHER_TEXT, count: 1 });
+  const before = snapshots(fake);
+  await assert.rejects(sm.step({ session: sw.session, ops: SNAP }), isCode('needs-human'));
+  assert.equal(snapshots(fake), before);
+});
+
+test('identity probe: on an identity provider host and on a borrowed page it is skipped: no element is read, the session carries on', async () => {
   const idp = 'http://sso.example.org/';
   const { sm, fake } = await setupIdent({
-    [ID_A]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } }, passwordField: true },
     'http://a.example.com/to-sso': { redirectTo: idp }, [idp]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } },
     'http://localhost:5173/': { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } },
   });
-  const wall = await sm.open({ url: ID_A, name: 'wall' });
-  assert.equal(wall.identity, 'skipped');
-  assert.equal((await sm.step({ session: wall.session, ops: SNAP })).results[0]?.outcome, 'ok');
   const viaIdp = await sm.open({ url: 'http://a.example.com/to-sso', name: 'idp' });
   assert.equal(viaIdp.identity, 'skipped');
   const borrowed = await sm.open({ url: 'http://localhost:5173/', profile: 'a', name: 'bor' });
@@ -2973,7 +3007,7 @@ test('identity probe: on a login wall, on an identity provider host, and on a bo
   assert.equal((await sm.step({ session: borrowed.session, ops: SNAP })).results[0]?.outcome, 'ok');
   assert.equal(methodCount(fake, 'read'), 0);
   assert.equal(methodCount(fake, 'text'), 0);
-  for (const s of [wall, viaIdp, borrowed]) {
+  for (const s of [viaIdp, borrowed]) {
     const id = readResult((await sm.close({ session: s.session })).runDir).identity;
     assert.equal(id?.mismatch, false); assert.equal(id?.checks, 0); assert.ok((id?.skipped ?? 0) >= 1);
   }
@@ -3000,9 +3034,11 @@ test('identity probe: the identity is taken from the approved snapshot at each p
   mock.restoreAll();
 });
 
-test('identity probe: it runs before the declared-writes gate: a mismatching account gets no approval box and nothing else', async () => {
-  const { sm, dialog } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
+test('identity probe: it runs before the declared-writes gate: the tenant is switched after open, the step with declarations stops with the identity error and no approval box is shown', async () => {
+  const { sm, fake, dialog } = await setupIdent({ [ID_A]: { elements: TENANT } });
   const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'ok');
+  fake.setElement(fake.openPages().at(-1)!, ID_EL, { text: OTHER_TEXT, count: 1 });
   const boxes = dialog.requests.length;
   await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [{ method: 'POST', url: 'http://a.example.com/api/save' }] }),
     (e: unknown) => isCode('needs-human')(e) && /身份探针不符/.test((e as Error).message));
@@ -3044,4 +3080,38 @@ test('identity probe: only the main page is probed, not a popup and not a login 
   assert.ok(!touched(popup.id).some((m) => m === 'read' || m === 'text' || m === 'location'));
   assert.ok(!touched(loginPage).some((m) => m === 'read' || m === 'text'));
   await sm.close({ session: r.session });
+});
+
+test('identity probe: a session frozen while the probe is awaiting the page gets the frozen error, no approval box and no operation', async () => {
+  const { sm, fake, dialog } = await setupIdent({ [ID_A]: { elements: TENANT }, 'http://b.example.com/landing': {} });
+  const r = await sm.open({ url: ID_A });
+  const page = fake.openPages().at(-1)!;
+  fake.setElement(page, ID_EL, { text: 'Test Tenant', count: 1, readDelayMs: 150 });
+  const boxes = dialog.requests.length;
+  const before = snapshots(fake);
+  const step = sm.step({ session: r.session, ops: SNAP, allow: [{ method: 'POST', url: 'http://a.example.com/api/save' }] });
+  const settled = step.then(() => null, (e: unknown) => e);
+  await sleep(30);
+  fake.emitHop(page, 'http://b.example.com/landing');   // 探针在等页面时被重定向进了组 b：冻结
+  const e = await settled;
+  assert.ok(isCode('needs-human')(e) && /会话已冻结/.test((e as Error).message), String(e));
+  await settleDialog();
+  assert.equal(dialog.requests.length, boxes);
+  assert.equal(snapshots(fake), before);
+  await sm.close({ session: r.session });
+});
+
+test('identity probe: a main page that closes while the probe is awaiting it is skipped, not a mismatch', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: TENANT } });
+  const r = await sm.open({ url: ID_A });
+  const page = fake.openPages().at(-1)!;
+  fake.setElement(page, ID_EL, { text: 'Test Tenant', count: 1, readDelayMs: 100 });
+  const settled = sm.step({ session: r.session, ops: SNAP }).then(() => null, (e: unknown) => e);
+  await sleep(30);
+  fake.closePage(page);
+  const e = await settled;
+  assert.ok(!(e instanceof E2kError && /身份探针不符/.test(e.message)), String(e));
+  await until(() => sm.list().length === 0);
+  const out = readResult(r.runDir);   // 报告在探针落定之前就收尾了，所以这里只看没有记不符；不符的话上面的 step 会抛身份错误
+  assert.deepEqual([out.identity?.mismatch, out.closedBy], [false, 'page-gone']);
 });
