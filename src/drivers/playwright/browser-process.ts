@@ -10,7 +10,7 @@ import { DriverError } from '../../driver/types.ts';
 // Playwright 通过 connectOverCDP 的公开重载（ConnectOverCDPTransport，见 types.d.ts）接管这条管道。
 
 // Chromium 命令行开关。来自 Playwright 1.65.1 自己启动浏览器时用的那一份（packages/playwright-core 的 chromiumSwitches），
-// 去掉了只对 Windows、Edge、Android 有意义的几项，也不带 --no-sandbox（保留浏览器自己的沙箱）。
+// 去掉了只对 Windows、Edge、Android 有意义的几项，以及 Linux 专属的 --disable-dev-shm-usage（/dev/shm 过小时浏览器会崩；这里只在 macOS 上用，将来要在 Linux 上跑，要把它补回来），也不带 --no-sandbox（保留浏览器自己的沙箱）。
 // 不是随手挑的：Playwright 的文档提醒，不用它的启动参数，部分功能会坏。要紧的几项：
 // - --use-mock-keychain、--password-store=basic：profile 里的 cookie 是按这个方式加密的，换了就读不出登录态，还会弹钥匙串框；
 // - --disable-popup-blocking：页面自己 window.open 的弹窗不被拦；

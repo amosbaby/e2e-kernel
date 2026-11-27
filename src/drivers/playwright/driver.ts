@@ -906,7 +906,11 @@ class PlaywrightInstance implements Instance, Host {
         const found = this.context.pages().find((cand) => !this.byPage.has(cand) && !this.anchors.has(cand) && cand.url() === marker);
         if (found !== undefined) {
           const cleaned = found.evaluate(`history.replaceState(null, '', 'about:blank')`).then(() => true, () => false);
-          if (!(await raceDeadline(cleaned, PAGE_READY_TIMEOUT_MS))) throw new DriverError('timeout', 'the new page did not become ready');
+          if (!(await raceDeadline(cleaned, PAGE_READY_TIMEOUT_MS))) {
+            // 认到了但页内脚本跑不起来：外层 catch 会 closeTarget 关掉它；先把它从暂存表里摘掉，免得被关的页留在 deferred 里等着被登记成未归属页。
+            this.deferred.delete(found);
+            throw new DriverError('timeout', 'the new page did not become ready');
+          }
           return found;
         }
         const left = deadline - Date.now();

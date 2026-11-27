@@ -93,6 +93,12 @@ test('the driver opens pages with Target.createTarget in the background and neve
   assert.match(code('src/drivers/playwright/browser-process.ts'), /background:\s*!foreground/);
 });
 
+// Task 16 遗留：认领到的页脚本跑不起来、被 closeTarget 关掉时，抛错之前要先把它从暂存表（deferred）里摘掉。
+// 这条超时走不到真浏览器里（认领的页脚本总是能跑），所以只守源码里的顺序；变异（删掉这一行）会让它失败。
+test('a claimed page that never became ready is dropped from the deferred set before the error is thrown', () => {
+  assert.match(code('src/drivers/playwright/driver.ts'), /this\.deferred\.delete\(found\);\s*throw new DriverError\('timeout', 'the new page did not become ready'\)/);
+});
+
 test('nothing in src opens a TCP debugging port: the browser is controlled over a pipe only', () => {
   for (const f of readSources('src')) {
     assert.doesNotMatch(stripLineComments(f.text), /remote-debugging-port|remote-debugging-address|--remote-allow-origins|DevToolsActivePort/, f.path);
