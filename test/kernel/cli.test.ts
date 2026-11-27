@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, symlin
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
-import { formatClose, formatStatus, formatStep } from '../../src/cli/format.ts';
+import { formatClose, formatOpen, formatStatus, formatStep } from '../../src/cli/format.ts';
 import type { Io } from '../../src/cli/main.ts';
 import { noDialog } from '../../src/kernel/approval.ts';
 import { startKernel } from '../../src/kernel/server.ts';
@@ -976,4 +976,66 @@ describe('terminal control characters from the page never reach the terminal', (
     assert.ok(text.includes('标题 title\\x1b[2K'));
     assert.ok(text.includes('- text "snap\\x1b[1A"'));
   });
+});
+
+// ---- --profile：按域名组选 profile、借用（M2b 任务 6） ----
+
+const PROFILE_RULES = JSON.stringify({ version: 1, rules: [{ match: 'a.example.com', mode: 'readonly' }], loginHosts: [],
+  groups: [{ name: 'a', hosts: ['a.example.com'], loginHosts: ['sso.example.org'] }, { name: 'b', hosts: ['b.example.com'] }] });
+
+// 规则先批准好（走解析器的 approvePending，和内核同一条路径），再起一个独立的内核。
+async function withGroupKernel(fn: (h: ReturnType<typeof makeTmpHome>, f: FakeDriver) => Promise<void>): Promise<void> {
+  const h = makeTmpHome();
+  const f = new FakeDriver({ pages: pages() });
+  writeFileSync(h.home.rulesFile, PROFILE_RULES);
+  approveRulesFile(h.home);
+  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog() });
+  try { await fn(h, f); } finally { await kernel.stop(); h.cleanup(); }
+}
+
+test('open --profile: the domain\'s own group and slot, borrowing on an unlisted host, and the usage errors never echo what was given', async () => {
+  await withGroupKernel(async (h, f) => {
+    const run = async (args: string[]) => { const t = io({ env: h.env }); const code = await main(['open', ...args, '--json'], t); return { code, t }; };
+    const own = await run(['http://a.example.com/']);
+    assert.equal(own.code, 0); assert.deepEqual([JSON.parse(own.t.outText()).profile, JSON.parse(own.t.outText()).borrowed], ['a', false]);
+    const slot = await run(['http://a.example.com/', '--profile', 'a/t1']);
+    assert.equal(slot.code, 0); assert.equal(JSON.parse(slot.t.outText()).profile, 'a@t1');
+    assert.deepEqual(f.launched.map((l) => l.name), ['a', 'a@t1']);
+    const borrowed = await run(['http://localhost:5173/', '--profile', 'a']);
+    assert.equal(borrowed.code, 0); assert.deepEqual([JSON.parse(borrowed.t.outText()).profile, JSON.parse(borrowed.t.outText()).borrowed], ['a', true]);
+    const text = io({ env: h.env });
+    assert.equal(await main(['open', 'http://localhost:5173/', '--profile', 'a'], text), 0);
+    assert.ok(text.outText().split('\n').includes('借用组 a 的登录：发往 a 的写按那边的模式判；不核对账号'));
+    const plain = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], plain), 0);
+    assert.ok(!plain.outText().includes('借用'));
+    for (const args of [['http://a.example.com/', '--profile', 'b'], ['http://localhost:5173/', '--profile', 'nope'], ['http://localhost:5173/', '--profile', 'a/t1']]) {
+      const bad = await run(args); assert.equal(bad.code, 2, args.join(' ')); assert.ok(!bad.t.outText().includes('nope'));
+    }
+    const shape = io({ env: h.env });
+    assert.equal(await main(['open', 'http://localhost:5173/', '--profile', 'Not Valid Zq7x91'], shape), 2);
+    assert.ok(!shape.errText().includes('Zq7x91'));
+    assert.equal(await main(['open', 'http://localhost:5173/', '--profile'], io({ env: h.env })), 2);   // 缺值
+    const help = io(); assert.equal(await main(['help'], help), 0);
+    assert.match(help.outText(), /open <url> .*--profile <组>\[\/<槽>\]/); assert.match(help.outText(), /login <url> \[--profile <组>\[\/<槽>\]\]/);
+  });
+});
+
+test('login --profile: the login window borrows or uses the group, and the record goes to that profile', async () => {
+  await withGroupKernel(async (h, f) => {
+    const t = io({ env: h.env, isTTY: true });
+    assert.equal(await main(['login', 'http://localhost:5173/login.html', '--profile', 'a'], t), 0);
+    assert.deepEqual(f.launched.map((l) => l.name), ['a']);
+    assert.ok(existsSync(join(h.home.profilesDir, 'a.login.json')) && !existsSync(join(h.home.profilesDir, 'default.login.json')));
+    assert.equal(await main(['login', 'http://a.example.com/login', '--profile', 'b'], io({ env: h.env, isTTY: true })), 2);
+    assert.equal(await main(['login', 'http://localhost:5173/login.html', '--profile', 'a/t1'], io({ env: h.env, isTTY: true })), 2);
+    assert.equal(f.launches, 1);
+  });
+});
+
+test('formatOpen: the borrowed line is only printed for borrowed:true; an older kernel\'s reply (no borrowed) prints none', () => {
+  const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null };
+  assert.ok(formatOpen({ ...base, profile: 'a', borrowed: true }).includes('借用组 a 的登录'));
+  assert.ok(!formatOpen({ ...base, profile: 'a', borrowed: false }).includes('借用'));
+  assert.ok(!formatOpen(base as never).includes('借用'));
+  assert.ok(formatOpen({ ...base, profile: 'a@t1', borrowed: true }).includes('借用组 a 的登录'));
 });

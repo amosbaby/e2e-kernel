@@ -29,7 +29,7 @@ test('skip keys are exactly the documented list, and no kernel field name is a s
     'results', 'tallies', 'exit', 'index', 'op', 'outcome', 'output', 'actual', 'expected', 'consistency', 'sessions', 'idleSec', 'version', 'pid',
     'driver', 'capabilities', 'instance', 'actions', 'writes', 'allowed', 'blocked', 'unattributed', 'hosts', 'verdict', 'findings', 'notDone',
     'coverage', 'closedBy', 'start', 'stable', 'via', 'status', 'failed', 'body', 'pageUrl', 'decision', 'targetMode', 'resourceType', 'level', 'text', 'bodyOmitted', 'fromLoginForm',
-    'profiles', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing', 'graphql', 'summary',
+    'profiles', 'profile', 'borrowed', 'state', 'lastLogin', 'at', 'host', 'outputOmitted', 'jsHash', 'hints', 'seq', 'keepGoing', 'graphql', 'summary',
     'superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'label', 'format', 'mask', 'fullPage', 'idle', 'touch', 'readonly', 'writesBlocked', 'notices'];
   for (const k of kernelFields) assert.ok(!isSensitiveKey(k), k);
 });
@@ -132,6 +132,21 @@ test('open takes readonly as a boolean and nothing else', () => {
   assert.deepEqual(validateParams('open', { url: 'http://localhost/', readonly: true }), { url: 'http://localhost/', readonly: true });
   assert.deepEqual(validateParams('open', { url: 'http://localhost/', readonly: false }), { url: 'http://localhost/', readonly: false });
   for (const readonly of ['yes', 1, null, {}, []]) assert.throws(() => validateParams('open', { url: 'http://localhost/', readonly }), isUsage, String(readonly));
+});
+
+test('open and login.begin take profile as a string of 1 to 65 characters and nothing else; its shape is checked in the kernel', () => {
+  const longest = 'a'.repeat(32) + '/' + 'b'.repeat(32);
+  assert.equal(longest.length, 65);
+  for (const profile of ['a', 'a/t1', longest, 'Not A Profile', '../x']) {   // 写法对不对由内核查，这里只看类型和长度
+    assert.deepEqual(validateParams('open', { url: 'http://localhost/', profile }), { url: 'http://localhost/', profile });
+    assert.deepEqual(validateParams('login.begin', { url: 'http://localhost/', profile }), { url: 'http://localhost/', profile });
+  }
+  assert.deepEqual(validateParams('login.begin', { url: 'http://localhost/' }), { url: 'http://localhost/' });
+  for (const profile of ['', 'a'.repeat(66), 1, null, true, {}, ['a']]) {
+    assert.throws(() => validateParams('open', { url: 'http://localhost/', profile }), isUsage, `open ${JSON.stringify(profile)?.slice(0, 20)}`);
+    assert.throws(() => validateParams('login.begin', { url: 'http://localhost/', profile }), isUsage, `login.begin ${JSON.stringify(profile)?.slice(0, 20)}`);
+  }
+  assert.throws(() => validateParams('login.begin', { url: 'http://localhost/', slot: 't1' }), isUsage);
 });
 
 test('validateParams rejects bad parameters with usage', () => {

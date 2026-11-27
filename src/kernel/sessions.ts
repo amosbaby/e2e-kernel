@@ -11,7 +11,7 @@ import type { Viewport } from '../shared/ops.ts';
 import { ensurePrivateDir, resolveInside } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
 import { tally } from '../shared/protocol.ts';
-import type { CloseParams, CloseResult, Mode, OpenParams, OpenResult, SessionInfo, StepParams, StepResult }
+import type { CloseParams, CloseResult, LoginBeginParams, Mode, OpenParams, OpenResult, SessionInfo, StepParams, StepResult }
   from '../shared/protocol.ts';
 import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
@@ -19,9 +19,12 @@ import { pendingError } from './approval.ts';
 import type { Approvals, DialogRequest } from './approval.ts';
 import type { ApprovalStore } from './approval-store.ts';
 import type { ModeResolver } from './mode.ts';
-import { DEFAULT_PROFILE, checkProfileKey, prepareProfileDir, recordLogin } from './profiles.ts';
+import { checkProfileKey, parseProfileArg, prepareProfileDir, profileKey, recordLogin } from './profiles.ts';
+import type { ProfileRef } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
+import { DEFAULT_GROUP_NAME } from './rules.ts';
+import { blockOtherGroup, otherGroupMessage } from './write-policy.ts';
 import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
 
 // 会话管理（设计 5.2、5.5、5.6）：实例的懒启动和复用、会话的开、执行、收尾、闲置超时、关停。
@@ -51,7 +54,13 @@ interface Session {
   readonly runDir: string;
   readonly startedAt: Date;
   readonly instance: Instance;               // 会话的页所在的实例
-  readonly start: { url: string; viewport: Viewport | null; touch: boolean; profile: string };   // profile 存 key（`组` 或 `组@槽`）
+  readonly start: { url: string; viewport: Viewport | null; touch: boolean; profile: string; borrowed: boolean };   // profile 存 key（`组` 或 `组@槽`）
+  // profile 的组名（只存名字，不存 modes.group() 返回的缓存对象：规则刷新、被批准的改动都不会改写它），和是否借用了别的组的登录。
+  readonly group: string;
+  readonly borrowed: boolean;
+  // 跨组导航被拦的次数，和还没在 step 的 notices 里提示过的提示句（去重）。
+  crossCount: number;
+  readonly crossNotices: Set<string>;
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
   readonly recorder: Recorder;
@@ -75,6 +84,8 @@ interface Login {
   readonly id: string;
   readonly instance: Instance;
   readonly profile: string;                  // 登录用的 profile（key）：人按回车结束时，登录记录记到它名下
+  readonly group: string;                    // profile 的组名（只存名字）：loginHosts 按它查，跨组导航拦的也是它
+  readonly borrowed: boolean;                // 借用了别的组的登录
   readonly host: string;                     // 起始地址的主机（URL.hostname），人按回车结束时记进登录记录
   readonly mode: Mode;                       // resolve(起始主机)：起点只读，登录里的写就都按只读
   readonly pages: Map<string, Page | null>;  // 只知道 id、还没拿到对象的记 null
@@ -182,13 +193,16 @@ export class SessionManager {
     return this.track(() => this.openSession(p));
   }
 
-  // profile 是 profile key；协议里还没有选 profile 的参数，调用方都用 default（选 profile 是后面的任务）。
-  private async openSession(p: OpenParams, profile: string = DEFAULT_PROFILE): Promise<OpenResult> {
+  private async openSession(p: OpenParams): Promise<OpenResult> {
+    // profile 参数的写法先查（不对就 usage）：要在 gateRules 之前，不能为一个写错的参数弹规则批准框。
+    const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
     const host = new URL(p.url).hostname;
     // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
     this.gateRules();
+    const { ref, borrowed } = this.pickProfile(host, arg);
+    const profile = profileKey(ref);
     const forced = p.readonly === true;
     const mode: Mode = forced ? 'readonly' : this.deps.modes.resolve(host);
     // 「denied」是 M3 的事，规则文件现在不收；到了这里也宁可拒绝，不开任何页面。
@@ -199,14 +213,14 @@ export class SessionManager {
     }
     const slot = this.pin(profile);
     try {
-      return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile });
+      return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile, group: ref.group, borrowed });
     } finally {
       this.unpin(slot);
     }
   }
 
-  private async openOn(instance: Instance, p: OpenParams, o: { host: string; mode: Mode; forced: boolean; profile: string }): Promise<OpenResult> {
-    const { host, mode, forced, profile } = o;
+  private async openOn(instance: Instance, p: OpenParams, o: { host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean }): Promise<OpenResult> {
+    const { host, mode, forced, profile, group, borrowed } = o;
     if (this.stopping) throw stopping();
 
     const name = p.name ?? DEFAULT_NAME;
@@ -220,7 +234,7 @@ export class SessionManager {
       ensurePrivateDir(nameDir);
       const runDir = resolveInside(nameDir, dirName);
       ensurePrivateDir(runDir);
-      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced, profile });
+      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced, profile, group, borrowed });
     } finally {
       this.reserved.delete(id);
     }
@@ -235,16 +249,20 @@ export class SessionManager {
     this.pauseIdle(s);
     try {
       const blockedBefore = s.recorder.blockedEvents();
+      const crossBefore = s.crossCount;
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
         { keepGoing: p.keepGoing === true, aborted: () => s.gone });
       // 口径：本批执行期间被拦下的本会话请求。执行结束之后才到的「重定向被拒」算进下一批；未归属的请求不算（它们不属于任何会话的记录）。
       const writesBlocked = s.recorder.blockedEvents() - blockedBefore;
+      const crossBlocked = s.crossCount - crossBefore;   // 其中跨组导航被拦的：不是只读模式拦的，提示另说
       const tallies = tally(results);
       await this.syncTopHost(s);
       const wall = await loginWall(s.page, s.start.url);
       s.lastWall = wall.blocked;
       const notices: string[] = [];
-      if (writesBlocked > 0) notices.push(`本批被拦 ${writesBlocked} 条写（只读模式），详见报告`);
+      if (writesBlocked - crossBlocked > 0) notices.push(`本批被拦 ${writesBlocked - crossBlocked} 条写（只读模式），详见报告`);
+      notices.push(...s.crossNotices);   // 还没提示过的跨组导航（含两次 step 之间发生的），提示一次就清掉
+      s.crossNotices.clear();
       const rules = this.deps.modes.state();
       if (rules.error !== null) notices.push('规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝');
       if (rules.pending !== null) notices.push('规则文件有未批准的改动（收紧的部分已生效）');
@@ -327,25 +345,53 @@ export class SessionManager {
     }
   }
 
-  // 在 default profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录窗口里 loginHosts 之外的写照只读规则拦。
-  loginBegin(p: { url: string }): Promise<{ loginId: string }> {
+  // 按域名所在的组选 profile（设计 5.2）。组信息只认已批准的快照（modes.groupOf / modes.group），待批的组不算数。
+  // 没给 arg：用域名所在的组。给了：组要存在；和域名所在的组一致就用它；域名没编组（default 组）就借用那个组的登录（不能带槽）；
+  // 域名属于别的组则拒绝。借用不弹框、也不核对账号：发往被借组的写按那边的模式判（decideForSession）。
+  private pickProfile(host: string, arg: ProfileRef | null): { ref: ProfileRef; borrowed: boolean } {
+    const { modes } = this.deps;
+    const hg = modes.groupOf(host).name;
+    if (arg === null) return { ref: { group: hg, slot: null }, borrowed: false };
+    if (modes.group(arg.group) === null) throw new E2kError('usage', '没有这个组', 'e2k rule list 看有哪些组');
+    if (arg.group === hg) return { ref: arg, borrowed: false };
+    if (hg === DEFAULT_GROUP_NAME) {
+      if (arg.slot !== null) throw new E2kError('usage', '槽只能用在本组的域名上', '去掉 profile 里的槽，或换成这个组自己的域名');
+      return { ref: arg, borrowed: true };
+    }
+    throw new E2kError('usage', `这个域名属于组 ${hg}，不能用组 ${arg.group} 的 profile`, `用 --profile ${hg}，或不指定`);
+  }
+
+  // 在选定的 profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录窗口里 loginHosts 之外的写照只读规则拦。
+  loginBegin(p: LoginBeginParams): Promise<{ loginId: string }> {
     return this.track(() => this.beginLogin(p));
   }
 
-  private async beginLogin(p: { url: string }, profile: string = DEFAULT_PROFILE): Promise<{ loginId: string }> {
+  private async beginLogin(p: LoginBeginParams): Promise<{ loginId: string }> {
+    // profile 参数的写法先查：要在 gateRules 之前。
+    const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
     // 规则先刷新一遍：文件有错就不开登录页（和 open 一致）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
     this.gateRules();
+    // 取不到主机不挡登录（后面也一样）：按没编组的 default 组算。
+    let host = '';
+    try {
+      host = hostOf(p.url);
+    } catch {
+      // 取不到主机：host 留空
+    }
+    const { ref, borrowed } = this.pickProfile(host, arg);
+    const profile = profileKey(ref);
     const slot = this.pin(profile);
     try {
-      return await this.loginOn(await this.acquireInstance(profile, slot), p, profile);
+      return await this.loginOn(await this.acquireInstance(profile, slot), p, { profile, group: ref.group, borrowed });
     } finally {
       this.unpin(slot);
     }
   }
 
-  private async loginOn(instance: Instance, p: { url: string }, profile: string): Promise<{ loginId: string }> {
+  private async loginOn(instance: Instance, p: LoginBeginParams, o: { profile: string; group: string; borrowed: boolean }): Promise<{ loginId: string }> {
+    const { profile, group, borrowed } = o;
     if (this.stopping) throw stopping();
     let id = `l-${randomHex()}`;
     while (this.logins.has(id)) id = `l-${randomHex()}`;
@@ -361,7 +407,7 @@ export class SessionManager {
     try {
       const page = await instance.openPage({});
       // 先登记再导航：登录页的首个请求就按登录页放行。关停已经开始的，登记后由下面的 catch 关页。
-      login = { id, instance, profile, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, requestIds: new Map() };
+      login = { id, instance, profile, group, borrowed, host, mode, pages: new Map([[page.id, page]]), places: new Map([[page.id, { committed: host, pending: new Set() }]]), blocked: 0, requestIds: new Map() };
       this.logins.set(id, login);
       if (this.stopping) throw stopping();
       await page.goto(p.url);
@@ -574,7 +620,7 @@ export class SessionManager {
   }
 
   private async openPage(instance: Instance, p: OpenParams, o: { id: string; name: string; nameDir: string; dirName: string;
-    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean; profile: string }): Promise<OpenResult> {
+    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean }): Promise<OpenResult> {
     let page: Page | undefined;
     let registered = false;
     try {
@@ -582,7 +628,8 @@ export class SessionManager {
       if (this.stopping) throw stopping();
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
-        start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile },
+        start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
+        group: o.group, borrowed: o.borrowed, crossCount: 0, crossNotices: new Set(),
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
@@ -608,7 +655,7 @@ export class SessionManager {
       this.restartIdle(s);
       return {
         session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: this.sessionMode(s, []), runDir: s.runDir,
-        snapshot: cappedSnapshot(snapshot), ...wall,
+        snapshot: cappedSnapshot(snapshot), ...wall, profile: o.profile, borrowed: o.borrowed,
       };
     } catch (e) {
       // 先清理（关页、删空的报告目录、撤销登记），会话不建立；再把驱动的错误换成 action-failed，别的原样抛。
@@ -819,18 +866,29 @@ export class SessionManager {
     const topHost = hostOf(req.topUrl ?? req.url);
     const place = this.loginPlace(login, req.pageId, req.openerPageId);
     const isNav = req.isNavigation && req.topFrame;
+    // 跨组导航先于 loginHosts 的豁免和写策略：去别的组的域名，登录窗口里也不放行（含弹窗）。
+    if (isNav) {
+      const cross = this.crossGroup(req, login.group);
+      if (cross !== null) {
+        login.blocked++;
+        this.logLine(`登录 ${login.id}：拦下跨组导航 ${safely(() => redactText(hostOf(req.url)))}`);
+        return cross.verdict.decision;
+      }
+    }
     // 顶层导航带着发起页已提交的地址（initiatorUrl）：这是页面在哪的直接证据（经重定向进入、又没发过子资源的页面也靠它），
     // 先据此定下发起页的主机，再判断；没有就用跟踪到的 committed/pending。
     if (isNav && req.initiatorUrl !== null) {
       place.committed = hostOf(req.initiatorUrl);
       place.pending.clear();
     }
-    const exempt = modes.isLoginHost(hostOf(req.url), 'default')
-      || (isNav && [place.committed, ...place.pending].some((h) => modes.isLoginHost(h, 'default')));
+    const exempt = modes.isLoginHost(hostOf(req.url), login.group)
+      || (isNav && [place.committed, ...place.pending].some((h) => modes.isLoginHost(h, login.group)));
     let decision: Decision;
     if (exempt) decision = { action: 'continue' };
     else {
-      const all = [login.mode, ...[place.committed, ...place.pending, topHost].map((h) => modes.resolve(h))];
+      // 借用的登录：发往被借组的请求，也按目标主机自己的模式算进去。
+      const target = login.borrowed && modes.groupOf(hostOf(req.url)).name === login.group ? [hostOf(req.url)] : [];
+      const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...target].map((h) => modes.resolve(h))];
       const mode: Mode = all.includes('readonly') ? 'readonly' : all.includes('denied') ? 'denied' : 'default';
       const verdict = this.deps.policy.decide(req, { mode });
       decision = verdict.decision;
@@ -864,6 +922,14 @@ export class SessionManager {
     return place;
   }
 
+  // 顶层导航的目标主机属于别的组（不是 default 组、也不是 ownGroup）：给出 403 的判定；否则 null。组只认已批准的快照。
+  // message 是给 step 的提示句（和 403 页面上的是同一句）。
+  private crossGroup(req: RequestInfo, ownGroup: string): { verdict: PolicyVerdict; message: string } | null {
+    const target = this.deps.modes.groupOf(hostOf(req.url)).name;
+    if (target === DEFAULT_GROUP_NAME || target === ownGroup) return null;
+    return { verdict: blockOtherGroup(safely(() => redactText(hostOf(req.url))), target, ownGroup), message: otherGroupMessage(target, ownGroup) };
+  }
+
   // 会话页（主页面、弹窗）的请求。模式跟着页面走（设计 5.2）：有效模式 = 会话主页面的顶层主机和请求所在页的顶层主机取并，
   // 任何一边只读就按只读；默认模式的页面发往只读主机的写照旧放行，只记录（targetMode）。
   private decideForSession(s: Session, req: RequestInfo): Decision {
@@ -873,11 +939,24 @@ export class SessionManager {
     const mainNav = isMain && req.isNavigation && req.topFrame;
     // 主页面的顶层导航：规则可能刚被人改过，先刷新。导航前的主机（s.topHost）和目标一起算，所以只读页跨主机的表单 POST 也拦得住。
     if (mainNav) this.deps.modes.refresh();
-    // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
-    if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
-    const mode = this.sessionMode(s, [topHost]);
     const host = hostOf(req.url);
     const targetMode = this.deps.modes.resolve(host);
+    // 跨组导航（主页面和弹窗的顶层导航）先于写策略：目标域名属于别的组就不放行，进记录（other-group），并给下一次 step 一条提示。
+    // 被拦的导航不改主机、待定主机，也不算「到过」的域名。iframe 和子资源不管。
+    if (req.isNavigation && req.topFrame) {
+      const cross = this.crossGroup(req, s.group);
+      if (cross !== null) {
+        s.recorder.addRequest(req, cross.verdict, { mode: this.sessionMode(s, []), targetMode }, this.deps.now());
+        s.crossCount++;
+        s.crossNotices.add(cross.message);
+        return cross.verdict.decision;
+      }
+    }
+    // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
+    if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
+    // 借用的会话：发往被借组的请求，有效模式里再并上目标主机自己的模式（那边只读就按只读判）。
+    const borrowedTarget = s.borrowed && this.deps.modes.groupOf(host).name === s.group ? [host] : [];
+    const mode = this.sessionMode(s, [topHost, ...borrowedTarget]);
     const verdict: PolicyVerdict = this.deps.policy.decide(req, { mode });
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);

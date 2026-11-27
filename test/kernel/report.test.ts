@@ -281,7 +281,7 @@ test('an eval step shows its recorded result and source hash; a token in the res
 test('no key anywhere in buildResult output is a sensitive key', () => {
   const r = buildResult(input({
     verdict: { value: 'pass', because: 'b' }, findings: [{ claim: 'c', basis: 'b', verdict: 'fail' }], notDone: ['n'], webSockets: 1, superseded: [{ failed: 9001, by: 9002 }],
-    driver: driverWith({ nativeFormSubmit: 'unknown' }),
+    driver: driverWith({ nativeFormSubmit: 'unknown' }), start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'a', borrowed: true },
     actions: [act('click', 'ok', { target: { given: 'e2', stable: { selector: '#a', via: 'id' } }, shot: 'shots/01.jpg' }),
       act('assert', 'match', { actual: 1, expected: 1, error: 'e' }),
       act('click', 'failed', { seq: 9001, target: { given: '#b', stable: null }, error: 'other: x', hints: ['2 matches', '1) button "A" >> nth=0'] }),
@@ -311,7 +311,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   collect(r);
   for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
-    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed']) assert.ok(keys.has(k), k);
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 
@@ -327,7 +327,7 @@ test('buildResult carries the read-only fields through as given', () => {
   assert.deepEqual(r.modes, modes);
   assert.deepEqual(r.rules, { hash: 'sha256:0123456789abcdef', count: 3, pendingHash: 'sha256:fedcba9876543210' });
   assert.equal(r.blocked, 'login');
-  assert.deepEqual(r.start, { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', readonly: true });
+  assert.deepEqual(r.start, { url: 'http://localhost/', viewport: null, touch: false, profile: 'default', borrowed: false, readonly: true });
   const plain = buildResult(input({}));
   assert.deepEqual([plain.modes, plain.rules, plain.blocked, plain.start.readonly], [[], { hash: null, count: 0, pendingHash: null }, null, false]);
 });
@@ -356,6 +356,19 @@ test('blockedSummary groups blocked writes by host, method and reason, includes 
   ]);
   assert.ok(!JSON.stringify(r.writes.blockedSummary).includes('/api'));
   assert.deepEqual(buildResult(input({})).writes.blockedSummary, []);
+});
+
+test('start.borrowed is false unless the session borrowed a group\'s login; the report names the profile and says borrowed, and other-group has its own text', () => {
+  const plain = buildResult(input({}));
+  assert.equal(plain.start.borrowed, false);
+  assert.ok(!renderReport(plain).includes('（借用）'));
+  const borrowed = buildResult(input({ start: { url: 'http://localhost/', viewport: null, touch: false, profile: 'a', borrowed: true } }));
+  assert.deepEqual([borrowed.start.profile, borrowed.start.borrowed], ['a', true]);
+  assert.ok(section(renderReport(borrowed), 'env').includes('profile a（借用）'));
+  const cross = buildResult(input({ writes: [blockedWrite('GET', 'http://b.example.com/x', 'other-group')] }));
+  assert.deepEqual(cross.writes.blockedSummary, [{ host: 'b.example.com', method: 'GET', reason: 'other-group', count: 1, unattributed: false }]);
+  const sec = section(renderReport(cross), 'blocked-writes');
+  assert.ok(sec.includes('跨组导航') && !sec.includes('原因不明'), sec);
 });
 
 test('a blocked write without a reason is counted under the fixed reason unknown, and shown in the report', () => {

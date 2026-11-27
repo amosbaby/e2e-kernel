@@ -4,7 +4,7 @@ import { graphqlKind, isMutationLikeUrl, isPersistedOnly, isStrictQuery } from '
 
 // 写策略（设计 5.3）。只读模式里只放行读（GET/HEAD/OPTIONS）和严格的 GraphQL query，其余一律拦；拿不准的也拦（失败关闭）。
 // reason 只给报告分组用，放行时是 null。
-export type BlockReason = 'method' | 'graphql-mutation' | 'persisted-query' | 'redirected-write' | 'unattributed';
+export type BlockReason = 'method' | 'graphql-mutation' | 'persisted-query' | 'redirected-write' | 'unattributed' | 'other-group';
 export interface PolicyVerdict { decision: Decision; reason: BlockReason | null }
 
 export interface WritePolicy {
@@ -25,6 +25,18 @@ function block(req: RequestInfo, reason: BlockReason): PolicyVerdict {
     ? { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${BLOCK_MESSAGE}</p>` }
     : { action: 'fulfill', status: 403, contentType: 'application/json', body: JSON.stringify({ error: BLOCK_MESSAGE }) };
   return { decision, reason };
+}
+
+// 跨组导航的提示（组名只含小写字母、数字、_、-）：写进 403 页面，也进 step 的 notices。
+export function otherGroupMessage(targetGroup: string, ownGroup: string): string {
+  return `这个域名属于组 ${targetGroup}，当前 profile 是组 ${ownGroup} 的。请用 --profile ${targetGroup} 另开会话。`;
+}
+
+// 顶层导航去了别的组的域名：回一张 403 页面，不放行。host 是已脱敏的目标主机；页面上的转义由这里做。
+export function blockOtherGroup(host: string, targetGroup: string, ownGroup: string): PolicyVerdict {
+  const esc = host.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  const body = `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${otherGroupMessage(targetGroup, ownGroup)}</p><p>目标主机：${esc}</p>`;
+  return { decision: { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body }, reason: 'other-group' };
 }
 
 function decideReadonly(req: RequestInfo): PolicyVerdict {

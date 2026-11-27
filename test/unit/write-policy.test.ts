@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { RequestInfo } from '../../src/driver/types.ts';
-import { BLOCK_MESSAGE, allowAllPolicy, policy } from '../../src/kernel/write-policy.ts';
+import { BLOCK_MESSAGE, allowAllPolicy, blockOtherGroup, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
 import type { BlockReason } from '../../src/kernel/write-policy.ts';
 
 const JSON_CT = 'application/json';
@@ -164,4 +164,15 @@ test('any safe method that carries a body goes through the write checks', () => 
     blocked(ro(req({ method, url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'query{a}' }) })), 'method');
   }
   assert.deepEqual(ro(req({ method: 'GET', body: null })), { decision: { action: 'continue' }, reason: null });
+});
+
+test('a cross-group navigation gets a fixed 403 page with the group names and the redacted host, escaped; the reason is other-group', () => {
+  const sentence = '这个域名属于组 b，当前 profile 是组 a 的。请用 --profile b 另开会话。';
+  assert.equal(otherGroupMessage('b', 'a'), sentence);
+  const v = blockOtherGroup('b.example.com', 'b', 'a');
+  assert.equal(v.reason, 'other-group');
+  assert.deepEqual(v.decision, { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8',
+    body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${sentence}</p><p>目标主机：b.example.com</p>` });
+  const odd = blockOtherGroup('<b>"x"&\'y\'', 'b', 'a');
+  assert.ok(odd.decision.action === 'fulfill' && !odd.decision.body.includes('<b>') && odd.decision.body.includes('&#60;b&#62;'));
 });

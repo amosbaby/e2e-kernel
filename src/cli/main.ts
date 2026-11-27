@@ -58,7 +58,8 @@ function helpText(selfCmd: string): string {
     '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
     '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则，注明是否已批准（只读，不需要内核；规则文件只由人维护）',
     '  rule diff [--json]                     规则文件和已批准的规则之间的完整差异（只读，不需要内核；批准只能由人在内核弹出的框里做）',
-    '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--json]',
+    '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--profile <组>[/<槽>]] [--json]',
+    '                                          --profile 选 profile：不写就用域名所在的组；域名没编组时可借用某个组的登录（不能带槽）；域名属于别的组则拒绝',
     '                                          --readonly 强制这个会话只读（不管域名规则）：只放行读和严格的 GraphQL query，其余写请求一律拦下；驱动不能拦网络时 open 失败',
     '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
     '  step <会话> <JSON 数组> [--keep-going] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
@@ -66,7 +67,7 @@ function helpText(selfCmd: string): string {
     '  close <会话> [--verdict pass|fail|exists|absent|undetermined] [--because <文字>]',
     '               [--findings <JSON>] [--not-done <JSON>] [--superseded <JSON>] [--json]',
     '                                          --findings 每条可带 "verdict"；--superseded 如 [{"failed":3,"by":5}]：序号 3 的失败由之后的序号 5 取代',
-    '  login <url>                            在专用 profile 里登录（要在终端里由人按回车确认）',
+    '  login <url> [--profile <组>[/<槽>]]    在专用 profile 里登录（要在终端里由人按回车确认）；--profile 同 open',
     '  --version',
     '  help',
     '',
@@ -230,13 +231,15 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function open(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' }, readonly: { type: 'boolean' } });
+  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' }, readonly: { type: 'boolean' }, profile: { type: 'string' } });
   const [url] = positionals(ctx, p, 1, '<url>');
   const raw: Record<string, unknown> = { url };
   const viewport = optString(p, 'viewport');
   const name = optString(p, 'name');
   if (viewport !== undefined) raw.viewport = parseViewport(viewport);
   if (name !== undefined) raw.name = name;
+  const profile = optString(p, 'profile');
+  if (profile !== undefined) raw.profile = profile;
   if (p.values.touch === true) raw.touch = true;
   if (p.values.readonly === true) raw.readonly = true;
   const params = validateParams('open', raw);
@@ -287,8 +290,10 @@ async function close(ctx: Ctx, args: string[]): Promise<number> {
 
 async function login(ctx: Ctx, args: string[]): Promise<number> {
   needsTerminal(ctx, 'login');
-  const [url] = positionals(ctx, parse(ctx, args, {}), 1, '<url>');
-  const params = validateParams('login.begin', { url });
+  const p = parse(ctx, args, { profile: { type: 'string' } });
+  const [url] = positionals(ctx, p, 1, '<url>');
+  const profile = optString(p, 'profile');
+  const params = validateParams('login.begin', profile === undefined ? { url } : { url, profile });
   const home = resolveHome(ctx.io.env);
   const begun = await send(ctx, home, 'login.begin', params);
   let end: { loginId: string };

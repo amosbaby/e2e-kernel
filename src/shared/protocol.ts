@@ -47,7 +47,9 @@ export interface Verdict { value: VerdictValue; because?: string }
 export interface Finding { claim: string; basis: string; verdict?: VerdictValue }
 // 「序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代」。序号是整个会话从 1 起的序号（OpResult.seq）。
 export interface Supersede { failed: number; by: number }
-export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean; readonly?: boolean }
+// profile：`组` 或 `组/槽`（只在协议层校验类型和长度，规范化和选择在内核里做）。
+export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean; readonly?: boolean; profile?: string }
+export interface LoginBeginParams { url: string; profile?: string }
 export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean }
 export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[]; superseded?: Supersede[] }
 export type Outcome = 'ok' | 'match' | 'mismatch' | 'failed' | 'not-run';
@@ -72,6 +74,8 @@ export function tally(items: readonly { outcome: Outcome }[]): Tallies {
 export interface SessionInfo { session: string; name: string; url: string; idleSec: number }
 export interface OpenResult {
   session: string; name: string; url: string; title: string; mode: Mode; runDir: string; snapshot: string; blocked: 'login' | null; next: string | null;
+  profile: string;     // 会话用的 profile key（`组` 或 `组@槽`）
+  borrowed: boolean;   // 借用了别的组的登录（域名没编组、却指定了某个组的 profile）
 }
 export interface StepResult {
   session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 | 20; blocked: 'login' | null; next: string | null;
@@ -101,6 +105,7 @@ const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const LOGIN_ID = /^l-[0-9a-f]{6}$/;
 const MAX_LIST = 20;
 const MAX_SUPERSEDED = 50;
+const MAX_PROFILE_ARG = 65;   // 组 32 + "/" + 槽 32
 
 function usage(message: string): E2kError {
   return new E2kError('usage', message);
@@ -172,7 +177,7 @@ export function validateParams(method: 'status', p: unknown): Record<string, nev
 export function validateParams(method: 'open', p: unknown): OpenParams;
 export function validateParams(method: 'step', p: unknown): StepParams;
 export function validateParams(method: 'close', p: unknown): CloseParams;
-export function validateParams(method: 'login.begin', p: unknown): { url: string };
+export function validateParams(method: 'login.begin', p: unknown): LoginBeginParams;
 export function validateParams(method: 'login.end', p: unknown): { loginId: string };
 export function validateParams(method: Method, p: unknown): unknown {
   switch (method) {
@@ -180,12 +185,13 @@ export function validateParams(method: Method, p: unknown): unknown {
       plainObject(p, 'params', []);
       return {};
     case 'open': {
-      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch', 'readonly']);
+      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch', 'readonly', 'profile']);
       const out: OpenParams = { url: httpUrl(o.url, 'params.url') };
       if (o.viewport !== undefined) out.viewport = viewport(o.viewport, 'params.viewport');
       if (o.name !== undefined) out.name = str(o.name, 'params.name', { min: 1, max: 40, pattern: SESSION_NAME });
       if (o.touch !== undefined) out.touch = bool(o.touch, 'params.touch');
       if (o.readonly !== undefined) out.readonly = bool(o.readonly, 'params.readonly');
+      if (o.profile !== undefined) out.profile = str(o.profile, 'params.profile', { min: 1, max: MAX_PROFILE_ARG });
       return out;
     }
     case 'step': {
@@ -210,8 +216,10 @@ export function validateParams(method: Method, p: unknown): unknown {
       return out;
     }
     case 'login.begin': {
-      const o = plainObject(p, 'params', ['url']);
-      return { url: httpUrl(o.url, 'params.url') };
+      const o = plainObject(p, 'params', ['url', 'profile']);
+      const out: LoginBeginParams = { url: httpUrl(o.url, 'params.url') };
+      if (o.profile !== undefined) out.profile = str(o.profile, 'params.profile', { min: 1, max: MAX_PROFILE_ARG });
+      return out;
     }
     case 'login.end': {
       const o = plainObject(p, 'params', ['loginId']);

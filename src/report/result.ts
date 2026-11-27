@@ -15,7 +15,7 @@ export type ClosedBy = 'agent' | 'idle-timeout' | 'kernel-shutdown' | 'browser-g
 
 export interface RunInput {
   kernelVersion: string; session: string; name: string; startedAt: Date; endedAt: Date; closedBy: ClosedBy;
-  start: { url: string; viewport: Viewport | null; touch: boolean; profile: string };
+  start: { url: string; viewport: Viewport | null; touch: boolean; profile: string; borrowed?: boolean };   // borrowed：借用了别的组的登录（没给就是 false）
   driver: { name: string; capabilities: Capabilities };
   actions: ActionRecord[]; writes: WriteRecord[]; unattributedWrites: WriteRecord[];
   hosts: { host: string; mode: Mode }[]; webSockets: number;
@@ -42,7 +42,7 @@ export interface BlockedSummaryRow { host: string; method: string; reason: Block
 
 export interface RunResult {
   schema: 1; kernelVersion: string; session: string; name: string; startedAt: string; endedAt: string; closedBy: ClosedBy;
-  start: RunInput['start'] & { readonly: boolean }; driver: RunInput['driver']; hosts: RunInput['hosts'];
+  start: Omit<RunInput['start'], 'borrowed'> & { borrowed: boolean; readonly: boolean }; driver: RunInput['driver']; hosts: RunInput['hosts'];
   modes: ModeChange[]; rules: RunInput['rules'];
   verdict: Verdict | null; findings: Finding[]; notDone: string[]; superseded: SupersededEntry[];
   tallies: Tallies; consistency: 'ok' | 'conflict'; conflicts: ConflictReason[];
@@ -177,7 +177,7 @@ export function buildResult(input: RunInput): RunResult {
     startedAt: input.startedAt.toISOString(),
     endedAt: input.endedAt.toISOString(),
     closedBy: input.closedBy,
-    start: { ...input.start, readonly: input.forced },
+    start: { ...input.start, borrowed: input.start.borrowed === true, readonly: input.forced },
     driver: { name: input.driver.name, capabilities: { ...input.driver.capabilities } },
     hosts: input.hosts.map((h) => ({ ...h })),
     modes: input.modes.map((m) => ({ ...m })),

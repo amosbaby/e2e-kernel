@@ -30,7 +30,7 @@ const MODE_REASON_TEXT: Record<ModeChange['reason'], string> = {
 };
 const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
   'method': '非读方法', 'graphql-mutation': 'GraphQL mutation', 'persisted-query': '持久化查询',
-  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'unknown': '原因不明',
+  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'other-group': '跨组导航', 'unknown': '原因不明',
 };
 
 function clip(s: string, max: number): string {
@@ -232,7 +232,7 @@ function envSection(r: RunResult): string {
     + `<h3>域名和当时的模式</h3>${listOrNone(hosts)}`
     + `<h3>驱动和能力</h3><p>${own(r.driver.name)}</p>${listOrNone(capLines)}`
     + `<h3>覆盖说明</h3>${listOrNone(notes)}`
-    + `<p>起始地址 ${pageUrl(r.start.url)}，视口 ${vp}，触屏模拟 ${r.start.touch ? '是' : '否'}，profile ${own(r.start.profile)}</p>`
+    + `<p>起始地址 ${pageUrl(r.start.url)}，视口 ${vp}，触屏模拟 ${r.start.touch ? '是' : '否'}，profile ${own(r.start.profile)}${r.start.borrowed === true ? '（借用）' : ''}</p>`
     + `<p>开始 ${own(r.startedAt)}，结束 ${own(r.endedAt)}，结束方式 ${CLOSED_BY_TEXT[r.closedBy] ?? '未知'}，内核版本 ${own(r.kernelVersion)}</p>`
     + (r.blocked === 'login' ? '<p id="env-blocked">收尾时停在登录页</p>' : '')
     + (r.next === null ? '' : `<p>${own(r.next)}</p>`)
