@@ -317,6 +317,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
     modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: 'sha256:fedcba9876543210' }],
     rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' }, blocked: 'login', forced: true,
     declarations: [{ method: 'POST', url: 'http://localhost/a', operation: 'Save', approved: 'dialog' }, { method: 'PUT', url: 'http://localhost/b', operation: null, approved: 'remembered' }],
+    identity: { group: 'a', checks: 2, skipped: 1, mismatch: true },
   }));
   const bad: string[] = [];
   const walk = (v: unknown): void => {
@@ -334,7 +335,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   collect(r);
   for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
-    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy', 'declarations', 'operation', 'approved']) assert.ok(keys.has(k), k);
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy', 'declarations', 'operation', 'approved', 'identity', 'group', 'checks', 'skipped', 'mismatch']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 
@@ -794,4 +795,24 @@ test('the report lists the declarations: method, address, operation or the whole
   assert.ok(html.includes('DELETE') && html.includes('这个地址上的所有写') && html.includes('沿用之前的批准'));
   assert.ok(html.includes('未知'), 'an unknown approval value is shown as unknown');
   assert.ok(!html.includes('<b>x</b>') && !html.includes('<i>'), 'escaped');
+});
+
+test('identity: result.json carries the counts as given; with none given (group without identity) it is null', () => {
+  assert.equal(buildResult(input({})).identity, null);
+  assert.equal(buildResult(input({ identity: null })).identity, null);
+  const given = { group: 'a', checks: 3, skipped: 1, mismatch: false };
+  const r = buildResult(input({ identity: given }));
+  assert.deepEqual(r.identity, given);
+  assert.notEqual(r.identity, given, 'a copy, not the same object');
+});
+
+test('identity: the report has a section only when the group has an identity; a mismatch is flagged; only the group name and counts are shown', () => {
+  assert.equal(section(renderReport(buildResult(input({}))), 'identity'), '');
+  const ok = section(renderReport(buildResult(input({ identity: { group: 'a', checks: 3, skipped: 1, mismatch: false } }))), 'identity');
+  assert.ok(ok.includes('组 a') && ok.includes('核对 3 次') && ok.includes('跳过 1 次') && ok.includes('未发现不符') && !ok.includes('identity-mismatch'));
+  const bad = renderReport(buildResult(input({ identity: { group: 'a<b>', checks: 1, skipped: 0, mismatch: true } })));
+  assert.ok(section(bad, 'identity').includes('id="identity-mismatch"') && section(bad, 'identity').includes('a&lt;b&gt;'));
+  const old = JSON.parse(JSON.stringify(buildResult(input({})))) as Record<string, unknown>;
+  delete old.identity;   // 老版本的 result.json 没有这个字段
+  assert.equal(section(renderReport(old as never), 'identity'), '');
 });

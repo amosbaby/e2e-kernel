@@ -26,7 +26,11 @@ export interface RunInput {
   rules: { hash: string | null; count: number; pendingHash: string | null };   // hash、count：收尾时已批准的规则；pendingHash：同时生效（取更严）的待批文件
   blocked: 'login' | null;   // 会话最后一次登录墙检查的结果
   forced: boolean;           // open --readonly
+  identity?: IdentityRecord | null;   // 身份探针的计数；组没配身份为 null（没给也是 null）
 }
+
+// 身份探针的计数，不含任何页面文字。checks：真正做了比较的探测次数（含不符，不含跳过）；skipped：前提不满足而跳过的次数。
+export interface IdentityRecord { group: string; checks: number; skipped: number; mismatch: boolean }
 
 // 本会话提过、人批准了的放行声明（url 是规范化后的地址，不带查询串）。approved：本次在弹框里批准的 / 之前批准过、这次沿用的。
 export interface DeclarationRecord { method: string; url: string; operation: string | null; approved: 'dialog' | 'remembered' }
@@ -50,6 +54,7 @@ export interface RunResult {
   modes: ModeChange[]; rules: RunInput['rules'];
   verdict: Verdict | null; findings: Finding[]; notDone: string[]; superseded: SupersededEntry[];
   declarations: DeclarationRecord[];
+  identity: IdentityRecord | null;
   tallies: Tallies; consistency: 'ok' | 'conflict'; conflicts: ConflictReason[];
   actions: ActionRecord[];
   writes: { allowed: WriteRecord[]; blocked: WriteRecord[]; unattributed: WriteRecord[]; summary: WriteSummaryRow[]; blockedSummary: BlockedSummaryRow[] };
@@ -192,6 +197,7 @@ export function buildResult(input: RunInput): RunResult {
     notDone: [...input.notDone],
     superseded,
     declarations: input.declarations.map((d) => ({ ...d })),
+    identity: input.identity === undefined || input.identity === null ? null : { ...input.identity },
     tallies,
     consistency: conflicts.length > 0 ? 'conflict' : 'ok',
     conflicts,

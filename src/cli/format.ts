@@ -79,8 +79,15 @@ function borrowedLine(r: OpenResult): string[] {
   return [`借用组 ${g} 的登录：发往 ${g} 的写按那边的模式判；不核对账号`];
 }
 
+// 身份探针不符：醒目的一行，放在最前面。老内核的回应没有 identity：当作没探。不带页面上读到的任何文字（内核也没给）。
+function identityLine(r: OpenResult): string[] {
+  return r.identity === 'mismatch'
+    ? ['!! 身份探针不符：页面上的账号或租户不是组配置里期望的那个。先别继续，请人确认后关掉这个会话重开（这个会话的 step 一律 22）']
+    : [];
+}
+
 export function formatOpen(r: OpenResult): string {
-  return [`${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`,
+  return [...identityLine(r), `${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`,
     ...borrowedLine(r), ...waitLine(r), block(r.snapshot)].join('\n');
 }
 

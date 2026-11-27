@@ -1668,3 +1668,20 @@ test('clearCookies also removes a cookie set with a Domain attribute for that ho
   await inst.clearCookies('xsub.example.test'); await inst.clearCookies('other.example.test'); await inst.clearCookies('example.test');
   assert.deepEqual(await names(), []);
 });
+
+// 身份探针（M2b 任务 10）用的读法：`css=` 前缀走 Playwright 的 css 引擎（driver.ts 的 locate：既不是快照引用、也不是 role=…），
+// 先数、恰好 1 个再取文字；页面上有两个匹配的元素，数出来就是 2（内核据此判不符）。
+test('identity probe reads: css= counts the matches without waiting, a second match shows as 2, and the text of a single match comes back as the page shows it', { timeout: 60_000 }, async () => {
+  await page.evaluate(`document.body.innerHTML = '<span id="acct">  Test Tenant </span><ul><li class="who">A</li><li class="who">B</li></ul>'
+    + '<span id="e2">not a ref</span><iframe srcdoc="<span id=inner>x</span>"></iframe>'`);
+  await sleep(300);   // iframe 的文档加载完，免得「没搜 iframe」其实是还没加载
+  const t0 = Date.now();
+  assert.equal(await page.read({ kind: 'count', target: 'css=#acct' }), 1);
+  assert.equal(await page.read({ kind: 'count', target: 'css=.who' }), 2);
+  assert.equal(await page.read({ kind: 'count', target: 'css=#nope' }), 0);
+  assert.equal(await page.read({ kind: 'count', target: 'css=#inner' }), 0, 'the main page only: an iframe is not searched');
+  assert.equal(await page.read({ kind: 'count', target: 'css=#e2' }), 1, 'a css selector that looks like a ref is still a selector after the css= prefix');
+  assert.equal((await page.text({ target: 'css=#acct' })).trim(), 'Test Tenant');
+  await assert.rejects(page.text({ target: 'css=#nope' }), (e: unknown) => e instanceof DriverError && e.kind === 'not-found');
+  assert.ok(Date.now() - t0 < ACTION_WAIT_MS, 'none of these waited for an element to appear');
+});

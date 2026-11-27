@@ -78,6 +78,8 @@ export interface OpenResult {
   session: string; name: string; url: string; title: string; mode: Mode; runDir: string; snapshot: string; blocked: 'login' | null; next: string | null;
   profile: string;     // 会话用的 profile key（`组` 或 `组@槽`）
   borrowed: boolean;   // 借用了别的组的登录（域名没编组、却指定了某个组的 profile）
+  // 身份探针对首屏的结果：组没配身份为 null；前提不满足（登录墙、页面不在本组的主机上、借用）为 skipped；mismatch 时会话照样开着，下一次 step 起是 22。
+  identity: 'ok' | 'mismatch' | 'skipped' | null;
 }
 export interface StepResult {
   session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 | 20; blocked: 'login' | null; next: string | null;

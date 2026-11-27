@@ -36,11 +36,14 @@ export interface SessionDeps {
   store: ApprovalStore;   // 批准记录：放行声明、主机模式的批准存在这里（调用方在后面的任务里接上）
   idleMs: number; keepRuns: number; now(): Date; kernelVersion: string; log(line: string): void;
   approvals: Approvals;   // 待批表：弹框和结果都在这里（调用方在后面的任务里接上）
+  identityProbeMs?: number;   // 身份探针整体的时限（毫秒），缺省 IDENTITY_PROBE_MS；超时按不符处理。测试用来把「永远不落定」缩短
 }
 
 const DEFAULT_NAME = 'session';
 const APPROVAL_TIMEOUT_SEC = 120;
 const MAX_UNATTRIBUTED = 200;
+// 身份探针（location、密码框检查、count、text 四次页面读取）整体的时限：驱动的 read / text 没有不等待的开关，页面卡住时不能让 step 一直占着会话。
+const IDENTITY_PROBE_MS = 5000;
 // 同时在跑（含正在启动）的浏览器实例上限：每个 profile 一个实例，每个实例是一整个有头浏览器。
 const MAX_INSTANCES = 4;
 
@@ -88,6 +91,12 @@ interface Session {
   // 本会话提过且已批准的放行声明（只增不减）。判定时才和批准记录里当前的内容、会话当前的组和页面主机核对（declaredFor）。
   readonly declared: DeclaredEntry[];
   lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
+  // 身份探针（设计 5.2）：只探主页面。configured：探的时候组配了身份（报告里 identity 是不是 null 看它）；
+  // checks / skipped：做了比较的次数 / 前提不满足跳过的次数；mismatch：一旦记下永久生效，直到 close（记的是当时的组和期望文字，不含页面文字）。
+  identityConfigured: boolean;
+  identityChecks: number;
+  identitySkipped: number;
+  identityMismatch: { readonly group: string; readonly expect: string } | null;
   url: string;                               // 首屏读数里的地址（已脱敏），给 list()
   state: State;
   gone: boolean;                             // 主页面已关或会话已在收尾：同步置位，step 的后续操作据此不再执行
@@ -135,6 +144,11 @@ const KNOWN_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 
 
 function busy(): E2kError {
   return new E2kError('busy', '会话正忙', '稍后重试');
+}
+
+// 消息里只有组名和规则里写的期望文字，不含页面上读到的任何内容。
+function identityMismatchError(m: { group: string; expect: string }): E2kError {
+  return new E2kError('needs-human', `身份探针不符：组 ${m.group} 期望「${m.expect}」，页面上不是`, '账号或租户可能被别的会话切走了；请人确认后关掉这个会话重开');
 }
 
 // 冻结的会话 step 不执行：要人关掉它，用目标组的 profile 另开。group 为 null 是判断不出归属（失败关闭）。
@@ -290,11 +304,22 @@ export class SessionManager {
       await Promise.all([...s.frozen.clearing]);
       throw frozenError(s.frozen);
     }
-    // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；没有 await，和上面的状态检查之间不会交错。
-    if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow);
+    // 身份早就不符的会话：不探、不执行，直接 22。没有 await，和上面的状态检查之间不会交错。
+    if (s.identityMismatch !== null) throw identityMismatchError(s.identityMismatch);
+    // 先置 stepping 再探：探针要 await 页面读取，期间别的 step、close 都是 busy；下面任何一处抛错，finally 都把状态放回 idle。
     s.state = 'stepping';
     this.pauseIdle(s);
     try {
+      // 次序：冻结 → 身份探针 → 放行声明的批准 → 执行。账号不对时不该先弹「放行写请求」的框让人批。
+      await this.probeIdentity(s);
+      if (s.identityMismatch !== null) throw identityMismatchError(s.identityMismatch);
+      const frozenNowOnProbe = frozenNow(s);   // 探针的 await 期间被重定向冻结了：和上面同一个错
+      if (frozenNowOnProbe !== null) {
+        await Promise.all([...frozenNowOnProbe.clearing]);
+        throw frozenError(frozenNowOnProbe);
+      }
+      // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；探针之后到这里、再到开始执行之间没有 await。
+      if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow);
       const blockedBefore = s.recorder.blockedEvents();
       const crossBefore = s.crossCount;
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
@@ -329,6 +354,56 @@ export class SessionManager {
         this.restartIdle(s);
       }
     }
+  }
+
+  // 身份探针（设计 5.2）。身份每次从批准快照里会话所在组现取，不缓存；组没配身份返回 null、什么都不记。
+  // 前提：主页面的主机属于会话的组（借用、停在身份提供方 / loginHosts 上都不满足）且页面上没有登录墙，否则 skipped。
+  // 比较：`css=选择器` 恰好匹配 1 个、文字 trim 后等于期望才是 ok；其余是 mismatch。驱动抛 DriverError、整体超时都按 mismatch（失败关闭）；
+  // 别的异常照常往上抛。页面已关（会话在收尾）时读不到不算不符。读到的文字只在这里比较，不进任何消息、记录、日志。
+  private async probeIdentity(s: Session): Promise<'ok' | 'mismatch' | 'skipped' | null> {
+    const identity = this.deps.modes.group(s.group)?.identity ?? null;
+    if (identity === null) return null;
+    s.identityConfigured = true;
+    let outcome: 'ok' | 'mismatch' | 'skipped';
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const work = this.readIdentity(s, identity.selector, identity.expect);
+      work.catch(() => {});   // 超时后才落定的失败没人等，别变成未处理的拒绝
+      const limit = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => { reject(new DriverError('timeout', 'identity probe timed out')); }, this.deps.identityProbeMs ?? IDENTITY_PROBE_MS);
+      });
+      outcome = await Promise.race([work, limit]);
+    } catch (e) {
+      if (!(e instanceof DriverError)) throw e;
+      outcome = s.gone ? 'skipped' : 'mismatch';
+    } finally {
+      clearTimeout(timer);
+    }
+    if (outcome === 'skipped') {
+      s.identitySkipped++;
+    } else {
+      s.identityChecks++;
+      if (outcome === 'mismatch' && s.identityMismatch === null) {
+        s.identityMismatch = { group: s.group, expect: identity.expect };
+        this.logLine(`会话 ${s.id}：身份探针不符（组 ${s.group}）`);
+      }
+    }
+    return outcome;
+  }
+
+  private async readIdentity(s: Session, selector: string, expect: string): Promise<'ok' | 'mismatch' | 'skipped'> {
+    const loc = await s.page.location();
+    let host: string;
+    try {
+      host = hostOf(loc.url);
+    } catch {
+      return 'skipped';
+    }
+    if (this.deps.modes.groupOf(host).name !== s.group) return 'skipped';
+    if ((await loginWall(s.page, s.start.url)).blocked !== null) return 'skipped';
+    const target = `css=${selector}`;   // parseIdentity 已拒掉引用、引擎前缀、>>、role、XPath：驱动的 locate 里只会走 css 引擎
+    if ((await s.page.read({ kind: 'count', target })) !== 1) return 'mismatch';
+    return (await s.page.text({ target })).trim() === expect ? 'ok' : 'mismatch';
   }
 
   // step 在跑或已在收尾时都是 busy：不在操作进行到一半时关页、出报告。
@@ -776,6 +851,7 @@ export class SessionManager {
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
         group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [],
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
+        identityConfigured: false, identityChecks: 0, identitySkipped: 0, identityMismatch: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
       session = s;
@@ -799,12 +875,15 @@ export class SessionManager {
       const wall = await loginWall(page, p.url);
       if (this.stopping) throw stopping();
       s.lastWall = wall.blocked;
+      // 首屏之后探一次：不符照样把会话交出去（人要看到提示），记在会话上，下一次 step 起就是 22。状态还是 opening，没有别的调用能碰到它。
+      const identity = await this.probeIdentity(s);
+      if (this.stopping) throw stopping();
       s.url = safely(() => redactUrl(loc.url));
       s.state = 'idle';
       this.restartIdle(s);
       return {
         session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: this.sessionMode(s, []), runDir: s.runDir,
-        snapshot: cappedSnapshot(snapshot), ...wall, profile: o.profile, borrowed: o.borrowed,
+        snapshot: cappedSnapshot(snapshot), ...wall, profile: o.profile, borrowed: o.borrowed, identity,
       };
     } catch (e) {
       // 先清理（关页、删空的报告目录、撤销登记），会话不建立；再把驱动的错误换成 action-failed，别的原样抛。
@@ -862,6 +941,7 @@ export class SessionManager {
         actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
         verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [], declarations: this.declarationRecords(s),
         modes: s.recorder.modes, rules: this.rulesInForce(), blocked: s.lastWall, forced: s.forced,
+        identity: s.identityConfigured ? { group: s.group, checks: s.identityChecks, skipped: s.identitySkipped, mismatch: s.identityMismatch !== null } : null,
       });
       paths = writeRun(s.runDir, result);
     } catch (e) {

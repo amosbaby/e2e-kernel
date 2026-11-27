@@ -2850,3 +2850,198 @@ test('declared writes: an asked box whose dialog timed out is a dead entry and i
   await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
   assert.deepEqual(askedSizes(c.sm), [1], 'the dead key of the first session was dropped');
 });
+
+// ---- 身份探针（M2b 任务 10） ----
+
+const ID_RULES = {
+  version: 1, rules: [{ match: 'a.example.com', mode: 'readonly' }], loginHosts: [],
+  groups: [{ name: 'a', hosts: ['a.example.com'], loginHosts: ['sso.example.org'], identity: { selector: '#acct', expect: 'Test Tenant' } },
+    { name: 'b', hosts: ['b.example.com'] }],
+};
+const ID_A = 'http://a.example.com/';
+const ID_EL = 'css=#acct';
+const TENANT = { [ID_EL]: { text: '  Test Tenant \n', count: 1 } };
+const OTHER_TEXT = 'Zeta Corp 8841';   // 页面上的别人的账号名：不许出现在任何输出里
+
+// 真的规则解析器（规则经假对话框批准，同线上一条路径）、假驱动；页面规格由测试给。
+async function setupIdent(pages: Record<string, FakePageSpec>, extra: Partial<SessionDeps> = {}, rules: unknown = ID_RULES) {
+  const tmp = makeTmpHome();
+  writeFileSync(tmp.home.rulesFile, JSON.stringify(rules));
+  const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
+  const modes = createRulesResolver(tmp.home.rulesFile, store);
+  const dialog = fakeDialog(approving);
+  const s = setup({ modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}), ...extra });
+  cleanups.push(async () => { tmp.cleanup(); });
+  for (const [url, spec] of Object.entries(pages)) s.fake.definePage(url, spec);
+  await assert.rejects(s.sm.loginBegin({ url: LOGIN_URL }), isCode('wait-approval'));
+  await settleDialog();
+  const { loginId } = await s.sm.loginBegin({ url: LOGIN_URL });
+  await s.sm.loginEnd({ loginId });
+  assert.equal(modes.state().pending, null);
+  return { ...s, modes, dialog };
+}
+
+const snapshots = (fake: FakeDriver): number => methodCount(fake, 'snapshot');
+
+test('identity probe: the expected text (trimmed) is ok at open and before each step; result.json counts the comparisons and carries no page text', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: TENANT } });
+  const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'ok');
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).results[0]?.outcome, 'ok');
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  assert.deepEqual(readResult((await sm.close({ session: r.session })).runDir).identity, { group: 'a', checks: 3, skipped: 0, mismatch: false });
+  assert.equal(methodCount(fake, 'text'), 3);
+});
+
+test('identity probe: another name is a mismatch at open (the session is still returned), the next step is needs-human and runs nothing, and the page text appears nowhere', async () => {
+  const { sm, fake, logs } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
+  const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'mismatch');
+  const before = snapshots(fake);
+  const reads = methodCount(fake, 'read');
+  const bad = (e: unknown): boolean => {
+    assert.ok(e instanceof E2kError); assert.equal(e.code, 'needs-human');
+    assert.equal(e.message, '身份探针不符：组 a 期望「Test Tenant」，页面上不是');
+    assert.equal(e.next, '账号或租户可能被别的会话切走了；请人确认后关掉这个会话重开');
+    assert.ok(!JSON.stringify(e).includes(OTHER_TEXT));
+    return true;
+  };
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), bad);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), bad);
+  assert.equal(snapshots(fake), before, 'no operation reached the page');
+  assert.equal(methodCount(fake, 'read'), reads, 'a remembered mismatch is not probed again');
+  const closed = await sm.close({ session: r.session });   // 会话没被锁死：可以关
+  assert.deepEqual(readResult(closed.runDir).identity, { group: 'a', checks: 1, skipped: 0, mismatch: true });
+  for (const f of ['result.json', 'report.html']) assert.ok(!readFileSync(join(closed.runDir, f), 'utf8').includes(OTHER_TEXT), f);
+  assert.ok(logs.every((l) => !l.includes(OTHER_TEXT)));
+});
+
+test('identity probe: a tenant switched inside one step by goto is only seen by the next step, which stops before running anything', async () => {
+  const swapped = 'http://a.example.com/switched';
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: TENANT }, [swapped]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
+  const r = await sm.open({ url: ID_A });
+  assert.equal((await sm.step({ session: r.session, ops: [{ op: 'goto', url: swapped }, { op: 'snapshot' }] })).exit, 0);   // 这一批开始前探的是旧页面
+  const before = snapshots(fake);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isCode('needs-human'));
+  assert.equal(snapshots(fake), before);
+  assert.deepEqual(readResult((await sm.close({ session: r.session })).runDir).identity, { group: 'a', checks: 3, skipped: 0, mismatch: true });
+});
+
+test('identity probe: not exactly one match is a mismatch (two, none, no element at all), and so is a different text', async () => {
+  for (const el of [{ count: 2, text: 'Test Tenant' }, { count: 0, text: 'Test Tenant' }, undefined, { count: 1, text: 'Test Tenant 2' }, { count: 1, text: '' }]) {
+    const { sm } = await setupIdent({ [ID_A]: { elements: el === undefined ? {} : { [ID_EL]: el } } });
+    const r = await sm.open({ url: ID_A });
+    assert.equal(r.identity, 'mismatch', JSON.stringify(el));
+    await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isCode('needs-human'), JSON.stringify(el));
+  }
+});
+
+test('identity probe: the count is read before the text, and the text is not read when the count is not 1', async () => {
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 2 } } } });
+  await sm.open({ url: ID_A });
+  assert.equal(methodCount(fake, 'text'), 0);
+  assert.deepEqual(fake.calls.filter((c) => c.method === 'read').map((c) => c.args[0]), [{ kind: 'count', target: ID_EL }]);
+});
+
+test('identity probe: a driver error while reading is a mismatch (fail closed); an unrelated error is not swallowed', async () => {
+  const { sm } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readFails: true } } } });
+  assert.equal((await sm.open({ url: ID_A })).identity, 'mismatch');
+});
+
+test('identity probe: a probe that never settles is cut off after the configured time and counts as a mismatch', async () => {
+  const { sm } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: 'Test Tenant', count: 1, readHangs: true } } } }, { identityProbeMs: 30 });
+  const t0 = Date.now();
+  const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'mismatch');
+  assert.ok(Date.now() - t0 < 1500);
+});
+
+test('identity probe: on a login wall, on an identity provider host, and on a borrowed page it is skipped: no element is read, the session carries on', async () => {
+  const idp = 'http://sso.example.org/';
+  const { sm, fake } = await setupIdent({
+    [ID_A]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } }, passwordField: true },
+    'http://a.example.com/to-sso': { redirectTo: idp }, [idp]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } },
+    'http://localhost:5173/': { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } },
+  });
+  const wall = await sm.open({ url: ID_A, name: 'wall' });
+  assert.equal(wall.identity, 'skipped');
+  assert.equal((await sm.step({ session: wall.session, ops: SNAP })).results[0]?.outcome, 'ok');
+  const viaIdp = await sm.open({ url: 'http://a.example.com/to-sso', name: 'idp' });
+  assert.equal(viaIdp.identity, 'skipped');
+  const borrowed = await sm.open({ url: 'http://localhost:5173/', profile: 'a', name: 'bor' });
+  assert.deepEqual([borrowed.borrowed, borrowed.identity], [true, 'skipped']);
+  assert.equal((await sm.step({ session: borrowed.session, ops: SNAP })).results[0]?.outcome, 'ok');
+  assert.equal(methodCount(fake, 'read'), 0);
+  assert.equal(methodCount(fake, 'text'), 0);
+  for (const s of [wall, viaIdp, borrowed]) {
+    const id = readResult((await sm.close({ session: s.session })).runDir).identity;
+    assert.equal(id?.mismatch, false); assert.equal(id?.checks, 0); assert.ok((id?.skipped ?? 0) >= 1);
+  }
+});
+
+test('identity probe: a group without identity (and the default group) is not probed: identity is null in the open result and in result.json', async () => {
+  const { sm, fake } = await setupIdent({ 'http://b.example.com/': { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
+  for (const url of ['http://b.example.com/', 'http://localhost:5173/']) {
+    const r = await sm.open({ url });
+    assert.equal(r.identity, null);
+    await sm.step({ session: r.session, ops: SNAP });
+    assert.equal(readResult((await sm.close({ session: r.session })).runDir).identity, null);
+  }
+  assert.equal(methodCount(fake, 'read'), 0);
+});
+
+test('identity probe: the identity is taken from the approved snapshot at each probe, not cached at open', async () => {
+  const { sm, modes } = await setupIdent({ [ID_A]: { elements: TENANT } });
+  const r = await sm.open({ url: ID_A });
+  assert.equal(r.identity, 'ok');
+  const real = modes.group.bind(modes);
+  mock.method(modes, 'group', (name: string) => { const g = real(name); return g === null ? null : { ...g, identity: g.identity === null ? null : { ...g.identity, expect: 'Changed Tenant' } }; });
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), (e: unknown) => isCode('needs-human')(e) && (e as E2kError).message.includes('「Changed Tenant」'));
+  mock.restoreAll();
+});
+
+test('identity probe: it runs before the declared-writes gate: a mismatching account gets no approval box and nothing else', async () => {
+  const { sm, dialog } = await setupIdent({ [ID_A]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
+  const r = await sm.open({ url: ID_A });
+  const boxes = dialog.requests.length;
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [{ method: 'POST', url: 'http://a.example.com/api/save' }] }),
+    (e: unknown) => isCode('needs-human')(e) && /身份探针不符/.test((e as Error).message));
+  await settleDialog();
+  assert.equal(dialog.requests.length, boxes);
+});
+
+test('identity probe: while it is awaiting the page, another step and a close are busy; a failing probe and a failing gate both put the session back to idle', async () => {
+  const { sm, fake, dialog } = await setupIdent({ [ID_A]: { elements: TENANT } }, { identityProbeMs: 300 });
+  const r = await sm.open({ url: ID_A });
+  const page = fake.openPages().at(-1)!;
+  // 门闸失败（没人批）也要复位：之后的 step 不是 busy。
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP, allow: [{ method: 'POST', url: 'http://a.example.com/api/one' }] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.ok(dialog.requests.length >= 1);
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  // 探针悬着：并发的 step、close 被挡。
+  fake.setElement(page, ID_EL, { text: 'Test Tenant', count: 1, readHangs: true });
+  const first = sm.step({ session: r.session, ops: SNAP });
+  const settled = first.then(() => null, (e: unknown) => e);
+  await assert.rejects(sm.step({ session: r.session, ops: SNAP }), isCode('busy'));
+  await assert.rejects(sm.close({ session: r.session }), isCode('busy'));
+  assert.equal(sm.list()[0]?.idleSec, 0);
+  assert.ok(isCode('needs-human')(await settled));
+  // 探针失败后会话回到 idle：能关。
+  await sm.close({ session: r.session });
+});
+
+test('identity probe: only the main page is probed, not a popup and not a login window', async () => {
+  const pop = 'http://a.example.com/pop';
+  const { sm, fake } = await setupIdent({ [ID_A]: { elements: TENANT }, [pop]: { elements: { [ID_EL]: { text: OTHER_TEXT, count: 1 } } } });
+  const r = await sm.open({ url: ID_A });
+  const popup = fake.emitPopup(fake.openPages().at(-1)!, pop);
+  assert.equal((await sm.step({ session: r.session, ops: SNAP })).exit, 0);
+  const { loginId } = await sm.loginBegin({ url: ID_A, profile: 'a' });
+  const loginPage = fake.openPages().at(-1)!;
+  await sm.loginEnd({ loginId });
+  const touched = (id: string): string[] => fake.calls.filter((c) => c.pageId === id).map((c) => c.method);
+  assert.ok(!touched(popup.id).some((m) => m === 'read' || m === 'text' || m === 'location'));
+  assert.ok(!touched(loginPage).some((m) => m === 'read' || m === 'text'));
+  await sm.close({ session: r.session });
+});

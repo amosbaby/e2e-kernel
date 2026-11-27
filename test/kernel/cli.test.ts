@@ -1033,11 +1033,43 @@ test('login --profile: the login window borrows or uses the group, and the recor
 });
 
 test('formatOpen: the borrowed line is only printed for borrowed:true; an older kernel\'s reply (no borrowed) prints none', () => {
-  const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null };
+  const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null, identity: null };
   assert.ok(formatOpen({ ...base, profile: 'a', borrowed: true }).includes('借用组 a 的登录'));
   assert.ok(!formatOpen({ ...base, profile: 'a', borrowed: false }).includes('借用'));
   assert.ok(!formatOpen(base as never).includes('借用'));
   assert.ok(formatOpen({ ...base, profile: 'a@t1', borrowed: true }).includes('借用组 a 的登录'));
+});
+
+test('formatOpen: an identity mismatch gets a conspicuous first line (no page text); ok, skipped, null and an older kernel\'s reply (no identity) print none', () => {
+  const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'default' as const, runDir: '/r', snapshot: '', blocked: null, next: null, profile: 'a', borrowed: false };
+  const out = formatOpen({ ...base, identity: 'mismatch' });
+  assert.ok(out.split('\n')[0]!.startsWith('!! 身份探针不符'));
+  for (const identity of ['ok', 'skipped', null] as const) assert.ok(!formatOpen({ ...base, identity }).includes('身份探针'));
+  assert.ok(!formatOpen(base as never).includes('身份探针'));
+});
+
+test('open and step with an identity probe: a mismatch is exit 22 at open (the session stays open, with the conspicuous line), step is 22 with the stop message, ok is 0; no page text on screen', async () => {
+  const h = makeTmpHome();
+  const rules = JSON.stringify({ version: 1, rules: [], loginHosts: [], groups: [{ name: 'a', hosts: ['a.example.com', 'c.example.com'], identity: { selector: '#acct', expect: 'Test Tenant' } }] });
+  writeFileSync(h.home.rulesFile, rules);
+  approveRulesFile(h.home);
+  const el = (text: string): FakePageSpec => ({ elements: { 'css=#acct': { text, count: 1 } } });
+  const f = new FakeDriver({ pages: { 'http://a.example.com/': el('Test Tenant'), 'http://c.example.com/': el('Zq7x91 Other') } });
+  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog() });
+  try {
+    const good = io({ env: h.env });
+    assert.equal(await main(['open', 'http://a.example.com/', '--json'], good), 0);
+    assert.equal(JSON.parse(good.outText()).identity, 'ok');
+    const bad = io({ env: h.env });
+    assert.equal(await main(['open', 'http://c.example.com/'], bad), 22);
+    assert.ok(bad.outText().split('\n')[0]!.startsWith('!! 身份探针不符'));
+    assert.ok(!bad.outText().includes('Zq7x91'));
+    const id = /s-[0-9a-f]{6}/.exec(bad.outText())![0];
+    const step = io({ env: h.env });
+    assert.equal(await main(['step', id, '[{"op":"snapshot"}]'], step), 22);
+    assert.ok(step.errText().includes('身份探针不符：组 a 期望「Test Tenant」，页面上不是'));
+    assert.ok(!step.errText().includes('Zq7x91') && !step.outText().includes('Zq7x91'));
+  } finally { await kernel.stop(); h.cleanup(); }
 });
 
 test('login end: cross-group navigations that were blocked get their own sentence and are not blamed on the read-only rules; read-only blocks keep theirs', async () => {

@@ -150,6 +150,16 @@ function declarationsSection(r: RunResult): string {
   return `${head}<ul>${items.join('')}</ul></section>`;
 }
 
+// 身份探针：组没配身份（或老版本的 result.json 没有这个字段）整节不出现。只有组名和次数，不含页面上读到的任何文字。
+function identitySection(r: RunResult): string {
+  const id = r.identity;
+  if (id === null || id === undefined || typeof id !== 'object') return '';
+  const counts = `<p>组 ${own(id.group)}：核对 ${own(id.checks)} 次，跳过 ${own(id.skipped)} 次（登录墙、页面不在本组的主机上、借用时不核对）</p>`;
+  return '<section id="identity"><h2>身份探针</h2>'
+    + (id.mismatch === true ? '<p id="identity-mismatch" class="flag">身份不符：页面上的账号或租户不是组配置里期望的那个，这场会话在不符之后没有执行任何操作</p>' : '<p>未发现不符</p>')
+    + `${counts}</section>`;
+}
+
 // 模式变更时间线：只有一条且是默认模式（或一条也没有）时写「全程默认模式」。host 是页面内容，脱敏后转义。
 function modesSection(r: RunResult): string {
   const modes = Array.isArray(r.modes) ? r.modes : [];
@@ -269,6 +279,6 @@ export function renderReport(r: RunResult): string {
     + `<meta http-equiv="Content-Security-Policy" content="${CSP}">`
     + `<title>e2e 报告 ${own(r.name)}</title><style>${STYLE}</style></head><body>`
     + `<h1>e2e 报告：${own(r.name)}（${own(r.session)}）</h1>`
-    + verdictSection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + declarationsSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
+    + verdictSection(r) + identitySection(r) + failuresSection(r) + notDoneSection(r) + findingsSection(r) + modesSection(r) + declarationsSection(r) + writesSection(r) + blockedWritesSection(r) + stepsSection(r) + envSection(r)
     + '</body></html>\n';
 }

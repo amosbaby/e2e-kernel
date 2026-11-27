@@ -11,7 +11,7 @@ import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/op
 
 export interface FakeElement { text?: string; visible?: boolean; css?: Record<string, string>; count?: number;
   password?: boolean; kind?: Described['kind']; stable?: Stable | null; failWith?: 'not-found' | 'timeout' | 'other'; describeFails?: number;
-  hints?: string[]; waitFails?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时
+  hints?: string[]; waitFails?: boolean; readFails?: boolean; readHangs?: boolean }   // hints：失败（动作、describe、等待）时带给 DriverError；waitFails：waitFor 这个目标会超时；readFails：read/text 这个目标抛 DriverError；readHangs：read/text 这个目标永不落定
 export interface FakePageSpec { title?: string; snapshot?: string; elements?: Record<Target, FakeElement>; evalResult?: unknown;
   console?: { level: string; text: string }[]; gotoFailWith?: 'timeout' | 'other';
   redirectTo?: string;   // goto 这个地址时页面落到另一个地址（用那个地址的规格），模拟重定向
@@ -64,6 +64,11 @@ class FakePage implements Page {
     this.elements = new Map(Object.entries(spec.elements ?? {}).map(([k, v]) => [k, { ...v }]));
   }
 
+  // 测试里直接改这一页此刻的元素（模拟页面在两次 step 之间变了）。
+  setElement(target: Target, el: FakeElement): void {
+    this.elements.set(target, { ...el });
+  }
+
   // 监听器的注册不算页面动作：不记 calls，页关了也不抛。
   onClosed(listener: () => void): void {
     this.closedListeners.push(listener);
@@ -82,6 +87,12 @@ class FakePage implements Page {
     const el = this.elements.get(target);
     if (el === undefined) throw new DriverError('not-found', 'element not found');
     return el;
+  }
+
+  // readHangs：永不落定（测探针的超时）；readFails：抛 DriverError（测失败关闭）。
+  private async readGuard(el: FakeElement): Promise<void> {
+    if (el.readHangs === true) await new Promise<void>(() => {});
+    if (el.readFails === true) throw new DriverError('other', 'read failed');
   }
 
   private act(target: Target): FakeElement {
@@ -103,7 +114,11 @@ class FakePage implements Page {
 
   async text(o: { target?: Target }): Promise<string> {
     this.enter('text', [o]);
-    if (o.target !== undefined) return this.element(o.target).text ?? '';
+    if (o.target !== undefined) {
+      const el = this.element(o.target);
+      await this.readGuard(el);
+      return el.text ?? '';
+    }
     return [...this.elements.values()].flatMap((el) => (el.text === undefined ? [] : [el.text])).join('\n');
   }
 
@@ -177,6 +192,7 @@ class FakePage implements Page {
     this.enter('read', [q]);
     if (q.kind === 'url') return this.url;
     const el = q.target === undefined ? undefined : this.elements.get(q.target);
+    if (el !== undefined) await this.readGuard(el);
     switch (q.kind) {
       case 'count':
         return el === undefined ? 0 : (el.count ?? 1);
@@ -342,6 +358,13 @@ export class FakeDriver implements Driver {
   // 测试里临时给一个 URL 加页面规格（比如让某个地址 goto 之后落到别处）。
   definePage(url: string, spec: FakePageSpec): void {
     this.pageSpecs[url] = spec;
+  }
+
+  // 测试里改某一页此刻的元素；不记 calls。
+  setElement(pageId: string, target: Target, el: FakeElement): void {
+    const page = this.pages.find((p) => p.id === pageId);
+    if (page === undefined) throw new Error('fake driver: no such page');
+    page.setElement(target, el);
   }
 
   get launches(): number {
