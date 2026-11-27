@@ -38,10 +38,13 @@ const URL_PARAM_NAME = /(^|[?&#\s;,({\[])([^=&#?\s"'<>;,({\[]+)=/g;
 const PARAM_VALUE_END = /[&#\s"<>]/;
 // 选择器里的 `名字=`：和 URL_PARAM_NAME 一样，只是名字前的分隔符另外认引号和 `=`（`text=token=…`、`[name="token=…"]`），
 // 并且分隔符放在后顾里，前一个匹配吃掉的 `=` 也能当分隔符。名字的字符类不含这些分隔符，所以每段名字只有一个起点，不回溯。
-// 两种各跑一遍、结果取并集：宽的名字可以含 `]`（`pw]x=`、`[token]=` 按整段判），窄的把 `]` 也当分隔符（`[pw=1]sessionid=` 里第一个值
+// 名字和 `=` 之间可以有空白（`pw =x`；名字的字符类不含空白，所以不回溯）。两种各跑一遍、结果取并集：宽的名字可以含 `]`（`pw]x=`、`[token]=` 按整段判），窄的把 `]` 也当分隔符（`[pw=1]sessionid=` 里第一个值
 // 的扫描会跨过第二个名字，要单独找到它）。窄的名字不能含 `]`，否则每个 `]` 后都成起点、扫到串尾。
-const SELECTOR_PARAM_NAME_WIDE = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)=/g;
-const SELECTOR_PARAM_NAME_NARROW = /(?<=(^|[?&#\s;,({\[\]"'=]))([^=&#?\s"'<>;,({\[\]]+)=/g;
+const SELECTOR_PARAM_NAME_WIDE = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)\s*=/g;
+const SELECTOR_PARAM_NAME_NARROW = /(?<=(^|[?&#\s;,({\[\]"'=]))([^=&#?\s"'<>;,({\[\]]+)\s*=/g;
+// 属性选择器的 `]` 后面常见的接续字符：空白、下一个属性或谓词、伪类、类、id、组合符、逗号、`)`，以及 XPath 的 `/`、`]`、`|`。
+// 不在里面的（引号、XPath 的 `=`、`!=`、`<`、`*`、`-`，CSS 嵌套的 `&`）按值的一部分处理、换到串尾：少数合法写法会多换，偏向失败关闭。
+const ATTR_FOLLOW = /[\s[\]:.#>+~,)/|]/;
 const ATTR_OPS = new Set(['~', '|', '^', '$', '*', '!']);   // `!=` 是 XPath 的
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 // 自由文本里 JSON 形态的 `"名字" : "`，以及套了一层转义的 `\"名字\" : \"`。值的结尾由 redactJsonPairsInText 逐字符找。
@@ -103,7 +106,8 @@ function redactParamsInText(s: string, selectorRe?: RegExp): string {
     let start = m.index + m[0].length;
     if (selector) {
       // 名字紧跟 `[`（中间可有空白）：属性值，到配对的 `]` 为止。别的位置不知道值在哪结束，换到串尾（失败关闭，再过一遍也不变）。
-      let b = start - 1 - m[2]!.length - 1;               // 名字前一个字符
+      while (start < s.length && /\s/.test(s[start]!)) start++;   // `=` 后的空白保留（和 redactSelectorAttrs 一致）
+      let b = m.index - 1;                                 // 名字前一个字符（分隔符在后顾里，不在匹配内）
       while (b >= 0 && /\s/.test(s[b]!)) b--;
       const end = b >= 0 && s[b] === '[' && !m[2]!.includes(']') ? selectorValueEnd(s, start) : s.length;
       out += s.slice(copied, start) + REDACTED;
@@ -139,7 +143,9 @@ function redactParamsInText(s: string, selectorRe?: RegExp): string {
 // 选择器里属性值的结尾（不含）：从 start 起到配对的 `]` 为止。值里成对的方括号、反斜杠连同下一个字符、引号里的内容（含 `]`）
 // 都算进值，空白和引号外的其他字符也是；所以已换成 [REDACTED] 的值再过一遍不变。`/* … */` 注释和引号一样整段算进值（里面的 `]` 不算结尾）。
 // 找不到配对的 `]`、引号或注释没闭合，就到串尾（失败关闭）。
-// 已知的边界：值里有不成对、也没转义、不在引号里的 `]`（比如 Playwright 正则值 `[token=/a]b/]`）时，`]` 之后的部分不换。
+// 配对的 `]` 后面是接不上属性选择器的字符（`[token=/a]b/]` 里的 `b`）时，这个 `]` 只可能是值的一部分，也到串尾。
+// 已知的边界：值里有不成对、也没转义、不在引号里的 `]`，后面又恰好是能接上的字符（空白、`[`、`]`、`:`、`.`、`#`、`>`、`+`、`~`、`,`、`)`、`/`、`|`）时，
+// `]` 之后的部分不换。
 function selectorValueEnd(s: string, start: number): number {
   let depth = 0;
   for (let i = start; i < s.length; i++) {
@@ -156,7 +162,7 @@ function selectorValueEnd(s: string, start: number): number {
       i = k + 1;
     } else if (c === '[') depth++;
     else if (c === ']') {
-      if (depth === 0) return i;
+      if (depth === 0) return i + 1 >= s.length || ATTR_FOLLOW.test(s[i + 1]!) ? i : s.length;
       depth--;
     }
   }
@@ -277,7 +283,15 @@ function redactSelectorAttrs(s: string, comments: boolean): string {
       i = escBracket >= 0 ? escBracket : s.indexOf('[', nameEnd);
       continue;
     }
-    if (j < s.length && ATTR_OPS.has(s[j]!) && s[j + 1] === '=') j++;
+    if (j < s.length && ATTR_OPS.has(s[j]!)) {
+      const k = gap(j + 1);                                // 运算符和 `=` 之间也可以有空白（`[pw ^ =x]`，不是合法 CSS，但要接住）
+      if (k < 0 && sensitive()) {                          // 敏感名的运算符后面注释没闭合：从运算符后换到串尾（失败关闭）
+        out += s.slice(copied, j + 1) + REDACTED;
+        copied = s.length;
+        break;
+      }
+      if (k >= 0 && s[k] === '=') j = k;
+    }
     if (s[j] === '=' && sensitive()) {
       j++;
       while (j < s.length && /\s/.test(s[j]!)) j++;

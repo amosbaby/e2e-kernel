@@ -384,7 +384,40 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
     assert.ok(!out.includes('secret'), `${sel} -> ${out}`);
     assert.equal(redactSelector(out), out, `idempotent: ${sel}`);
   }
-  for (const sel of ['[x=1]>a', 'div[a="1"]:has-text("x")', '[a=1][b=2]', '[title="a/* b */c"]', '[data-x/**/=1]']) assert.equal(redactSelector(sel), sel);
+  // 敏感值在 `]` 处结束、但 `]` 后面的字符不可能接在属性选择器后面：值里那个 `]` 是值的一部分，换到串尾。
+  // 运算符和 `=` 之间有空白、括号外名字和 `=` 之间有空白，也算。
+  const tail: Array<[string, string]> = [
+    ['[token=/a]b/]', `[token=${REDACTED}`],
+    ['[data-token=a]b][x=1]', `[data-token=${REDACTED}`],
+    ['[pw="a"]b"secret"]', `[pw=${REDACTED}`],
+    ['[pw ^ =secret][x=1]', `[pw ^ =${REDACTED}][x=1]`],
+    ['xpath=//input[@pw ! = "secret"]', `xpath=//input[@pw ! = ${REDACTED}]`],
+    ['text=password = secret', `text=password = ${REDACTED}`],
+    ['#x pw =secret >> div', `#x pw =${REDACTED}`],
+    ['pw] =secret', `pw] =${REDACTED}`],
+    ['[pw=a]"secret"]', `[pw=${REDACTED}`],
+    ['[pw ^ /**/ =secret]', `[pw ^ /**/ =${REDACTED}]`],
+    ['[pw $/*=secret', `[pw $${REDACTED}`],
+    ['a>]token =secret', `a>]token =${REDACTED}`],
+    ['a>]token=secret', `a>]token=${REDACTED}`],
+  ];
+  for (const [sel, want] of tail) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // `]` 后面是合法的接续字符时，值照旧在 `]` 处结束。
+  const keepTail: Array<[string, string]> = [
+    ['[data-token=x]:visible', `[data-token=${REDACTED}]:visible`],
+    ['//input[@pw="x"]/..', `//input[@pw=${REDACTED}]/..`],
+    ['//a[b[@pw=1]]/c', `//a[b[@pw=${REDACTED}]]/c`],
+    ['[pw=x] >> text=a', `[pw=${REDACTED}] >> text=a`],
+    ['a[pw=x].b#c+d~e,f', `a[pw=${REDACTED}].b#c+d~e,f`],
+    [':is([pw=x])', `:is([pw=${REDACTED}])`],
+    ...['#', '>', '+', '~', ','].map((c): [string, string] => [`[pw=x]${c}a`, `[pw=${REDACTED}]${c}a`]),
+    ['//a[@pw="x"]|//b', `//a[@pw=${REDACTED}]|//b`],
+  ];
+  for (const [sel, want] of keepTail) assert.equal(redactSelector(sel), want, sel);
+  for (const sel of ['[type ^ =x]', 'text=Sign in = ok', '[x=1]>a', 'div[a="1"]:has-text("x")','[a=1][b=2]', '[title="a/* b */c"]', '[data-x/**/=1]']) assert.equal(redactSelector(sel), sel);
   // 路径或文字里按分段认出的精确敏感名：换到串尾。
   for (const sel of ['[href="/cb/pw=secret"][x=1]', 'text=data-pw=secret >> div']) {
     const out = redactSelector(sel);
@@ -434,7 +467,8 @@ test('redactSelector stays fast on adversarial input', () => {
     '[' + '\\1'.repeat(50000), '[' + '\\111111'.repeat(30000), '[\\'.repeat(30000), '"a='.repeat(30000), "'a=".repeat(30000),
     '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5),
     '[a /*'.repeat(30000), '[a /* '.repeat(30000) + '*/', '/*'.repeat(50000), '[pw/*'.repeat(30000), '[a/**/'.repeat(30000), 'a=1; '.repeat(30000),
-    ']a'.repeat(20000), ']a='.repeat(10000), '[t/*'.repeat(30000), '[a/*'.repeat(30000), 't/*x*/'.repeat(10000) + '=', '[' + 't/*x*/'.repeat(10000) + '=x]'];
+    ']a'.repeat(20000), ']a='.repeat(10000), '[t/*'.repeat(30000), '[a/*'.repeat(30000), 't/*x*/'.repeat(10000) + '=', '[' + 't/*x*/'.repeat(10000) + '=x]',
+    '[a ^ '.repeat(30000), 'pw '.repeat(30000), '[pw=x]b'.repeat(30000), 'a ='.repeat(30000)];
   // 每个输入单独限时：平方级退化在这些长度下要十几秒以上，而机器忙时总耗时会累积，不用总预算。
   for (const s of inputs) {
     const start = performance.now();
