@@ -38,10 +38,17 @@ const URL_PARAM_NAME = /(^|[?&#\s;,({\[])([^=&#?\s"'<>;,({\[]+)=/g;
 const PARAM_VALUE_END = /[&#\s"<>]/;
 // 选择器里的 `名字=`：和 URL_PARAM_NAME 一样，只是名字前的分隔符另外认引号和 `=`（`text=token=…`、`[name="token=…"]`），
 // 并且分隔符放在后顾里，前一个匹配吃掉的 `=` 也能当分隔符。名字的字符类不含这些分隔符，所以每段名字只有一个起点，不回溯。
-// 名字和 `=` 之间可以有空白（`pw =x`；名字的字符类不含空白，所以不回溯）。两种各跑一遍、结果取并集：宽的名字可以含 `]`（`pw]x=`、`[token]=` 按整段判），窄的把 `]` 也当分隔符（`[pw=1]sessionid=` 里第一个值
-// 的扫描会跨过第二个名字，要单独找到它）。窄的名字不能含 `]`，否则每个 `]` 后都成起点、扫到串尾。
-const SELECTOR_PARAM_NAME_WIDE = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)\s*=/g;
-const SELECTOR_PARAM_NAME_NARROW = /(?<=(^|[?&#\s;,({\[\]"'=]))([^=&#?\s"'<>;,({\[\]]+)\s*=/g;
+// 宽的名字可以含 `]`（`pw]x=`、`[token]=` 按整段判），窄的把 `]` 也当分隔符（`[pw=1]sessionid=` 里第一个值的扫描会跨过第二个名字，
+// 要单独找到它）；窄的名字不能含 `]`，否则每个 `]` 后都成起点、扫到串尾。
+// _PLAIN 的名字和 `=` 之间只认空白（`pw =x`）；另外两条还认不含 `*`、`=` 的注释（`pw /**/ =x`）。这两条的名字不能以 `/*` 开头、
+// 名字里也不能有 `*/`，所以注释的开头和收尾都当不了名字的起点，一串空白和注释前最多一个起点；名字和名字后的空白、注释再用
+// 「先行断言加反向引用」做成原子的（不回溯）。不然 `/**/ /**/ …`、`/* x */ /* x */ …` 会让每个起点都扫到串尾。
+// 名字中间夹注释的（`t/*x*/oken=`）交给 _PLAIN；认注释的那两条又会把注释吞进前一个名字（`x /*pw*/=` 里的 `pw`），所以四条都跑、结果取并集。
+const SELECTOR_PARAM_NAME_WIDE_PLAIN = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)\s*=/g;
+const SELECTOR_PARAM_NAME_NARROW_PLAIN = /(?<=(^|[?&#\s;,({\[\]"'=]))([^=&#?\s"'<>;,({\[\]]+)\s*=/g;
+const SELECTOR_PARAM_NAME_WIDE = /(?<=(^|[?&#\s;,({\["'=]))(?!\/\*)(?=((?:[^=&#?\s"'<>;,({\[*]|\*(?!\/))+))\2(?=((?:\s|\/\*[^*=]*\*\/)*))\3=/g;
+const SELECTOR_PARAM_NAME_NARROW = /(?<=(^|[?&#\s;,({\[\]"'=]))(?!\/\*)(?=((?:[^=&#?\s"'<>;,({\[\]*]|\*(?!\/))+))\2(?=((?:\s|\/\*[^*=]*\*\/)*))\3=/g;
+const SELECTOR_PARAM_NAMES = [SELECTOR_PARAM_NAME_WIDE_PLAIN, SELECTOR_PARAM_NAME_NARROW_PLAIN, SELECTOR_PARAM_NAME_WIDE, SELECTOR_PARAM_NAME_NARROW];
 // 属性选择器的 `]` 后面常见的接续字符：空白、下一个属性或谓词、伪类、类、id、组合符、逗号、`)`，以及 XPath 的 `/`、`]`、`|`。
 // 不在里面的（引号、XPath 的 `=`、`!=`、`<`、`*`、`-`，CSS 嵌套的 `&`）按值的一部分处理、换到串尾：少数合法写法会多换，偏向失败关闭。
 const ATTR_FOLLOW = /[\s[\]:.#>+~,)/|]/;
@@ -93,7 +100,7 @@ function redactCookieLine(line: string): string {
 // 自由文本里的 URL 参数，线性扫描：名字敏感时，值从 `=` 后一直到第一个 `&`、`#`、空白、`"`、`<`、`>` 或结尾
 // （`?` 不结束值，空值也换掉），换成 [REDACTED] 后从值的结尾接着找；名字不敏感时从 `=` 后接着找，
 // 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
-// 给了 selectorRe 时（只用于选择器，SELECTOR_PARAM_NAME_WIDE 或 _NARROW）：名字前的分隔符另外认引号和 `=`（窄的还认 `]`）；
+// 给了 selectorRe 时（只用于选择器，SELECTOR_PARAM_NAMES 之一）：名字前的分隔符另外认引号和 `=`（窄的还认 `]`）；
 // 名字紧跟 `[`（中间可有空白）、本身不含 `]` 的，值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
 function redactParamsInText(s: string, selectorRe?: RegExp): string {
   const selector = selectorRe !== undefined;
@@ -107,9 +114,8 @@ function redactParamsInText(s: string, selectorRe?: RegExp): string {
     if (selector) {
       // 名字紧跟 `[`（中间可有空白）：属性值，到配对的 `]` 为止。别的位置不知道值在哪结束，换到串尾（失败关闭，再过一遍也不变）。
       while (start < s.length && /\s/.test(s[start]!)) start++;   // `=` 后的空白保留（和 redactSelectorAttrs 一致）
-      let b = m.index - 1;                                 // 名字前一个字符（分隔符在后顾里，不在匹配内）
-      while (b >= 0 && /\s/.test(s[b]!)) b--;
-      const end = b >= 0 && s[b] === '[' && !m[2]!.includes(']') ? selectorValueEnd(s, start) : s.length;
+      const attrLike = bracketBefore(s, m.index - 1) || nameStartsInBracketComment(s, m.index, m[2]!);
+      const end = attrLike && !m[2]!.includes(']') ? selectorValueEnd(s, start) : s.length;
       out += s.slice(copied, start) + REDACTED;
       copied = end;
       re.lastIndex = end;
@@ -167,6 +173,30 @@ function selectorValueEnd(s: string, start: number): number {
     }
   }
   return s.length;
+}
+
+// 从 b 往回跳过空白和完整的 `/* … */` 注释后是不是 `[`（`[/* c */ pw /* c */= x]` 里的 `pw` 是属性名）。注释体里不会有 `*/`，
+// 往回找 `/*` 时先碰到另一个 `*/` 就不是注释；每段只扫一次。
+function bracketBefore(s: string, b: number): boolean {
+  for (;;) {
+    while (b >= 0 && /\s/.test(s[b]!)) b--;
+    if (b < 1 || s[b] !== '/' || s[b - 1] !== '*') return b >= 0 && s[b] === '[';
+    let k = b - 2;
+    while (k >= 1 && !(s[k - 1] === '/' && s[k] === '*') && !(s[k - 1] === '*' && s[k] === '/')) k--;
+    if (k < 1 || s[k - 1] !== '/' || s[k] !== '*') return false;
+    b = k - 2;
+  }
+}
+
+// 名字是从 `[` 后一段带空白的注释中间截出来的（`[/* c */pw = x]` 里的 `*/pw`）：名字里有 `*/`，往回找这段注释的 `/*`
+// （先碰到 `*/` 就不是），`/*` 前跳过空白和完整的注释是 `[`（见 bracketBefore）。往回扫到上一个注释记号为止，每段注释体最多扫一次。
+function nameStartsInBracketComment(s: string, nameStart: number, name: string): boolean {
+  if (!name.includes('*/')) return false;
+  for (let k = nameStart - 1; k >= 0; k--) {
+    if (s[k] === '*' && s[k + 1] === '/') return false;
+    if (s[k] === '/' && s[k + 1] === '*') return bracketBefore(s, k - 1);
+  }
+  return false;
 }
 
 // CSS 转义在 i 处（s[i] 是 `\`）的结尾（不含）：`\` 加 1–6 位十六进制、可再跟一个空白；或者 `\` 加任意一个字符。
@@ -248,13 +278,12 @@ function redactSelectorAttrs(s: string, comments: boolean): string {
       } else return j;
     }
   };
+  // 认注释时，注释里的 `[` 不当属性开头（不认注释的那遍会接住）：没匹配上就从这次扫到的最远处（far）往后找下一个 `[`，
+  // 扫过的地方除了名字里转义的 `[` 都不会再扫，所以是线性的。不认注释时从名字结尾找（名字后面的空白里不会有 `[`）。
   let i = s.indexOf('[');
   while (i >= 0) {
     let j = gap(i + 1);
-    if (j < 0) {
-      i = s.indexOf('[', i + 1);
-      continue;
-    }
+    if (j < 0) break;                                      // 只在认注释时出现：后面整个是没闭合的注释
     const nameStart = j;
     let escBracket = -1;                                   // 名字里最后一个被转义的 `[`：没匹配上时它也可能是属性开头
     while (j < s.length) {
@@ -280,16 +309,24 @@ function redactSelectorAttrs(s: string, comments: boolean): string {
         copied = s.length;
         break;
       }
-      i = escBracket >= 0 ? escBracket : s.indexOf('[', nameEnd);
+      if (escBracket < 0) break;
+      i = escBracket;
       continue;
     }
+    let far = j;
     if (j < s.length && ATTR_OPS.has(s[j]!)) {
-      const k = gap(j + 1);                                // 运算符和 `=` 之间也可以有空白（`[pw ^ =x]`，不是合法 CSS，但要接住）
+      // 运算符和 `=` 之间也可以有空白、注释，运算符也可以重复（`[pw ^ =x]`、`[pw ^ ^=x]`，不是合法 CSS，但要接住）；j 停在最后一个运算符上。
+      let k = gap(j + 1);
+      while (k >= 0 && k < s.length && ATTR_OPS.has(s[k]!)) {
+        j = k;
+        k = gap(k + 1);
+      }
       if (k < 0 && sensitive()) {                          // 敏感名的运算符后面注释没闭合：从运算符后换到串尾（失败关闭）
         out += s.slice(copied, j + 1) + REDACTED;
         copied = s.length;
         break;
       }
+      far = k < 0 ? s.length : k;
       if (k >= 0 && s[k] === '=') j = k;
     }
     if (s[j] === '=' && sensitive()) {
@@ -301,7 +338,7 @@ function redactSelectorAttrs(s: string, comments: boolean): string {
       i = s.indexOf('[', end);
       continue;
     }
-    i = escBracket >= 0 ? escBracket : s.indexOf('[', nameEnd);
+    i = escBracket >= 0 ? escBracket : s.indexOf('[', comments ? Math.max(nameEnd, far) : nameEnd);
   }
   return out + s.slice(copied);
 }
@@ -371,7 +408,7 @@ function redactTextWith(s: string, selector: boolean): string {
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
   if (selector) out = redactSelectorAttrs(redactSelectorAttrs(out, false), true);
-  out = selector ? redactParamsInText(redactParamsInText(out, SELECTOR_PARAM_NAME_WIDE), SELECTOR_PARAM_NAME_NARROW) : redactParamsInText(out);
+  out = selector ? SELECTOR_PARAM_NAMES.reduce((acc, re) => redactParamsInText(acc, re), out) : redactParamsInText(out);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);
   out = redactHeaderLines(out);

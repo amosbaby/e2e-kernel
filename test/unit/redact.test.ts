@@ -398,6 +398,20 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
     ['[pw=a]"secret"]', `[pw=${REDACTED}`],
     ['[pw ^ /**/ =secret]', `[pw ^ /**/ =${REDACTED}]`],
     ['[pw $/*=secret', `[pw $${REDACTED}`],
+    ['#x pw /**/ =secret', `#x pw /**/ =${REDACTED}`],
+    ['text=password /* c */= secret', `text=password /* c */= ${REDACTED}`],
+    ['[pw ^ ^=secret][x=1]', `[pw ^ ^=${REDACTED}][x=1]`],
+    ['[pw ~|=secret][x=1]', `[pw ~|=${REDACTED}][x=1]`],
+    ['#x t/*x*/oken=a] secret', `#x t/*x*/oken=${REDACTED}`],
+    ['#x */pw=secret] secret', `#x */pw=${REDACTED}`],
+    ['text=/* a */pw=secret] secret', `text=/* a */pw=${REDACTED}`],
+    ['div a*/pw!=a] secret', `div a*/pw!=${REDACTED}`],
+    ['text=x /*pw*/= secret', `text=x /*pw*/= ${REDACTED}`],
+    ['[a /*x pw*/=secret]', `[a /*x pw*/=${REDACTED}`],
+    ['#x a /* token*/=secret; b', `#x a /* token*/=${REDACTED}`],
+    ['[/* a */ b */pw=1][y=1]', `[/* a */ b */pw=${REDACTED}`],
+    ['[/* q */ x */ pw = 1] secret', `[/* q */ x */ pw = ${REDACTED}`],
+    ['[/* c pw=1] secret', `[/* c pw=${REDACTED}`],
     ['a>]token =secret', `a>]token =${REDACTED}`],
     ['a>]token=secret', `a>]token=${REDACTED}`],
   ];
@@ -414,6 +428,10 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
     ['a[pw=x].b#c+d~e,f', `a[pw=${REDACTED}].b#c+d~e,f`],
     [':is([pw=x])', `:is([pw=${REDACTED}])`],
     ...['#', '>', '+', '~', ','].map((c): [string, string] => [`[pw=x]${c}a`, `[pw=${REDACTED}]${c}a`]),
+    ['[/* c */ pw /* c */= x][y=1]', `[/* c */ pw /* c */= ${REDACTED}][y=1]`],
+    ['[/* a */ /* b */pw /* c */ = x][y=1]', `[/* a */ /* b */pw /* c */ = ${REDACTED}][y=1]`],
+    ['[ /* c */pw = x][y=1]', `[ /* c */pw = ${REDACTED}][y=1]`],
+    ['[/* a */ /* b */ /* c */pw = x][y=1]', `[/* a */ /* b */ /* c */pw = ${REDACTED}][y=1]`],
     ['//a[@pw="x"]|//b', `//a[@pw=${REDACTED}]|//b`],
   ];
   for (const [sel, want] of keepTail) assert.equal(redactSelector(sel), want, sel);
@@ -468,12 +486,16 @@ test('redactSelector stays fast on adversarial input', () => {
     '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5),
     '[a /*'.repeat(30000), '[a /* '.repeat(30000) + '*/', '/*'.repeat(50000), '[pw/*'.repeat(30000), '[a/**/'.repeat(30000), 'a=1; '.repeat(30000),
     ']a'.repeat(20000), ']a='.repeat(10000), '[t/*'.repeat(30000), '[a/*'.repeat(30000), 't/*x*/'.repeat(10000) + '=', '[' + 't/*x*/'.repeat(10000) + '=x]',
-    '[a ^ '.repeat(30000), 'pw '.repeat(30000), '[pw=x]b'.repeat(30000), 'a ='.repeat(30000)];
-  // 每个输入单独限时：平方级退化在这些长度下要十几秒以上，而机器忙时总耗时会累积，不用总预算。
+    '[a ^ '.repeat(30000), 'pw '.repeat(30000), '[pw=x]b'.repeat(30000), 'a ='.repeat(30000),
+    'x /*'.repeat(30000), 'x /* x'.repeat(30000), 'x /**/ '.repeat(30000),
+    '/**/ '.repeat(30000), '/**/'.repeat(30000), '/* x */ '.repeat(30000), '/* a*/ '.repeat(30000), '\t/*|"*/ '.repeat(30000),
+    '*/ /*pw,^x'.repeat(20000), ',*/\t/*^'.repeat(20000), 'x|\t/*/\t;)a*/'.repeat(15000),
+    '^ /*[ /**/ *'.repeat(20000), ' ^ /*[ /**/ *'.repeat(20000), ' /**/ */*)[/* "'.repeat(20000), '!/* |[, /**/'.repeat(20000), '[ ^ /*[*/ ^ '.repeat(20000), '[a' + ' /* [ */'.repeat(30000), '[a' + ' /*[*/'.repeat(30000), 'a' + ' /**/'.repeat(30000), 'pw' + ' /*x*/'.repeat(30000), 'x' + '\t/**/\t'.repeat(30000), '[a ^ ^ '.repeat(30000), '[pw ^'.repeat(30000) + '^'.repeat(30000)];
+  // 每个输入单独限时：平方级退化在这些长度下要十几秒以上；机器很忙（load 50）时正常输入也可能接近 1 秒，所以每个上限 3 秒、不用总预算。
   for (const s of inputs) {
     const start = performance.now();
     redactSelector(s);
     const ms = performance.now() - start;
-    assert.ok(ms < 1000, `${JSON.stringify(s.slice(0, 20))}… took ${ms.toFixed(0)}ms`);
+    assert.ok(ms < 3000, `${JSON.stringify(s.slice(0, 20))}… took ${ms.toFixed(0)}ms`);
   }
 });
