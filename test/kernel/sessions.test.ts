@@ -3738,7 +3738,7 @@ test('focus: a popup whose event arrives after the step returned still gets the 
   await clock.advance(100);
   assert.deepEqual(focus.handedBack, ['com.example.app']);
   await clock.advance(1000);
-  assert.deepEqual(focus.handedBack, ['com.example.app'], 'handed back once, then it stops');
+  assert.deepEqual(focus.handedBack, ['com.example.app'], 'handed back for the first grab');
   await sm.close({ session });
 });
 

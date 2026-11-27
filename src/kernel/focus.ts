@@ -9,7 +9,7 @@ export interface FocusKeeper {
   // 记下当前前台应用的 bundle id；取不到、不合格、或前台已经是 e2k 的 Chromium 都返回 null。
   capture(): Promise<string | null>;
   // 把前台还给 token：token 为 null 什么也不做；只有「此刻前台是 e2k 的 Chromium」才还，别的情况（用户已经切走了）不动。
-  // 返回 true 表示这次真的执行了 `open -b`（不管它成没成：每次只还一次，调用方不要重试）；false 表示没动手
+  // 返回 true 表示这次真的执行了 `open -b`（不管它成没成：每次调用只还一次；要不要再试由调用方决定，step 之后的后台循环会在截止前每次看到浏览器又在前台时再调）；false 表示没动手
   // （token 为 null 或不合格、前台还不是 e2k 的 Chromium、读不到前台）。调用方靠它决定要不要稍后再试。
   restore(token: string | null): Promise<boolean>;
 }
