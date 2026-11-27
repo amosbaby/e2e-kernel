@@ -406,6 +406,41 @@ test('Approvals: a queued request of a kind denied in the meantime is not shown;
   assert.equal(m.seen.length, 2);
 });
 
+test('an approved entry past its ttl is asked again; one within it is still approved; an entry without a ttl never expires', async () => {
+  const c = clock();
+  const m = manualDialog();
+  const a = new Approvals(m.dialog, () => {}, { now: c.now });
+  const TTL = 5 * 60_000;
+  assert.equal(a.ask('d', 'deny', req(), APPROVE, { ttlMs: TTL }).status, 'pending');
+  assert.equal(a.ask('plain', 'rules', req(), APPROVE).status, 'pending');
+  await m.release({ kind: 'button', button: '允许' });
+  await m.release({ kind: 'button', button: '允许' });
+  c.advance(TTL - 1);
+  assert.deepEqual(a.ask('d', 'deny', req(), APPROVE, { ttlMs: TTL }), { status: 'approved', button: '允许' });
+  c.advance(2);   // 批准之后过了 ttl 还没被 forget
+  assert.equal(a.ask('d', 'deny', req(), APPROVE, { ttlMs: TTL }).status, 'pending', 'expired: asked again');
+  assert.equal(a.stateOf('d'), 'showing');
+  assert.equal(m.seen.length, 3, 'a second box for the same key');
+  assert.deepEqual(a.ask('plain', 'rules', req(), APPROVE), { status: 'approved', button: '允许' });   // 没给 ttl 的不过期
+});
+
+test('a denied entry does not expire with the ttl', async () => {
+  const c = clock();
+  const m = manualDialog();
+  const a = new Approvals(m.dialog, () => {}, { now: c.now });
+  a.ask('d', 'deny', req(), APPROVE, { ttlMs: 1000 });
+  await m.release({ kind: 'button', button: '不允许' });
+  c.advance(10 * 60_000);
+  assert.deepEqual(a.ask('d', 'deny', req(), APPROVE, { ttlMs: 1000 }), { status: 'denied', cooling: false });
+  assert.equal(m.seen.length, 1);
+});
+
+test('the kinds deny and borrow are accepted', () => {
+  const a = new Approvals(fakeDialog(), () => {}, { now: clock().now });
+  assert.equal(a.ask('x', 'deny', req(), APPROVE).status, 'pending');
+  assert.equal(a.ask('y', 'borrow', req(), APPROVE).status, 'pending');
+});
+
 test('Approvals: a different kind queued behind a denial is still shown', async () => {
   const m = manualDialog();
   const a = new Approvals(m.dialog, () => {}, { now: clock().now });

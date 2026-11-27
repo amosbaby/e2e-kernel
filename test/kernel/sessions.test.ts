@@ -25,7 +25,8 @@ import { Approvals, noDialog } from '../../src/kernel/approval.ts';
 import type { Dialog, DialogRequest, DialogResult } from '../../src/kernel/approval.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
-import { approving, choosingMode, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { answeringDeny, approving, choosingMode, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { approveRulesFile } from '../support/approve-rules.ts';
 import { noFocus } from '../../src/kernel/focus.ts';
 import type { FocusKeeper } from '../../src/kernel/focus.ts';
 import { fakeFocus, manualClock } from '../support/fake-focus.ts';
@@ -3256,7 +3257,7 @@ test('identity probe: a main page that closes while the probe is awaiting it is 
 
 const NEW_URL = 'http://app.example.com/login.html';
 const NEW_API = 'http://app.example.com/api/login';
-const isLoginBox = (r: DialogRequest): boolean => r.buttons.includes('只读');
+const isLoginBox = (r: DialogRequest): boolean => r.title.startsWith('e2k：在新域名上登录');   // 按标题认：deny 框也有「只读」键
 const loginBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter(isLoginBox);
 const usageMatch = (re: RegExp) => (e: unknown): boolean => e instanceof E2kError && e.code === 'usage' && re.test(e.message);
 const openedPages = (fake: FakeDriver): number => methodCount(fake, 'openPage');
@@ -3958,4 +3959,174 @@ test('focus: a hand-back that throws is swallowed and logged; the step result is
   await clock.advance(300);
   assert.ok(logs.some((l) => l.includes('late boom')));
   await sm.close({ session });
+});
+
+// ---- open 打开不允许的域名要人批准（M3 任务 3） ----
+
+const DENY_URL = 'http://127.0.0.1:5173/';
+const DENY_RULES = { version: 1, rules: [{ match: '127.0.0.1', mode: 'deny' }] };
+const DENY_TITLE = 'e2k：打开不允许的域名';
+const ALLOW_SAVE = { method: 'POST', url: 'http://127.0.0.1:5173/api/save' };
+const ALLOW_DROP = { method: 'DELETE', url: 'http://127.0.0.1:5173/api/x', operation: 'Drop' };
+const denyBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter((r) => r.title.startsWith(DENY_TITLE));
+
+// 真的规则解析器（规则文件里 127.0.0.1 是 deny）、真的写策略、假驱动、可编排的假对话框。approveRules 为 false 时规则文件还在待批。
+function setupDeny(script: (r: DialogRequest) => DialogResult | Promise<DialogResult>, o: { now?: () => number; approveRules?: boolean; capabilities?: { networkInterception: boolean } } = {}) {
+  const tmp = makeTmpHome();
+  writeFileSync(tmp.home.rulesFile, JSON.stringify(DENY_RULES));
+  if (o.approveRules !== false) approveRulesFile(tmp.home);
+  const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
+  const modes = listedAll(createRulesResolver(tmp.home.rulesFile, store));
+  const dialog = fakeDialog(script);
+  const fake = new FakeDriver({ pages: { [DENY_URL]: HOME_PAGE, 'http://localhost:5173/': HOME_PAGE }, ...(o.capabilities === undefined ? {} : { capabilities: o.capabilities }) });
+  const s = setup({ driver: fake, modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}, o.now === undefined ? {} : { now: o.now }) });
+  cleanups.push(async () => { tmp.cleanup(); });
+  return { ...s, fake, dialog, modes, store };
+}
+
+const grantOf = (sm: SessionManager, id: string): { host: string | null; mode: string | null; allow: unknown[]; borrowGroup: string | null } => (inner(sm, id) as unknown as { grant: never }).grant;
+
+test('open on a deny host asks once and answers 21 until the person clicks: one box that names the host and the profile, no browser started, no page opened', async () => {
+  const { sm, fake, dialog } = setupDeny(() => new Promise<DialogResult>(() => {}));   // 人一直没点
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await assert.rejects(sm.open({ url: DENY_URL }), (e: E2kError) => e.code === 'wait-approval' && /等人在弹框里批准：打开不允许的域名/.test(e.message));
+  assert.equal(dialog.requests.length, 1, 'the retry meets the same box');
+  const req = dialog.requests[0]!;
+  assert.match(req.title, /^e2k：打开不允许的域名（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual(req.lines, ['会话：session（profile default）', '要打开不允许的域名：127.0.0.1', '', '拒绝：不打开（默认）', '只读：这次会话里只放行读']);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['拒绝', '只读'], '拒绝', 120]);   // R19：默认按钮是拒绝
+  assert.deepEqual(fake.openPages(), []); assert.equal(fake.launches, 0); assert.deepEqual(sm.list(), []);
+});
+
+test('answered 只读: the retry opens the session read-only (grant host only, no writable mode, no allow list), and a write to that host is blocked while a read goes through', async () => {
+  const { sm, fake, dialog } = setupDeny(answeringDeny('只读'));
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  const r = await sm.open({ url: DENY_URL });
+  assert.equal(r.mode, 'readonly');
+  assert.equal(dialog.requests.length, 1);
+  assert.deepEqual(grantOf(sm, r.session), { host: '127.0.0.1', mode: 'readonly', allow: [], borrowGroup: null });
+  assert.deepEqual((inner(sm, r.session) as unknown as { denyAllow: unknown[] }).denyAllow, []);
+  const pageId = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: DENY_URL, topUrl: DENY_URL })).action, 'continue');
+  assert.equal((await fake.emitRequest({ pageId, method: 'POST', url: 'http://127.0.0.1:5173/api', topUrl: DENY_URL, body: '{}', contentType: 'application/json' })).action, 'fulfill');
+});
+
+test('with --allow the dialog offers 可写 and lists every entry; answering 可写 stores the normalized list, and the session is still read-only (Task 4 applies the list)', async () => {
+  const { sm, dialog } = setupDeny(answeringDeny('可写'));
+  await assert.rejects(sm.open({ url: DENY_URL, allow: [ALLOW_SAVE, ALLOW_DROP, ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  const req = denyBoxes(dialog)[0]!;
+  assert.deepEqual(req.buttons, ['拒绝', '只读', '可写']);
+  assert.equal(req.defaultButton, '拒绝');
+  assert.deepEqual(req.lines, ['会话：session（profile default）', '要打开不允许的域名：127.0.0.1', '放行清单（选「可写」才生效）：',
+    'DELETE http://127.0.0.1:5173/api/x（只放行 operation Drop）', 'POST http://127.0.0.1:5173/api/save',
+    '', '拒绝：不打开（默认）', '只读：这次会话里只放行读', '可写：只放行上面的清单']);
+  const r = await sm.open({ url: DENY_URL, allow: [ALLOW_SAVE, ALLOW_DROP, ALLOW_SAVE] });   // 原样重试：顺序、重复怎么写都对得上同一个框
+  assert.equal(r.mode, 'readonly');
+  assert.deepEqual(grantOf(sm, r.session), { host: '127.0.0.1', mode: 'writable', allow: [{ ...ALLOW_DROP }, { ...ALLOW_SAVE, operation: null }], borrowGroup: null });
+  assert.equal(dialog.requests.length, 1);
+});
+
+test('answering 只读 to a box that offered 可写 keeps the list out of the grant', async () => {
+  const { sm } = setupDeny(answeringDeny('只读'));
+  await assert.rejects(sm.open({ url: DENY_URL, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  const r = await sm.open({ url: DENY_URL, allow: [ALLOW_SAVE] });
+  assert.deepEqual(grantOf(sm, r.session), { host: '127.0.0.1', mode: 'readonly', allow: [], borrowGroup: null });
+});
+
+test('open --readonly on a deny host still asks, without 可写 (and without the list, which would do nothing)', async () => {
+  const { sm, dialog } = setupDeny(answeringDeny('可写'));   // 框里没有「可写」：按拒绝
+  await assert.rejects(sm.open({ url: DENY_URL, readonly: true, allow: [ALLOW_SAVE] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.deepEqual(denyBoxes(dialog)[0]!.buttons, ['拒绝', '只读']);
+  assert.ok(!denyBoxes(dialog)[0]!.lines.some((l) => l.includes('放行清单') || l.startsWith('可写')));
+  await assert.rejects(sm.open({ url: DENY_URL, readonly: true, allow: [ALLOW_SAVE] }), isCode('usage'));
+  const ok = setupDeny(answeringDeny('只读'));
+  await assert.rejects(ok.sm.open({ url: DENY_URL, readonly: true }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal((await ok.sm.open({ url: DENY_URL, readonly: true })).mode, 'readonly');
+  assert.deepEqual(denyBoxes(ok.dialog)[0]!.buttons, ['拒绝', '只读']);
+});
+
+test('拒绝 is a usage error and opens nothing; the same request is not asked again until restart', async () => {
+  const { sm, fake, dialog } = setupDeny(answeringDeny('拒绝'));
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(sm.open({ url: DENY_URL }), (e: E2kError) => e.code === 'usage' && /人拒绝了打开这个不允许的域名/.test(e.message));
+  }
+  assert.equal(dialog.requests.length, 1);
+  assert.deepEqual(fake.openPages(), []); assert.equal(fake.launches, 0); assert.deepEqual(sm.list(), []);
+});
+
+test('the approval is used once: a second open of the same host asks again (R7)', async () => {
+  const { sm, dialog } = setupDeny(answeringDeny('只读'));
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  await sm.open({ url: DENY_URL });
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  assert.equal(denyBoxes(dialog).length, 2);
+});
+
+test('two concurrent opens after one click: exactly one session opens, the other asks again', async () => {
+  const { sm, dialog } = setupDeny(answeringDeny('只读'));
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  const settled = await Promise.allSettled([sm.open({ url: DENY_URL }), sm.open({ url: DENY_URL })]);
+  assert.deepEqual(settled.map((x) => x.status).sort(), ['fulfilled', 'rejected']);
+  const bad = settled.find((x) => x.status === 'rejected') as PromiseRejectedResult;
+  assert.equal((bad.reason as E2kError).code, 'wait-approval');
+  assert.equal(sm.list().length, 1);
+  assert.equal(denyBoxes(dialog).length, 2);
+});
+
+test('an approval not used within 5 minutes is asked again (R20); one used within it opens', async () => {
+  let t = 1_000_000;
+  const { sm, dialog } = setupDeny(answeringDeny('只读'), { now: () => t });
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  t += 5 * 60_000 + 1;
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));   // 作废了，重新问
+  await settleDialog();
+  assert.equal(denyBoxes(dialog).length, 2);
+  t += 60_000;
+  assert.equal((await sm.open({ url: DENY_URL })).mode, 'readonly');
+  assert.equal(denyBoxes(dialog).length, 2);
+});
+
+test('a dialog that cannot be shown is needs-human (22) and opens nothing', async () => {
+  const { sm, fake } = setupDeny(() => ({ kind: 'unavailable', why: '没有桌面' }));
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm.open({ url: DENY_URL }), (e: E2kError) => e.code === 'needs-human' && e.message.includes('弹不出批准框：没有桌面') && e.next === '在有桌面的终端里起内核');
+  assert.deepEqual(fake.openPages(), []); assert.deepEqual(sm.list(), []);
+});
+
+test('open --allow on a host that is not deny is a usage error and shows no dialog; a malformed entry is a usage error too, also before any dialog (R6)', async () => {
+  const { sm, dialog, fake } = setupDeny(answeringDeny('只读'));
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/', allow: [ALLOW_SAVE] }), (e: E2kError) => e.code === 'usage' && /open --allow 只用在不允许的域名上/.test(e.message) && /step --allow/.test(e.message));
+  await assert.rejects(sm.open({ url: DENY_URL, allow: [{ method: 'POST', url: 'not a url' }] }), isCode('usage'));
+  assert.equal(dialog.requests.length, 0);
+  assert.deepEqual(fake.openPages(), []);
+  assert.equal((await sm.open({ url: 'http://localhost:5173/', allow: [] })).mode, 'default', 'an empty list is no list');
+});
+
+test('a driver without network interception cannot open a deny host: refused before any dialog (R9)', async () => {
+  const { sm, dialog, fake } = setupDeny(answeringDeny('只读'), { capabilities: { networkInterception: false } });
+  await assert.rejects(sm.open({ url: DENY_URL }), (e: E2kError) => e.code === 'internal' && e.message.includes('不能拦网络请求'));
+  assert.equal(dialog.requests.length, 0);
+  assert.deepEqual(fake.openPages(), []); assert.equal(fake.launches, 0);
+});
+
+test('an open that needs two gates (rules waiting for approval, then the deny host) asks each box once and goes through on the first retry after the last click', async () => {
+  const { sm, dialog } = setupDeny(answeringDeny('只读'), { approveRules: false });
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));   // 规则待批
+  await settleDialog();
+  await assert.rejects(sm.open({ url: DENY_URL }), isCode('wait-approval'));   // 规则批准了，轮到 deny 框
+  await settleDialog();
+  const r = await sm.open({ url: DENY_URL });   // 两个都批准了：一次走通，没有哪一道再被问
+  assert.equal(r.mode, 'readonly');
+  assert.deepEqual(dialog.requests.map((d) => d.title.replace(/（请求 .*$/, '')), ['e2k：域名规则改了', DENY_TITLE]);
 });

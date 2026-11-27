@@ -48,9 +48,10 @@ export interface Finding { claim: string; basis: string; verdict?: VerdictValue 
 // 「序号 failed 的失败 / 未执行，由之后的序号 by 的成功操作取代」。序号是整个会话从 1 起的序号（OpResult.seq）。
 export interface Supersede { failed: number; by: number }
 // profile：`组` 或 `组/槽`（只在协议层校验类型和长度，规范化和选择在内核里做）。
-export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean; readonly?: boolean; profile?: string }
+// allow：只用在不允许的域名上（弹框里列出来，人选「可写」才生效），在别的域名上给是 usage 错误（内核里判）。
+export interface OpenParams { url: string; viewport?: Viewport; name?: string; touch?: boolean; readonly?: boolean; profile?: string; allow?: AllowItem[] }
 export interface LoginBeginParams { url: string; profile?: string }
-// 放行声明（只在 step 上提，一律要人批准）：协议层只查形状和长度，规范化（地址写法、operation 名）在内核里做。
+// 放行声明（step 和 open 上提，一律要人批准）：协议层只查形状和长度，规范化（地址写法、operation 名）在内核里做。
 export interface AllowItem { method: string; url: string; operation?: string }
 export interface StepParams { session: string; ops: Op[]; keepGoing?: boolean; allow?: AllowItem[] }
 export interface CloseParams { session: string; verdict?: Verdict; findings?: Finding[]; notDone?: string[]; superseded?: Supersede[] }
@@ -199,13 +200,14 @@ export function validateParams(method: Method, p: unknown): unknown {
       plainObject(p, 'params', []);
       return {};
     case 'open': {
-      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch', 'readonly', 'profile']);
+      const o = plainObject(p, 'params', ['url', 'viewport', 'name', 'touch', 'readonly', 'profile', 'allow']);
       const out: OpenParams = { url: httpUrl(o.url, 'params.url') };
       if (o.viewport !== undefined) out.viewport = viewport(o.viewport, 'params.viewport');
       if (o.name !== undefined) out.name = str(o.name, 'params.name', { min: 1, max: 40, pattern: SESSION_NAME });
       if (o.touch !== undefined) out.touch = bool(o.touch, 'params.touch');
       if (o.readonly !== undefined) out.readonly = bool(o.readonly, 'params.readonly');
       if (o.profile !== undefined) out.profile = str(o.profile, 'params.profile', { min: 1, max: MAX_PROFILE_ARG });
+      if (o.allow !== undefined) out.allow = list(o.allow, 'params.allow', MAX_ALLOW).map((x, i) => allowItem(x, `params.allow[${i}]`));
       return out;
     }
     case 'step': {

@@ -112,7 +112,7 @@ export const noDialog: Dialog = {
   show: async () => ({ kind: 'unavailable', why: '内核以 --no-dialogs 启动' }),
 };
 
-export type ApprovalKind = 'rules' | 'writes' | 'login';
+export type ApprovalKind = 'rules' | 'writes' | 'login' | 'deny' | 'borrow';
 export type ApprovalState =
   | { status: 'approved'; button: string }
   | { status: 'denied'; cooling: boolean }
@@ -123,6 +123,8 @@ interface Entry {
   id: string; kind: ApprovalKind; req: DialogRequest; approveButtons: string[];
   state: 'queued' | 'showing' | 'approved' | 'denied';
   button?: string;
+  ttlMs?: number;        // 批准后有效多久：超过还没被 forget 的，下一次同键的 ask 当作没有，重新排队
+  approvedAt?: number;
 }
 
 export function pendingError(id: string, what: string): E2kError {
@@ -150,7 +152,8 @@ export class Approvals {
     this.newId = o.newId ?? (() => `a-${randomBytes(3).toString('hex')}`);
   }
 
-  ask(key: string, kind: ApprovalKind, req: DialogRequest, approveButtons: string[]): ApprovalState {
+  // o.ttlMs：批准的有效期（毫秒，从人点下去算）。过期的答复在下一次同键的 ask 里被丢掉、重新问；被拒的不过期（一直记到 forget 或重启）。
+  ask(key: string, kind: ApprovalKind, req: DialogRequest, approveButtons: string[], o: { ttlMs?: number } = {}): ApprovalState {
     checkDialogText(req);
     const problem = shapeProblem(req);
     if (problem !== null) throw new E2kError('internal', `对话框请求不合法：${problem}`);
@@ -159,7 +162,11 @@ export class Approvals {
       throw new E2kError('internal', '对话框请求不合法：批准按钮不对');
     }
     const t = this.now();
-    const have = this.entries.get(key);
+    let have = this.entries.get(key);
+    if (have?.state === 'approved' && have.ttlMs !== undefined && have.approvedAt !== undefined && t - have.approvedAt > have.ttlMs) {
+      this.entries.delete(key);   // 批准过期了没人用：当作没有
+      have = undefined;
+    }
     if (have !== undefined) {
       if (have.state === 'approved') return { status: 'approved', button: have.button ?? '' };
       if (have.state === 'denied') {
@@ -172,7 +179,7 @@ export class Approvals {
     const last = this.lastDenied.get(kind);
     if (last !== undefined && t - last < COOLING_MS) return { status: 'denied', cooling: true };
     if (this.showing === null && this.shownRecently(t) >= RATE_MAX_SHOWN) return { status: 'unavailable', why: '弹框太频繁，请人看一下' };
-    const entry: Entry = { id: this.freshId(), kind, req, approveButtons: [...approveButtons], state: 'queued' };
+    const entry: Entry = { id: this.freshId(), kind, req, approveButtons: [...approveButtons], state: 'queued', ...(o.ttlMs === undefined ? {} : { ttlMs: o.ttlMs }) };
     this.entries.set(key, entry);
     this.queue.push(key);
     this.pump();
@@ -249,6 +256,7 @@ export class Approvals {
       if (entry.approveButtons.includes(result.button)) {
         entry.state = 'approved';
         entry.button = result.button;
+        entry.approvedAt = t;
       } else {
         entry.state = 'denied';
         this.lastDenied.set(entry.kind, t);

@@ -69,7 +69,7 @@ test('validateParams', () => {
   assert.deepEqual(validateParams('open', { url: 'http://localhost:5173/', viewport: { width: 1280, height: 800 }, name: 'orders' }),
     { url: 'http://localhost:5173/', viewport: { width: 1280, height: 800 }, name: 'orders' });
   for (const bad of [{ url: 'http://localhost/', name: '../x' }, { url: 'http://localhost/', name: 'A B' },
-    { url: 'http://localhost/', allow: [] }, { url: 'ftp://localhost/' }])
+    { url: 'http://localhost/', bogus: 1 }, { url: 'ftp://localhost/' }])
     assert.throws(() => validateParams('open', bad));
   assert.throws(() => validateParams('step', { session: 'x', ops: [{ op: 'snapshot' }] }));
   assert.throws(() => validateParams('close', { session: 's-a41f00', verdict: { value: 'undetermined' } }), /because/);
@@ -116,6 +116,24 @@ test('step takes an optional allow list: at most 12 { method, url, operation? } 
   for (const allow of bad) assert.throws(() => validateParams('step', { ...base, allow }), isUsage, JSON.stringify(allow)?.slice(0, 60));
   // 查询串、operation 的写法是内核里的规范化管：协议层只收类型和长度
   assert.doesNotThrow(() => validateParams('step', { ...base, allow: [{ method: 'POST', url: 'http://api.example.com/x?y=1', operation: 'not valid' }] }));
+});
+
+test('open.allow is checked like step.allow: at most 12 { method, url, operation? } items, write methods only, no extra keys', () => {
+  const base = { url: 'http://127.0.0.1:5173/' };
+  const one = { method: 'POST', url: 'http://api.example.com/x', operation: 'Save' };
+  const two = { method: 'DELETE', url: 'http://api.example.com/y' };
+  assert.deepEqual(validateParams('open', { ...base, allow: [one, two] }), { ...base, allow: [one, two] });
+  assert.deepEqual(validateParams('open', { ...base, allow: [] }), { ...base, allow: [] });
+  assert.deepEqual(validateParams('open', base), base);
+  const many = (n: number) => Array.from({ length: n }, (_, i) => ({ method: 'POST', url: `http://api.example.com/${i}` }));
+  assert.equal(validateParams('open', { ...base, allow: many(12) }).allow?.length, 12);
+  const bad: unknown[] = [
+    many(13), 'x', null, {}, [null], [[]], [{ method: 'GET', url: 'http://api.example.com/x' }], [{ url: 'http://api.example.com/x' }], [{ method: 'POST' }],
+    [{ method: 'POST', url: '' }], [{ method: 'POST', url: `http://api.example.com/${'a'.repeat(2048)}` }],
+    [{ method: 'POST', url: 'http://api.example.com/x', operation: '' }], [{ method: 'POST', url: 'http://api.example.com/x', extra: 1 }],
+  ];
+  for (const allow of bad) assert.throws(() => validateParams('open', { ...base, allow }), isUsage, JSON.stringify(allow)?.slice(0, 60));
+  assert.throws(() => validateParams('open', { ...base, alow: [] }), isUsage);
 });
 
 test('close takes superseded pairs and a verdict per finding', () => {

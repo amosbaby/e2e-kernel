@@ -53,6 +53,8 @@ const DEFAULT_FOCUS_TIMING = { pollMs: 100, graceMs: 1500, deadlineMs: 2000 };
 
 const DEFAULT_NAME = 'session';
 const APPROVAL_TIMEOUT_SEC = 120;
+// deny 类批准（打开不允许的域名、借用）的有效期（R20）：批准后这么久没被用掉就作废，下一次重试重新问。
+export const DENY_TTL_MS = 5 * 60_000;
 const MAX_UNATTRIBUTED = 200;
 // 身份探针（location、密码框检查、count、text 四次页面读取）整体的时限：驱动的 read / text 没有不等待的开关，页面卡住时不能让 step 一直占着会话。
 const IDENTITY_PROBE_MS = 5000;
@@ -103,6 +105,9 @@ interface Session {
   readonly pendingHosts: Set<string>;
   // 本会话提过且已批准的放行声明（只增不减）。判定时才和批准记录里当前的内容、会话当前的组和页面主机核对（declaredFor）。
   readonly declared: DeclaredEntry[];
+  // 这个会话的 deny 授权（open 时人批准的）；deny 主机上 step --allow 的声明只活在会话里、绑主机（Task 6 写入，这里先是空的）。
+  readonly grant: DenyGrant;
+  readonly denyAllow: { host: string; decl: Declaration }[];
   lastWall: 'login' | null;                  // 最近一次读到的登录墙状态（open 和每次 step 之后更新）
   // 身份探针（设计 5.2）：只探主页面。configured：探的时候组配了身份（报告里 identity 是不是 null 看它）；
   // checks / skipped：做了比较的次数（含没能确认的）/ 前提不满足跳过的次数；mismatch：只有确认是别的账号才记，一旦记下永久生效，直到 close（记的是当时的组和期望文字，不含页面文字）。
@@ -118,8 +123,22 @@ interface Session {
   finished: Promise<CloseResult> | undefined;
 }
 
+// 人对「打开不允许的域名」的批准（设计 5.4，R2）：只覆盖打开的那个主机（规范化后精确相等）。
+// mode：人选的「只读」或「可写」；allow：选「可写」时 open --allow 的放行清单（规范化后），其余为空；borrowGroup：借用的组（Task 6 写入）。没有授权时全 null / 空。
+export interface DenyGrant { host: string | null; mode: 'readonly' | 'writable' | null; allow: Declaration[]; borrowGroup: string | null }
+const noGrant = (): DenyGrant => ({ host: null, mode: null, allow: [], borrowGroup: null });
+
 // scope：批准是在哪个组、哪个页面主机上给的（`组/主机`；主机名里不会有 `/`，也不会撞上 `constructor` 一类原型上的名字）。
 interface DeclaredEntry { readonly scope: string; readonly decl: Declaration; readonly approved: DeclarationRecord['approved'] }
+
+// 两个主机写法规范化后是否相同；规范化不了就当不同（失败关闭）。
+function sameNormalizedHost(a: string, b: string): boolean {
+  try {
+    return normalizeHost(a) === normalizeHost(b);
+  } catch {
+    return false;
+  }
+}
 
 const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
@@ -281,27 +300,78 @@ export class SessionManager {
     // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
+    this.openAllow(p, host);   // --allow 的写法和落点也先查：写错的参数不弹规则批准框
     this.gateRules();
     const { ref, borrowed } = this.pickProfile(host, arg);
     const profile = profileKey(ref);
     const forced = p.readonly === true;
-    const mode: Mode = forced ? 'readonly' : this.deps.modes.resolve(host);
-    // 「denied」是 M3 的事，规则文件现在不收；到了这里也宁可拒绝，不开任何页面。
-    if (mode === 'denied') throw new E2kError('internal', '这个版本还不支持「denied」模式');
-    // 只读靠拦网络请求落实：驱动拦不了就不能开，不开页（失败关闭）。
-    if (mode === 'readonly' && !this.deps.driver.capabilities.networkInterception) {
-      throw new E2kError('internal', '这个驱动不能拦网络请求，不能以只读方式打开');
+    const hostMode = this.deps.modes.resolve(host);
+    // 只读、不允许都靠拦网络请求落实：驱动拦不了就不能开，不开页，也不先弹框让人白点一次（失败关闭）。
+    if ((forced || hostMode !== 'default') && !this.deps.driver.capabilities.networkInterception) {
+      throw new E2kError('internal', hostMode === 'denied' ? '这个驱动不能拦网络请求，不能打开不允许的域名' : '这个驱动不能拦网络请求，不能以只读方式打开');
     }
+    // 闸门的固定次序（设计 5.4、R7）：规则待批 → deny 主机 →（借用，Task 6）。全部同步，在第一个 await（safeCapture）之前：
+    // 两个并发的重试不能同时看到同一个 approved。全过了才一起 forget，免得后面的闸被拒时前面已批准的答复在重试时又被问一次。
+    const deny = this.gateDeny(p, host, profile);
+    if (deny !== null) this.deps.approvals.forget(deny.key);
+    const grant: DenyGrant = deny === null ? noGrant() : { ...deny.grant, borrowGroup: null };
+    // 授权覆盖的 denied 先映射成 readonly（R9）；Task 4 之后由 sessionMode 统一算。
+    const mode: Mode = forced ? 'readonly' : hostMode === 'denied' && grant.host !== null ? 'readonly' : hostMode;
     // 浏览器启动和开页会抢前台：启动之前先记下用户在用的应用，开完再还（失败时也还：浏览器可能已经起来抢过了）。
     // 开始或结束时任一刻有登录窗口开着就不还：那是人要操作的窗口。
     const loginOpenAtStart = this.loginActive();
     const token = await this.safeCapture();
     const slot = this.pin(profile);
     try {
-      return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile, group: ref.group, borrowed });
+      return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile, group: ref.group, borrowed, grant });
     } finally {
       this.unpin(slot);
       if (!loginOpenAtStart && !this.loginActive()) await this.safeRestore(token);
+    }
+  }
+
+  // open --allow：只用在不允许的域名上（R6）。写法先规范化（usage 错误不弹框）；空清单等于没给。
+  private openAllow(p: OpenParams, host: string): Declaration[] {
+    if (p.allow === undefined || p.allow.length === 0) return [];
+    const decls = normalizeDeclarations(p.allow);
+    if (this.deps.modes.resolve(host) !== 'denied') {
+      throw new E2kError('usage', 'open --allow 只用在不允许的域名上；只读域名请用 step --allow', '去掉 --allow，或把放行声明放到 step --allow');
+    }
+    return decls;
+  }
+
+  // 打开不允许的域名的闸门（设计 5.4）：每次运行都要人点，不管 --readonly（闸门看规则，不看 forced）。主机不是 deny 返回 null。
+  // 答复的键绑定框里显示的全部内容：会话名、profile、主机、是否 --readonly、放行清单；批准后 5 分钟（DENY_TTL_MS）内没用掉就作废。
+  // 这里不 forget：调用方等所有闸都过了才一起 forget（R7）。弹框在后台，没批准就抛错，人点完原样重试。
+  private gateDeny(p: OpenParams, host: string, profile: string): { key: string; grant: Pick<DenyGrant, 'host' | 'mode' | 'allow'> } | null {
+    const allow = this.openAllow(p, host);
+    if (this.deps.modes.resolve(host) !== 'denied') return null;
+    const { approvals } = this.deps;
+    const name = p.name ?? DEFAULT_NAME;
+    const forced = p.readonly === true;
+    const canWrite = !forced && allow.length > 0;   // --readonly 时「可写」没有意思：清单不显示，也不给这个键
+    const normalized = normalizeHost(host);
+    const key = `deny:${sha256(JSON.stringify([name, profile, normalized, forced, allow.map(declarationKey)]))}`;
+    const request: DialogRequest = {
+      title: 'e2k：打开不允许的域名',
+      lines: [`会话：${name}（profile ${profile}）`, `要打开不允许的域名：${normalized}`,
+        ...(canWrite ? ['放行清单（选「可写」才生效）：', ...allow.map((d) => `${d.method} ${d.url}${d.operation === null ? '' : `（只放行 operation ${d.operation}）`}`)] : []),
+        '', '拒绝：不打开（默认）', '只读：这次会话里只放行读', ...(canWrite ? ['可写：只放行上面的清单'] : [])],
+      buttons: canWrite ? ['拒绝', '只读', '可写'] : ['拒绝', '只读'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
+    const asked = approvals.ask(key, 'deny', request, canWrite ? ['只读', '可写'] : ['只读'], { ttlMs: DENY_TTL_MS });
+    switch (asked.status) {
+      case 'pending':
+        throw pendingError(asked.id, '打开不允许的域名');
+      case 'denied':
+        if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试');
+        throw new E2kError('usage', '人拒绝了打开这个不允许的域名', '内核重启前同一个请求不会再问');
+      case 'unavailable':
+        throw new E2kError('needs-human', `要打开不允许的域名但弹不出批准框：${asked.why}`, '在有桌面的终端里起内核');
+      case 'approved':
+        if (asked.button === '只读') return { key, grant: { host: normalized, mode: 'readonly', allow: [] } };
+        if (asked.button === '可写' && canWrite) return { key, grant: { host: normalized, mode: 'writable', allow } };
+        throw new E2kError('internal', '打开不允许的域名的答复对不上');   // 不放行
     }
   }
 
@@ -369,8 +439,8 @@ export class SessionManager {
     });
   }
 
-  private async openOn(instance: Instance, p: OpenParams, o: { host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean }): Promise<OpenResult> {
-    const { host, mode, forced, profile, group, borrowed } = o;
+  private async openOn(instance: Instance, p: OpenParams, o: { host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean; grant: DenyGrant }): Promise<OpenResult> {
+    const { host, mode, forced, profile, group, borrowed, grant } = o;
     if (this.stopping) throw stopping();
 
     const name = p.name ?? DEFAULT_NAME;
@@ -384,7 +454,7 @@ export class SessionManager {
       ensurePrivateDir(nameDir);
       const runDir = resolveInside(nameDir, dirName);
       ensurePrivateDir(runDir);
-      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced, profile, group, borrowed });
+      return await this.openPage(instance, p, { id, name, nameDir, dirName, runDir, startedAt, host, mode, forced, profile, group, borrowed, grant });
     } finally {
       this.reserved.delete(id);
     }
@@ -1018,7 +1088,7 @@ export class SessionManager {
   }
 
   private async openPage(instance: Instance, p: OpenParams, o: { id: string; name: string; nameDir: string; dirName: string;
-    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean }): Promise<OpenResult> {
+    runDir: string; startedAt: Date; host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean; grant: DenyGrant }): Promise<OpenResult> {
     let page: Page | undefined;
     let registered = false;
     let session: Session | undefined;
@@ -1028,7 +1098,7 @@ export class SessionManager {
       const s: Session = {
         id: o.id, name: o.name, nameDir: o.nameDir, dirName: o.dirName, runDir: o.runDir, startedAt: o.startedAt, instance,
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
-        group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [],
+        group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [], grant: o.grant, denyAllow: [],
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
         pagesOpened: 0, identityConfigured: false, identityChecks: 0, identitySkipped: 0, identityMismatch: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
@@ -1579,7 +1649,11 @@ export class SessionManager {
   // 会话的有效模式：被 --readonly 强制，或 [主页面顶层主机, ...extraHosts] 里任一只读 → readonly；任一 denied → denied；否则 default。
   private sessionMode(s: Session, extraHosts: string[]): Mode {
     if (s.forced) return 'readonly';
-    const modes = [s.topHost, ...s.pendingHosts, ...extraHosts].map((h) => this.deps.modes.resolve(h));
+    // 授权覆盖的主机上 denied 先映射成 readonly（R2、R9）：只认 open 时批准的那个主机，规范化后精确相等；其余 deny 主机照旧是 denied。
+    const modes = [s.topHost, ...s.pendingHosts, ...extraHosts].map((h) => {
+      const m = this.deps.modes.resolve(h);
+      return m === 'denied' && s.grant.host !== null && sameNormalizedHost(h, s.grant.host) ? 'readonly' : m;
+    });
     if (modes.includes('readonly')) return 'readonly';
     if (modes.includes('denied')) return 'denied';
     return 'default';
