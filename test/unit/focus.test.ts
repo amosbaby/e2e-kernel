@@ -123,6 +123,19 @@ test('restore swallows an open failure and logs it', async () => {
   assert.ok(t.logs.length > 0);
 });
 
+test('restore reports whether it handed the foreground back: true once open -b was run (even if that failed), false otherwise', async () => {
+  const ok = rig({ info: info('com.google.chrome.for.testing') });
+  assert.equal(await ok.focus.restore('com.example.app'), true);
+  const failed = rig({ info: info('com.google.chrome.for.testing'), open: new Error('open failed') });
+  assert.equal(await failed.focus.restore('com.example.app'), true, 'attempted exactly once; the caller must not retry');
+  assert.equal(failed.opens().length, 1);
+  assert.equal(await rig({ info: info('com.example.other') }).focus.restore('com.example.app'), false, 'not in front');
+  assert.equal(await rig({ front: new Error('x') }).focus.restore('com.example.app'), false, 'unreadable: try again later');
+  assert.equal(await rig({ info: info('com.google.chrome.for.testing') }).focus.restore(null), false);
+  assert.equal(await rig({ info: info('com.google.chrome.for.testing') }).focus.restore('--help'), false);
+  assert.equal(await noFocus.restore('com.example.app'), false);
+});
+
 test('log lines are single-line and bounded', async () => {
   const t = rig({ front: new Error(`line1\nline2 ${'z'.repeat(5000)}`) });
   await t.focus.capture();

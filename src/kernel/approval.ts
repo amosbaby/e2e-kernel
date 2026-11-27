@@ -97,7 +97,7 @@ export function osascriptDialog(o: { exec?: ExecFn; managerName?: () => Promise<
         const { stdout } = await exec('osascript', args, { timeout: (r.timeoutSec + KILL_GRACE_SEC) * 1000 });
         return parseResult(stdout, r.buttons);
       } catch (e) {
-        // 人取消（点了被当作系统取消键的按钮，或按 Esc）：osascript 以 1 退出，stderr 里是「User canceled. (-128)」。
+        // 人取消（点了被当作系统取消键的按钮；真机实测按 Esc 对这些框没有作用，所以这里只是兜底）：osascript 以 1 退出，stderr 里是「User canceled. (-128)」。
         // 这是人的答复，不是弹不出：按「按了默认按钮」处理（所有批准框的默认按钮都是拒绝一类，ask 保证批准键不含默认按钮）。
         // 只看 stderr 字段：错误消息里带着命令行参数（正文），正文里出现这几个字不能算取消；被杀（超时）的更不算。
         if (isUserCancel(e)) return { kind: 'button', button: r.defaultButton };

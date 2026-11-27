@@ -188,6 +188,10 @@ D browser.close()              耗时 10ms    结论: 不抢     子进程 exitC
 
 没变的：页面自己弹出的窗口仍抢；没测的：`createTarget` 开出的窗口在没有 `-j` 时显示在别的窗口后面还是前面（没有直接观察窗口）。
 
+### 7.4 弹窗抢前台比 step 返回晚（M2b 任务 12 的真机验收，2026-11-27）
+
+任务 12 在 step 末尾同步还一次前台，真机验收没还回来：`step '[{"op":"click","target":"#open-popup"}]'` 返回之后每 100 毫秒采样前台，先是原应用，随后变成 `com.google.chrome.for.testing`，1 秒后仍是它。两个原因都会让旧做法落空，修法同时覆盖：(a) 弹窗的 `onPageOpened` 事件比 step 返回晚，step 末尾 `pagesOpened` 还没变，根本没调 restore；(b) restore 调了，但那一刻前台还不是 Chromium（抢得比还晚），`restore` 只在前台是 Chromium 时才 `open -b`，什么也没做。采样里「step 返回时前台还是原应用」说明 (b) 一定成立，(a) 没法从采样里分开，两者各有一条单元测试单独复现（见 `test/kernel/sessions.test.ts` 里 `focus: a popup whose event arrives after the step returned …` 和 `focus: a grab that comes after the step ended …`，修之前都失败）。修法见 design 的「把焦点还回去」一条：step 结束后在后台每 100 毫秒一轮，最多 2 秒，前台真的变成 Chromium 才还一次。
+
 ## 8. 人关窗口后
 
 作者自己跑的 `node scripts/m0/window-close.ts`，原样输出：

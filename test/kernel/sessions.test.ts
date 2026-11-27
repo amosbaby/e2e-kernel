@@ -28,7 +28,7 @@ import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
 import { approving, choosingMode, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 import { noFocus } from '../../src/kernel/focus.ts';
 import type { FocusKeeper } from '../../src/kernel/focus.ts';
-import { fakeFocus } from '../support/fake-focus.ts';
+import { fakeFocus, manualClock } from '../support/fake-focus.ts';
 
 const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null, allowedBy: null };
 
@@ -3455,7 +3455,7 @@ test('focus: open captures before the browser is launched and restores once afte
   let c!: ReturnType<typeof setup>;
   const focus: FocusKeeper = {
     capture: async () => { order.push(`capture launches=${c.fake.launches} pages=${c.fake.openPages().length}`); return 'com.example.app'; },
-    restore: async (t) => { order.push(`restore ${t} launches=${c.fake.launches} pages=${c.fake.openPages().length}`); },
+    restore: async (t) => { order.push(`restore ${t} launches=${c.fake.launches} pages=${c.fake.openPages().length}`); return true; },
   };
   c = setup({ focus });
   await c.sm.open({ url: 'http://localhost:5173/' });
@@ -3492,7 +3492,7 @@ test('focus: a login window that appears while open is running means no restore'
   let c!: ReturnType<typeof setup>;
   const focus: FocusKeeper = {
     capture: async () => { calls.push('capture'); await c.sm.loginBegin({ url: 'http://localhost:5173/login.html' }); return 'com.example.app'; },
-    restore: async (t) => { calls.push(`restore:${t}`); },
+    restore: async (t) => { calls.push(`restore:${t}`); return true; },
   };
   c = setup({ focus });
   await c.sm.open({ url: 'http://localhost:5173/' });
@@ -3529,6 +3529,7 @@ test('focus: a step that opens a page in its session restores once, with what it
   assert.deepEqual(focus.calls, ['capture'], 'captured before the ops run');
   fake.emitPopup(pageId, 'http://localhost:5173/popup');
   assert.equal((await step).exit, 0);
+  await until(() => focus.calls.length === 2);   // 还焦点在后台进行，step 不等它
   assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
   await sm.close({ session });
 });
@@ -3679,6 +3680,7 @@ test('focus: a step that ends in an error after opening a page still restores, a
   fake.emitPopup(pageId, 'about:blank');
   fake.emitHop(pageId, B_URL + 'landing');
   await rejected;
+  await until(() => focus.calls.length === 2);
   assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
 });
 
@@ -3689,7 +3691,7 @@ test('focus: a login window that was open when open started but is closed by the
   let loginId = '';
   const focus: FocusKeeper = {
     capture: async () => { calls.push('capture'); await c.sm.loginEnd({ loginId }); return 'com.example.app'; },
-    restore: async (t) => { calls.push(`restore:${t}`); },
+    restore: async (t) => { calls.push(`restore:${t}`); return true; },
   };
   c = setup({ focus });
   ({ loginId } = await c.sm.loginBegin({ url: 'http://localhost:5173/login.html' }));
@@ -3704,7 +3706,7 @@ test('focus: a login window that was open when a step started but is closed by t
   let armed = false;
   const focus: FocusKeeper = {
     capture: async () => { calls.push('capture'); if (armed) await c.sm.loginEnd({ loginId }); return 'com.example.app'; },
-    restore: async (t) => { calls.push(`restore:${t}`); },
+    restore: async (t) => { calls.push(`restore:${t}`); return true; },
   };
   c = setup({ focus });
   const { pageId, session } = await opened(c.sm, c.fake);
@@ -3715,4 +3717,203 @@ test('focus: a login window that was open when a step started but is closed by t
   c.fake.emitPopup(pageId, 'http://localhost:5173/popup');
   await step;
   assert.deepEqual(calls, ['capture']);
+});
+
+// ---- 焦点：弹窗事件或抢焦点比 step 返回晚时，在后台等到「前台真的是 e2k 的 Chromium」再还 ----
+
+// 起一个会在执行期间等一会的 step（用手动时钟时 wait 仍是真时间），等它进入执行阶段，返回它的 promise。
+function stepNow(sm: SessionManager, session: string, ops: Op[] = [{ op: 'snapshot' }]) {
+  return sm.step({ session, ops });
+}
+
+test('focus: a popup whose event arrives after the step returned still gets the foreground handed back', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  assert.equal((await stepNow(sm, session)).exit, 0);   // step 已经返回，弹窗事件还没来
+  assert.deepEqual(focus.handedBack, []);
+  fake.emitPopup(pageId, 'http://localhost:5173/late-popup');
+  await clock.advance(100);
+  assert.deepEqual(focus.handedBack, ['com.example.app']);
+  await clock.advance(1000);
+  assert.deepEqual(focus.handedBack, ['com.example.app'], 'handed back once, then it stops');
+  await sm.close({ session });
+});
+
+test('focus: a grab that comes after the step ended waits until the browser is really in front, then hands back once', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  focus.chromiumFront = false;   // 弹窗开了，但 Chromium 还没抢到前台
+  const step = runningStep(sm, focus, session, 150);
+  await until(() => focus.calls.length === 1);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  assert.equal((await step).exit, 0);
+  await clock.advance(500);
+  assert.deepEqual(focus.handedBack, [], 'the user’s app is still in front: nothing is touched');
+  assert.ok(focus.restores.length >= 4, `kept polling (${focus.restores.length})`);
+  focus.chromiumFront = true;   // 现在抢到了
+  await clock.advance(100);
+  assert.deepEqual(focus.handedBack, ['com.example.app']);
+  const attempts = focus.restores.length;
+  await clock.advance(1500);
+  assert.equal(focus.restores.length, attempts, 'no further attempts after it was handed back');
+  await sm.close({ session });
+});
+
+test('focus: a page opened after the grace period does not count; one inside it does', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  // 宽限期（1.5 秒）之外才开的页：不还，连前台都不查
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  await clock.advance(1600);
+  fake.emitPopup(pageId, 'http://localhost:5173/too-late');
+  await clock.advance(1000);
+  assert.deepEqual(focus.restores, []);
+  assert.equal(clock.pending(), 0, 'the background wait ended by itself');
+  // 宽限期之内：还
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  await clock.advance(1400);
+  fake.emitPopup(pageId, 'http://localhost:5173/in-time');
+  await clock.advance(100);
+  assert.deepEqual(focus.handedBack, ['com.example.app']);
+  await sm.close({ session });
+});
+
+test('focus: the background wait gives up after the deadline when the browser never comes to the front', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  focus.chromiumFront = false;
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await clock.advance(2200);
+  const attempts = focus.restores.length;
+  assert.ok(attempts >= 5 && attempts <= 25, `polled about every 100 ms for about 2 s (${attempts})`);
+  focus.chromiumFront = true;
+  await clock.advance(1000);
+  assert.equal(focus.restores.length, attempts, 'gave up: no attempts after the deadline');
+  assert.deepEqual(focus.handedBack, []);
+  assert.equal(clock.pending(), 0);
+  await sm.close({ session });
+});
+
+test('focus: a login window that shows up while the background wait is running stops the hand-back', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  focus.chromiumFront = false;
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await clock.advance(200);
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  focus.chromiumFront = true;   // 登录窗口自己把浏览器带到了前台
+  const attempts = focus.restores.length;
+  await clock.advance(1000);
+  assert.equal(focus.restores.length, attempts, 'no attempt once a login window is up');
+  assert.deepEqual(focus.handedBack, []);
+  await sm.loginEnd({ loginId });
+  // 登录窗口先开着、弹窗事件在 step 返回之后才到：同样不还
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  const login2 = await sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  fake.emitPopup(pageId, 'http://localhost:5173/popup2');
+  await clock.advance(500);
+  assert.deepEqual(focus.handedBack, []);
+  await sm.loginEnd(login2);
+  await sm.close({ session });
+});
+
+test('focus: a second step does not cancel a pending hand-back and the two never conflict', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  focus.chromiumFront = false;
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await clock.advance(200);
+  focus.token = null;   // 第二个 step 开始时前台还是 Chromium，capture 取到 null：它自己不还
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  await clock.advance(200);
+  focus.chromiumFront = true;
+  await clock.advance(100);
+  assert.deepEqual(focus.handedBack, ['com.example.app'], 'the first step’s hand-back still ran, exactly once');
+  assert.ok(!focus.calls.includes('restore:null'), 'the second step never called restore with null');
+  await clock.advance(2000);
+  assert.deepEqual(focus.handedBack, ['com.example.app']);
+  await sm.close({ session });
+});
+
+test('focus: shutdown ends a pending hand-back; the real timers are unref’d and cleared', async () => {
+  const focus = fakeFocus('com.example.app');
+  focus.chromiumFront = false;
+  const made: { ms: number | undefined; t: NodeJS.Timeout }[] = [];   // Node 的 Timeout 对象（有 hasRef）
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((fn: () => void, ms?: number, ...a: unknown[]) => {
+    const t = realSetTimeout(fn, ms, ...a) as unknown as NodeJS.Timeout;
+    made.push({ ms, t });
+    return t;
+  }) as unknown as typeof setTimeout;
+  try {
+    const { sm, fake } = setup({ focus });
+    const { session, pageId } = await opened(sm, fake);
+    focus.reset();
+    assert.equal((await stepNow(sm, session)).exit, 0);
+    fake.emitPopup(pageId, 'http://localhost:5173/popup');
+    await until(() => focus.restores.length >= 1);
+    const polls = made.filter((m) => m.ms === 100);
+    assert.ok(polls.length >= 1, 'a poll timer is pending');
+    assert.ok(polls.every((m) => !m.t.hasRef()), 'poll timers do not keep the process alive');
+    await sm.shutdown();
+    assert.equal((sm as unknown as { focusSleepers: Set<unknown> }).focusSleepers.size, 0, 'every sleeping poll was woken by shutdown');
+    const attempts = focus.restores.length;
+    focus.chromiumFront = true;
+    await sleep(250);
+    assert.equal(focus.restores.length, attempts, 'no attempt after shutdown');
+    assert.deepEqual(focus.handedBack, []);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+});
+
+test('focus: with no captured app (token null) a popup is never followed by any restore call, even in the background', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus(null);
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  const step = runningStep(sm, focus, session, 150);
+  await until(() => focus.calls.length === 1);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await step;
+  fake.emitPopup(pageId, 'http://localhost:5173/popup-later');
+  await clock.advance(1000);
+  assert.deepEqual(focus.calls, ['capture']);
+  assert.equal(clock.pending(), 0, 'no background wait was started at all');
+  await sm.close({ session });
+});
+
+test('focus: a hand-back that throws is swallowed and logged; the step result is unaffected', async () => {
+  const clock = manualClock();
+  const boom: FocusKeeper = { capture: async () => 'com.example.app', restore: async () => { throw new Error('late boom'); } };
+  const { sm, fake, logs } = setup({ focus: boom, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  logs.length = 0;   // 开会话那一步也会调 restore（同样抛、同样记）：只看 step 之后的
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await clock.advance(300);
+  assert.ok(logs.some((l) => l.includes('late boom')));
+  await sm.close({ session });
 });

@@ -9,12 +9,14 @@ export interface FocusKeeper {
   // 记下当前前台应用的 bundle id；取不到、不合格、或前台已经是 e2k 的 Chromium 都返回 null。
   capture(): Promise<string | null>;
   // 把前台还给 token：token 为 null 什么也不做；只有「此刻前台是 e2k 的 Chromium」才还，别的情况（用户已经切走了）不动。
-  restore(token: string | null): Promise<void>;
+  // 返回 true 表示这次真的执行了 `open -b`（不管它成没成：每次只还一次，调用方不要重试）；false 表示没动手
+  // （token 为 null 或不合格、前台还不是 e2k 的 Chromium、读不到前台）。调用方靠它决定要不要稍后再试。
+  restore(token: string | null): Promise<boolean>;
 }
 
 export const noFocus: FocusKeeper = {
   capture: async () => null,
-  restore: async () => {},
+  restore: async () => false,
 };
 
 const CALL_TIMEOUT_MS = 2000;
@@ -63,14 +65,18 @@ export function macFocus(o: { exec?: ExecFn; platform?: NodeJS.Platform; log?: (
       }
     },
     async restore(token) {
-      if (token === null) return;
+      if (token === null) return false;
+      let opening = false;
       try {
-        if (!TOKEN_SHAPE.test(token)) return;
+        if (!TOKEN_SHAPE.test(token)) return false;
         const now = await frontBundleId();
-        if (now === null || !isOurChromium(now)) return;   // 前台已经不是 e2k 的浏览器（用户自己切走了）：不抢回来
+        if (now === null || !isOurChromium(now)) return false;   // 前台已经不是 e2k 的浏览器（用户自己切走了）：不抢回来
+        opening = true;
         await exec('open', ['-b', token], { timeout: CALL_TIMEOUT_MS });
+        return true;
       } catch (e) {
         note('还回前台', e);
+        return opening;   // open -b 已经动手（哪怕失败）算还过了，不重试；读前台出错则稍后再试
       }
     },
   };

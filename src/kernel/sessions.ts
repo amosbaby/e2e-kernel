@@ -38,8 +38,18 @@ export interface SessionDeps {
   idleMs: number; keepRuns: number; now(): Date; kernelVersion: string; log(line: string): void;
   approvals: Approvals;   // 待批表：弹框和结果都在这里（调用方在后面的任务里接上）
   focus: FocusKeeper;   // 开会话、step 里新开页之后把前台还给用户的应用；测试传 noFocus 或假的，绝不真的切换前台
+  focusTiming?: Partial<FocusTiming>;   // step 之后后台还前台的时间参数；缺省见 DEFAULT_FOCUS_TIMING。测试注入手动时钟，不靠真的等
   identityProbeMs?: number;   // 身份探针整体的时限（毫秒），缺省 IDENTITY_PROBE_MS；超时按不符处理。测试用来把「永远不落定」缩短
 }
+
+// step 结束后「把前台还给用户的应用」在后台做：弹窗事件、浏览器抢前台都可能比 step 返回晚（实测，docs/m0-findings.md §7.4）。
+// graceMs：step 结束后这么久之内本会话新开的页还算这次 step 的；deadlineMs：从 step 结束起最多等这么久，前台还没变成 e2k 的浏览器就不动。
+export interface FocusTiming {
+  pollMs: number; graceMs: number; deadlineMs: number;
+  sleep(ms: number): Promise<void>;   // 缺省是 unref 的定时器，关停时被叫醒
+  nowMs(): number;
+}
+const DEFAULT_FOCUS_TIMING = { pollMs: 100, graceMs: 1500, deadlineMs: 2000 };
 
 const DEFAULT_NAME = 'session';
 const APPROVAL_TIMEOUT_SEC = 120;
@@ -253,6 +263,8 @@ export class SessionManager {
   private stopped: Promise<void> | undefined;
   // 还没有结果的 open 和 loginBegin：关停要等它们落定后才停实例。
   private readonly inflight = new Set<Promise<unknown>>();
+  // 还在睡的后台还前台的定时器（的唤醒函数）：关停时一起叫醒，让它们看到 stopping 后结束，不留悬挂的定时器。
+  private readonly focusSleepers = new Set<() => void>();
 
   constructor(deps: SessionDeps) {
     this.deps = deps;
@@ -314,6 +326,47 @@ export class SessionManager {
     } catch (e) {
       this.logFailure(null, '还回前台', e);
     }
+  }
+
+  // step 结束后的后台还前台（不阻塞 step；错误吞掉记日志；整个过程不返回 promise 给调用方）。
+  // 每 pollMs 一轮：本会话在 step 期间或结束后 graceMs 之内新开了页（pagesOpened 比 step 开始时多）才进入「等前台」；
+  // 一直没开页，graceMs 一到就结束，什么也不碰。开了页之后，每轮让管家试一次 restore：前台还不是 e2k 的 Chromium 它返回 false（不动手），
+  // 下一轮再试；真还了（返回 true）就结束，只还一次；deadlineMs 到了前台还不是就放弃。任何一轮看到登录窗口在进行（含正在开）就放弃：那是人要操作的窗口。
+  // 同一会话的下一个 step 不取消上一次还没结束的后台还焦点：它只会在「前台是 e2k 的 Chromium」时动手，且每次动手后就结束，
+  // 两次先后触发时第二次看到前台已不是 Chromium，什么也不做，不会冲突；取消反而会丢掉第一次要还的应用
+  // （第二个 step 开始时前台还是 Chromium，它自己 capture 到的是 null）。关停时 stopping 为真，所有睡着的轮询被叫醒后结束。
+  private handBackLater(s: Session, token: string, pagesBefore: number): void {
+    const t = { ...DEFAULT_FOCUS_TIMING, sleep: (ms: number) => this.focusSleep(ms), nowMs: () => Date.now(), ...this.deps.focusTiming };
+    const started = t.nowMs();
+    void (async () => {
+      let opened = false;
+      try {
+        for (;;) {
+          if (this.stopping || this.loginActive()) return;
+          const elapsed = t.nowMs() - started;
+          if (!opened) {
+            if (s.pagesOpened > pagesBefore) opened = true;
+            else if (elapsed >= t.graceMs) return;
+          }
+          if (opened && await this.deps.focus.restore(token)) return;
+          if (t.nowMs() - started >= t.deadlineMs) return;
+          await t.sleep(t.pollMs);
+        }
+      } catch (e) {
+        this.logFailure(null, '还回前台', e);
+      }
+    })();
+  }
+
+  // 默认的睡：unref 的定时器（不拖住进程退出），关停时被叫醒。
+  private focusSleep(ms: number): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const wake = (): void => { clearTimeout(timer); this.focusSleepers.delete(wake); resolve(); };
+      const timer = setTimeout(wake, ms);
+      timer.unref();
+      this.focusSleepers.add(wake);
+    });
   }
 
   private async openOn(instance: Instance, p: OpenParams, o: { host: string; mode: Mode; forced: boolean; profile: string; group: string; borrowed: boolean }): Promise<OpenResult> {
@@ -398,7 +451,8 @@ export class SessionManager {
       return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
     } finally {
       // 成功、抛错都走到这里；会话仍是 stepping，restore 期间 close 和别的 step 都是 busy。safeRestore 不抛，不改变 step 的结果或错误。
-      if (focus !== undefined && s.pagesOpened > focus.pagesBefore && !focus.loginOpenAtStart && !this.loginActive()) await this.safeRestore(focus.token);
+      // 前台怎么还回去在后台做（见 handBackLater），step 不等：弹窗事件和抢前台都可能比这里晚。
+      if (focus !== undefined && focus.token !== null && !focus.loginOpenAtStart && !this.loginActive()) this.handBackLater(s, focus.token, focus.pagesBefore);
       // 执行期间会话可能已经被关停收尾，那就不再计时。
       if (s.state === 'stepping') {
         s.state = 'idle';
@@ -787,6 +841,7 @@ export class SessionManager {
   // 不会建成会话。再让所有会话出报告（kernel-shutdown，正在执行 step 的也收尾），关登录页，最后停实例。
   shutdown(): Promise<void> {
     this.stopping = true;
+    for (const wake of [...this.focusSleepers]) wake();   // 后台还前台的轮询看到 stopping 就结束，不留定时器
     this.stopped ??= this.drainAndStop();
     return this.stopped;
   }
