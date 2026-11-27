@@ -26,6 +26,9 @@ import type { Dialog, DialogRequest, DialogResult } from '../../src/kernel/appro
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
 import { approving, choosingMode, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { noFocus } from '../../src/kernel/focus.ts';
+import type { FocusKeeper } from '../../src/kernel/focus.ts';
+import { fakeFocus } from '../support/fake-focus.ts';
 
 const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null, allowedBy: null };
 
@@ -54,6 +57,7 @@ function setup(overrides: Partial<SessionDeps> & { launchDelayMs?: number; failO
     idleMs: 15 * 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: (line) => { logs.push(line); },
     approvals: new Approvals(fakeDialog(), () => {}),
     store: ApprovalStore.open(tmp.home.approvalsFile, () => {}),
+    focus: noFocus,   // 测试绝不真的切换用户的前台应用
     ...depsOverrides,
   });
   cleanups.push(async () => {
@@ -1251,7 +1255,7 @@ test('a refused redirect turns the allowed write into a blocked redirected-write
 test('a driver that cannot intercept requests refuses to open read-only (by rule or by --readonly), and opens nothing', async () => {
   const fake = new FakeDriver({ capabilities: { networkInterception: false }, pages: { 'http://localhost:5173/': HOME_PAGE } });
   const rules = mutableRules(['example.com']); const tmp = makeTmpHome();
-  const sm = new SessionManager({ driver: fake, home: tmp.home, modes: rules.resolver, policy, idleMs: 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: () => {}, approvals: new Approvals(fakeDialog(), () => {}), store: ApprovalStore.open(tmp.home.approvalsFile, () => {}) });
+  const sm = new SessionManager({ driver: fake, home: tmp.home, modes: rules.resolver, policy, idleMs: 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: () => {}, approvals: new Approvals(fakeDialog(), () => {}), store: ApprovalStore.open(tmp.home.approvalsFile, () => {}), focus: noFocus });
   cleanups.push(async () => { await sm.shutdown(); tmp.cleanup(); });
   await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'internal' && e.message.includes('不能拦网络请求'));
   await assert.rejects(sm.open({ url: 'http://localhost:5173/', readonly: true }), (e: E2kError) => e.code === 'internal');
@@ -3334,4 +3338,201 @@ test('the stored host choice reaches all four request paths: session page, sessi
   assert.equal((await post(null, { topUrl: NEW_URL })).action, 'fulfill');
   assert.equal((await post(null, {})).action, 'fulfill');
   assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api' })).action, 'continue');
+});
+
+// ---- 焦点：开会话和 step 里新开的页之后，把前台还给用户原来的应用 ----
+
+test('focus: open captures before the browser is launched and restores once after the page is open', async () => {
+  const order: string[] = [];
+  let c!: ReturnType<typeof setup>;
+  const focus: FocusKeeper = {
+    capture: async () => { order.push(`capture launches=${c.fake.launches} pages=${c.fake.openPages().length}`); return 'com.example.app'; },
+    restore: async (t) => { order.push(`restore ${t} launches=${c.fake.launches} pages=${c.fake.openPages().length}`); },
+  };
+  c = setup({ focus });
+  await c.sm.open({ url: 'http://localhost:5173/' });
+  assert.deepEqual(order, ['capture launches=0 pages=0', 'restore com.example.app launches=1 pages=1']);
+});
+
+test('focus: open restores even when it fails after the browser may have grabbed the foreground', async () => {
+  const focus = fakeFocus('com.example.app');
+  const { sm } = setup({ focus, failOpenWith: new DriverError('other', 'launch broke') });
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/' }));
+  assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
+});
+
+test('focus: an open rejected before anything is launched does not touch the foreground at all', async () => {
+  const focus = fakeFocus();
+  const { sm } = setup({ focus });
+  await assert.rejects(sm.open({ url: 'http://localhost:5173/', profile: 'BAD NAME' }), (e: E2kError) => e.code === 'usage');
+  assert.deepEqual(focus.calls, []);
+});
+
+test('focus: a login window already open when open starts means no restore', async () => {
+  const focus = fakeFocus();
+  const { sm } = setup({ focus });
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  assert.deepEqual(focus.calls, [], 'login.begin does not touch the foreground');
+  await sm.open({ url: 'http://localhost:5173/' });
+  assert.deepEqual(focus.calls, ['capture'], 'captured, but the login window stays in front');
+  await sm.loginEnd({ loginId });
+  assert.deepEqual(focus.calls, ['capture'], 'login.end does not touch the foreground either');
+});
+
+test('focus: a login window that appears while open is running means no restore', async () => {
+  const calls: string[] = [];
+  let c!: ReturnType<typeof setup>;
+  const focus: FocusKeeper = {
+    capture: async () => { calls.push('capture'); await c.sm.loginBegin({ url: 'http://localhost:5173/login.html' }); return 'com.example.app'; },
+    restore: async (t) => { calls.push(`restore:${t}`); },
+  };
+  c = setup({ focus });
+  await c.sm.open({ url: 'http://localhost:5173/' });
+  assert.deepEqual(calls, ['capture']);
+});
+
+test('focus: a keeper that throws changes nothing about open and step, and is logged', async () => {
+  const boom: FocusKeeper = { capture: async () => { throw new Error('capture boom'); }, restore: async () => { throw new Error('restore boom'); } };
+  const { sm, fake, logs } = setup({ focus: boom });
+  const { session, pageId } = await opened(sm, fake);
+  const wait = sm.step({ session, ops: [{ op: 'wait', for: { ms: 300 } }] });
+  await until(() => logs.some((l) => l.includes('capture boom')));
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  assert.equal((await wait).exit, 0);
+  assert.ok(logs.some((l) => l.includes('capture boom')) && logs.some((l) => l.includes('restore boom')));
+  await sm.close({ session });
+});
+
+// 起一个 step，等它进入执行阶段（capture 已经调过），返回这次 step 的 promise。wait 足够长，让测试有时间在 step 进行中动手。
+async function runningStep(sm: SessionManager, focus: { calls: string[] }, session: string, ms = 400) {
+  const before = focus.calls.length;
+  const step = sm.step({ session, ops: [{ op: 'wait', for: { ms } }] });
+  await until(() => focus.calls.length > before);
+  return step;
+}
+
+test('focus: a step that opens a page in its session restores once, with what it captured before the ops', async () => {
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus });
+  const { session, pageId } = await opened(sm, fake);
+  focus.calls.length = 0;
+  const step = runningStep(sm, focus, session);
+  await until(() => focus.calls.length === 1);
+  assert.deepEqual(focus.calls, ['capture'], 'captured before the ops run');
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  assert.equal((await step).exit, 0);
+  assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
+  await sm.close({ session });
+});
+
+test('focus: a step that opens no page captures but never restores', async () => {
+  const focus = fakeFocus();
+  const { sm, fake } = setup({ focus });
+  const { session, pageId } = await opened(sm, fake);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup-between-steps');   // 两次 step 之间开的页不算这次 step 的
+  focus.calls.length = 0;
+  assert.equal((await sm.step({ session, ops: [{ op: 'snapshot' }] })).exit, 0);
+  assert.deepEqual(focus.calls, ['capture']);
+  await sm.close({ session });
+});
+
+test('focus: a page opened by another session during a step does not count', async () => {
+  const focus = fakeFocus();
+  const { sm, fake } = setup({ focus });
+  const a = await opened(sm, fake, 'a');
+  const b = await opened(sm, fake, 'b');
+  focus.calls.length = 0;
+  const step = runningStep(sm, focus, a.session);
+  await until(() => focus.calls.length === 1);
+  fake.emitPopup(b.pageId, 'http://localhost:5173/popup-of-b');
+  await step;
+  assert.deepEqual(focus.calls, ['capture']);
+});
+
+test('focus: a step that opens a page while a login window is open (at its start or during it) does not restore', async () => {
+  // 开始时就有登录窗口
+  const f1 = fakeFocus();
+  const one = setup({ focus: f1 });
+  const s1 = await opened(one.sm, one.fake);
+  const login1 = await one.sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  f1.calls.length = 0;
+  const step1 = runningStep(one.sm, f1, s1.session);
+  await until(() => f1.calls.length === 1);
+  one.fake.emitPopup(s1.pageId, 'http://localhost:5173/popup');
+  await step1;
+  assert.deepEqual(f1.calls, ['capture']);
+  await one.sm.loginEnd(login1);
+  // 开始时没有，执行期间来了一个
+  const f2 = fakeFocus();
+  const two = setup({ focus: f2 });
+  const s2 = await opened(two.sm, two.fake);
+  f2.calls.length = 0;
+  const step2 = runningStep(two.sm, f2, s2.session);
+  await until(() => f2.calls.length === 1);
+  two.fake.emitPopup(s2.pageId, 'http://localhost:5173/popup');
+  await two.sm.loginBegin({ url: 'http://localhost:5173/login.html' });
+  await step2;
+  assert.deepEqual(f2.calls, ['capture']);
+});
+
+test('focus: a step rejected as busy neither captures nor restores', async () => {
+  const focus = fakeFocus();
+  const { sm, fake } = setup({ focus });
+  const { session } = await opened(sm, fake);
+  focus.calls.length = 0;
+  const first = runningStep(sm, focus, session, 150);
+  await assert.rejects(sm.step({ session, ops: [{ op: 'snapshot' }] }), (e: E2kError) => e.code === 'busy');
+  await first;
+  assert.deepEqual(focus.calls, ['capture'], 'only the running step captured');
+  await sm.close({ session });
+});
+
+test('focus: a step that ends in an error after opening a page still restores, and the error is unchanged', async () => {
+  const { sm, fake } = await setupGroups();
+  const focus = fakeFocus('com.example.app');
+  (sm as unknown as { deps: SessionDeps }).deps.focus = focus;   // setupGate 建的管理器缺省是 noFocus；这条换成会记调用的假管家
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  focus.calls.length = 0;
+  const step = sm.step({ session: a.session, ops: [{ op: 'wait', for: { ms: 300 } }] });
+  const rejected = assert.rejects(step, FROZEN_STEP_ERROR);   // 步骤执行期间被重定向进别的组：冻结，step 抛 needs-human
+  await until(() => focus.calls.length === 1);
+  fake.emitPopup(pageId, 'about:blank');
+  fake.emitHop(pageId, B_URL + 'landing');
+  await rejected;
+  assert.deepEqual(focus.calls, ['capture', 'restore:com.example.app']);
+});
+
+// 开始时登录窗口开着、结束时已经关了：「开始或结束时任一」里的「开始」那一半。登录窗口在 capture 里关掉（capture 在开始标志之后）。
+test('focus: a login window that was open when open started but is closed by the end still blocks the restore', async () => {
+  const calls: string[] = [];
+  let c!: ReturnType<typeof setup>;
+  let loginId = '';
+  const focus: FocusKeeper = {
+    capture: async () => { calls.push('capture'); await c.sm.loginEnd({ loginId }); return 'com.example.app'; },
+    restore: async (t) => { calls.push(`restore:${t}`); },
+  };
+  c = setup({ focus });
+  ({ loginId } = await c.sm.loginBegin({ url: 'http://localhost:5173/login.html' }));
+  await c.sm.open({ url: 'http://localhost:5173/' });
+  assert.deepEqual(calls, ['capture']);
+});
+
+test('focus: a login window that was open when a step started but is closed by the end still blocks the restore', async () => {
+  const calls: string[] = [];
+  let c!: ReturnType<typeof setup>;
+  let loginId = '';
+  let armed = false;
+  const focus: FocusKeeper = {
+    capture: async () => { calls.push('capture'); if (armed) await c.sm.loginEnd({ loginId }); return 'com.example.app'; },
+    restore: async (t) => { calls.push(`restore:${t}`); },
+  };
+  c = setup({ focus });
+  const { pageId, session } = await opened(c.sm, c.fake);
+  ({ loginId } = await c.sm.loginBegin({ url: 'http://localhost:5173/login.html' }));
+  calls.length = 0; armed = true;
+  const step = c.sm.step({ session, ops: [{ op: 'wait', for: { ms: 300 } }] });
+  await until(() => calls.length === 1);
+  c.fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await step;
+  assert.deepEqual(calls, ['capture']);
 });

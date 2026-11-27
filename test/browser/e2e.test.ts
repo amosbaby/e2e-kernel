@@ -12,6 +12,7 @@ import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 import { approving, choosingMode, fakeDialog } from '../support/fake-dialog.ts';
+import { noFocus } from '../../src/kernel/focus.ts';
 
 // 端到端验收：真浏览器（有头 Chromium）、真 fixture 服务、测试进程内的内核，CLI 走 bin/e2k.js 子进程。
 // 这份文件里的测试按书写顺序执行，共用模块级的 sid 和 ref。
@@ -65,7 +66,7 @@ function allFilesUnder(dir: string): string[] {
 before(async () => {
   server = await startFixtureServer();
   origin = server.origin;
-  kernel = await startKernel({ home, driver: createPlaywrightDriver(), dialog: fakeDialog(approving) });   // 批准走真路径：21 → 假对话框回「批准」→ 原样重试
+  kernel = await startKernel({ focus: noFocus, home, driver: createPlaywrightDriver(), dialog: fakeDialog(approving) });   // 批准走真路径：21 → 假对话框回「批准」→ 原样重试
 });
 
 after(async () => {
@@ -90,7 +91,7 @@ async function loginAfterChoice(h: typeof home, url: string): Promise<{ loginId:
 
 test('a page opened by login leaves its cookie for later sessions', { timeout: 180_000 }, async () => {
   const own = makeTmpHome();
-  const k = await startKernel({ home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('默认')) });
+  const k = await startKernel({ focus: noFocus, home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('默认')) });
   try {
     const begin = await loginAfterChoice(own.home, origin + '/login.html');
     assert.ok((await call(own.home, 'login.end', begin)).ok);
@@ -492,7 +493,7 @@ test('a popup opened with noopener by a read-only session page is still read-onl
 test('a click that is redirected into another group freezes the session: step exits 22, the session refuses everything afterwards, and result.json records other-group', { timeout: 180_000 }, async () => {
   const own = makeTmpHome();
   writeFileSync(own.home.rulesFile, JSON.stringify({ version: 1, rules: [], loginHosts: [], groups: [{ name: 'a', hosts: ['127.0.0.1'] }, { name: 'b', hosts: ['localhost'] }] }));
-  const k = await startKernel({ home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(approving) });
+  const k = await startKernel({ focus: noFocus, home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(approving) });
   const run = (input: string | undefined, ...args: string[]): Promise<Run> => e2kAt(own.home, input, ...args);
   try {
     const gate = await run(undefined, 'open', origin + '/cross-hop.html', '--json');
@@ -524,7 +525,7 @@ test('a click that is redirected into another group freezes the session: step ex
 // 登录时选「只读」：这个登录窗口自己发出的写（发往 localhost 的 /api/login，和发回本主机的 /api/x）都被拦，之后开这个主机也是只读。
 test('login on an unlisted host answered read-only: the window\'s own writes are blocked and counted, and a later open of that host is read-only with the reason on record', { timeout: 180_000 }, async () => {
   const own = makeTmpHome();
-  const k = await startKernel({ home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('只读')) });
+  const k = await startKernel({ focus: noFocus, home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('只读')) });
   try {
     const from = server.hits.length;
     const begin = await loginAfterChoice(own.home, server.altOrigin + '/login-writes.html');

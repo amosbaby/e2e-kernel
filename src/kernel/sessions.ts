@@ -17,6 +17,7 @@ import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
 import { pendingError } from './approval.ts';
 import type { Approvals, DialogRequest } from './approval.ts';
+import type { FocusKeeper } from './focus.ts';
 import type { ApprovalStore, Declaration } from './approval-store.ts';
 import { declarationKey, normalizeDeclarations, sameDeclaration } from './declarations.ts';
 import type { ModeResolver } from './mode.ts';
@@ -36,6 +37,7 @@ export interface SessionDeps {
   store: ApprovalStore;   // 批准记录：放行声明、主机模式的批准存在这里（调用方在后面的任务里接上）
   idleMs: number; keepRuns: number; now(): Date; kernelVersion: string; log(line: string): void;
   approvals: Approvals;   // 待批表：弹框和结果都在这里（调用方在后面的任务里接上）
+  focus: FocusKeeper;   // 开会话、step 里新开页之后把前台还给用户的应用；测试传 noFocus 或假的，绝不真的切换前台
   identityProbeMs?: number;   // 身份探针整体的时限（毫秒），缺省 IDENTITY_PROBE_MS；超时按不符处理。测试用来把「永远不落定」缩短
 }
 
@@ -82,6 +84,7 @@ interface Session {
   frozen: Freeze | null;                     // 经重定向进了别的组的域名：整个会话冻结
   readonly page: Page;                       // 会话的主页面，操作只作用在它上面
   readonly pages: Map<string, Page | null>;  // 本会话的所有页（含弹窗）；只知道 id、还没拿到对象的记 null
+  pagesOpened: number;                       // 会话建成后新开了多少页（弹窗、新标签页）：step 前后相减，判断这次 step 开没开新页
   readonly recorder: Recorder;
   readonly forced: boolean;                  // open --readonly：不管规则，整场会话只读
   topHost: string;                           // 主页面已确认的顶层主机（URL.hostname）：模式跟着页面走，只在有「已提交」的证据时更新
@@ -267,11 +270,34 @@ export class SessionManager {
     if (mode === 'readonly' && !this.deps.driver.capabilities.networkInterception) {
       throw new E2kError('internal', '这个驱动不能拦网络请求，不能以只读方式打开');
     }
+    // 浏览器启动和开页会抢前台：启动之前先记下用户在用的应用，开完再还（失败时也还：浏览器可能已经起来抢过了）。
+    // 开始或结束时任一刻有登录窗口开着就不还：那是人要操作的窗口。
+    const loginOpenAtStart = this.logins.size > 0;
+    const token = await this.safeCapture();
     const slot = this.pin(profile);
     try {
       return await this.openOn(await this.acquireInstance(profile, slot), p, { host, mode, forced, profile, group: ref.group, borrowed });
     } finally {
       this.unpin(slot);
+      if (!loginOpenAtStart && this.logins.size === 0) await this.safeRestore(token);
+    }
+  }
+
+  // 焦点管家按约定不抛错；这里再兜一层，管家（或测试里的假管家）抛了也只记日志，不影响 open / step 的结果。
+  private async safeCapture(): Promise<string | null> {
+    try {
+      return await this.deps.focus.capture();
+    } catch (e) {
+      this.logFailure(null, '记录前台应用', e);
+      return null;
+    }
+  }
+
+  private async safeRestore(token: string | null): Promise<void> {
+    try {
+      await this.deps.focus.restore(token);
+    } catch (e) {
+      this.logFailure(null, '还回前台', e);
     }
   }
 
@@ -310,6 +336,8 @@ export class SessionManager {
     // 先置 stepping 再探：探针要 await 页面读取，期间别的 step、close 都是 busy；下面任何一处抛错，finally 都把状态放回 idle。
     s.state = 'stepping';
     this.pauseIdle(s);
+    // 焦点：执行操作前记下前台应用；这次 step 里会话开了新页（弹窗、新标签页）才还。
+    let focus: { token: string | null; pagesBefore: number; loginOpenAtStart: boolean } | undefined;
     try {
       // 次序：冻结 → 身份探针 → 放行声明的批准 → 执行。账号不对时不该先弹「放行写请求」的框让人批。
       await this.probeIdentity(s);
@@ -321,6 +349,9 @@ export class SessionManager {
       }
       // 放行声明先过批准：没批准就在这里抛（21、拒绝、22），这一批的操作一个都不执行；探针之后到这里、再到开始执行之间没有 await。
       if (p.allow !== undefined && p.allow.length > 0) this.gateDeclarations(s, p.allow);
+      const loginOpenAtStart = this.logins.size > 0;
+      const token = await this.safeCapture();
+      focus = { token, pagesBefore: s.pagesOpened, loginOpenAtStart };
       const blockedBefore = s.recorder.blockedEvents();
       const crossBefore = s.crossCount;
       const results = await runOps(s.page, p.ops, { recorder: s.recorder, runDir: s.runDir, now: () => this.deps.now() },
@@ -349,6 +380,8 @@ export class SessionManager {
       // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。退出码不受 notices 影响。
       return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
     } finally {
+      // 成功、抛错都走到这里；会话仍是 stepping，restore 期间 close 和别的 step 都是 busy。safeRestore 不抛，不改变 step 的结果或错误。
+      if (focus !== undefined && s.pagesOpened > focus.pagesBefore && !focus.loginOpenAtStart && this.logins.size === 0) await this.safeRestore(focus.token);
       // 执行期间会话可能已经被关停收尾，那就不再计时。
       if (s.state === 'stepping') {
         s.state = 'idle';
@@ -907,7 +940,7 @@ export class SessionManager {
         start: { url: p.url, viewport: p.viewport ?? null, touch: p.touch === true, profile: o.profile, borrowed: o.borrowed },
         group: o.group, crossCount: 0, crossNotices: new Set(), refused: new Set(), frozen: null, declared: [],
         page, pages: new Map([[page.id, page]]), recorder: new Recorder(), forced: o.forced, topHost: o.host, pendingHosts: new Set(), lastWall: null,
-        identityConfigured: false, identityChecks: 0, identitySkipped: 0, identityMismatch: null,
+        pagesOpened: 0, identityConfigured: false, identityChecks: 0, identitySkipped: 0, identityMismatch: null,
         url: '', state: 'opening', gone: false, lastActive: 0, timer: undefined, finished: undefined,
       };
       session = s;
@@ -1531,6 +1564,7 @@ export class SessionManager {
     if (s !== undefined) {
       const owner = s;
       owner.pages.set(page.id, page);
+      owner.pagesOpened++;
       // 会话的弹窗被关，只把它从会话的页面表里去掉。
       page.onClosed(() => { owner.pages.delete(page.id); });
     } else if (login !== undefined) {

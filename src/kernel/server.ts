@@ -14,6 +14,8 @@ import { redactDeep, redactText, safely } from '../shared/redact.ts';
 import { kernelVersion } from '../shared/version.ts';
 import { Approvals, osascriptDialog } from './approval.ts';
 import type { Dialog } from './approval.ts';
+import { macFocus } from './focus.ts';
+import type { FocusKeeper } from './focus.ts';
 import type { RulesState } from './mode.ts';
 import { ApprovalStore } from './approval-store.ts';
 import { createRulesResolver } from './rules.ts';
@@ -28,6 +30,7 @@ export interface KernelOptions {
   home: Home; driver: Driver; idleMs?: number; keepRuns?: number;
   stopDeadlineMs?: number;   // stop() 等会话收尾的期限，过了就直接停浏览器实例并退出
   dialog?: Dialog;           // 向人弹确认框的实现，缺省是 macOS 原生对话框；测试和 --no-dialogs 传别的
+  focus?: FocusKeeper;       // 把前台还给用户应用的实现，缺省 macFocus()（非 macOS 上什么也不做）；测试一律传 noFocus 或假的
 }
 // abort()：关停进行中时再来一次停止信号用——不再等任何期限，直接停浏览器实例、断开连接、清理文件。
 export interface KernelHandle { stop(): Promise<void>; abort(): Promise<void> }
@@ -267,6 +270,7 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
     idleMs: o.idleMs ?? DEFAULT_IDLE_MS, keepRuns: o.keepRuns ?? DEFAULT_KEEP_RUNS, now: () => new Date(),
     kernelVersion: version, log: (line) => { log.write(line); },
     approvals: new Approvals(o.dialog ?? osascriptDialog(), (line) => { log.write(line); }),
+    focus: o.focus ?? macFocus({ log: (line) => { log.write(line); } }),
   });
   const connections = new Set<Socket>();
   const answering = new Set<Promise<void>>();

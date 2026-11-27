@@ -20,6 +20,7 @@ import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
 import { approving, choosingModeOnly, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { noFocus } from '../../src/kernel/focus.ts';
 
 // 长得像 token 的串在运行时拼出来，不写成字面量。
 const jwt = ['eyJ' + 'hbGciOiJIUzI1NiJ9', 'eyJ' + 'zdWIiOiIxMjM0NSJ9', 'c2lnbmF0dXJl' + 'LXZhbHVlLWZvci10ZXN0'].join('.');
@@ -55,14 +56,14 @@ function tmpHome(): Home {
 
 // 测试里另起的内核：断言失败时也由 afterEach 停掉，不让测试进程挂住。
 async function started(o: KernelOptions): Promise<KernelHandle> {
-  const handle = await startKernel({ dialog: fakeDialog(), ...o });
+  const handle = await startKernel({ focus: noFocus, dialog: fakeDialog(), ...o });
   cleanups.push(() => handle.stop());
   return handle;
 }
 
 beforeEach(async () => {
   home = tmpHome();
-  k = await startKernel({ home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(choosingModeOnly('默认')) });   // 登录前问模式的框回「默认」；别的框弹不出
+  k = await startKernel({ focus: noFocus, home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(choosingModeOnly('默认')) });   // 登录前问模式的框回「默认」；别的框弹不出
 });
 
 afterEach(async () => {
@@ -243,7 +244,7 @@ test('over the socket: an approvals record that cannot be read at start puts rul
 });
 
 test('a second start on the same home is refused while the first is alive', async () => {
-  await assert.rejects(startKernel({ home, driver: new FakeDriver(), dialog: fakeDialog() }), /内核已在运行/);
+  await assert.rejects(startKernel({ focus: noFocus, home, driver: new FakeDriver(), dialog: fakeDialog() }), /内核已在运行/);
   assert.ok((await call(home, 'status', {})).ok);                       // 第一个不受影响
   assert.equal(readFileSync(home.pidFile, 'utf8').trim(), String(process.pid));
 });
@@ -264,7 +265,7 @@ test('leftovers of a killed kernel do not block start', async () => {
 test('a pid file pointing at a live process without a socket needs a human', async () => {
   const lonely = tmpHome();
   writeFileSync(lonely.pidFile, String(process.pid));                   // 活着的进程（测试自己），但没有 socket
-  await assert.rejects(startKernel({ home: lonely, driver: new FakeDriver(), dialog: fakeDialog() }), (e: E2kError) => e.code === 'needs-human');
+  await assert.rejects(startKernel({ focus: noFocus, home: lonely, driver: new FakeDriver(), dialog: fakeDialog() }), (e: E2kError) => e.code === 'needs-human');
   assert.ok(existsSync(lonely.pidFile));                                // 不自动删
 });
 

@@ -50,7 +50,7 @@ const SCRIPT_LINES = [
 
 const RESULT_SHAPE = /^button returned:(.*), gave up:(true|false)$/;
 
-const defaultExec: ExecFn = (file, args, o) => new Promise((resolve, reject) => {
+export const defaultExec: ExecFn =(file, args, o) => new Promise((resolve, reject) => {
   execFile(file, args, { timeout: o.timeout, killSignal: 'SIGKILL', maxBuffer: 64 * 1024, encoding: 'utf8' }, (error, stdout) => {
     if (error !== null) reject(error);
     else resolve({ stdout });

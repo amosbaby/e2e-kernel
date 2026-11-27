@@ -23,6 +23,7 @@ import { makeTmpHome } from '../support/tmp-home.ts';
 import { approving, choosingMode, choosingModeOnly, denying, fakeDialog } from '../support/fake-dialog.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { approveRulesFile } from '../support/approve-rules.ts';
+import { noFocus } from '../../src/kernel/focus.ts';
 
 // 一个不能出现在任何输出里的值：运行时拼出来，不写成字面量。
 const secret = ['pw', 'Zq7', 'x91', 'Lk'].join('-');
@@ -68,7 +69,7 @@ const fake = new FakeDriver({ pages: pages() });
 let k: KernelHandle;
 
 before(async () => {
-  k = await startKernel({ home: kernelTmp.home, driver: fake, dialog: fakeDialog(choosingModeOnly('默认')) });   // 登录前问模式的框回「默认」；别的框弹不出
+  k = await startKernel({ focus: noFocus, home: kernelTmp.home, driver: fake, dialog: fakeDialog(choosingModeOnly('默认')) });   // 登录前问模式的框回「默认」；别的框弹不出
 });
 
 after(async () => {
@@ -105,7 +106,7 @@ function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; m
       }),
     },
     makeDriver: o.makeDriver ?? (async () => new FakeDriver({ pages: pages() })),
-    startKernel: o.startKernel ?? ((ko) => startKernel({ dialog: fakeDialog(), ...ko })),   // start 命令也不用真的对话框
+    startKernel: o.startKernel ?? ((ko) => startKernel({ focus: noFocus, dialog: fakeDialog(), ...ko })),   // start 命令也不用真的对话框
     onStopSignal: (cb) => { stops.push(cb); },
     exit: (code) => { exits.push(code); },
     exits,
@@ -170,7 +171,7 @@ test('step text output prints each notice on its own line; a reply without notic
 test('open on a broken rules file is refused with exit 2 and a pointer to rule list; fixing the file lets it through', async () => {
   await withRules(GOOD_RULES, async (h) => {
     const dialog = fakeDialog(approving);
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog });
+    const kk = await startKernel({ focus: noFocus, home: h.home, driver: new FakeDriver({ pages: pages() }), dialog });
     try {
       writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');
       const t = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], t), 2);
@@ -413,7 +414,7 @@ test('there is no approve command, and no start option that approves anything', 
 test('start --no-dialogs hands the kernel noDialog; plain start leaves the default dialog alone', async () => {
   for (const flag of [true, false]) {
     const seen: Parameters<NonNullable<Io['startKernel']>>[0][] = [];
-    const t = io({ env: freshEnv, startKernel: async (ko) => { seen.push(ko); return startKernel({ dialog: fakeDialog(), ...ko }); } });
+    const t = io({ env: freshEnv, startKernel: async (ko) => { seen.push(ko); return startKernel({ focus: noFocus, dialog: fakeDialog(), ...ko }); } });
     const done = main(flag ? ['start', '--no-dialogs'] : ['start'], t);
     await until(() => existsSync(fresh.socket)); t.fireStopSignal();
     assert.equal(await done, 0);
@@ -444,7 +445,7 @@ async function loginWithBlockedWrites(posts: number): Promise<string> {
   const h = makeTmpHome();
   const f = new FakeDriver({ pages: pages() });
   writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] }));
-  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog(approving) });
+  const kernel = await startKernel({ focus: noFocus, home: h.home, driver: f, dialog: fakeDialog(approving) });
   try {
     // 规则文件是新的：先要人批准（login 收到 21 自己重试），再因为 app.example.com 已在规则里，不再问模式
     assert.equal(await main(['login', 'http://app.example.com/login'], io({ env: h.env, isTTY: true })), 0);
@@ -466,7 +467,7 @@ test('open and login on changed rules: denied is exit 2, a kernel started withou
   for (const [dialog, want] of [[fakeDialog(denying), 2], [noDialog, 22]] as const) {
     await withRules(GOOD_RULES, async (h) => {
       const f = new FakeDriver({ pages: pages() });
-      const kk = await startKernel({ home: h.home, driver: f, dialog });
+      const kk = await startKernel({ focus: noFocus, home: h.home, driver: f, dialog });
       try {
         assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 21);
         await sleep(5);
@@ -776,7 +777,7 @@ test('status from an older kernel (no rules field) still formats', () => {
 
 test('status carries rules (the approved ones); the text format adds a line for a broken file, for unapproved changes and when approvals.json was changed from outside', async () => {
   await withRules(GOOD_RULES, async (h) => {
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(approving) });
+    const kk = await startKernel({ focus: noFocus, home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(approving) });
     try {
       assert.equal(await main(['open', 'http://localhost:5173/'], io({ env: h.env })), 21);   // 批准走弹框：第一次 open 得 21，人点批准后重试
       const opened = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/', '--json'], opened), 0);
@@ -996,7 +997,7 @@ async function withGroupKernel(fn: (h: ReturnType<typeof makeTmpHome>, f: FakeDr
   const f = new FakeDriver({ pages: pages() });
   writeFileSync(h.home.rulesFile, PROFILE_RULES);
   approveRulesFile(h.home);
-  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog(choosingModeOnly('默认')) });   // localhost 上第一次登录问模式：回「默认」
+  const kernel = await startKernel({ focus: noFocus, home: h.home, driver: f, dialog: fakeDialog(choosingModeOnly('默认')) });   // localhost 上第一次登录问模式：回「默认」
   try { await fn(h, f); } finally { await kernel.stop(); h.cleanup(); }
 }
 
@@ -1062,7 +1063,7 @@ test('open and step with an identity probe: a mismatch is exit 22 at open (the s
   approveRulesFile(h.home);
   const el = (text: string): FakePageSpec => ({ elements: { 'css=#acct': { text, count: 1 } } });
   const f = new FakeDriver({ pages: { 'http://a.example.com/': el('Test Tenant'), 'http://c.example.com/': el('Zq7x91 Other') } });
-  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog() });
+  const kernel = await startKernel({ focus: noFocus, home: h.home, driver: f, dialog: fakeDialog() });
   try {
     const good = io({ env: h.env });
     assert.equal(await main(['open', 'http://a.example.com/', '--json'], good), 0);
@@ -1109,7 +1110,7 @@ test('login end: cross-group navigations that were blocked get their own sentenc
 test('step --allow: unreadable or non-write declarations are usage errors that send nothing; a good one is 21 until a person approves, then the step runs', async () => {
   await withRules(null, async (h) => {
     const dialog = fakeDialog((r) => ({ kind: 'button', button: r.buttons.includes('放行') ? '放行' : '拒绝' }));
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog });
+    const kk = await startKernel({ focus: noFocus, home: h.home, driver: new FakeDriver({ pages: pages() }), dialog });
     try {
       const o = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/', '--json'], o), 0);
       const sid = (JSON.parse(o.outText()) as { session: string }).session;
@@ -1144,7 +1145,7 @@ const NEW_LOGIN = 'http://app.example.com/login.html';
 async function withChoiceKernel(dialog: ReturnType<typeof fakeDialog> | typeof noDialog, fn: (h: ReturnType<typeof makeTmpHome>, f: FakeDriver, store: () => ApprovalStore) => Promise<void>): Promise<void> {
   const h = makeTmpHome();
   const f = new FakeDriver({ pages: pages() });
-  const kk = await startKernel({ home: h.home, driver: f, dialog });
+  const kk = await startKernel({ focus: noFocus, home: h.home, driver: f, dialog });
   try { await fn(h, f, () => ApprovalStore.open(h.home.approvalsFile, () => {})); } finally { await kk.stop(); h.cleanup(); }
 }
 
