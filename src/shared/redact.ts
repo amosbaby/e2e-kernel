@@ -38,7 +38,10 @@ const URL_PARAM_NAME = /(^|[?&#\s;,({\[])([^=&#?\s"'<>;,({\[]+)=/g;
 const PARAM_VALUE_END = /[&#\s"<>]/;
 // 选择器里的 `名字=`：和 URL_PARAM_NAME 一样，只是名字前的分隔符另外认引号和 `=`（`text=token=…`、`[name="token=…"]`），
 // 并且分隔符放在后顾里，前一个匹配吃掉的 `=` 也能当分隔符。名字的字符类不含这些分隔符，所以每段名字只有一个起点，不回溯。
-const SELECTOR_PARAM_NAME = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)=/g;
+// 两种各跑一遍、结果取并集：宽的名字可以含 `]`（`pw]x=`、`[token]=` 按整段判），窄的把 `]` 也当分隔符（`[pw=1]sessionid=` 里第一个值
+// 的扫描会跨过第二个名字，要单独找到它）。窄的名字不能含 `]`，否则每个 `]` 后都成起点、扫到串尾。
+const SELECTOR_PARAM_NAME_WIDE = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)=/g;
+const SELECTOR_PARAM_NAME_NARROW = /(?<=(^|[?&#\s;,({\[\]"'=]))([^=&#?\s"'<>;,({\[\]]+)=/g;
 const ATTR_OPS = new Set(['~', '|', '^', '$', '*', '!']);   // `!=` 是 XPath 的
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 // 自由文本里 JSON 形态的 `"名字" : "`，以及套了一层转义的 `\"名字\" : \"`。值的结尾由 redactJsonPairsInText 逐字符找。
@@ -87,10 +90,11 @@ function redactCookieLine(line: string): string {
 // 自由文本里的 URL 参数，线性扫描：名字敏感时，值从 `=` 后一直到第一个 `&`、`#`、空白、`"`、`<`、`>` 或结尾
 // （`?` 不结束值，空值也换掉），换成 [REDACTED] 后从值的结尾接着找；名字不敏感时从 `=` 后接着找，
 // 所以 `?next=/cb?token=…` 里嵌套的 `?token=` 仍会被单独找到。
-// selector 为真时（只用于选择器）：名字前的分隔符另外认引号和 `=`（SELECTOR_PARAM_NAME）；名字紧跟 `[`（中间可有空白）、本身不含 `]` 的，
-// 值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
-function redactParamsInText(s: string, selector = false): string {
-  const re = new RegExp((selector ? SELECTOR_PARAM_NAME : URL_PARAM_NAME).source, 'g');
+// 给了 selectorRe 时（只用于选择器，SELECTOR_PARAM_NAME_WIDE 或 _NARROW）：名字前的分隔符另外认引号和 `=`（窄的还认 `]`）；
+// 名字紧跟 `[`（中间可有空白）、本身不含 `]` 的，值的结尾由 selectorValueEnd 定（和 redactSelectorAttrs 一致）；别的位置换到串尾。
+function redactParamsInText(s: string, selectorRe?: RegExp): string {
+  const selector = selectorRe !== undefined;
+  const re = new RegExp((selectorRe ?? URL_PARAM_NAME).source, 'g');
   let out = '';
   let copied = 0;
   for (let m = re.exec(s); m !== null; m = re.exec(s)) {
@@ -168,7 +172,8 @@ function cssEscapeEnd(s: string, i: number): number {
 }
 
 // 选择器里的名字是否敏感：先解开 CSS 转义；原样的名字、还原后的名字、URL 解码后的名字、只解合法 `%XX` 的宽松解码结果
-// （非法的 `%` 原样留下，不影响别处编码过的字符），或其中按非字母数字字符分出的任一段是敏感键，就算敏感
+// （非法的 `%` 原样留下，不影响别处编码过的字符）、去掉 `/* … */` 注释后的名字（`t/*x*/oken`），或其中按非字母数字字符分出的任一段
+// 是敏感键，就算敏感
 // （`data-pw`、`data_pass`、`ns|pw`、`@ns:pw`、`data.pw`、`/cb/pw`、`%|p%77`；拿不准时偏向敏感）。
 function selectorNameSensitive(raw: string): boolean {
   if (isSensitiveKey(raw)) return true;
@@ -189,17 +194,31 @@ function selectorNameSensitive(raw: string): boolean {
     i = end;
   }
   const lenient = name.replace(/%([0-9A-Fa-f]{2})/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16)));
-  const candidates = [raw, name, safeDecode(name), lenient];
+  const candidates = [raw, name, safeDecode(name), lenient, withoutComments(name)];
   return candidates.some((n) => isSensitiveKey(n) || n.split(/[^A-Za-z0-9]+/).some((part) => isSensitiveKey(part)));
+}
+
+// 去掉 `/* … */` 注释；没闭合的注释连同后面全部去掉。逐段找，线性。
+function withoutComments(s: string): string {
+  let out = '';
+  let i = 0;
+  for (let k = s.indexOf('/*'); k >= 0; k = s.indexOf('/*', i)) {
+    out += s.slice(i, k);
+    const e = s.indexOf('*/', k + 2);
+    if (e < 0) return out;
+    i = e + 2;
+  }
+  return out + s.slice(i);
 }
 
 // 选择器里名字敏感的 `[名字 运算符 值]`，值换掉（含引号），名字、运算符、空白和 `]` 保留。手写扫描，不交给正则：
 // `[`、名字、运算符、`=` 之间可以有空白；运算符是 `~ | ^ $ * !` 加 `=`；名字到空白、`=`、方括号、引号或「运算符=」为止，
-// 反斜杠转义（见 cssEscapeEnd）算进名字。comments 为真时，`/* … */` 注释也当空白、名字到注释为止；敏感名后面的注释没闭合时，
+// 反斜杠转义（见 cssEscapeEnd）算进名字。comments 为真时，`[`、名字、运算符、`=` 之间的 `/* … */` 注释也当空白，
+// 紧贴名字或在名字中间的注释算进名字（`t/*x*/oken`，判敏感时去掉）；注释没闭合时名字到此为止，敏感名后面的注释没闭合时，
 // 从名字结尾换到串尾（失败关闭）。调用方两种各跑一遍：两遍都只把值换成 [REDACTED]，结果是并集，认注释不会比不认注释漏得多
-// （开头注释没闭合、注释里的 `[`、名字中间的注释，不认注释的那遍能接住）。
-// 没匹配上就从名字里最后一个转义的 `[`（没有就从名字结尾）找下一个 `[`：名字里不含真正的 `[`，所以只有最后一个转义的 `[`
-// 可能另起一个属性；每个字符最多扫两次。找 `*/` 的结果记下来，同一段注释不重复扫。
+// （开头注释没闭合、注释里的 `[`，不认注释的那遍能接住）。
+// 没匹配上就从名字里最后一个转义的 `[`（没有就从名字结尾）找下一个 `[`：名字里（注释外）不含真正的 `[`，所以只有最后一个转义的 `[`
+// 可能另起一个属性（名字中注释里的 `[` 由不认注释的那遍接住）；每个字符最多扫两次。找 `*/` 的结果记下来，同一段注释不重复扫。
 function redactSelectorAttrs(s: string, comments: boolean): string {
   let out = '';
   let copied = 0;
@@ -238,7 +257,12 @@ function redactSelectorAttrs(s: string, comments: boolean): string {
         if (s[j + 1] === '[') escBracket = j + 1;
         j = cssEscapeEnd(s, j);
       }
-      else if (/[\s=[\]"']/.test(c) || (ATTR_OPS.has(c) && s[j + 1] === '=') || (comments && c === '/' && s[j + 1] === '*')) break;
+      else if (comments && c === '/' && s[j + 1] === '*') {
+        const e = closeAfter(j + 2);                       // 名字里（或紧贴名字）的注释算进名字，判敏感时去掉；没闭合就到此为止
+        if (e < 0) break;
+        j = e;
+      }
+      else if (/[\s=[\]"']/.test(c) || (ATTR_OPS.has(c) && s[j + 1] === '=')) break;
       else j++;
     }
     const nameEnd = j;
@@ -333,7 +357,7 @@ function redactTextWith(s: string, selector: boolean): string {
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
   if (selector) out = redactSelectorAttrs(redactSelectorAttrs(out, false), true);
-  out = redactParamsInText(out, selector);
+  out = selector ? redactParamsInText(redactParamsInText(out, SELECTOR_PARAM_NAME_WIDE), SELECTOR_PARAM_NAME_NARROW) : redactParamsInText(out);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);
   out = redactHeaderLines(out);

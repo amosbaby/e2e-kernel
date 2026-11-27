@@ -377,6 +377,14 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
     assert.equal(redactSelector(out), out, `idempotent: ${sel}`);
   }
   assert.equal(redactSelector('xpath=//input[@pw !="secret"]'), `xpath=//input[@pw !=${REDACTED}]`);
+  // 无效但可能出现的写法：`]` 紧贴下一个 `名字=`；注释把敏感名从中间切开。
+  for (const sel of ['[token]=secret', 'pw]=secret', '[pw]x=secret', 'pass]word=secret', '[a=1]pw]x=secret', 'pw]^=secret', '[a]token]=secret', '[pw=1]sessionid=secret', '[@pw=]sessionid=secret', '[x=1]token=secret', '[t/*x*/oken=secret]', '[t/*x*/oken = secret][a=1]', 't/*x*/oken=secret', '[p/**/w=secret]',
+    '[t/*x*/oken /**/=secret]', '[ t/*x*/oken /*y*/=secret]', '[p/* a b */w=secret]', '[/**/ p/**/w =secret]', '[pw]x=a][b="secret"]']) {
+    const out = redactSelector(sel);
+    assert.ok(!out.includes('secret'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out, `idempotent: ${sel}`);
+  }
+  for (const sel of ['[x=1]>a', 'div[a="1"]:has-text("x")', '[a=1][b=2]', '[title="a/* b */c"]', '[data-x/**/=1]']) assert.equal(redactSelector(sel), sel);
   // 路径或文字里按分段认出的精确敏感名：换到串尾。
   for (const sel of ['[href="/cb/pw=secret"][x=1]', 'text=data-pw=secret >> div']) {
     const out = redactSelector(sel);
@@ -425,8 +433,13 @@ test('redactSelector stays fast on adversarial input', () => {
     '[token="' + '\\'.repeat(1e5), '[token = ['.repeat(30000), '[token="' + ']'.repeat(1e5), "[a='".repeat(30000),
     '[' + '\\1'.repeat(50000), '[' + '\\111111'.repeat(30000), '[\\'.repeat(30000), '"a='.repeat(30000), "'a=".repeat(30000),
     '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5),
-    '[a /*'.repeat(30000), '[a /* '.repeat(30000) + '*/', '/*'.repeat(50000), '[pw/*'.repeat(30000), '[a/**/'.repeat(30000), 'a=1; '.repeat(30000)];
-  const start = performance.now();
-  for (const s of inputs) redactSelector(s);
-  assert.ok(performance.now() - start < 2000);
+    '[a /*'.repeat(30000), '[a /* '.repeat(30000) + '*/', '/*'.repeat(50000), '[pw/*'.repeat(30000), '[a/**/'.repeat(30000), 'a=1; '.repeat(30000),
+    ']a'.repeat(20000), ']a='.repeat(10000), '[t/*'.repeat(30000), '[a/*'.repeat(30000), 't/*x*/'.repeat(10000) + '=', '[' + 't/*x*/'.repeat(10000) + '=x]'];
+  // 每个输入单独限时：平方级退化在这些长度下要十几秒以上，而机器忙时总耗时会累积，不用总预算。
+  for (const s of inputs) {
+    const start = performance.now();
+    redactSelector(s);
+    const ms = performance.now() - start;
+    assert.ok(ms < 1000, `${JSON.stringify(s.slice(0, 20))}… took ${ms.toFixed(0)}ms`);
+  }
 });
