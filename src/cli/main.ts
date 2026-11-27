@@ -17,13 +17,13 @@ import type { CloseResult, Method, OpenResult, StepResult } from '../shared/prot
 import { redactText, safely } from '../shared/redact.ts';
 import { isObject } from '../shared/validate.ts';
 import { kernelVersion } from '../shared/version.ts';
-import { saveCase } from './commands.ts';
+import { runCaseFile, saveCase } from './commands.ts';
 import { runDoctor } from './doctor.ts';
-import { formatChecks, formatClose, formatError, formatOpen, formatRuleDiff, formatRuleList, formatSaveCase, formatStatus, formatStep } from './format.ts';
-import type { RuleDiffResult, RuleListResult, SaveCaseResult } from './format.ts';
+import { formatChecks, formatClose, formatError, formatOpen, formatRuleDiff, formatRuleList, formatRun, formatSaveCase, formatStatus, formatStep } from './format.ts';
+import type { RuleDiffResult, RuleListResult, RunResult, SaveCaseResult } from './format.ts';
 
 // e2k 命令行（设计 5.9）。只做校验和转发：参数先用和内核同一套 validateParams 校验，再经 socket 发给内核。
-// 这一版没有 run，rule 只有只读的 list 和 diff，也没有任何批准类的命令。
+// rule 只有只读的 list 和 diff，没有任何批准类的命令。
 // 报错不回显调用方给的值：参数解析、JSON 解析的原始错误消息都不打印。
 
 export interface Io {
@@ -76,6 +76,10 @@ function helpText(selfCmd: string): string {
     '  save-case <会话> --out <文件> [--steps <JSON>] [--json]    从已 close 的会话记录导出可重放的用例（不需要内核）',
     '                                          --out 必填、.json 结尾、文件已存在就拒绝（不覆盖）、不能放在状态目录里；--steps 如 [3,4,7]：只导出这些序号（可含 eval，写成跳过项），',
     '                                          不给就留成功的动作和执行了的断言；不能重放的步骤（eval、没有稳定选择器的引用、含脱敏内容）写成跳过项',
+    '  run <用例文件> [--name <名字>] [--json]    重放 save-case 导出的用例：open、每批最多 50 步的 step、close（要内核在跑）',
+    '                                          结论由重放结果定：有失败或未执行、有不符是 fail；有不能重放的步骤是 undetermined；都相符是 pass；原会话里 agent 的结论照带，但标成未判定',
+    '                                          --name 给新会话起名（缺省用用例里的名字）；放行声明和不允许的域名仍要人在弹框里批准（21：每 2 秒重试，同一个请求等满 120 秒才退出 21）',
+    '                                          退出码：撞到登录墙 20 > 失败 11 > 不符 10 > 0；open、step 出错时是那个错误的码（2、21、22），已开的会话仍会收尾成 undetermined',
     '  login <url> [--profile <组>[/<槽>]]    在专用 profile 里登录（要在终端里由人按回车确认）；--profile 同 open',
     '  --version',
     '  help',
@@ -305,13 +309,18 @@ async function close(ctx: Ctx, args: string[]): Promise<number> {
   return result.exit;
 }
 
+// 重试用的时钟：缺省是真的时间，测试注入假的。
+function clockOf(ctx: Ctx): NonNullable<Io['clock']> {
+  return ctx.io.clock ?? { now: () => Date.now(), sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }) };
+}
+
 const LOGIN_WAIT_MS = 120_000;
 const LOGIN_RETRY_MS = 2000;
 
 // login.begin 收到 21（等人在弹框里批准或选模式）就每 2 秒原样重试，最多等 120 秒；其他错误原样往上抛。
 // 提示只打印一次。等到时间了返回 null。
 async function beginLogin(ctx: Ctx, home: Home, params: unknown): Promise<unknown> {
-  const clock = ctx.io.clock ?? { now: () => Date.now(), sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }) };
+  const clock = clockOf(ctx);
   const deadline = clock.now() + LOGIN_WAIT_MS;
   let told = false;
   for (;;) {
@@ -379,6 +388,22 @@ async function saveCaseCmd(ctx: Ctx, args: string[]): Promise<number> {
   return outcome.exit;
 }
 
+// run：读用例文件、重放。等人批准的提示走标准错误（--json 时标准输出只有结果）。
+async function runCmd(ctx: Ctx, args: string[]): Promise<number> {
+  const p = parse(ctx, args, { ...JSON_OPTION, name: { type: 'string' } });
+  const [file] = positionals(ctx, p, 1, '<用例文件>');
+  const name = optString(p, 'name');
+  const home = resolveHome(ctx.io.env);
+  const outcome = await runCaseFile((method, params) => send(ctx, home, method, params), file, {
+    ...(name === undefined ? {} : { name }),
+    clock: clockOf(ctx),
+    onWaiting: (id) => { ctx.io.err(id === null ? '请在弹出的对话框里选择' : `请在弹出的对话框里选择（请求 ${id}）`); },
+  });
+  if ('error' in outcome) throw new E2kError(outcome.error.code, outcome.error.message, outcome.error.next);
+  print(ctx, outcome.result as RunResult, formatRun);
+  return outcome.exit;
+}
+
 async function run(ctx: Ctx, argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
   switch (command) {
@@ -396,6 +421,7 @@ async function run(ctx: Ctx, argv: string[]): Promise<number> {
     case 'close': return close(ctx, rest);
     case 'login': return login(ctx, rest);
     case 'save-case': return saveCaseCmd(ctx, rest);
+    case 'run': return runCmd(ctx, rest);
     default:
       // 不回显命令名：它可能是调用方误贴的任何东西。
       throw usage(command === undefined ? '缺少命令' : '没有这个命令', `${ctx.io.selfCmd} help 查看可用命令`);

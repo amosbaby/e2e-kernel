@@ -4,7 +4,7 @@ import type { ProfileInfo } from '../kernel/profiles.ts';
 import type { Rule, RulesFile } from '../kernel/rules.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { conflictText } from '../shared/protocol.ts';
-import type { CloseResult, OpResult, OpenResult, StepResult, Tallies } from '../shared/protocol.ts';
+import type { CloseResult, OpResult, OpenResult, StepResult, Tallies, VerdictValue } from '../shared/protocol.ts';
 import { redactText } from '../shared/redact.ts';
 
 // CLI 的紧凑文本输出。打印的内容都来自内核的回应（内核已经脱敏），这里只排版，不加回任何调用方给的原值。
@@ -126,6 +126,24 @@ export interface SaveCaseResult { path: string; steps: number; skipped: number; 
 export function formatSaveCase(r: SaveCaseResult): string {
   const out = [`已导出用例 ${inline(r.path)}`, `共 ${r.steps} 步，其中 ${r.skipped} 步不能重放，写成了跳过项`];
   if (r.containsWrites) out.push('注意：原会话放行过写请求或提过放行声明；重放时写仍受只读规则管，放行声明要重新由人批准');
+  return out.join('\n');
+}
+
+export interface RunResult {
+  session: string | null; reportPath: string | null; verdict: VerdictValue | null; skipped: number; tallies: Tallies | null;
+  error: { code: string; message: string; next?: string } | null;
+}
+
+export function formatRun(r: RunResult): string {
+  const out = [`${r.session === null ? '重放' : `重放 ${inline(r.session)}`} ${r.error === null ? '已完成' : '中途出错，已尽力收尾'}`];
+  out.push(`结论 ${r.verdict === null ? '未写入（收尾没成功）' : inline(r.verdict)}`);
+  if (r.reportPath !== null) out.push(`报告 ${inline(r.reportPath)}`);
+  if (r.tallies !== null) out.push(tallyText(r.tallies));
+  if (r.skipped > 0) out.push(`有 ${r.skipped} 步不能重放，已跳过，逐条见报告里的没做的事`);
+  if (r.error !== null) {
+    out.push(`出错（${inline(r.error.code)}）：${firstLine(r.error.message)}`);
+    if (r.error.next !== undefined) out.push(`下一步：${firstLine(r.error.next)}`);
+  }
   return out.join('\n');
 }
 

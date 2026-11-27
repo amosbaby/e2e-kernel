@@ -393,9 +393,8 @@ test('formatClose prints a fixed text for a reason it does not know, never the r
   assert.ok(!formatClose({ ...base }).includes('原因'));
 });
 
-test('this build has no approve, rule or run command, and save-case without arguments is a usage error', async () => {
-  for (const c of ['approve', 'rule', 'run']) assert.equal(await main([c], io()), 2, c);
-  assert.equal(await main(['save-case'], io()), 2);
+test('this build has no approve command; rule, run and save-case without arguments are usage errors', async () => {
+  for (const c of ['approve', 'rule', 'run', 'save-case']) assert.equal(await main([c], io()), 2, c);
 });
 
 test('start without a terminal runs until the stop signal', async () => {

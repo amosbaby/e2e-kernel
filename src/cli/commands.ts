@@ -1,12 +1,15 @@
 import { closeSync, constants, fchmodSync, openSync, realpathSync, rmSync, statSync, writeSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
-import { MAX_CASE_BYTES, buildCase, parseCase } from '../cases/case.ts';
+import { MAX_CASE_BYTES, buildCase, parseCase, readCaseFile } from '../cases/case.ts';
 import { findRun } from '../cases/find-run.ts';
+import { runCase } from '../cases/run-case.ts';
+import type { RunOptions, RunOutcome } from '../cases/run-case.ts';
 import { E2kError } from '../shared/errors.ts';
 import type { ErrorCode } from '../shared/errors.ts';
 import type { Home } from '../shared/paths.ts';
 import { exitCodeFor } from '../shared/protocol.ts';
+import type { Method } from '../shared/protocol.ts';
 
 // 在客户端做的命令（不经内核）：返回 { exit, result } 或 { exit, error }，CLI 和 MCP 壳各自打印。
 
@@ -101,6 +104,18 @@ export function saveCase(home: Home, p: { session: string; out: string; steps?: 
     parseCase(text);
     writeNew(path, text);
     return { exit: 0, result: { path, steps: c.steps.length, skipped: c.steps.filter((s) => s.skip !== undefined).length, containsWrites: c.containsWrites } };
+  } catch (e) {
+    return toOutcome(e);
+  }
+}
+
+// run：读用例文件（不对就在开会话之前拒绝），再用 open / step / close 重放。没开成会话就出错的，按错误返回；
+// 开了会话的（含中途出错、已 close 的）返回结果，错误放在 result.error 里，退出码是 outcome.exit。
+export async function runCaseFile(send: (method: Method, params: unknown) => Promise<unknown>, path: string, o: RunOptions): Promise<CommandOutcome> {
+  try {
+    const outcome: RunOutcome = await runCase(send, readCaseFile(path), o);
+    if (outcome.session === null && outcome.error !== null) return { exit: outcome.exit, error: outcome.error };
+    return { exit: outcome.exit, result: { session: outcome.session, reportPath: outcome.reportPath, verdict: outcome.verdict, skipped: outcome.skipped, tallies: outcome.tallies, error: outcome.error } };
   } catch (e) {
     return toOutcome(e);
   }
