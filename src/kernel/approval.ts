@@ -12,8 +12,8 @@ export interface Dialog { show(r: DialogRequest): Promise<DialogResult> }
 
 export type ExecFn = (file: string, args: string[], o: { timeout: number }) => Promise<{ stdout: string }>;
 
-const MAX_LINE_CHARS = 200;
-const MAX_BODY_CHARS = 1500;
+export const MAX_LINE_CHARS = 200;
+export const MAX_BODY_CHARS = 1500;
 const KILL_GRACE_SEC = 15;
 const MAX_TIMEOUT_SEC = 3600;
 const COOLING_MS = 60_000;

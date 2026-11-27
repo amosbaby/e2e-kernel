@@ -15,7 +15,7 @@ import type { CloseParams, CloseResult, LoginBeginParams, Mode, OpenParams, Open
   from '../shared/protocol.ts';
 import { redactText, redactUrl, safely } from '../shared/redact.ts';
 import { MAX_SNAPSHOT, exitFor, redactCap, runOps } from './executor.ts';
-import { pendingError } from './approval.ts';
+import { checkDialogText, pendingError } from './approval.ts';
 import type { Approvals, DialogRequest } from './approval.ts';
 import type { FocusKeeper } from './focus.ts';
 import type { ApprovalStore, Declaration } from './approval-store.ts';
@@ -584,19 +584,30 @@ export class SessionManager {
       // 键里有三样：已批准基线的完整哈希、待批的完整哈希。基线变了（别的批准落了盘）旧答案就对不上，
       // 所以没用掉的旧批准不会在新基线上直接生效（比如改回一份早先批准过的文本，必须重新问）。
       const key = `rules:${pending.baseHash ?? 'none'}:${pending.hash ?? 'deleted'}`;
-      // 改动太多框里放不下：只给「拒绝」一个按钮，必然 denied，让人先看完整差异、拆开再改。
-      const request: DialogRequest = pending.tooLong
-        ? { title: 'e2k：域名规则改了', lines: [`规则文件改动太多，框里放不下（${short}）：`, '先运行 e2k rule diff 看完整差异，再拆成几次改。', '', '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）'],
+      // 改动太多框里放不下（按字符判：差异超过 1300 字符或有一行超过 200 字符，见 rules.ts 的 summaryTooLong）：只给「拒绝」一个按钮，必然 denied，
+      // 让人先看完整差异、拆开再改。框架文字加上差异万一仍超出弹框的限制（approval.ts 的 checkDialogText），也走这条路，不从 ask 抛「内容太长」。
+      const FOOT = '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）';
+      const shortRequest: DialogRequest = { title: 'e2k：域名规则改了', lines: [`规则文件有改动（${short}），批准后才生效：`, ...pending.summary, '', FOOT],
+        buttons: ['拒绝', '批准'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC };
+      let tooLong = pending.tooLong;
+      if (!tooLong) {
+        try {
+          checkDialogText(shortRequest);
+        } catch {
+          tooLong = true;
+        }
+      }
+      const request: DialogRequest = tooLong
+        ? { title: 'e2k：域名规则改了', lines: [`规则文件改动太多，框里放不下（${short}）：`, '先运行 e2k rule diff 看完整差异，再拆成几次改。', '', FOOT],
           buttons: ['拒绝'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC }
-        : { title: 'e2k：域名规则改了', lines: [`规则文件有改动（${short}），批准后才生效：`, ...pending.summary, '', '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）'],
-          buttons: ['拒绝', '批准'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC };
-      const asked = approvals.ask(key, 'rules', request, pending.tooLong ? [] : ['批准']);
+        : shortRequest;
+      const asked = approvals.ask(key, 'rules', request, tooLong ? [] : ['批准']);
       switch (asked.status) {
         case 'pending':
           throw pendingError(asked.id, '域名规则的改动');
         case 'denied':
           if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '把 rules.json 改回去或改成别的再试；内核重启前同一份改动不会再问');
-          if (pending.tooLong) {
+          if (tooLong) {
             throw new E2kError('usage', '规则改动太多，框里放不下，没有批准；按上一次批准的规则，新的 open 和 login 也不开',
               '运行 e2k rule diff 看完整差异，再拆成几次改');
           }

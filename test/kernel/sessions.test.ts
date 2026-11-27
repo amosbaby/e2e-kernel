@@ -958,6 +958,20 @@ test('when the pending file no longer matches the answer the gate does not open 
   assert.equal(g.dialogRequests(), 2);
 });
 
+test('a difference that the resolver thinks fits but whose box would still exceed the dialog limits is shown as a deny-only "too much" box, never as an 内容太长 usage error from the dialog check', async () => {
+  const hash = 'ab'.repeat(32);
+  const summary = Array.from({ length: 8 }, (_, i) => `+ 规则 ${i}${'x'.repeat(168)}.example.com（只读）`);   // 8 行 × 190 字符（每行都不超过 200）：加上首尾两句，正文超过 1500
+  const pending = { hash, baseHash: null, text: '{}', summary, tooLong: false };
+  const modes: ModeResolver = { ...defaultOnlyResolver, pending: () => pending,
+    state: () => ({ ...defaultOnlyResolver.state(), pending: { hash: 'sha256:abababababababab', tooLong: false }, pendingHash: 'sha256:abababababababab' }) };
+  const dialog = fakeDialog(approving);
+  const { sm } = setup({ modes, approvals: new Approvals(dialog, () => {}) });
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  assert.deepEqual(dialog.requests[0]!.buttons, ['拒绝']);
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'usage' && /规则改动太多/.test(e.message));
+});
+
 test('a failure to write the approval is passed up as it is (needs-human), not wrapped as internal', async () => {
   const g = stubGate(() => { throw new E2kError('needs-human', '批准记录写不进磁盘'); });
   await assert.rejects(g.sm.open({ url: RO }), isCode('wait-approval'));
@@ -1037,7 +1051,7 @@ test('deleting rules.json is a pending change too: the dialog says so, and appro
 
 test('too many changes: the dialog has only a deny button and the result is a usage error that points at rule diff', async () => {
   const dialog = fakeDialog(approving);   // 脚本想批准也没得批：框里没有「批准」
-  const many = { version: 1, rules: Array.from({ length: 13 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };
+  const many = { version: 1, rules: Array.from({ length: 53 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };   // 53 条 1314 字符：超过 1300，框放不下（52 条 1289 字符放得下）
   const { sm, store } = setupGate(dialog, many);
   await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
   await settleDialog();
@@ -1051,7 +1065,7 @@ test('too many changes: the dialog has only a deny button and the result is a us
 
 test('the same text that was too long against one approved baseline is an ordinary dialog against another', async () => {
   const dialog = fakeDialog(approving);
-  const many = { version: 1, rules: Array.from({ length: 13 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };
+  const many = { version: 1, rules: Array.from({ length: 53 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };   // 53 条 1314 字符：超过 1300，框放不下（52 条 1289 字符放得下）
   let clock = 1_000_000;
   const { sm, home, store } = setupGate(dialog, many, () => clock);
   await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
@@ -1060,7 +1074,7 @@ test('the same text that was too long against one approved baseline is an ordina
   await assert.rejects(sm.open({ url: RO }), isCode('usage'));
   clock += 61_000;   // 过了拒绝后的冷却
   // 基线换成差不多的一份（人批准了另一次小改动）：同一份文本只差一条，不再算太长
-  const nearly = { version: 1, rules: many.rules.slice(0, 12) };
+  const nearly = { version: 1, rules: many.rules.slice(0, 52) };
   writeRules(home, nearly);
   await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
   await settleDialog();
@@ -1075,11 +1089,26 @@ test('the same text that was too long against one approved baseline is an ordina
   assert.equal(store.get().rules?.text, fullText(many));
 });
 
-test('a dialog text that is too long is a usage error and nothing is shown', async () => {
+test('a difference with a line over 200 characters is too long for the box like any other: deny-only box (21), then the "too much" usage error that points at rule diff; no 内容太长 from the dialog check', async () => {
   const dialog = fakeDialog(approving);
-  const { sm } = setupGate(dialog, { version: 1, rules: [{ match: `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.example.com`, mode: 'readonly' }] });
-  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'usage' && /内容太长/.test(e.message));
-  assert.equal(dialog.requests.length, 0);
+  const { sm, store } = setupGate(dialog, { version: 1, rules: [{ match: `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.example.com`, mode: 'readonly' }] });
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'wait-approval');
+  await settleDialog();
+  assert.equal(dialog.requests.length, 1);
+  assert.deepEqual(dialog.requests[0]!.buttons, ['拒绝']);
+  assert.ok(dialog.requests[0]!.lines.join('\n').includes('e2k rule diff'));
+  await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'usage' && /规则改动太多/.test(e.message) && /e2k rule diff/.test(e.next ?? ''));
+  assert.equal(store.get().rules, null);
+});
+
+test('a difference of 52 short lines (about 1300 characters) still fits one ordinary box: the real dialog frame does not push it over the limit', async () => {
+  const dialog = fakeDialog(approving);
+  const fits = { version: 1, rules: Array.from({ length: 52 }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' })) };
+  const { sm } = setupGate(dialog, fits);
+  await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
+  await settleDialog();
+  assert.deepEqual(dialog.requests[0]!.buttons, ['拒绝', '批准']);
+  assert.ok(dialog.requests[0]!.lines.join('\n').length <= 1500 && dialog.requests[0]!.lines.every((l) => l.length <= 200));
 });
 
 test('approvals.json deleted while the kernel runs: a readonly session stays readonly, step says the record was changed from outside', async () => {
@@ -2367,7 +2396,7 @@ const WL_RULES = {
       readPosts: [{ method: 'POST', url: 'http://api.example.com/v1/*/search' }],
       persistedQueries: [{ url: 'http://api.example.com/graphql', hashes: [WL_HASH] }],
       logout: [{ url: 'http://a.example.com/logout' }, { url: 'http://sso.example.org/logout' }] },
-    { name: 'b', hosts: ['b.example.com'], logout: [{ url: 'http://b.example.com/logout' }] },   // 规则改动不能超过 12 行（框放不下）：b 不带读型 POST
+    { name: 'b', hosts: ['b.example.com'], logout: [{ url: 'http://b.example.com/logout' }] },   // 规则改动的差异要放得进框（正文 1300 字符、每行 200 字符）：b 不带读型 POST
   ],
 };
 const API_SEARCH = 'http://api.example.com/v1/t1/search';

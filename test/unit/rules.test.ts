@@ -728,17 +728,25 @@ describe('pending summary', () => {
     assert.deepEqual(summaryOf({ rules: [{ match: 'a.example.com', mode: 'readonly' }] }, null), ['规则文件被删了：所有规则失效']);
   });
 
-  test('13 changes are too long for a dialog; 12 are not', () => {
+  // 终审 M-1：按字符判，不按行数。弹框正文 ≤ 1500 字符、每行 ≤ 200 字符；差异的正文留出框架（首尾两句）的余量，上限 1300。
+  // 每条规则一行 `+ 规则 hN.example.com（只读）`：h0–h9 23 字符，之后 24 字符，行间一个换行：52 条 1289 字符，53 条 1314 字符。
+  test('too long for a dialog is judged by characters: many short lines fit (52), 53 do not; one line over 200 characters does not fit either', () => {
     const rules = (n: number): Obj[] => Array.from({ length: n }, (_, i) => ({ match: `h${i}.example.com`, mode: 'readonly' }));
-    for (const [n, tooLong] of [[12, false], [13, true]] as const) {
+    for (const [n, tooLong] of [[12, false], [13, false], [30, false], [52, false], [53, true], [80, true]] as const) {
       const { f, io } = fakeIo(fileOf({ rules: [] }));
       const m = resolverOf(io);
       approveNow(m);
       f.text = fileOf({ rules: rules(n) }); m.refresh();
       assert.equal(m.pending()?.summary.length, n);
       assert.equal(m.pending()?.tooLong, tooLong, String(n));
-      assert.equal(m.state().pending?.tooLong, tooLong);
+      assert.equal(m.state().pending?.tooLong, tooLong, String(n));
     }
+    const { f, io } = fakeIo(fileOf({ rules: [] }));
+    const m = resolverOf(io);
+    approveNow(m);
+    f.text = fileOf({ rules: [{ match: `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.example.com`, mode: 'readonly' }] }); m.refresh();
+    assert.ok((m.pending()?.summary[0] ?? '').length > 200);
+    assert.equal(m.pending()?.tooLong, true, 'a single line over 200 characters');
   });
 
   test('inspectRules reads the files itself: pending, approved, unreadable approvals', () => {

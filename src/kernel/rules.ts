@@ -434,7 +434,13 @@ function toRulesFile(loaded: Loaded): RulesFile {
 // ---- 批准快照 ----
 
 const EMPTY_RULES: Rules = Object.freeze({ rules: Object.freeze([]), loginHosts: Object.freeze([]), groups: Object.freeze([]) }) as unknown as Rules;
-export const MAX_SUMMARY_LINES = 12;
+// 待批改动的差异放不放得进弹框，按字符判，不按行数（终审 M-1：首次配几个组，行数很容易过 12，字符却放得下）：
+// 弹框的限制是每行 200 字符、正文 1500 字符（approval.ts 的 checkDialogText）；差异占正文的一部分，另有首尾两句框架（约 100 字符），所以差异本身留 1300。
+export const MAX_SUMMARY_BODY_CHARS = 1300;
+const MAX_SUMMARY_LINE_CHARS = 200;
+export function summaryTooLong(summary: readonly string[]): boolean {
+  return summary.some((l) => l.length > MAX_SUMMARY_LINE_CHARS) || summary.join('\n').length > MAX_SUMMARY_BODY_CHARS;
+}
 
 // 批准记录里的规则：哈希对得上原文、原文解析得了才算数；对不上或解析不了（被改过，或解析器收紧了）当没批准过。
 interface Snapshot { rules: Rules; hash: string | null; text: string | null; valid: boolean }
@@ -670,7 +676,7 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
   };
 
   const pendingView = (): PendingRules | null => pending === null ? null
-    : { hash: pending.hash, baseHash: snap.text === null ? null : fullHash(snap.text), text: pending.text, summary: [...pending.summary], tooLong: pending.summary.length > MAX_SUMMARY_LINES };
+    : { hash: pending.hash, baseHash: snap.text === null ? null : fullHash(snap.text), text: pending.text, summary: [...pending.summary], tooLong: summaryTooLong(pending.summary) };
 
   refresh();
   return {
@@ -698,7 +704,7 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     refresh,
     state: (): RulesState => ({
       count: snap.rules.rules.length, hash: snap.hash, error,
-      pending: pending === null ? null : { hash: pending.shortHash, tooLong: pending.summary.length > MAX_SUMMARY_LINES },
+      pending: pending === null ? null : { hash: pending.shortHash, tooLong: summaryTooLong(pending.summary) },
       pendingHash: pending?.shortHash ?? null,   // 报告用的短哈希；删文件没有哈希，是 null
       approvals, approvalsChanged,
     }),
