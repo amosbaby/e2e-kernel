@@ -106,6 +106,28 @@ test('writes section lists allowed, blocked and unattributed writes', () => {
   assert.ok(section(renderReport(buildResult(input({}))), 'writes').includes('<p>无</p>'));
 });
 
+test('an allowed write carries allowedBy in result.json and the report names the basis; other writes carry no such key; a logout block is a reason of its own', () => {
+  const r = buildResult(input({
+    writes: [write('POST', 'http://api.example.com/v1/t1/search', 200, { allowedBy: 'read-post' }), write('POST', 'http://api.example.com/graphql', 200, { allowedBy: 'persisted-query' }),
+      write('POST', 'http://api.example.com/items', 200, { allowedBy: 'declared' }), write('POST', 'http://api.example.com/plain', 200),
+      { ...write('GET', 'http://a.example.com/logout', null, { reason: 'logout', mode: 'readonly' }), decision: 'blocked' }],
+  }));
+  assert.deepEqual(r.writes.allowed.map((w) => w.allowedBy), ['read-post', 'persisted-query', 'declared', undefined]);
+  assert.ok(!('allowedBy' in r.writes.allowed[3]!) && !('allowedBy' in r.writes.blocked[0]!));
+  assert.deepEqual(r.writes.blockedSummary, [{ host: 'a.example.com', method: 'GET', reason: 'logout', count: 1, unattributed: false }]);
+  const html = renderReport(r);
+  const w = section(html, 'writes');
+  for (const t of ['放行依据 读型 POST 白名单', '放行依据 持久化查询白名单', '放行依据 放行声明']) assert.ok(w.includes(t), t);
+  assert.equal(w.split('放行依据').length - 1, 3);
+  assert.ok(section(html, 'blocked-writes').includes('登出'));
+});
+
+test('an allowedBy value the report does not know is shown as unknown and escaped', () => {
+  const r = buildResult(input({ writes: [write('POST', 'http://x.example.com/a', 200, { allowedBy: '<b>x</b>' as never })] }));
+  const w = section(renderReport(r), 'writes');
+  assert.ok(w.includes('放行依据 未知') && !w.includes('<b>x</b>'));
+});
+
 test('the writes summary groups attributed writes by host, method and GraphQL kind, with counts and a stable order', () => {
   const blocked = (m: string, u: string, extra: Partial<WriteRecord> = {}): WriteRecord => ({ ...write(m, u, null, extra), decision: 'blocked' });
   const r = buildResult(input({
@@ -290,7 +312,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
       act('wait', 'ok', { op: { op: 'wait', for: { idle: 300 }, timeoutMs: 2000 } }),
       act('eval', 'ok', { output: '1', jsHash: 'sha256:0123456789abcdef' }), act('eval', 'ok', { outputOmitted: true, jsHash: 'sha256:0123456789abcdef' })],
     writes: [write('POST', 'http://localhost/a', 200, { body: '{}', pageUrl: 'http://localhost/' }), write('POST', 'http://localhost/c', 200, { bodyOmitted: true }),
-      write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' })],
+      write('POST', 'http://localhost/graphql', 200, { graphql: 'mutation' }), write('POST', 'http://localhost/s', 200, { allowedBy: 'read-post' })],
     unattributedWrites: [{ ...write('PUT', 'http://localhost/b', null, { reason: 'unattributed', mode: 'readonly' }), decision: 'blocked' }],
     modes: [{ at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'readonly', reason: 'forced', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: 'sha256:fedcba9876543210' }],
     rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' }, blocked: 'login', forced: true,
@@ -311,7 +333,7 @@ test('no key anywhere in buildResult output is a sensitive key', () => {
   };
   collect(r);
   for (const k of ['superseded', 'by', 'conflicts', 'failedOp', 'failedTarget', 'byOp', 'byTarget', 'byReadOnly', 'summary', 'host', 'graphql', 'bodyOmitted', 'allowed', 'blocked', 'label', 'format', 'mask', 'idle',
-    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed']) assert.ok(keys.has(k), k);
+    'modes', 'rules', 'hash', 'count', 'mode', 'reason', 'rulesHash', 'pendingHash', 'pendingRulesHash', 'readonly', 'blockedSummary', 'unattributed', 'profile', 'borrowed', 'allowedBy']) assert.ok(keys.has(k), k);
   assert.ok(Array.isArray(r.conflicts));
 });
 

@@ -30,7 +30,10 @@ const MODE_REASON_TEXT: Record<ModeChange['reason'], string> = {
 };
 const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
   'method': '非读方法', 'graphql-mutation': 'GraphQL mutation', 'persisted-query': '持久化查询',
-  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'other-group': '跨组导航', 'unknown': '原因不明',
+  'redirected-write': '重定向的写', 'unattributed': '未归属的写', 'other-group': '跨组导航', 'logout': '登出', 'unknown': '原因不明',
+};
+const ALLOWED_BY_TEXT: Record<NonNullable<WriteRecord['allowedBy']>, string> = {
+  'read-post': '读型 POST 白名单', 'persisted-query': '持久化查询白名单', 'declared': '放行声明',
 };
 
 function clip(s: string, max: number): string {
@@ -102,7 +105,9 @@ function writeItem(w: WriteRecord): string {
   const flag = w.targetMode === 'default' ? '' : ` <strong class="flag">非默认模式域名（${own(w.targetMode)}）</strong>`;
   const body = w.bodyOmitted ? '<br>请求体未记录（发出它的页面有密码框，或判断不出）'
     : w.body === null ? '' : `<br>请求体 <code>${pageBody(w.body)}</code>`;
-  return `<li><code>${page(w.method)} ${pageUrl(w.url)}</code> 时间 ${own(w.at)} 状态码 ${own(status)}${flag}${body}</li>`;
+  // 放行依据：只有靠组级白名单放行的写才有；报告也可能从磁盘上读回来，不认识的值落到「未知」。
+  const by = w.allowedBy === undefined ? '' : ` 放行依据 ${escapeHtml(ALLOWED_BY_TEXT[w.allowedBy] ?? '未知')}`;
+  return `<li><code>${page(w.method)} ${pageUrl(w.url)}</code> 时间 ${own(w.at)} 状态码 ${own(status)}${by}${flag}${body}</li>`;
 }
 
 // 汇总表：只有主机名、方法、GraphQL 类型和计数，不带路径和请求体；不含未归属的写。

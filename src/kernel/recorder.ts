@@ -3,7 +3,7 @@ import type { Op, Target } from '../shared/ops.ts';
 import type { Mode, Outcome, RequestSummary } from '../shared/protocol.ts';
 import { graphqlKind } from './graphql.ts';
 import type { GraphqlKind } from './graphql.ts';
-import type { BlockReason, PolicyVerdict } from './write-policy.ts';
+import type { AllowedBy, BlockReason, PolicyVerdict } from './write-policy.ts';
 import { REDACTED, redactBody, redactText, redactUrl, safely } from '../shared/redact.ts';
 
 // 会话的记录（设计 5.7、5.8）：动作、写、请求摘要、到过的域名。进记录之前先脱敏。
@@ -21,7 +21,9 @@ export interface WriteRecord { id: string; at: string; method: string; url: stri
   // graphql：null 表示不是 GraphQL；从原始请求体算，请求体不记录时照样算；拿不准是 'unknown'。
   host: string; graphql: GraphqlKind | null;
   // reason：被拦的原因，放行是 null；mode：判定当时的有效模式（targetMode 是请求目标主机自己的模式，两者可以不同）。
-  reason: BlockReason | null; mode: Mode }
+  reason: BlockReason | null; mode: Mode;
+  // allowedBy：靠组级白名单（读型 POST、持久化查询、放行声明）放行的才有；其余放行、所有拦截都没有这个键。
+  allowedBy?: AllowedBy }
 // 模式变更时间线（设计 5.2）：host 已脱敏；rulesHash 是已批准规则（快照）的摘要，没有是 null；
 // pendingRulesHash 是变化当时待批规则文件的摘要（它里面的收紧已经生效），没有待批是 null。
 export interface ModeChange { at: string; host: string; mode: Mode; reason: 'rule' | 'forced' | 'no-rule'; rulesHash: string | null; pendingRulesHash: string | null }
@@ -68,6 +70,7 @@ export function toWriteRecord(req: RequestInfo, verdict: PolicyVerdict, ctx: { m
     graphql: classify(req),
     reason: verdict.reason,
     mode: ctx.mode,
+    ...(verdict.allowedBy === null ? {} : { allowedBy: verdict.allowedBy }),
   };
 }
 
@@ -141,6 +144,7 @@ export class Recorder {
       if (redirectRefused === true && write.decision !== 'blocked') {
         write.decision = 'blocked';
         write.reason = 'redirected-write';
+        delete write.allowedBy;   // 那条写没有跟过去：不再算「靠白名单放行」
         this.blocked++;
       }
     }

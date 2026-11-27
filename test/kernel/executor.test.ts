@@ -18,7 +18,7 @@ import type { FakePageSpec } from '../support/fake-driver.ts';
 // 长得像 token 的串在运行时拼出来，不写成字面量。
 const jwt = ['eyJ' + 'hbGciOiJIUzI1NiJ9', 'eyJ' + 'zdWIiOiIxMjM0NSJ9', 'c2lnbmF0dXJl' + 'LXZhbHVlLWZvci10ZXN0'].join('.');
 const now = new Date('2026-01-02T03:04:05.000Z');
-const PASS: PolicyVerdict = { decision: { action: 'continue' }, reason: null };
+const PASS: PolicyVerdict = { decision: { action: 'continue' }, reason: null, allowedBy: null };
 const DEFAULT_CTX = { mode: 'default', targetMode: 'default' } as const;
 
 const PAGE_URL = 'http://localhost/';
@@ -621,7 +621,7 @@ test('toWriteRecord classifies GraphQL from the original body, also when the bod
 });
 
 test('recorder records a blocked read, but not an allowed one', () => {
-  const blocked: PolicyVerdict = { decision: { action: 'fulfill', status: 403, contentType: 'application/json', body: '{}' }, reason: 'graphql-mutation' };
+  const blocked: PolicyVerdict = { decision: { action: 'fulfill', status: 403, contentType: 'application/json', body: '{}' }, reason: 'graphql-mutation', allowedBy: null };
   recorder.addRequest({ ...req('GET', 'http://localhost/graphql?query=mutation%20X', null), id: 'b1' }, blocked, { mode: 'readonly', targetMode: 'readonly' }, now);
   recorder.addRequest({ ...req('GET', 'http://localhost/api/items', null), id: 'b2' }, PASS, { mode: 'readonly', targetMode: 'readonly' }, now);
   assert.equal(recorder.writes.length, 1); assert.equal(recorder.requests.length, 2);
@@ -634,7 +634,7 @@ test('recorder counts blocked events monotonically and ignores allowed writes', 
   assert.equal(recorder.blockedEvents(), 0);
   recorder.addRequest({ ...req('POST', 'http://localhost/api/a', null), id: 'a1' }, PASS, DEFAULT_CTX, now);
   assert.equal(recorder.blockedEvents(), 0);
-  const blocked: PolicyVerdict = { decision: { action: 'abort' }, reason: 'method' };
+  const blocked: PolicyVerdict = { decision: { action: 'abort' }, reason: 'method', allowedBy: null };
   recorder.addRequest({ ...req('POST', 'http://localhost/api/b', null), id: 'a2' }, blocked, { mode: 'readonly', targetMode: 'readonly' }, now);
   assert.equal(recorder.blockedEvents(), 1);
   // 写记录不删（也不受 200 条上限影响），计数只增不减。
@@ -679,7 +679,7 @@ test('noteMode records mode changes, skips a repeat of the same mode and redacts
 });
 
 test('toWriteRecord carries the block reason and the effective mode', () => {
-  const blocked: PolicyVerdict = { decision: { action: 'abort' }, reason: 'persisted-query' };
+  const blocked: PolicyVerdict = { decision: { action: 'abort' }, reason: 'persisted-query', allowedBy: null };
   const w = toWriteRecord({ ...req('POST', 'http://localhost/graphql', null), id: 'p1' }, blocked, { mode: 'readonly', targetMode: 'default' }, now);
   assert.equal(w.reason, 'persisted-query'); assert.equal(w.mode, 'readonly'); assert.equal(w.targetMode, 'default'); assert.equal(w.decision, 'blocked');
   const ok = toWriteRecord({ ...req('POST', 'http://localhost/api/x', null), id: 'p2' }, PASS, DEFAULT_CTX, now);
@@ -688,7 +688,7 @@ test('toWriteRecord carries the block reason and the effective mode', () => {
 
 test('isWrite, toWriteRecord and hosts', () => {
   assert.deepEqual(['POST', 'PUT', 'PATCH', 'DELETE', 'patch', 'GET', 'HEAD', 'OPTIONS'].map(isWrite), [true, true, true, true, true, false, false, false]);
-  const w = toWriteRecord({ ...req('PUT', 'http://localhost/api/items/1', null), id: 'r5', topUrl: 'http://localhost/' }, { decision: { action: 'abort' }, reason: 'method' }, { mode: 'readonly', targetMode: 'readonly' }, now);
+  const w = toWriteRecord({ ...req('PUT', 'http://localhost/api/items/1', null), id: 'r5', topUrl: 'http://localhost/' }, { decision: { action: 'abort' }, reason: 'method', allowedBy: null }, { mode: 'readonly', targetMode: 'readonly' }, now);
   assert.deepEqual(w, { id: 'r5', at: now.toISOString(), method: 'PUT', url: 'http://localhost/api/items/1', status: null, failed: false,
     body: null, bodyOmitted: false, pageUrl: 'http://localhost/', decision: 'blocked', targetMode: 'readonly', host: 'localhost', graphql: null,
     reason: 'method', mode: 'readonly' });

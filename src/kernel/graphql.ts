@@ -319,3 +319,124 @@ function looksLikeMutation(value: string): boolean {
 export function isMutationLikeUrl(url: string): boolean {
   return graphqlKind(null, null, url) === 'mutation' || urlQueryParams(url).some(looksLikeMutation);
 }
+
+// ---- 组级白名单用的两个检查（M2b） ----
+
+// JSON 里任何对象有没有重复的键（精确相等，转义解码后比）。JSON.parse 对重复键取最后一个，取第一个的服务端会读到另一份，
+// 所以要看原文。body 已经是合法 JSON：逐字符走，字符串读到结尾（认转义），后面紧跟 `:` 的字符串就是键。
+// 比 hasRepeatedQueryKey 严：不限于 query 键，每个对象各记一个键集；读不了的键当重复（失败关闭）。
+export function hasRepeatedKey(body: string): boolean {
+  const stack: (Set<string> | null)[] = [];   // 每层一个：对象是已见过的键，数组是 null
+  const n = body.length;
+  let i = 0;
+  while (i < n) {
+    const c = body[i]!;
+    if (c === '{') stack.push(new Set());
+    else if (c === '[') stack.push(null);
+    else if (c === '}' || c === ']') stack.pop();
+    else if (c === '"') {
+      let j = i + 1;
+      while (j < n && body[j] !== '"') j += body[j] === '\\' ? 2 : 1;
+      let k = j + 1;
+      while (k < n && /\s/.test(body[k]!)) k++;
+      const keys = stack[stack.length - 1];
+      if (body[k] === ':' && keys !== undefined && keys !== null) {
+        let key: unknown;
+        try {
+          key = JSON.parse(body.slice(i, j + 1));
+        } catch {
+          return true;
+        }
+        if (typeof key !== 'string' || keys.has(key)) return true;
+        keys.add(key);
+      }
+      i = j;
+    }
+    i++;
+  }
+  return false;
+}
+
+const PERSISTED_ITEM_KEYS = new Set(['operationName', 'variables', 'extensions']);
+const SHA256_HEX = /^[0-9a-fA-F]{64}$/;
+
+// 恰好这些键（不多不少）。
+function exactlyKeys(o: Record<string, unknown>, keys: readonly string[]): boolean {
+  const have = Object.keys(o).sort();
+  return have.length === keys.length && have.every((k, i) => k === keys[i]);
+}
+
+// 一个持久化查询操作：键只在 {operationName, variables, extensions} 里（没有 query，大小写变体也不行），
+// extensions 只有 persistedQuery，persistedQuery 恰好是 {version, sha256Hash}，哈希是 64 位十六进制（转小写）。
+// operationName 和 variables 的值不解释（文档由哈希决定），只收形状：字符串 / null、对象 / null。
+function persistedHashOf(o: Record<string, unknown>): string | null {
+  if (!Object.keys(o).every((k) => PERSISTED_ITEM_KEYS.has(k))) return null;
+  if (o.operationName !== undefined && o.operationName !== null && typeof o.operationName !== 'string') return null;
+  if (o.variables !== undefined && o.variables !== null && !isRecord(o.variables)) return null;
+  const ext = o.extensions;
+  if (!isRecord(ext) || !exactlyKeys(ext, ['persistedQuery'])) return null;
+  const pq = ext.persistedQuery;
+  if (!isRecord(pq) || !exactlyKeys(pq, ['sha256Hash', 'version'])) return null;
+  if (typeof pq.version !== 'number' || typeof pq.sha256Hash !== 'string' || !SHA256_HEX.test(pq.sha256Hash)) return null;
+  return pq.sha256Hash.toLowerCase();
+}
+
+// 只带哈希的持久化查询请求：POST、Content-Type 的 MIME 是 application/json、体不到 64 KB（到了就可能被截断）、
+// 是合法 JSON 且没有重复的键、单个或数组（不能为空）、每一项都合规（见 persistedHashOf）。全部满足才返回哈希列表（小写，按出现顺序），
+// 否则 null（失败关闭）。URL 不在这里看：调用方用接口白名单匹配 URL（带查询串的 URL 不匹配）。
+export function persistedHashes(method: string, body: string | null, contentType: string | null): string[] | null {
+  if (method.toUpperCase() !== 'POST' || body === null) return null;
+  if ((contentType ?? '').split(';')[0]!.trim().toLowerCase() !== 'application/json') return null;
+  if (Buffer.byteLength(body, 'utf8') >= MAX_BODY_BYTES) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (hasRepeatedKey(body)) return null;
+  const items = Array.isArray(value) ? value : [value];
+  if (items.length === 0) return null;
+  const hashes: string[] = [];
+  for (const o of items) {
+    const h = isRecord(o) ? persistedHashOf(o) : null;
+    if (h === null) return null;
+    hashes.push(h);
+  }
+  return hashes;
+}
+
+// 体看起来像 GraphQL 请求：JSON（单个或数组）的任一项有 query 键（不分大小写，不管值是什么类型），或 extensions（不分大小写）里有
+// persistedQuery 键（不分大小写）。长得像 JSON 却解析不了（比如被截断）时，只要出现 query 这个词（不分大小写，含 persistedQuery）就算。
+// 读型 POST 白名单靠它挡住「借非 GraphQL 接口的地址发 GraphQL」；拿不准一律算（宁可多拦）。
+export function looksGraphql(body: string | null): boolean {
+  if (body === null) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    const head = body.trimStart()[0];
+    return (head === '{' || head === '[') && /query/i.test(body);
+  }
+  const items = Array.isArray(value) ? value : [value];
+  return items.some((o) => isRecord(o) && Object.keys(o).some((k) => {
+    const key = k.toLowerCase();
+    if (key === 'query') return true;
+    const ext = o[k];
+    return key === 'extensions' && isRecord(ext) && Object.keys(ext).some((e) => e.toLowerCase() === 'persistedquery');
+  }));
+}
+
+// 每一项的 operationName 都等于 operation（放行声明的 operation 命中）：体是合法 JSON、没有重复的键、单个或数组（不能为空）。
+export function operationsAre(body: string | null, operation: string): boolean {
+  if (body === null) return false;
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  if (hasRepeatedKey(body)) return false;
+  const items = Array.isArray(value) ? value : [value];
+  return items.length > 0 && items.every((o) => isRecord(o) && o.operationName === operation);
+}

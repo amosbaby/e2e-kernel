@@ -25,7 +25,7 @@ import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
 import { DEFAULT_GROUP_NAME } from './rules.ts';
 import { blockFrozen, blockOtherGroup, otherGroupMessage } from './write-policy.ts';
-import type { PolicyVerdict, WritePolicy } from './write-policy.ts';
+import type { PolicyCtx, PolicyVerdict, WritePolicy } from './write-policy.ts';
 
 // 会话管理（设计 5.2、5.5、5.6）：实例的懒启动和复用、会话的开、执行、收尾、闲置超时、关停。
 // 「主机」一律指 URL.hostname（不带端口）。
@@ -906,7 +906,8 @@ export class SessionManager {
     // 请求所在页自己的顶层主机只读也算（模式跟着页面走），不用等有只读会话。
     const anyReadonly = [...this.sessions.values()].some((x) => this.sessionMode(x, []) === 'readonly')
       || this.deps.modes.resolve(hostOf(req.topUrl ?? req.url)) === 'readonly';
-    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly });
+    // 未归属的请求不属于任何组：只带目标主机所在组的登出接口（只读时命中就拦）；白名单里的写一概不放行。
+    const verdict = this.deps.policy.decideUnattributed(req, { anyReadonly, logout: this.deps.modes.groupOf(hostOf(req.url)).logout });
     if (isWrite(req.method) || verdict.reason !== null) {
       const targetMode = this.deps.modes.resolve(hostOf(req.url));
       this.unattributed.push(toWriteRecord(req, verdict, { mode: anyReadonly ? 'readonly' : 'default', targetMode }, this.deps.now()));
@@ -956,7 +957,8 @@ export class SessionManager {
     else {
       const all = [login.mode, ...[place.committed, ...place.pending, topHost, ...this.groupTargets(login.group, hostOf(req.url), topHost)].map((h) => modes.resolve(h))];
       const mode: Mode = all.includes('readonly') ? 'readonly' : all.includes('denied') ? 'denied' : 'default';
-      const verdict = this.deps.policy.decide(req, { mode });
+      // 登录窗口里允许登出（好换账号），也没有放行声明：logout、declared 传空；读型 POST、持久化查询照目标主机所在组。
+      const verdict = this.deps.policy.decide(req, this.policyCtx(mode, null, hostOf(req.url), false));
       decision = verdict.decision;
       const method = KNOWN_METHODS.has(req.method.toUpperCase()) ? req.method.toUpperCase() : 'OTHER';
       const line = `登录 ${login.id}：拦下 ${method} ${safely(() => redactText(hostOf(req.url)))}`;
@@ -996,6 +998,15 @@ export class SessionManager {
     if (group === DEFAULT_GROUP_NAME) return [];
     const { modes } = this.deps;
     return modes.groupOf(targetHost).name === group && modes.groupOf(topHost).name !== group ? [targetHost] : [];
+  }
+
+  // 一次写策略判定的上下文：登出 = 会话组的 ∪ 目标主机组的（withLogout 为 false 时是空，登录窗口用）；读型 POST、持久化查询只取目标主机所在组的
+  // （组只认已批准的快照；接口的主机在组内由规则解析保证）。放行声明本任务不传。
+  private policyCtx(mode: Mode, ownGroup: string | null, targetHost: string, withLogout: boolean): PolicyCtx {
+    const { modes } = this.deps;
+    const target = modes.groupOf(targetHost);
+    const own = ownGroup === null ? null : modes.group(ownGroup);
+    return { mode, logout: withLogout ? [...(own?.logout ?? []), ...target.logout] : [], readPosts: target.readPosts, persisted: target.persistedQueries, declared: [] };
   }
 
   // message 是给 step 的提示句（和 403 页面上的是同一句）。
@@ -1122,7 +1133,7 @@ export class SessionManager {
       id: `hop${++this.hopSeq}`, pageId: null, openerPageId: null, method: 'GET', url, resourceType: 'document',
       isNavigation: true, topFrame: true, topUrl: url, initiatorUrl: null, contentType: null, body: null, fromLoginForm: null,
     };
-    const verdict: PolicyVerdict = { decision: { action: 'abort' }, reason: 'other-group' };
+    const verdict: PolicyVerdict = { decision: { action: 'abort' }, reason: 'other-group', allowedBy: null };
     s.recorder.addRequest(req, verdict, { mode: this.sessionMode(s, []), targetMode: this.deps.modes.resolve(host ?? '') }, this.deps.now());
     this.logLine(`会话 ${s.id}：页面经重定向进了${group === null ? '判断不出归属的' : `组 ${group} 的`}域名 ${safely(() => redactText(host ?? ''))}，已冻结`);
   }
@@ -1177,7 +1188,7 @@ export class SessionManager {
     if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
     // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
     const mode = this.sessionMode(s, [topHost, ...this.groupTargets(s.group, host, topHost)]);
-    const verdict: PolicyVerdict = this.deps.policy.decide(req, { mode });
+    const verdict: PolicyVerdict = this.deps.policy.decide(req, this.policyCtx(mode, s.group, host, true));
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
     // 判定之后才动主机。放行的顶层导航只记成待定（不确定它会不会提交）；主页面的其他请求带着的顶层地址是「已提交」的证据，

@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { RequestInfo } from '../../src/driver/types.ts';
-import { BLOCK_MESSAGE, allowAllPolicy, blockFrozen, blockOtherGroup, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
-import type { BlockReason } from '../../src/kernel/write-policy.ts';
+import { BLOCK_MESSAGE, DEFAULT_CTX, allowAllPolicy, blockFrozen, blockOtherGroup, frozenMessage, otherGroupMessage, policy } from '../../src/kernel/write-policy.ts';
+import type { BlockReason, PolicyCtx } from '../../src/kernel/write-policy.ts';
+import { parseEndpoint } from '../../src/kernel/rules.ts';
+import type { Declaration } from '../../src/kernel/approval-store.ts';
 
 const JSON_CT = 'application/json';
 const j = (v: unknown): string => JSON.stringify(v);
@@ -12,7 +14,7 @@ const req = (o: Partial<RequestInfo> = {}): RequestInfo => ({
 });
 const post = (body: string | null, contentType: string | null = JSON_CT, o: Partial<RequestInfo> = {}): RequestInfo =>
   req({ method: 'POST', url: 'http://localhost/graphql', contentType, body, ...o });
-const ro = (r: RequestInfo) => policy.decide(r, { mode: 'readonly' });
+const ro = (r: RequestInfo) => policy.decide(r, { ...DEFAULT_CTX, mode: 'readonly' });
 
 const BLOCK_JSON = { action: 'fulfill', status: 403, contentType: 'application/json', body: `{"error":"${BLOCK_MESSAGE}"}` };
 const BLOCK_HTML = { action: 'fulfill', status: 403, contentType: 'text/html; charset=utf-8', body: `<!doctype html><meta charset="utf-8"><title>e2k</title><p>${BLOCK_MESSAGE}</p>` };
@@ -32,15 +34,15 @@ test('the block message is fixed', () => {
 
 test('safe methods are allowed in read-only mode', () => {
   for (const method of ['GET', 'HEAD', 'OPTIONS', 'get']) {
-    assert.deepEqual(ro(req({ method })), { decision: { action: 'continue' }, reason: null });
+    assert.deepEqual(ro(req({ method })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   }
 });
 
 test('a GET whose url query parameter is a mutation is blocked; other GET queries pass', () => {
   blocked(ro(req({ url: 'http://localhost/graphql?query=mutation%7Ba%7D' })), 'graphql-mutation');
   blocked(ro(req({ method: 'HEAD', url: 'http://localhost/graphql?query=mutation%7Ba%7D' })), 'graphql-mutation');
-  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?query=query%7Ba%7D' })), { decision: { action: 'continue' }, reason: null });
-  assert.deepEqual(ro(req({ url: 'http://localhost/graphql' })), { decision: { action: 'continue' }, reason: null });
+  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?query=query%7Ba%7D' })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(ro(req({ url: 'http://localhost/graphql' })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
 });
 
 test('a strict GraphQL query over POST is allowed without following redirects', () => {
@@ -94,24 +96,24 @@ test('a navigation is answered with an HTML page, a subresource with JSON', () =
 
 test('default mode lets everything through; denied and unknown modes abort', () => {
   for (const method of ['GET', 'POST', 'DELETE']) {
-    assert.deepEqual(policy.decide(req({ method, body: 'x' }), { mode: 'default' }), { decision: { action: 'continue' }, reason: null });
+    assert.deepEqual(policy.decide(req({ method, body: 'x' }), { ...DEFAULT_CTX, mode: 'default' }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   }
-  assert.deepEqual(policy.decide(req(), { mode: 'denied' }), { decision: { action: 'abort' }, reason: 'method' });
-  assert.deepEqual(policy.decide(req(), { mode: 'bogus' as never }), { decision: { action: 'abort' }, reason: 'method' });
+  assert.deepEqual(policy.decide(req(), { ...DEFAULT_CTX, mode: 'denied' }), { decision: { action: 'abort' }, reason: 'method', allowedBy: null });
+  assert.deepEqual(policy.decide(req(), { ...DEFAULT_CTX, mode: 'bogus' as never }), { decision: { action: 'abort' }, reason: 'method', allowedBy: null });
 });
 
 test('unattributed requests are only blocked when some session is read-only, and only writes', () => {
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: false }), { decision: { action: 'continue' }, reason: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET' }), { anyReadonly: true }), { decision: { action: 'continue' }, reason: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'head' }), { anyReadonly: true }), { decision: { action: 'continue' }, reason: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'OPTIONS' }), { anyReadonly: true }), { decision: { action: 'continue' }, reason: null });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true }), { decision: BLOCK_JSON, reason: 'unattributed' });
-  assert.deepEqual(policy.decideUnattributed(req({ method: 'purge' }), { anyReadonly: true }), { decision: BLOCK_JSON, reason: 'unattributed' });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: false, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'GET' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'head' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'OPTIONS' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [] }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
+  assert.deepEqual(policy.decideUnattributed(req({ method: 'purge' }), { anyReadonly: true, logout: [] }), { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
 });
 
 test('allowAllPolicy allows everything and is frozen', () => {
-  assert.deepEqual(allowAllPolicy.decide(req({ method: 'POST' }), { mode: 'readonly' }), { decision: { action: 'continue' }, reason: null });
-  assert.deepEqual(allowAllPolicy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true }), { decision: { action: 'continue' }, reason: null });
+  assert.deepEqual(allowAllPolicy.decide(req({ method: 'POST' }), { ...DEFAULT_CTX, mode: 'readonly' }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(allowAllPolicy.decideUnattributed(req({ method: 'POST' }), { anyReadonly: true, logout: [] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   assert.ok(Object.isFrozen(allowAllPolicy));
 });
 
@@ -119,7 +121,7 @@ test('OPTIONS with a body is not a safe read: it goes through the write checks',
   blocked(ro(req({ method: 'OPTIONS', url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'mutation{b}' }) })), 'graphql-mutation');
   blocked(ro(req({ method: 'OPTIONS', url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'query{a}' }) })), 'method');
   blocked(ro(req({ method: 'options', body: '' })), 'method');
-  assert.deepEqual(ro(req({ method: 'OPTIONS' })), { decision: { action: 'continue' }, reason: null });
+  assert.deepEqual(ro(req({ method: 'OPTIONS' })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
 });
 
 test('a GET whose query parameter hides a mutation behind odd whitespace or a semicolon is blocked', () => {
@@ -128,7 +130,7 @@ test('a GET whose query parameter hides a mutation behind odd whitespace or a se
   }
   blocked(ro(req({ url: 'http://localhost/graphql?x=1;query=mutation%7Ba%7D' })), 'graphql-mutation');
   blocked(ro(req({ method: 'HEAD', url: 'http://localhost/graphql?x=1;query=%0Bmutation%7Ba%7D' })), 'graphql-mutation');
-  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?query=query%7Ba%7D&x=mutation' })), { decision: { action: 'continue' }, reason: null });
+  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?query=query%7Ba%7D&x=mutation' })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
 });
 
 test('a strict query body is not enough when the url carries a query parameter in semicolon style', () => {
@@ -144,8 +146,8 @@ test('a repeated query key or an extra key in the body is blocked', () => {
 });
 
 test('an unattributed block answers with JSON even for a navigation', () => {
-  const v = policy.decideUnattributed(req({ method: 'POST', isNavigation: true, topFrame: true }), { anyReadonly: true });
-  assert.deepEqual(v, { decision: BLOCK_JSON, reason: 'unattributed' });
+  const v = policy.decideUnattributed(req({ method: 'POST', isNavigation: true, topFrame: true }), { anyReadonly: true, logout: [] });
+  assert.deepEqual(v, { decision: BLOCK_JSON, reason: 'unattributed', allowedBy: null });
 });
 
 test('a percent-encoded query key behind a semicolon cannot hide a mutation, in GET and POST alike', () => {
@@ -154,7 +156,7 @@ test('a percent-encoded query key behind a semicolon cannot hide a mutation, in 
     blocked(ro(req({ url })), 'graphql-mutation');
     blocked(ro(post(j({ query: 'query{a}' }), JSON_CT, { url })), 'graphql-mutation');
   }
-  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?x=1;%71uery=query%7Ba%7D' })), { decision: { action: 'continue' }, reason: null });
+  assert.deepEqual(ro(req({ url: 'http://localhost/graphql?x=1;%71uery=query%7Ba%7D' })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
   blocked(ro(post(j({ query: 'query{a}' }), JSON_CT, { url: 'http://localhost/graphql?x=1;%71uery=query%7Ba%7D' })), 'method');
 });
 
@@ -163,7 +165,7 @@ test('any safe method that carries a body goes through the write checks', () => 
     blocked(ro(req({ method, url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'mutation{b}' }) })), 'graphql-mutation');
     blocked(ro(req({ method, url: 'http://localhost/graphql', contentType: JSON_CT, body: j({ query: 'query{a}' }) })), 'method');
   }
-  assert.deepEqual(ro(req({ method: 'GET', body: null })), { decision: { action: 'continue' }, reason: null });
+  assert.deepEqual(ro(req({ method: 'GET', body: null })), { decision: { action: 'continue' }, reason: null, allowedBy: null });
 });
 
 test('a cross-group navigation gets a fixed 403 page with the group names and the redacted host, escaped; the reason is other-group', () => {
@@ -189,4 +191,206 @@ test('a frozen session answers every request with a fixed 403 (HTML for navigati
     assert.ok(v.decision.action === 'fulfill' && v.decision.status === 403 && v.decision.contentType === 'application/json' && v.decision.body.includes('session frozen'));
   }
   assert.ok(frozenMessage(null).includes('判断不出归属'));
+});
+
+// ---- 组级白名单（M2b 任务 8） ----
+
+const HASH_A = 'a'.repeat(64);
+const HASH_B = 'b'.repeat(64);
+const API = 'http://api.example.com';
+const ep = (method: string, url: string) => parseEndpoint(method === '*' ? { url } : { method, url }, 'x', { methods: 'any' });
+const ctxOf = (o: Partial<PolicyCtx> = {}): PolicyCtx => ({ ...DEFAULT_CTX, mode: 'readonly', ...o });
+const readPostCtx = ctxOf({ readPosts: [ep('POST', `${API}/v1/*/search`)] });
+const pqBody = (hash: string, extra: Record<string, unknown> = {}): string =>
+  j({ operationName: 'Q', variables: {}, extensions: { persistedQuery: { version: 1, sha256Hash: hash } }, ...extra });
+const pqCtx = ctxOf({ persisted: [{ endpoint: ep('POST', `${API}/graphql`), hashes: [HASH_A] }] });
+const pqPost = (body: string | null, o: Partial<RequestInfo> = {}): RequestInfo => post(body, JSON_CT, { url: `${API}/graphql`, ...o });
+const searchPost = (body: string | null, o: Partial<RequestInfo> = {}): RequestInfo =>
+  req({ method: 'POST', url: `${API}/v1/t1/search`, contentType: JSON_CT, body, ...o });
+
+function allowedAs(v: ReturnType<typeof ro>, by: string): void {
+  assert.deepEqual(v.decision, { action: 'continue', followRedirects: false });
+  assert.deepEqual([v.reason, v.allowedBy], [null, by]);
+}
+
+test('a read-POST endpoint lets a POST through without following redirects and says why', () => {
+  allowedAs(policy.decide(searchPost(j({ term: 'x' })), readPostCtx), 'read-post');
+  allowedAs(policy.decide(searchPost(null), readPostCtx), 'read-post');
+  allowedAs(policy.decide(searchPost('term=x', { contentType: 'application/x-www-form-urlencoded' }), readPostCtx), 'read-post');
+});
+
+test('a read-POST endpoint is matched exactly: method, origin, path shape, and any query string means no match', () => {
+  const verdict = (r: RequestInfo) => policy.decide(r, readPostCtx);
+  blocked(verdict(searchPost(j({ term: 'x' }), { url: `${API}/v1/t1/search?x=1` })), 'method');
+  blocked(verdict(searchPost(j({ term: 'x' }), { method: 'PUT' })), 'method');
+  blocked(verdict(searchPost(j({ term: 'x' }), { url: `${API}/v1/t1/other` })), 'method');
+  blocked(verdict(searchPost(j({ term: 'x' }), { url: 'http://other.example.com/v1/t1/search' })), 'method');
+  blocked(verdict(searchPost(j({ term: 'x' }), { url: `${API}/v1//search` })), 'method');
+});
+
+test('a mutation on a read-POST url is still blocked as graphql-mutation, in every shape', () => {
+  const verdict = (r: RequestInfo) => policy.decide(r, readPostCtx);
+  blocked(verdict(searchPost(j({ query: 'mutation{a}' }))), 'graphql-mutation');
+  blocked(verdict(searchPost(j([{ query: '{a}' }, { query: 'mutation{b}' }]))), 'graphql-mutation');
+  blocked(verdict(searchPost(j({ Query: 'mutation{a}' }))), 'graphql-mutation');
+  blocked(verdict(searchPost('mutation{a}', { contentType: 'application/graphql' })), 'graphql-mutation');
+  blocked(verdict(searchPost(j({ term: 'x' }), { url: `${API}/v1/t1/search?query=mutation%7Ba%7D` })), 'graphql-mutation');
+});
+
+test('a GraphQL-looking body on a read-POST url is not a read-post: a strict query goes the strict-query way, the rest is blocked', () => {
+  const verdict = (r: RequestInfo) => policy.decide(r, readPostCtx);
+  const q = verdict(searchPost(j({ query: '{a}' })));
+  assert.deepEqual([q.decision, q.reason, q.allowedBy], [{ action: 'continue', followRedirects: false }, null, null]);   // 严格 query：allowedBy 为 null
+  blocked(verdict(searchPost(j({ Query: '{a}' }))), 'method');
+  blocked(verdict(searchPost(j({ query: 5 }))), 'method');
+  blocked(verdict(searchPost(j([{ term: 1 }, { query: '{a}' }]))), 'method');
+  blocked(verdict(searchPost(pqBody(HASH_A))), 'persisted-query');
+  blocked(verdict(searchPost(j({ extensions: { PersistedQuery: {} } }))), 'method');
+  blocked(verdict(searchPost('{"query":"{a}","x":"cut', {})), 'method');
+  blocked(verdict(searchPost('{"term":"x","Query":"{a}', {})), 'method');
+  blocked(verdict(searchPost('mutation{a} {b', { contentType: 'application/graphql' })), 'graphql-mutation');
+  const doc = verdict(searchPost('{a}', { contentType: 'application/graphql' }));   // 一份文档：不算读型 POST，按严格 query 放行
+  assert.deepEqual([doc.reason, doc.allowedBy], [null, null]);
+  blocked(verdict(searchPost('subscription { a }', { contentType: 'application/graphql' })), 'method');   // 不是严格 query：拦
+});
+
+test('a persisted query is allowed only when the url, the body shape and every hash fit one whitelist entry', () => {
+  allowedAs(policy.decide(pqPost(pqBody(HASH_A)), pqCtx), 'persisted-query');
+  allowedAs(policy.decide(pqPost(pqBody(HASH_A.toUpperCase())), pqCtx), 'persisted-query');       // 大小写按小写比
+  allowedAs(policy.decide(pqPost(`[${pqBody(HASH_A)},${pqBody(HASH_A)}]`), pqCtx), 'persisted-query');
+  allowedAs(policy.decide(pqPost(j({ extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } })), pqCtx), 'persisted-query');
+  const bad = (r: RequestInfo, reason: BlockReason = 'persisted-query') => blocked(policy.decide(r, pqCtx), reason);
+  bad(pqPost(pqBody(HASH_B)));                                                                    // 哈希不在白名单
+  bad(pqPost(`[${pqBody(HASH_A)},${pqBody(HASH_B)}]`));                                           // 批量里一项不在
+  bad(pqPost(pqBody(HASH_A), { url: `${API}/other` }));                                           // URL 不对
+  bad(pqPost(pqBody(HASH_A), { url: `${API}/graphql?x=1` }));                                     // 带查询串
+  bad(pqPost(pqBody(HASH_A), { url: 'http://evil.example.org/graphql' }));
+  bad(pqPost(pqBody(HASH_A), { method: 'PUT' }));                                                 // 方法不对
+  bad(pqPost(pqBody(HASH_A), { contentType: 'text/plain' }));                                     // Content-Type 不对
+  bad(pqPost(pqBody(HASH_A), { contentType: 'application/x-www-form-urlencoded' }));
+  bad(pqPost(pqBody(HASH_A), { contentType: null }));
+});
+
+test('a persisted query body with any extra key, case variant, repeated key or truncation is refused', () => {
+  // 不论最后落到哪个拦截原因（键对不上时可能是 method，不是 persisted-query），都不能放行、不能有 allowedBy。
+  const bad = (body: string) => {
+    const v = policy.decide(pqPost(body), pqCtx);
+    assert.deepEqual([v.decision.action, v.allowedBy], ['fulfill', null], body.slice(0, 120));
+  };
+  bad(pqBody(HASH_A, { extra: 1 }));                                                              // 多一个顶层键
+  bad(j({ extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A }, other: 1 } }));      // extensions 多一个键
+  bad(j({ extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A, extra: 1 } } }));      // persistedQuery 多一个键
+  bad(j({ extensions: { persistedQuery: { sha256Hash: HASH_A } } }));                             // 少 version
+  bad(j({ Extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } }));                 // 键的大小写变体
+  bad(j({ extensions: { PersistedQuery: { version: 1, sha256Hash: HASH_A } } }));
+  bad(j({ extensions: { persistedQuery: { version: 1, Sha256Hash: HASH_A } } }));
+  bad(j({ OperationName: 'Q', extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } }));
+  bad(j({ query: '{a}', extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } }));  // 带查询文档的不是纯持久化查询
+  bad(j({ Query: '{a}', extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } }));
+  bad(j({ extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A.slice(1) } } }));        // 63 位
+  bad(j({ extensions: { persistedQuery: { version: 1, sha256Hash: `${HASH_A}0` } } }));
+  bad(j({ extensions: { persistedQuery: { version: 1, sha256Hash: `g${HASH_A.slice(1)}` } } }));
+  bad(j({ extensions: { persistedQuery: { version: 1, sha256Hash: [HASH_A] } } }));
+  bad(j({ extensions: { persistedQuery: { version: '1', sha256Hash: HASH_A } } }));
+  bad(j({ operationName: 5, extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } }));
+  bad(j({ variables: [], extensions: { persistedQuery: { version: 1, sha256Hash: HASH_A } } }));
+  bad('[]');
+  bad(j([{}]));
+  bad(j([pqBody(HASH_A)]));
+  bad(`{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"${HASH_B}"}},"extensions":{"persistedQuery":{"version":1,"sha256Hash":"${HASH_A}"}}}`);   // 重复键：前一个被 JSON.parse 丢掉
+  bad(`{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"${HASH_A}","sha256Hash":"${HASH_A}"}}}`);
+  bad(`{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"${HASH_A}"}},"variables":{"a":1,"a":2}}`);
+  bad(pqBody(HASH_A).slice(0, -3));                                                               // 截断
+  bad(pqBody(HASH_A, { variables: { pad: 'x'.repeat(64 * 1024) } }));                             // 到了 64 KB：可能被截断
+});
+
+test('a persisted query body whose hash is on another endpoint of the group does not borrow that endpoint', () => {
+  const ctx = ctxOf({ persisted: [
+    { endpoint: ep('POST', `${API}/one`), hashes: [HASH_A] },
+    { endpoint: ep('POST', `${API}/two`), hashes: [HASH_B] },
+  ] });
+  allowedAs(policy.decide(pqPost(pqBody(HASH_B), { url: `${API}/two` }), ctx), 'persisted-query');
+  blocked(policy.decide(pqPost(pqBody(HASH_B), { url: `${API}/one` }), ctx), 'persisted-query');
+  blocked(policy.decide(pqPost(`[${pqBody(HASH_A)},${pqBody(HASH_B)}]`, { url: `${API}/one` }), ctx), 'persisted-query');
+});
+
+test('a persisted query is blocked as before when no whitelist matches (default ctx)', () => {
+  blocked(policy.decide(pqPost(pqBody(HASH_A)), ctxOf()), 'persisted-query');
+});
+
+test('a logout hit is blocked first, whatever the method, body or other whitelist', () => {
+  const ctx = ctxOf({
+    logout: [ep('POST', `${API}/auth/logout`), ep('POST', `${API}/graphql`), ep('*', 'http://app.example.com/logout')],
+    readPosts: [ep('POST', `${API}/auth/logout`)],
+    persisted: [{ endpoint: ep('POST', `${API}/graphql`), hashes: [HASH_A] }],
+    declared: [{ method: 'POST', url: `${API}/auth/logout`, operation: null }],
+  });
+  const nav = policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout', isNavigation: true, topFrame: true }), ctx);
+  assert.deepEqual([nav.decision, nav.reason, nav.allowedBy], [BLOCK_HTML, 'logout', null]);
+  blocked(policy.decide(req({ method: 'HEAD', url: 'http://app.example.com/logout' }), ctx), 'logout');
+  blocked(policy.decide(req({ method: 'POST', url: `${API}/auth/logout`, contentType: JSON_CT, body: '{}' }), ctx), 'logout');
+  blocked(policy.decide(pqPost(pqBody(HASH_A)), ctx), 'logout');
+  assert.deepEqual(policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout?next=/' }), ctx).reason, null);   // 带查询串不匹配：当普通读
+});
+
+test('a logout url with a query string does not match, so a GET passes as any read', () => {
+  const ctx = ctxOf({ logout: [ep('*', 'http://app.example.com/logout')] });
+  assert.deepEqual(policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout?x=1' }), ctx), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+});
+
+test('logout rules do not matter in the default mode', () => {
+  const ctx: PolicyCtx = { ...DEFAULT_CTX, mode: 'default', logout: [ep('*', 'http://app.example.com/logout')] };
+  assert.deepEqual(policy.decide(req({ method: 'GET', url: 'http://app.example.com/logout' }), ctx), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+  assert.deepEqual(policy.decide(searchPost('x'), { ...ctx, readPosts: [ep('POST', `${API}/v1/*/search`)] }), { decision: { action: 'continue' }, reason: null, allowedBy: null });
+});
+
+test('an unattributed logout is blocked while something is read-only; nothing else is whitelisted for unattributed requests', () => {
+  const logout = [ep('*', 'http://app.example.com/logout')];
+  const nav = policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/logout', isNavigation: true, topFrame: true }), { anyReadonly: true, logout });
+  assert.deepEqual([nav.decision, nav.reason, nav.allowedBy], [BLOCK_HTML, 'logout', null]);
+  assert.equal(policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/logout' }), { anyReadonly: false, logout }).reason, null);
+  assert.equal(policy.decideUnattributed(req({ method: 'GET', url: 'http://app.example.com/other' }), { anyReadonly: true, logout }).reason, null);
+  assert.equal(policy.decideUnattributed(searchPost(j({ term: 'x' })), { anyReadonly: true, logout }).reason, 'unattributed');
+});
+
+const decl = (method: string, url: string, operation: string | null): Declaration => ({ method, url, operation });
+
+test('a declaration with an operation is the only thing that lets a mutation through, and only when every item names that operation', () => {
+  const ctx = ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')] });
+  const m = (body: string, o: Partial<RequestInfo> = {}) => policy.decide(pqPost(body, o), ctx);
+  allowedAs(m(j({ operationName: 'Save', query: 'mutation Save{a}' })), 'declared');
+  allowedAs(m(j([{ operationName: 'Save', query: 'mutation Save{a}' }, { operationName: 'Save', query: 'query{b}' }])), 'declared');
+  blocked(m(j({ operationName: 'Other', query: 'mutation Other{a}' })), 'graphql-mutation');
+  blocked(m(j({ query: 'mutation Save{a}' })), 'graphql-mutation');
+  blocked(m(j([{ operationName: 'Save', query: 'mutation Save{a}' }, { operationName: 'Other', query: 'mutation Other{b}' }])), 'graphql-mutation');
+  blocked(m(`{"operationName":"Save","operationName":"Other","query":"mutation Save{a}"}`), 'graphql-mutation');
+  blocked(m(j({ operationName: 'Save', query: 'mutation Save{a}' }), { url: `${API}/other` }), 'graphql-mutation');
+  blocked(m(j({ operationName: 'Save', query: 'mutation Save{a}' }), { url: `${API}/graphql?x=1` }), 'graphql-mutation');
+  blocked(m(j({ operationName: 'Save', query: 'mutation Save{a}' }), { method: 'PUT' }), 'graphql-mutation');
+  const noOp = ctxOf({ declared: [decl('POST', `${API}/graphql`, null)] });
+  blocked(policy.decide(pqPost(j({ operationName: 'Save', query: 'mutation Save{a}' })), noOp), 'graphql-mutation');
+});
+
+test('a declaration without an operation covers the address but not a mutation or a hash-only persisted query', () => {
+  const ctx = ctxOf({ declared: [decl('POST', `${API}/items/*`, null)] });
+  const at = (body: string | null, o: Partial<RequestInfo> = {}) => req({ method: 'POST', url: `${API}/items/7`, contentType: JSON_CT, body, ...o });
+  allowedAs(policy.decide(at(j({ name: 'x' })), ctx), 'declared');
+  allowedAs(policy.decide(at(null), ctx), 'declared');
+  blocked(policy.decide(at(j({ query: 'mutation{a}' })), ctx), 'graphql-mutation');
+  blocked(policy.decide(at(pqBody(HASH_A)), ctx), 'persisted-query');
+  blocked(policy.decide(at(j({ name: 'x' }), { method: 'DELETE' }), ctx), 'method');
+});
+
+test('a declaration with an operation covers non-mutation requests only when they name it too; a bad declaration matches nothing', () => {
+  const ctx = ctxOf({ declared: [decl('POST', `${API}/graphql`, 'Save')] });
+  allowedAs(policy.decide(pqPost(pqBody(HASH_B, { operationName: 'Save' })), ctx), 'declared');
+  blocked(policy.decide(pqPost(pqBody(HASH_B, { operationName: 'Other' })), ctx), 'persisted-query');
+  const bad = ctxOf({ declared: [decl('GET', `${API}/graphql`, null), decl('POST', 'not a url', null), decl('POST', `${API}/graphql?x=1`, null)] });
+  blocked(policy.decide(pqPost(j({ a: 1 })), bad), 'method');
+});
+
+test('whitelisted allows never come from the strict-query path and carry allowedBy; strict queries and plain reads carry null', () => {
+  const strict = policy.decide(post(j({ query: '{a}' })), ctxOf());
+  assert.deepEqual([strict.reason, strict.allowedBy], [null, null]);
+  assert.equal(policy.decide(req(), ctxOf()).allowedBy, null);
 });

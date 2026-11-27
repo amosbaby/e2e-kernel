@@ -27,7 +27,7 @@ import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
 import { approving, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 
-const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null };
+const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null, allowedBy: null };
 
 const HOME_PAGE: FakePageSpec = {
   snapshot: '- button "Add" [ref=e2]',
@@ -347,7 +347,7 @@ test('writes from unknown pages are allowed in M1 but reported as unattributed',
 });
 
 test('the policy can refuse unattributed requests', async () => {
-  const deny: WritePolicy = { decide: () => CONTINUE, decideUnattributed: () => ({ decision: { action: 'abort' }, reason: 'unattributed' }) };
+  const deny: WritePolicy = { decide: () => CONTINUE, decideUnattributed: () => ({ decision: { action: 'abort' }, reason: 'unattributed', allowedBy: null }) };
   const { sm, fake } = setup({ policy: deny }); await opened(sm, fake);
   assert.deepEqual(await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api/x' }), { action: 'abort' });
 });
@@ -1228,7 +1228,7 @@ test('unattributed writes are blocked while a read-only session is alive, and le
 });
 
 test('a refused redirect turns the allowed write into a blocked redirected-write, for session and unattributed requests', async () => {
-  const noRedirect: WritePolicy = { decide: policy.decide, decideUnattributed: () => ({ decision: { action: 'continue', followRedirects: false }, reason: null }) };
+  const noRedirect: WritePolicy = { decide: policy.decide, decideUnattributed: () => ({ decision: { action: 'continue', followRedirects: false }, reason: null, allowedBy: null }) };
   const { sm, fake } = setupRo(['example.com'], { policy: noRedirect });
   const r = await sm.open({ url: RO }); const pageId = fake.openPages().at(-1)!;
   await fake.emitRequest({ id: 'q1', pageId, ...GRAPHQL_QUERY });
@@ -2318,4 +2318,176 @@ test('step on a frozen session waits for the pending cookie clearing before it a
   assert.ok(FROZEN_STEP_ERROR(await step));
   inst.clearCookies = () => Promise.resolve();
   await sm.close({ session: a.session });
+});
+
+// ---- 组级白名单：读型 POST、持久化查询、登出（M2b 任务 8） ----
+// 四条请求路径：会话页、会话弹窗（含首个导航）、登录页（含弹窗）、未归属请求。读型 POST 和持久化查询只在前三条里放行（未归属请求不放行任何白名单里的写）；
+// 登出在四条里都拦（登录窗口是例外：允许登出，好换账号）。
+
+const WL_HASH = 'c'.repeat(64);
+const WL_OTHER_HASH = 'd'.repeat(64);
+const WL_RULES = {
+  version: 1, rules: [{ match: '*.example.com', mode: 'readonly' }], loginHosts: [],
+  groups: [
+    { name: 'a', hosts: ['a.example.com', 'api.example.com'], loginHosts: ['sso.example.org'],
+      readPosts: [{ method: 'POST', url: 'http://api.example.com/v1/*/search' }],
+      persistedQueries: [{ url: 'http://api.example.com/graphql', hashes: [WL_HASH] }],
+      logout: [{ url: 'http://a.example.com/logout' }, { url: 'http://sso.example.org/logout' }] },
+    { name: 'b', hosts: ['b.example.com'], logout: [{ url: 'http://b.example.com/logout' }] },   // 规则改动不能超过 12 行（框放不下）：b 不带读型 POST
+  ],
+};
+const API_SEARCH = 'http://api.example.com/v1/t1/search';
+const API_GRAPHQL = 'http://api.example.com/graphql';
+const wlPq = (hash: string): string => JSON.stringify({ operationName: 'Q', variables: {}, extensions: { persistedQuery: { version: 1, sha256Hash: hash } } });
+const wlReq = (fake: FakeDriver, pageId: string | null, method: string, url: string, topUrl: string | null, body: string | null = null, contentType: string | null = body === null ? null : 'application/json') =>
+  fake.emitRequest({ id: `wl${++navSeq}`, pageId, method, url, topUrl, body, contentType });
+const isFulfill403 = (d: { action: string }): boolean => d.action === 'fulfill' && (d as unknown as { status: number }).status === 403;
+const NO_REDIRECT = { action: 'continue', followRedirects: false };
+
+test('whitelist, session page: a read-POST and a persisted query go through without following redirects and are recorded with allowedBy; a mutation on the same url, a wrong hash and a query string are blocked', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  assert.equal(a.mode, 'readonly');
+  const send = (method: string, url: string, body: string | null) => wlReq(fake, pageId, method, url, A_URL, body);
+  assert.deepEqual(await send('POST', API_SEARCH, '{"term":"x"}'), NO_REDIRECT);
+  assert.deepEqual(await send('POST', API_GRAPHQL, wlPq(WL_HASH)), NO_REDIRECT);
+  assert.ok(isFulfill403(await send('POST', API_SEARCH, '{"query":"mutation{a}"}')));
+  assert.ok(isFulfill403(await send('POST', API_SEARCH + '?x=1', '{"term":"x"}')));
+  assert.ok(isFulfill403(await send('POST', API_GRAPHQL, wlPq(WL_OTHER_HASH))));
+  assert.ok(isFulfill403(await send('POST', API_GRAPHQL, wlPq(WL_HASH).replace('"variables":{},', '"variables":{},"extra":1,'))));
+  assert.ok(isFulfill403(await send('PUT', API_SEARCH, '{"term":"x"}')));
+  assert.ok(isFulfill403(await send('POST', 'http://api.example.com/v1/t1/other', '{"term":"x"}')));
+  assert.ok(isFulfill403(await send('POST', 'http://a.example.com/v1/t1/search', '{"term":"x"}')));          // 路径对、主机不在白名单里
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => [w.url, w.allowedBy]), [[API_SEARCH, 'read-post'], [API_GRAPHQL, 'persisted-query']]);
+  assert.deepEqual(res.writes.blocked.map((w) => w.reason), ['graphql-mutation', 'method', 'persisted-query', 'persisted-query', 'method', 'method', 'method']);
+  assert.ok(res.writes.blocked.every((w) => w.allowedBy === undefined));
+});
+
+test('whitelist, session popup (also its first navigation): the popup is the session\'s page, so the same lists apply', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  const popup = fake.emitPopup(pageId, 'about:blank');
+  assert.deepEqual(await wlReq(fake, popup.id, 'POST', API_SEARCH, A_URL, '{"term":"x"}'), NO_REDIRECT);
+  assert.ok(isFulfill403(await wlReq(fake, popup.id, 'GET', 'http://a.example.com/logout', A_URL)));
+  // 弹窗的第一个导航还认不出页面（pageId 为 null）：走未归属分支，同样拦登出（写不放行，见下面未归属的测试）
+  const first = await fake.emitRequest({ id: `wl${++navSeq}`, pageId: null, openerPageId: pageId, method: 'GET', url: 'http://a.example.com/logout', topUrl: 'http://a.example.com/logout', isNavigation: true, topFrame: true });
+  assert.ok(isFulfill403(first));
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => w.allowedBy), ['read-post']);
+  assert.deepEqual(res.writes.blocked.map((w) => w.reason), ['logout']);
+  assert.deepEqual(res.writes.unattributed.map((w) => w.reason), ['logout']);
+});
+
+test('whitelist, group choice: only the target host\'s group counts for read-POSTs and persisted queries; logout is the session group\'s and the target group\'s together', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  const send = (method: string, url: string, body: string | null = null) => wlReq(fake, pageId, method, url, A_URL, body);
+  assert.ok(isFulfill403(await send('POST', 'http://b.example.com/search', '{"term":"x"}')));                    // 目标主机在组 b：组 b 没有这条白名单
+  assert.ok(isFulfill403(await send('POST', 'http://b.example.com/v1/t1/search', '{"term":"x"}')));              // a 的接口路径套不到 b 的主机上
+  assert.ok(isFulfill403(await send('POST', 'http://sso.example.org/v1/t1/search', '{"term":"x"}')));            // 没编组的主机没有白名单
+  assert.ok(isFulfill403(await send('GET', 'http://sso.example.org/logout')));                                   // 会话组 a 的登出（主机是它的 loginHost，不在 hosts 里）
+  assert.ok(isFulfill403(await send('GET', 'http://b.example.com/logout')));                                     // 目标组 b 的登出
+  assert.equal((await send('GET', 'http://sso.example.org/logout?next=1')).action, 'continue');                 // 带查询串不匹配：当普通读
+  assert.equal((await send('GET', 'http://b.example.com/other')).action, 'continue');
+  await sm.close({ session: a.session });
+  // 组 b 的会话往组 a 的接口发读型 POST：用目标主机所在的组 a 的白名单（会话组 b 没有）；b 自己的登出照拦，a 的登出主机（没编组）不归 b 管
+  const b = await sm.open({ url: B_URL }); const pageB = fake.openPages().at(-1)!;
+  assert.deepEqual(await wlReq(fake, pageB, 'POST', API_SEARCH, B_URL, '{"term":"x"}'), NO_REDIRECT);
+  assert.ok(isFulfill403(await wlReq(fake, pageB, 'GET', 'http://b.example.com/logout', B_URL)));
+  assert.equal((await wlReq(fake, pageB, 'GET', 'http://sso.example.org/logout', B_URL)).action, 'continue');
+  await sm.close({ session: b.session });
+});
+
+test('whitelist, logout navigation in a session: blocked with the 403 page and recorded with reason logout, ahead of everything', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  const nav = await topNav(fake, pageId, A_URL + 'logout');
+  assert.deepEqual([isFulfill403(nav), (nav as { contentType: string }).contentType], [true, 'text/html; charset=utf-8']);
+  assert.ok(isFulfill403(await wlReq(fake, pageId, 'POST', A_URL + 'logout', A_URL, '{}')));
+  assert.equal((await topNav(fake, pageId, A_URL + 'profile')).action, 'continue');
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.method, w.reason]), [['GET', 'logout'], ['POST', 'logout']]);
+  assert.deepEqual(res.writes.blockedSummary.map((r) => [r.method, r.reason, r.count]), [['GET', 'logout', 1], ['POST', 'logout', 1]]);
+});
+
+test('whitelist, borrowed session: a local page that borrowed group a is judged by group a\'s lists for what it sends to a host of that group', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const r = await sm.open({ url: HOME_URL, profile: 'a' }); const pageId = fake.openPages().at(-1)!;
+  assert.equal(r.borrowed, true);
+  assert.deepEqual(await wlReq(fake, pageId, 'POST', API_SEARCH, HOME_URL, '{"term":"x"}'), NO_REDIRECT);          // 目标主机只读、白名单放行
+  assert.ok(isFulfill403(await wlReq(fake, pageId, 'POST', API_SEARCH, HOME_URL, '{"query":"mutation{a}"}')));
+  assert.ok(isFulfill403(await wlReq(fake, pageId, 'GET', 'http://a.example.com/logout', HOME_URL)));
+  assert.equal((await wlReq(fake, pageId, 'POST', HOME_URL + 'api', HOME_URL, '{}')).action, 'continue');           // 本地主机默认模式：照旧
+  await sm.close({ session: r.session });
+});
+
+test('whitelist, default-mode session: nothing changes (all writes pass, logout included)', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const r = await sm.open({ url: HOME_URL }); const pageId = fake.openPages().at(-1)!;
+  assert.deepEqual(await wlReq(fake, pageId, 'POST', HOME_URL + 'api', HOME_URL, '{}'), { action: 'continue' });
+  assert.deepEqual(await wlReq(fake, pageId, 'GET', 'http://sso.example.org/logout', HOME_URL), { action: 'continue' });
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.ok(res.writes.allowed.every((w) => w.allowedBy === undefined));
+});
+
+test('whitelist, frozen session: the freeze check comes first, so a whitelisted write is refused too', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  fake.emitHop(pageId, B_URL + 'landing');
+  const d = await wlReq(fake, pageId, 'POST', API_SEARCH, A_URL, '{"term":"x"}');
+  assert.ok(isFulfill403(d)); assert.ok((d as { body: string }).body.includes('session frozen'));
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.ok(res.writes.blocked.every((w) => w.reason === 'other-group') && res.writes.allowed.length === 0);
+});
+
+test('whitelist, login window: logout is allowed (to switch accounts); read-POSTs and persisted queries follow the target group; a mutation is still blocked', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const { loginId } = await sm.loginBegin({ url: A_URL + 'login', profile: 'a' }); const pageId = fake.openPages().at(-1)!;
+  const top = A_URL + 'login';
+  assert.deepEqual(await wlReq(fake, pageId, 'GET', 'http://a.example.com/logout', top), { action: 'continue' });
+  assert.deepEqual(await wlReq(fake, pageId, 'POST', 'http://a.example.com/logout', top, '{}'), { action: 'fulfill', status: 403, contentType: 'application/json', body: '{"error":"blocked by e2k read-only mode"}' });   // 登出以外的写照只读规则：POST 不在白名单
+  assert.deepEqual(await wlReq(fake, pageId, 'POST', API_SEARCH, top, '{"term":"x"}'), NO_REDIRECT);
+  assert.deepEqual(await wlReq(fake, pageId, 'POST', API_GRAPHQL, top, wlPq(WL_HASH)), NO_REDIRECT);
+  assert.ok(isFulfill403(await wlReq(fake, pageId, 'POST', API_GRAPHQL, top, wlPq(WL_OTHER_HASH))));
+  assert.ok(isFulfill403(await wlReq(fake, pageId, 'POST', API_SEARCH, top, '{"query":"mutation{a}"}')));
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 3 });
+});
+
+test('whitelist, login popup: a popup of the login window is judged like the window', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const { loginId } = await sm.loginBegin({ url: A_URL + 'login', profile: 'a' }); const pageId = fake.openPages().at(-1)!;
+  const popup = fake.emitPopup(pageId, 'about:blank');
+  assert.deepEqual(await wlReq(fake, popup.id, 'POST', API_SEARCH, A_URL + 'login', '{"term":"x"}'), NO_REDIRECT);
+  assert.deepEqual(await wlReq(fake, popup.id, 'GET', 'http://a.example.com/logout', A_URL + 'login'), { action: 'continue' });
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 0 });
+});
+
+test('whitelist, unattributed requests: a logout of the target host\'s group is blocked while something is read-only; no whitelisted write is let through', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL });
+  const ia = instanceOf(fake, 'a');
+  const orphan = (method: string, url: string, body: string | null = null) =>
+    fake.emitRequest({ id: `wl${++navSeq}`, pageId: null, method, url, topUrl: null, body, contentType: body === null ? null : 'application/json' }, ia);
+  assert.ok(isFulfill403(await orphan('GET', 'http://a.example.com/logout')));
+  assert.ok(isFulfill403(await orphan('GET', 'http://b.example.com/logout')));
+  assert.equal((await orphan('GET', 'http://a.example.com/profile')).action, 'continue');
+  assert.ok(isFulfill403(await orphan('POST', API_SEARCH, '{"term":"x"}')));                                    // 读型 POST 白名单不管未归属请求
+  assert.ok(isFulfill403(await orphan('POST', API_GRAPHQL, wlPq(WL_HASH))));
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.writes.unattributed.map((w) => [w.method, w.reason]), [['GET', 'logout'], ['GET', 'logout'], ['POST', 'unattributed'], ['POST', 'unattributed']]);
+});
+
+test('whitelist: every whitelisted allow is sent without following redirects (the driver is told), and a refused 3xx first hop turns the record into a blocked redirected-write without allowedBy', async () => {
+  const { sm, fake } = await setupGroups(WL_RULES);
+  const a = await sm.open({ url: A_URL }); const pageId = fake.openPages().at(-1)!;
+  fake.noRedirectIds.length = 0;
+  await fake.emitRequest({ id: 'rp', pageId, method: 'POST', url: API_SEARCH, topUrl: A_URL, body: '{"term":"x"}', contentType: 'application/json' });
+  await fake.emitRequest({ id: 'pq', pageId, method: 'POST', url: API_GRAPHQL, topUrl: A_URL, body: wlPq(WL_HASH), contentType: 'application/json' });
+  assert.deepEqual(fake.noRedirectIds, ['rp', 'pq']);
+  fake.emitRequestDone('rp', 307, { redirectRefused: true });
+  fake.emitRequestDone('pq', 200);
+  const res = readResult((await sm.close({ session: a.session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => [w.url, w.allowedBy, w.status]), [[API_GRAPHQL, 'persisted-query', 200]]);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.url, w.reason, w.allowedBy]), [[API_SEARCH, 'redirected-write', undefined]]);
 });

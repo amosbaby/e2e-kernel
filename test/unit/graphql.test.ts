@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { graphqlKind, isMutationLikeUrl, isPersistedOnly, isStrictQuery } from '../../src/kernel/graphql.ts';
+import { graphqlKind, hasRepeatedKey, isMutationLikeUrl, isPersistedOnly, isStrictQuery, looksGraphql, operationsAre, persistedHashes } from '../../src/kernel/graphql.ts';
 
 const JSON_CT = 'application/json';
 const URL_GQL = 'http://localhost/graphql';
@@ -330,4 +330,160 @@ test('url query parameters are found by decoded key in every separator style', (
   }
   assert.equal(isMutationLikeUrl('http://localhost/graphql?x=1;%71uery=query%7Ba%7D'), false);
   assert.equal(isMutationLikeUrl('http://localhost/graphql?x=mutation#query=mutation'), false);
+});
+
+// ---- 组级白名单用的检查（M2b 任务 8） ----
+
+const H1 = 'a'.repeat(64);
+const H2 = 'B'.repeat(64);
+const pq = (hash: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> =>
+  ({ operationName: 'Q', variables: { id: 1 }, extensions: { persistedQuery: { version: 1, sha256Hash: hash } }, ...extra });
+const PJ = 'application/json';
+
+test('persistedHashes returns the lower-cased hashes of a strictly shaped persisted-query body, single or batch', () => {
+  assert.deepEqual(persistedHashes('POST', JSON.stringify(pq(H1)), PJ), [H1]);
+  assert.deepEqual(persistedHashes('post', JSON.stringify(pq(H2)), 'application/json; charset=UTF-8'), ['b'.repeat(64)]);
+  assert.deepEqual(persistedHashes('POST', JSON.stringify([pq(H1), pq(H2)]), PJ), [H1, 'b'.repeat(64)]);
+  assert.deepEqual(persistedHashes('POST', JSON.stringify({ extensions: { persistedQuery: { version: 1, sha256Hash: H1 } } }), PJ), [H1]);
+  assert.deepEqual(persistedHashes('POST', JSON.stringify(pq(H1, { operationName: null, variables: null })), PJ), [H1]);
+});
+
+test('persistedHashes refuses the wrong method, content type or a missing body', () => {
+  const body = JSON.stringify(pq(H1));
+  assert.equal(persistedHashes('PUT', body, PJ), null);
+  assert.equal(persistedHashes('GET', body, PJ), null);
+  assert.equal(persistedHashes('POST', body, 'text/plain'), null);
+  assert.equal(persistedHashes('POST', body, 'application/graphql'), null);
+  assert.equal(persistedHashes('POST', body, null), null);
+  assert.equal(persistedHashes('POST', null, PJ), null);
+});
+
+test('persistedHashes refuses every deviation from the shape: extra keys, case variants, query text, bad hashes, bad types', () => {
+  const no = (v: unknown): void => assert.equal(persistedHashes('POST', typeof v === 'string' ? v : JSON.stringify(v), PJ), null, JSON.stringify(v));
+  no(pq(H1, { extra: 1 }));
+  no(pq(H1, { query: '{a}' }));
+  no(pq(H1, { Query: '{a}' }));
+  no(pq(H1, { QUERY: '{a}' }));
+  no(pq(H1, { OperationName: 'x' }));
+  no({ Extensions: { persistedQuery: { version: 1, sha256Hash: H1 } } });
+  no({ extensions: { PersistedQuery: { version: 1, sha256Hash: H1 } } });
+  no({ extensions: { persistedQuery: { version: 1, SHA256Hash: H1 } } });
+  no({ extensions: { persistedQuery: { Version: 1, sha256Hash: H1 } } });
+  no({ extensions: { persistedQuery: { version: 1, sha256Hash: H1 }, other: true } });
+  no({ extensions: { persistedQuery: { version: 1, sha256Hash: H1, extra: 1 } } });
+  no({ extensions: { persistedQuery: { sha256Hash: H1 } } });
+  no({ extensions: { persistedQuery: { version: 1 } } });
+  no({ extensions: {} });
+  no({ extensions: [] });
+  no({ extensions: null });
+  no({ variables: {} });
+  no(pq('a'.repeat(63)));
+  no(pq('a'.repeat(65)));
+  no(pq(`${'a'.repeat(63)}z`));
+  no(pq(` ${'a'.repeat(63)}`));
+  no(pq(`sha256:${'a'.repeat(64)}`));
+  no(pq(12));
+  no(pq(null));
+  no(pq([H1]));
+  no(pq(H1, { operationName: 5 }));
+  no(pq(H1, { variables: [1] }));
+  no(pq(H1, { variables: 'x' }));
+  no({ extensions: { persistedQuery: { version: '1', sha256Hash: H1 } } });
+  no({ extensions: { persistedQuery: { version: null, sha256Hash: H1 } } });
+  no([]);
+  no([{}]);
+  no([pq(H1), { variables: {} }]);
+  no([pq(H1), 'x']);
+  no([[pq(H1)]]);
+  no('null');
+  no('"x"');
+  no('5');
+  no('not json');
+  no('');
+});
+
+test('persistedHashes refuses repeated keys anywhere, however they are spelled', () => {
+  const ext = (h: string): string => `{"version":1,"sha256Hash":"${h}"}`;
+  const no = (s: string): void => assert.equal(persistedHashes('POST', s, PJ), null, s);
+  no(`{"extensions":{"persistedQuery":${ext(H1)}},"extensions":{"persistedQuery":${ext('c'.repeat(64))}}}`);
+  no(`{"extensions":{"persistedQuery":${ext('c'.repeat(64))}},"extensions":{"persistedQuery":${ext(H1)}}}`);
+  no(`{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"${H1}","sha256Hash":"${H1}"}}}`);
+  no(`{"extensions":{"persistedQuery":{"version":1,"version":1,"sha256Hash":"${H1}"}}}`);
+  no(`{"extensions":{"persistedQuery":${ext(H1)},"persistedQuery":${ext(H1)}}}`);
+  no(`{"extensions":{"persistedQuery":${ext(H1)}},"operationName":"a","operationName":"b"}`);
+  no(`{"extensions":{"persistedQuery":${ext(H1)}},"variables":{"a":1,"\\u0061":2}}`);   // 转义写法的同一个键
+  no(`{"extensions":{"persistedQuery":${ext(H1)}},"extens\\u0069ons":{"persistedQuery":${ext(H1)}}}`);
+  no(`[${'{"extensions":{"persistedQuery":' + ext(H1) + '}'},"variables":{"a":1,"a":1}}]`);
+  // 不同对象里的同名键不算重复。
+  assert.deepEqual(persistedHashes('POST', `[{"variables":{"a":1},"extensions":{"persistedQuery":${ext(H1)}}},{"variables":{"a":2},"extensions":{"persistedQuery":${ext(H1)}}}]`, PJ), [H1, H1]);
+});
+
+test('persistedHashes refuses a body that may have been truncated (at the 64 KB cap) and a body that does not parse', () => {
+  const big = JSON.stringify(pq(H1, { variables: { pad: 'x'.repeat(64 * 1024) } }));
+  assert.equal(persistedHashes('POST', big, PJ), null);
+  const justUnder = JSON.stringify(pq(H1, { variables: { pad: 'x'.repeat(64 * 1024 - 200) } }));
+  assert.ok(Buffer.byteLength(justUnder) < 64 * 1024);
+  assert.deepEqual(persistedHashes('POST', justUnder, PJ), [H1]);
+  assert.equal(persistedHashes('POST', JSON.stringify(pq(H1)).slice(0, -2), PJ), null);
+  assert.equal(persistedHashes('POST', `${JSON.stringify(pq(H1))} x`, PJ), null);
+});
+
+test('looksGraphql: any query key (any case, any value), a persistedQuery extension (any case), or a broken JSON that mentions query', () => {
+  const yes = (v: unknown): void => assert.equal(looksGraphql(typeof v === 'string' ? v : JSON.stringify(v)), true, JSON.stringify(v));
+  const no = (v: unknown): void => assert.equal(looksGraphql(typeof v === 'string' || v === null ? v : JSON.stringify(v)), false, JSON.stringify(v));
+  yes({ query: '{a}' });
+  yes({ query: 5 });
+  yes({ query: null });
+  yes({ Query: '{a}' });
+  yes({ term: 'x', QUERY: 'mutation{a}' });
+  yes([{ term: 'x' }, { query: '{a}' }]);
+  yes({ extensions: { persistedQuery: { version: 1, sha256Hash: H1 } } });
+  yes({ Extensions: { PersistedQuery: {} } });
+  yes('{"query":"{a}","x":"cut');
+  yes('[{"term":1},{"Query":"{a');
+  yes('{"extensions":{"persistedQuery":');
+  no(null);
+  no('');
+  no({ term: 'x' });
+  no({ term: 'query' });
+  no([{ term: 'x' }, { page: 2 }]);
+  no({ extensions: { trace: true } });
+  no('term=query&x=1');
+  no('plain text query');
+  no('{"term":"x"}');
+  no('5');
+  no('"query"');
+  no([]);
+});
+
+test('operationsAre: every item names exactly that operation, and no key is repeated', () => {
+  const yes = (v: unknown, op = 'Save'): void => assert.equal(operationsAre(typeof v === 'string' ? v : JSON.stringify(v), op), true, JSON.stringify(v));
+  const no = (v: unknown, op = 'Save'): void => assert.equal(operationsAre(typeof v === 'string' || v === null ? v : JSON.stringify(v), op), false, JSON.stringify(v));
+  yes({ operationName: 'Save', query: 'mutation Save{a}' });
+  yes([{ operationName: 'Save' }, { operationName: 'Save' }]);
+  no({ operationName: 'Save2' });
+  no({ operationName: 'save' });
+  no({ operationName: ' Save' });
+  no({ query: 'mutation Save{a}' });
+  no({ operationName: null });
+  no([{ operationName: 'Save' }, { operationName: 'Other' }]);
+  no([{ operationName: 'Save' }, {}]);
+  no([]);
+  no([null]);
+  no(null);
+  no('not json');
+  no('{"operationName":"Save","operationName":"Other"}');
+  no('{"operationName":"Other","operationName":"Save"}');
+});
+
+test('hasRepeatedKey compares decoded keys per object and ignores string values and array items', () => {
+  assert.equal(hasRepeatedKey('{"a":1,"a":2}'), true);
+  assert.equal(hasRepeatedKey('{"a":1,"\\u0061":2}'), true);
+  assert.equal(hasRepeatedKey('{"a":{"b":1,"b":1}}'), true);
+  assert.equal(hasRepeatedKey('[{"a":1},{"a":1}]'), false);
+  assert.equal(hasRepeatedKey('{"a":{"b":1},"c":{"b":1}}'), false);
+  assert.equal(hasRepeatedKey('{"a":"x","b":"x"}'), false);
+  assert.equal(hasRepeatedKey('{"a":["a","a"]}'), false);
+  assert.equal(hasRepeatedKey('{"a":"\\"a\\":1"}'), false);
+  assert.equal(hasRepeatedKey('{"a" : 1 , "a" : 1}'), true);
 });
