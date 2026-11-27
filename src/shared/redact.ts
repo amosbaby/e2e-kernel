@@ -39,7 +39,7 @@ const PARAM_VALUE_END = /[&#\s"<>]/;
 // 选择器里的 `名字=`：和 URL_PARAM_NAME 一样，只是名字前的分隔符另外认引号和 `=`（`text=token=…`、`[name="token=…"]`），
 // 并且分隔符放在后顾里，前一个匹配吃掉的 `=` 也能当分隔符。名字的字符类不含这些分隔符，所以每段名字只有一个起点，不回溯。
 const SELECTOR_PARAM_NAME = /(?<=(^|[?&#\s;,({\["'=]))([^=&#?\s"'<>;,({\[]+)=/g;
-const ATTR_OPS = new Set(['~', '|', '^', '$', '*']);
+const ATTR_OPS = new Set(['~', '|', '^', '$', '*', '!']);   // `!=` 是 XPath 的
 const USERINFO = /:\/\/[^/\s:@?#]*(?::[^/\s?#]*)?@/g;
 // 自由文本里 JSON 形态的 `"名字" : "`，以及套了一层转义的 `\"名字\" : \"`。值的结尾由 redactJsonPairsInText 逐字符找。
 const JSON_PAIR_NAME = /"([^"\\\r\n]{1,100})"\s*:\s*"/g;
@@ -94,7 +94,8 @@ function redactParamsInText(s: string, selector = false): string {
   let out = '';
   let copied = 0;
   for (let m = re.exec(s); m !== null; m = re.exec(s)) {
-    if (!isSensitiveKey(safeDecode(m[2]!))) continue;   // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值（选择器模式下在后顾里）
+    // lastIndex 停在 `=` 后；m[1] 是名字前的分隔符，不属于值（选择器模式下在后顾里）。选择器模式下名字另按 selectorNameSensitive 判（`/cb/pw=`、`data-pw=`）。
+    if (!isSensitiveKey(safeDecode(m[2]!)) && !(selector && selectorNameSensitive(m[2]!))) continue;
     let start = m.index + m[0].length;
     if (selector) {
       // 名字紧跟 `[`（中间可有空白）：属性值，到配对的 `]` 为止。别的位置不知道值在哪结束，换到串尾（失败关闭，再过一遍也不变）。
@@ -132,7 +133,8 @@ function redactParamsInText(s: string, selector = false): string {
 }
 
 // 选择器里属性值的结尾（不含）：从 start 起到配对的 `]` 为止。值里成对的方括号、反斜杠连同下一个字符、引号里的内容（含 `]`）
-// 都算进值，空白和引号外的其他字符也是；所以已换成 [REDACTED] 的值再过一遍不变。找不到配对的 `]`、或引号没闭合，就到串尾（失败关闭）。
+// 都算进值，空白和引号外的其他字符也是；所以已换成 [REDACTED] 的值再过一遍不变。`/* … */` 注释和引号一样整段算进值（里面的 `]` 不算结尾）。
+// 找不到配对的 `]`、引号或注释没闭合，就到串尾（失败关闭）。
 // 已知的边界：值里有不成对、也没转义、不在引号里的 `]`（比如 Playwright 正则值 `[token=/a]b/]`）时，`]` 之后的部分不换。
 function selectorValueEnd(s: string, start: number): number {
   let depth = 0;
@@ -144,6 +146,10 @@ function selectorValueEnd(s: string, start: number): number {
       while (j < s.length && s[j] !== c) j += s[j] === '\\' ? 2 : 1;
       if (j >= s.length) return s.length;
       i = j;
+    } else if (c === '/' && s[i + 1] === '*') {
+      const k = s.indexOf('*/', i + 2);
+      if (k < 0) return s.length;
+      i = k + 1;
     } else if (c === '[') depth++;
     else if (c === ']') {
       if (depth === 0) return i;
@@ -161,9 +167,12 @@ function cssEscapeEnd(s: string, i: number): number {
   return j < s.length && /\s/.test(s[j]!) ? j + 1 : j;
 }
 
-// 选择器属性名是否敏感：先解开 CSS 转义，去掉命名空间前缀（最后一个 `|` 及之前）和 XPath 的 `@`；
-// 原样的名字、还原后的名字、URL 解码后的名字，或其中按 `-`、`_` 分出的任一段是敏感键，就算敏感（`data-pw`、`data_pass`；拿不准时偏向敏感）。
-function selectorAttrNameSensitive(raw: string): boolean {
+// 选择器里的名字是否敏感：先解开 CSS 转义；原样的名字、还原后的名字、URL 解码后的名字、只解合法 `%XX` 的宽松解码结果
+// （非法的 `%` 原样留下，不影响别处编码过的字符），或其中按非字母数字字符分出的任一段是敏感键，就算敏感
+// （`data-pw`、`data_pass`、`ns|pw`、`@ns:pw`、`data.pw`、`/cb/pw`、`%|p%77`；拿不准时偏向敏感）。
+function selectorNameSensitive(raw: string): boolean {
+  if (isSensitiveKey(raw)) return true;
+  if (!/[^A-Za-z0-9]/.test(raw)) return false;            // 纯字母数字：没有转义、分段和编码，上一行已经判完
   let name = '';
   for (let i = 0; i < raw.length;) {
     if (raw[i] !== '\\') {
@@ -179,22 +188,48 @@ function selectorAttrNameSensitive(raw: string): boolean {
     } else name += body;
     i = end;
   }
-  name = name.slice(name.lastIndexOf('|') + 1);
-  if (name.startsWith('@')) name = name.slice(1);
-  return [raw, name, safeDecode(name)].some((n) => isSensitiveKey(n) || n.split(/[-_]/).some((part) => isSensitiveKey(part)));
+  const lenient = name.replace(/%([0-9A-Fa-f]{2})/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16)));
+  const candidates = [raw, name, safeDecode(name), lenient];
+  return candidates.some((n) => isSensitiveKey(n) || n.split(/[^A-Za-z0-9]+/).some((part) => isSensitiveKey(part)));
 }
 
 // 选择器里名字敏感的 `[名字 运算符 值]`，值换掉（含引号），名字、运算符、空白和 `]` 保留。手写扫描，不交给正则：
-// `[`、名字、运算符、`=` 之间可以有空白；运算符是 `~ | ^ $ *` 加 `=`；名字到空白、`=`、方括号、引号或「运算符=」为止，
-// 反斜杠转义（见 cssEscapeEnd）算进名字。没匹配上就从名字里最后一个转义的 `[`（没有就从名字结尾）找下一个 `[`：
-// 名字里不含真正的 `[`，所以只有最后一个转义的 `[` 可能另起一个属性；每个字符最多扫两次。
-function redactSelectorAttrs(s: string): string {
+// `[`、名字、运算符、`=` 之间可以有空白；运算符是 `~ | ^ $ * !` 加 `=`；名字到空白、`=`、方括号、引号或「运算符=」为止，
+// 反斜杠转义（见 cssEscapeEnd）算进名字。comments 为真时，`/* … */` 注释也当空白、名字到注释为止；敏感名后面的注释没闭合时，
+// 从名字结尾换到串尾（失败关闭）。调用方两种各跑一遍：两遍都只把值换成 [REDACTED]，结果是并集，认注释不会比不认注释漏得多
+// （开头注释没闭合、注释里的 `[`、名字中间的注释，不认注释的那遍能接住）。
+// 没匹配上就从名字里最后一个转义的 `[`（没有就从名字结尾）找下一个 `[`：名字里不含真正的 `[`，所以只有最后一个转义的 `[`
+// 可能另起一个属性；每个字符最多扫两次。找 `*/` 的结果记下来，同一段注释不重复扫。
+function redactSelectorAttrs(s: string, comments: boolean): string {
   let out = '';
   let copied = 0;
+  let commentFrom = -1;
+  let commentEnd = -1;                                     // 上次从 commentFrom 找到的 `*/` 之后的位置；-1 表示到串尾都没有
+  const closeAfter = (from: number): number => {
+    if (commentFrom >= 0 && from >= commentFrom && (commentEnd < 0 || from <= commentEnd - 2)) return commentEnd;
+    const k = s.indexOf('*/', from);
+    commentFrom = from;
+    commentEnd = k < 0 ? -1 : k + 2;
+    return commentEnd;
+  };
+  // 跳过空白和注释；注释没闭合返回 -1。
+  const gap = (from: number): number => {
+    let j = from;
+    for (;;) {
+      if (j < s.length && /\s/.test(s[j]!)) j++;
+      else if (comments && s[j] === '/' && s[j + 1] === '*') {
+        j = closeAfter(j + 2);
+        if (j < 0) return -1;
+      } else return j;
+    }
+  };
   let i = s.indexOf('[');
   while (i >= 0) {
-    let j = i + 1;
-    while (j < s.length && /\s/.test(s[j]!)) j++;
+    let j = gap(i + 1);
+    if (j < 0) {
+      i = s.indexOf('[', i + 1);
+      continue;
+    }
     const nameStart = j;
     let escBracket = -1;                                   // 名字里最后一个被转义的 `[`：没匹配上时它也可能是属性开头
     while (j < s.length) {
@@ -203,13 +238,23 @@ function redactSelectorAttrs(s: string): string {
         if (s[j + 1] === '[') escBracket = j + 1;
         j = cssEscapeEnd(s, j);
       }
-      else if (/[\s=[\]"']/.test(c) || (ATTR_OPS.has(c) && s[j + 1] === '=')) break;
+      else if (/[\s=[\]"']/.test(c) || (ATTR_OPS.has(c) && s[j + 1] === '=') || (comments && c === '/' && s[j + 1] === '*')) break;
       else j++;
     }
     const nameEnd = j;
-    while (j < s.length && /\s/.test(s[j]!)) j++;
+    const sensitive = (): boolean => nameEnd > nameStart && selectorNameSensitive(s.slice(nameStart, nameEnd));
+    j = gap(j);
+    if (j < 0) {
+      if (sensitive()) {
+        out += s.slice(copied, nameEnd) + REDACTED;
+        copied = s.length;
+        break;
+      }
+      i = escBracket >= 0 ? escBracket : s.indexOf('[', nameEnd);
+      continue;
+    }
     if (j < s.length && ATTR_OPS.has(s[j]!) && s[j + 1] === '=') j++;
-    if (nameEnd > nameStart && s[j] === '=' && selectorAttrNameSensitive(s.slice(nameStart, nameEnd))) {
+    if (s[j] === '=' && sensitive()) {
       j++;
       while (j < s.length && /\s/.test(s[j]!)) j++;
       const end = selectorValueEnd(s, j);
@@ -268,8 +313,16 @@ export function redactText(s: string): string {
 
 // 选择器（agent 给的目标、内核生成的稳定选择器）专用：在 redactText 之外，名字敏感的属性 `[名字 运算符 值]`（`=` 两边可有空白）
 // 的值换到配对的 `]` 为止（见 selectorValueEnd），不把后面的选择器一起吞掉。自由文本仍用 redactText。
+// 各条规则依次跑一遍不一定是不动点（比如自由文本的 cookie 行规则会改动已换过的属性值），所以反复跑到不再变化，最多 4 遍；
+// 还在变就整个换掉（失败关闭）。这样再过一遍一定不变。
 export function redactSelector(s: string): string {
-  return redactTextWith(s, true);
+  let cur = redactTextWith(s, true);
+  for (let n = 0; n < 3; n++) {
+    const next = redactTextWith(cur, true);
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return REDACTED;
 }
 
 function redactTextWith(s: string, selector: boolean): string {
@@ -279,7 +332,7 @@ function redactTextWith(s: string, selector: boolean): string {
   out = out.replace(EMAIL, REDACTED);
   out = out.replace(HEX, REDACTED);
   out = out.replace(B64URL, (m) => (isMixedCase(m) ? REDACTED : m));
-  if (selector) out = redactSelectorAttrs(out);
+  if (selector) out = redactSelectorAttrs(redactSelectorAttrs(out, false), true);
   out = redactParamsInText(out, selector);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME, false);
   out = redactJsonPairsInText(out, JSON_PAIR_NAME_ESC, true);

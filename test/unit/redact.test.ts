@@ -350,6 +350,44 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
     assert.equal(redactSelector(sel), want, sel);
     assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
   }
+  // CSS 注释当空白；XPath 的 `!=`、`@前缀:名字`；`.`、`:` 也是分段符。
+  const more: Array<[string, string]> = [
+    ['[pw/**/=secret][x=1]', `[pw/**/=${REDACTED}][x=1]`],
+    ['[/* c */pw /* c */= secret][x=1]', `[/* c */pw /* c */= ${REDACTED}][x=1]`],
+    ['xpath=//input[@ns:pw="secret"]', `xpath=//input[@ns:pw=${REDACTED}]`],
+    ['xpath=//input[@pw!="secret"]', `xpath=//input[@pw!=${REDACTED}]`],
+    ['[data.pw=secret][x=1]', `[data.pw=${REDACTED}][x=1]`],
+  ];
+  for (const [sel, want] of more) {
+    assert.equal(redactSelector(sel), want, sel);
+    assert.equal(redactSelector(want), want, `idempotent: ${sel}`);
+  }
+  // 敏感名后面的注释没闭合：从名字结尾换到串尾（失败关闭）。
+  assert.equal(redactSelector('[pw/* =secret][x=1]'), `[pw${REDACTED}`);
+  // 认注释不能比不认注释时漏得多：开头注释没闭合、注释里的 `[`、名字中间的注释、前缀里非法的 `%`、值里注释中的 `]`。
+  for (const sel of [
+    '[/*-pw =secret', '[/*sessionid =secret', '[x=1][/*/data-pw $= "secret" ]',
+    '[/* [pw = secret] */ x]', '[pw /* [token = secret] */ = secret]',
+    '[x/**/-pw = secret]', '[&/**/data_pass ^= secret]',
+    '[%|p%77=secret', '[x%|p%61ss=secret][a=1]', '[%|%61pi_key=secret]', '[a%|%61pi-key=secret]', '[data%2epw=secret]',
+    '[pw=/*]*/secret]',
+  ]) {
+    const out = redactSelector(sel);
+    assert.ok(!out.includes('secret'), `${sel} -> ${out}`);
+    assert.equal(redactSelector(out), out, `idempotent: ${sel}`);
+  }
+  assert.equal(redactSelector('xpath=//input[@pw !="secret"]'), `xpath=//input[@pw !=${REDACTED}]`);
+  // 路径或文字里按分段认出的精确敏感名：换到串尾。
+  for (const sel of ['[href="/cb/pw=secret"][x=1]', 'text=data-pw=secret >> div']) {
+    const out = redactSelector(sel);
+    assert.ok(out.endsWith(REDACTED) && !out.includes('secret'), `${sel} -> ${out}`);
+  }
+  // 含 `; ` 的选择器（会碰到自由文本的 cookie 行规则）也要幂等。
+  for (const sel of ['[token=x]; s=', '[a=1]; [token=x]; b=2', 'text=a=1; token=b']) {
+    const once = redactSelector(sel);
+    assert.equal(redactSelector(once), once, sel);
+    assert.ok(!once.includes('token=x') && !once.includes('token=b'), `${sel} -> ${once}`);
+  }
   // 引号里、或紧跟 `=` 的 `名字=`（`text=token=…`、可访问名里的 `token=…`）：换到串尾。
   for (const sel of ['role=textbox[name="token=abc"]', 'text="token=abc"', "text='token=abc'", ':has-text("token=abc")', 'text=token=abc >> div']) {
     const out = redactSelector(sel);
@@ -357,7 +395,7 @@ test('redactSelector: an unquoted attribute value ends at its closing bracket, s
     assert.equal(redactSelector(out), out);
   }
   // 不敏感的照旧（含转义名、引号里的 `名字=`）。
-  for (const sel of ['[d\\61ta-x=1][y=2]', '[data-x="a=b"]', 'role=button[name="Author=me"]', '[data-passage=1]', 'text="Sign in"']) {
+  for (const sel of ['[d\\61ta-x=1][y=2]', '[data-x="a=b"]', 'role=button[name="Author=me"]', '[data-passage=1]', 'text="Sign in"', 'a[href="/cb/path=1"]', '[a/**/=1][b=2]']) {
     assert.equal(redactSelector(sel), sel);
   }
   // 引号没闭合：换到串尾（失败关闭）。
@@ -386,7 +424,8 @@ test('redactSelector stays fast on adversarial input', () => {
     '[' + 'a'.repeat(1e5), '[a '.repeat(30000), '[ '.repeat(30000), '[a^'.repeat(30000), '[token = "'.repeat(30000),
     '[token="' + '\\'.repeat(1e5), '[token = ['.repeat(30000), '[token="' + ']'.repeat(1e5), "[a='".repeat(30000),
     '[' + '\\1'.repeat(50000), '[' + '\\111111'.repeat(30000), '[\\'.repeat(30000), '"a='.repeat(30000), "'a=".repeat(30000),
-    '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5)];
+    '[a|'.repeat(30000), '[' + 'a|'.repeat(50000), '[' + '\\1 '.repeat(50000), '[' + '\\'.repeat(1e5),
+    '[a /*'.repeat(30000), '[a /* '.repeat(30000) + '*/', '/*'.repeat(50000), '[pw/*'.repeat(30000), '[a/**/'.repeat(30000), 'a=1; '.repeat(30000)];
   const start = performance.now();
   for (const s of inputs) redactSelector(s);
   assert.ok(performance.now() - start < 2000);
