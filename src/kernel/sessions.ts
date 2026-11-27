@@ -705,7 +705,7 @@ export class SessionManager {
     const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
     // 规则先刷新一遍：文件有错就不开登录页（和 open 一致）。
     this.deps.modes.refresh();
-    if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
+    if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 login', 'e2k rule list 看错误');
     this.gateRules();
     // 取不到主机不挡登录（后面也一样）：按没编组的 default 组算。
     let host = '';

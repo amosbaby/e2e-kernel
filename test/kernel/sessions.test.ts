@@ -1473,7 +1473,7 @@ test('login: with no rules the login page can write anywhere (regression)', asyn
 test('login: a rules file with an error refuses loginBegin and opens no page', async () => {
   const { sm, fake, st } = setupRo();
   st.error = 'rules.json: bad json';
-  await assert.rejects(sm.loginBegin({ url: LOGIN_START }), (e: E2kError) => e.code === 'usage' && e.message.includes('规则文件有错') && e.next === 'e2k rule list 看错误');
+  await assert.rejects(sm.loginBegin({ url: LOGIN_START }), (e: E2kError) => e.code === 'usage' && e.message === '规则文件有错，修好之前不能 login' && e.next === 'e2k rule list 看错误');
   assert.equal(fake.openPages().length, 0);
 });
 
