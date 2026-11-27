@@ -170,7 +170,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 - `step` 的结果里 `writesBlocked` 是本批被拦的写的条数，`notices` 是整句提示；有被拦的写不改退出码。想知道拦了什么，看 `result.json` 的 `writes.blocked` 或 `report.html`。
 - 验证需要真的写、又被拦了：`step … --allow '[{"method":"POST","url":"…"}]'` 申请放行（≤12 条，地址不带查询串，mutation 要加 `operation`）→ 21 → 人批准后原样重试；不批就停下告诉人，不要换主机、换会话或用 `eval` 去绕。
 - `rules.json` 有错时新的 `open` 会被拒（退出码 2），已开的会话照旧、`step` 的 `notices` 会提示。运行 `node bin/e2k.js rule list` 看错误，让人修。永远不要自己改 `rules.json`。
-- 规则被人改过后，新的 `open`、`login` 先得 21：等人点弹框再原样重试；人拒绝是 2，弹不出框是 22。批准前收紧已生效，放宽要等批准。
+- 规则被人改过后，新的 `open`、`login` 先得 21：等人点弹框再原样重试；人拒绝是 2，弹不出框是 22。批准前只有新增或改成只读的 `rules` 条目生效；登出、登录主机、白名单、身份、组的改动都要等批准。
 - 域名在某组里，`open` 默认用那组的 profile；本地页面要用某组的登录：`--profile <组>`（借用）。会话跳到别组的域名会 403（`notices` 有提示）；经重定向进去的会话被冻结（所有请求 403，`step` 退出 22），关掉后用 `--profile` 另开，不要绕。
 
 ## 报告在哪

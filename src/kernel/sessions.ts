@@ -383,7 +383,7 @@ export class SessionManager {
       s.crossNotices.clear();
       const rules = this.deps.modes.state();
       if (rules.error !== null) notices.push('规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝');
-      if (rules.pending !== null) notices.push('规则文件有未批准的改动（收紧的部分已生效）');
+      if (rules.pending !== null) notices.push('规则文件有未批准的改动（只有新增或改成只读的规则条目已先生效，其余改动要等批准）');
       if (rules.approvalsChanged) notices.push('批准记录被内核以外的进程改过，已忽略');
       // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。退出码不受 notices 影响。
       return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
@@ -563,7 +563,7 @@ export class SessionManager {
   }
 
   // 入口闸门（设计 5.4）：规则文件有待批的改动时，新的 open 和 login 先过人工批准，含收紧、含删文件。
-  // 收紧的部分在批准前已经按「更严合并」生效；这里只管放宽要不要放。批准的是内存里待批的那份（完整哈希），不重读磁盘。
+  // 批准前只有 rules 里新增或改成只读的条目按「更严合并」生效；组、登录主机、白名单、登出、身份的改动（哪怕是收紧）都要等批准才生效。批准的是内存里待批的那份（完整哈希），不重读磁盘。
   // 弹框在后台，这里同步返回：没批准就抛错，调用方等人点完再原样重试（重试靠内容键对上同一个框）。
   private gateRules(): void {
     const { modes, approvals } = this.deps;
@@ -576,9 +576,9 @@ export class SessionManager {
       const key = `rules:${pending.baseHash ?? 'none'}:${pending.hash ?? 'deleted'}`;
       // 改动太多框里放不下：只给「拒绝」一个按钮，必然 denied，让人先看完整差异、拆开再改。
       const request: DialogRequest = pending.tooLong
-        ? { title: 'e2k：域名规则改了', lines: [`规则文件改动太多，框里放不下（${short}）：`, '先运行 e2k rule diff 看完整差异，再拆成几次改。', '', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）'],
+        ? { title: 'e2k：域名规则改了', lines: [`规则文件改动太多，框里放不下（${short}）：`, '先运行 e2k rule diff 看完整差异，再拆成几次改。', '', '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）'],
           buttons: ['拒绝'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC }
-        : { title: 'e2k：域名规则改了', lines: [`规则文件有改动（${short}），批准后才生效：`, ...pending.summary, '', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）'],
+        : { title: 'e2k：域名规则改了', lines: [`规则文件有改动（${short}），批准后才生效：`, ...pending.summary, '', '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）'],
           buttons: ['拒绝', '批准'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC };
       const asked = approvals.ask(key, 'rules', request, pending.tooLong ? [] : ['批准']);
       switch (asked.status) {

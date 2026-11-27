@@ -811,7 +811,7 @@ test('changed rules: the first open gets 21 and asks once; approving lets the re
   assert.match(req.title, /^e2k：域名规则改了（请求 a-[0-9a-f]{6}）$/);
   assert.match(req.lines[0]!, /^规则文件有改动（sha256:[0-9a-f]{16}），批准后才生效：$/);
   assert.ok(req.lines.includes('+ 顶层登录主机：sso.example.com') && req.lines.includes('+ 规则 example.com（只读）'));
-  assert.deepEqual(req.lines.slice(-2), ['', '拒绝：继续按上一次批准的规则（收紧的部分已经先生效）']);
+  assert.deepEqual(req.lines.slice(-2), ['', '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）']);
   release();
   await settleDialog();
   const r = await sm.open({ url: RO });
@@ -884,7 +884,7 @@ test('an open session keeps working while a change is pending: step carries the 
   await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
   const r = await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] });
   assert.equal(r.exit, 0);
-  assert.ok(r.notices.includes('规则文件有未批准的改动（收紧的部分已生效）'), r.notices.join('|'));
+  assert.ok(r.notices.includes('规则文件有未批准的改动（只有新增或改成只读的规则条目已先生效，其余改动要等批准）'), r.notices.join('|'));
   await settleDialog();
   await sm.open({ url: RO });   // 批准、重试：待批清掉了
   assert.ok(!(await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] })).notices.some((n) => n.includes('未批准的改动')));

@@ -792,7 +792,7 @@ test('status carries rules (the approved ones); the text format adds a line for 
       assert.match(t.outText(), /^规则 2 条 sha256:[0-9a-f]{16}$/m); assert.ok(!t.outText().includes('规则文件有错') && !t.outText().includes('未批准'));
       writeFileSync(h.home.rulesFile, GOOD_RULES.replace('"readonly"', '"default"'));   // status 之前会先重读文件
       const pend = io({ env: h.env }); assert.equal(await main(['status'], pend), 0);
-      assert.match(pend.outText(), /^规则文件有未批准的改动：.*rule diff 查看/m); assert.match(pend.outText(), /^规则 2 条 sha256:/m);
+      assert.match(pend.outText(), /^规则文件有未批准的改动：.*只有新增或改成只读的规则条目已先生效.*rule diff 查看/m); assert.match(pend.outText(), /^规则 2 条 sha256:/m);
       const pj = io({ env: h.env }); await main(['status', '--json'], pj);
       const pr = JSON.parse(pj.outText()) as { rules: { count: number; hash: string; pending: { hash: string; tooLong: boolean } } };
       assert.equal(pr.rules.count, 2); assert.equal(pr.rules.hash, r.rules.hash); assert.match(pr.rules.pending.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(pr.rules.pending.tooLong, false);

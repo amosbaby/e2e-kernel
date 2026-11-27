@@ -132,7 +132,7 @@ function rulesLines(rules: StatusResult['rules'] | undefined): string[] {
   return [
     rules.hash === null ? `规则 ${rules.count} 条` : `规则 ${rules.count} 条 ${inline(rules.hash)}`,
     ...(rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(rules.error)}`]),
-    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，收紧立刻按更严的判（rule diff 查看）']),
+    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，只有新增或改成只读的规则条目已先生效（rule diff 查看）']),
     ...(rules.approvals === 'unreadable' ? ['批准记录读不了：现有规则全部要重新批准'] : []),
     ...(rules.approvalsChanged === true ? ['批准记录文件被外部改过：运行中仍按内存里的批准，重启内核时以磁盘上的为准'] : []),
   ];

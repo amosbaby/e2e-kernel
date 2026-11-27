@@ -183,7 +183,7 @@ function modesSection(r: RunResult): string {
   const rules = r.rules !== null && typeof r.rules === 'object' ? r.rules : { hash: null, count: 0, pendingHash: null };
   const approvedLine = rules.hash === null ? '<p>没有已批准的规则</p>' : `<p>收尾时生效的已批准规则 ${own(rules.count)} 条，哈希 <code>${own(rules.hash)}</code></p>`;
   const rulesLine = rules.pendingHash == null ? approvedLine
-    : `${approvedLine}<p>另有未批准的规则文件，哈希 <code>${own(rules.pendingHash)}</code>（其中的收紧已按更严合并生效）</p>`;
+    : `${approvedLine}<p>另有未批准的规则文件，哈希 <code>${own(rules.pendingHash)}</code>（其中新增或改成只读的规则条目已按更严合并生效）</p>`;
   const tail = profileBlock(r) + declarationsBlock(r) + identityBlock(r) + frozenBlock(r);
   let out = '<section id="modes"><h2>模式</h2>';
   if (modes.length === 0 || (modes.length === 1 && modes[0]!.mode === 'default')) return `${out}<p>全程默认模式</p>${rulesLine}${tail}</section>`;

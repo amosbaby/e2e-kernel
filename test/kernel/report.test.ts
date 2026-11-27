@@ -56,6 +56,8 @@ afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 test('the mode section also names an unapproved rules file whose tightening is already in force', () => {
   const html = section(renderReport(buildResult(input({ modes: [], rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: 'sha256:fedcba9876543210' } }))), 'modes');
   assert.ok(html.includes('sha256:0123456789abcdef') && html.includes('sha256:fedcba9876543210') && html.includes('未批准'));
+  assert.ok(html.includes('新增或改成只读的规则条目'), 'only those rules are in force before approval');
+  assert.ok(!html.includes('其中的收紧'));
   assert.ok(!section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('未批准'));
 });
 

@@ -19,3 +19,14 @@ test('every json block in the agent guide parses', () => {
     assert.doesNotThrow(() => { JSON.parse(m[1] ?? ''); }, `第 ${i + 1} 个 json 块不是合法 JSON`);
   }
 });
+
+// 终审 I-4：待批期间只有新增或改成只读的 rules 条目立即生效；登出、登录主机、白名单、身份、组的改动都要等批准。文字不能说多。
+test('the docs say that only new or read-only rules are in force before approval, not that tightening is', () => {
+  const guide = readFileSync(GUIDE, 'utf8');
+  const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
+  assert.match(guide, /新增或改成只读的 `rules` 条目/);
+  assert.match(guide, /登出、登录主机、白名单、身份、组/);
+  assert.doesNotMatch(guide, /收紧已生效|收紧的部分已生效/);
+  assert.match(readme, /only a new or read-only entry of `rules` is in force at once/);
+  assert.doesNotMatch(readme, /a tightening one is in force at once/);
+});
