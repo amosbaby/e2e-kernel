@@ -11,6 +11,7 @@ import { call } from '../../src/shared/client.ts';
 import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
+import { fakeDialog } from '../support/fake-dialog.ts';
 
 // 端到端验收：真浏览器（有头 Chromium）、真 fixture 服务、测试进程内的内核，CLI 走 bin/e2k.js 子进程。
 // 这份文件里的测试按书写顺序执行，共用模块级的 sid 和 ref。
@@ -60,7 +61,7 @@ function allFilesUnder(dir: string): string[] {
 before(async () => {
   server = await startFixtureServer();
   origin = server.origin;
-  kernel = await startKernel({ home, driver: createPlaywrightDriver() });
+  kernel = await startKernel({ home, driver: createPlaywrightDriver(), dialog: fakeDialog() });
 });
 
 after(async () => {

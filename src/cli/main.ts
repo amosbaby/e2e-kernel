@@ -2,9 +2,10 @@ import { basename, relative } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import type { Driver } from '../driver/types.ts';
+import { noDialog } from '../kernel/approval.ts';
 import { readRulesFile } from '../kernel/rules.ts';
 import { listenerErrorLogger, startKernel } from '../kernel/server.ts';
-import type { KernelHandle } from '../kernel/server.ts';
+import type { KernelHandle, KernelOptions } from '../kernel/server.ts';
 import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
 import { E2kError } from '../shared/errors.ts';
@@ -29,6 +30,7 @@ export interface Io {
   selfCmd: string;                        // 这个 CLI 实际该怎么调用，用在提示里
   stdin: { isTTY: boolean; readLine(): Promise<string>; readAll(maxBytes: number): Promise<string> };   // 超过 maxBytes 抛 E2kError('usage')
   makeDriver(): Promise<Driver>;
+  startKernel?(o: KernelOptions): Promise<KernelHandle>;   // 缺省是真的 startKernel；测试用它看 start 传了什么
   onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP；每收到一次调用一次 cb
   exit(code: number): void;               // 真实实现是 process.exit：第二次停止信号时不再等收尾
 }
@@ -51,7 +53,7 @@ function helpText(selfCmd: string): string {
   return [
     `用法：${selfCmd} <命令>`,
     '',
-    '  start                                  前台运行内核（Ctrl-C 或 SIGTERM 停止）',
+    '  start [--no-dialogs]                   前台运行内核（Ctrl-C 或 SIGTERM 停止）；--no-dialogs 不弹确认框，需要人批准的事一律走不通（22）',
     '  status [--json]                        版本、驱动、浏览器、会话、profile（含最近一次 login）和域名规则',
     '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
     '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则（只读，不需要内核；规则文件只由人维护）',
@@ -67,7 +69,7 @@ function helpText(selfCmd: string): string {
     '  --version',
     '  help',
     '',
-    '退出码：0 正常；10 有断言不符；11 有动作失败；20 撞到登录墙（open / step，请人运行 login）；2 用法错误、会话不存在或正忙；22 要人处理（内核没在跑、login 没有终端、状态目录有问题）',
+    '退出码：0 正常；10 有断言不符；11 有动作失败；20 撞到登录墙（open / step，请人运行 login）；21 等人在弹框里批准（原样重试）；2 用法错误、会话不存在或正忙；22 要人处理（内核没在跑、login 没有终端、状态目录有问题）',
   ].join('\n');
 }
 
@@ -137,7 +139,8 @@ function needsTerminal(ctx: Ctx, command: string): void {
 // ---- 命令 ----
 
 async function start(ctx: Ctx, args: string[]): Promise<number> {
-  positionals(ctx, parse(ctx, args, {}), 0, '无');
+  const p = parse(ctx, args, { 'no-dialogs': { type: 'boolean' } });
+  positionals(ctx, p, 0, '无');
   const home = resolveHome(ctx.io.env);
   let wake = (): void => {};
   const stopSignal = new Promise<void>((resolve) => { wake = resolve; });
@@ -152,8 +155,10 @@ async function start(ctx: Ctx, args: string[]): Promise<number> {
     ctx.io.out('再次收到停止信号，立即退出');
     void (kernel?.abort() ?? Promise.resolve()).finally(() => { ctx.io.exit(ExitCode.INTERNAL); });
   });
-  kernel = await startKernel({ home, driver: await ctx.io.makeDriver() });
+  const noDialogs = p.values['no-dialogs'] === true;
+  kernel = await (ctx.io.startKernel ?? startKernel)({ home, driver: await ctx.io.makeDriver(), ...(noDialogs ? { dialog: noDialog } : {}) });
   ctx.io.out(`内核已启动，状态目录 ${home.root}`);
+  if (noDialogs) ctx.io.out('已用 --no-dialogs 启动：不弹确认框，需要人批准的事一律走不通');
   ctx.io.out('按 Ctrl-C 或发送 SIGTERM 停止（收尾期间再按一次立即退出）');
   await stopSignal;
   ctx.io.out('正在停止内核……');

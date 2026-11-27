@@ -21,6 +21,8 @@ import type { Mode } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
+import { Approvals } from '../../src/kernel/approval.ts';
+import { fakeDialog } from '../support/fake-dialog.ts';
 
 const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null };
 
@@ -47,6 +49,7 @@ function setup(overrides: Partial<SessionDeps> & { launchDelayMs?: number; failO
   const sm = new SessionManager({
     driver: fake, home: tmp.home, modes: defaultOnlyResolver, policy: allowAllPolicy,
     idleMs: 15 * 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: (line) => { logs.push(line); },
+    approvals: new Approvals(fakeDialog(), () => {}),
     ...depsOverrides,
   });
   cleanups.push(async () => {
@@ -874,7 +877,7 @@ test('a refused redirect turns the allowed write into a blocked redirected-write
 test('a driver that cannot intercept requests refuses to open read-only (by rule or by --readonly), and opens nothing', async () => {
   const fake = new FakeDriver({ capabilities: { networkInterception: false }, pages: { 'http://localhost:5173/': HOME_PAGE } });
   const rules = mutableRules(['example.com']); const tmp = makeTmpHome();
-  const sm = new SessionManager({ driver: fake, home: tmp.home, modes: rules.resolver, policy, idleMs: 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: () => {} });
+  const sm = new SessionManager({ driver: fake, home: tmp.home, modes: rules.resolver, policy, idleMs: 60_000, keepRuns: 20, now: () => new Date(), kernelVersion: '0.1.0', log: () => {}, approvals: new Approvals(fakeDialog(), () => {}) });
   cleanups.push(async () => { await sm.shutdown(); tmp.cleanup(); });
   await assert.rejects(sm.open({ url: RO }), (e: E2kError) => e.code === 'internal' && e.message.includes('不能拦网络请求'));
   await assert.rejects(sm.open({ url: 'http://localhost:5173/', readonly: true }), (e: E2kError) => e.code === 'internal');

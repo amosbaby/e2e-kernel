@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
 import { formatClose, formatStatus, formatStep } from '../../src/cli/format.ts';
 import type { Io } from '../../src/cli/main.ts';
+import { noDialog } from '../../src/kernel/approval.ts';
 import { startKernel } from '../../src/kernel/server.ts';
 import type { KernelHandle, StatusResult } from '../../src/kernel/server.ts';
 import type { Driver } from '../../src/driver/types.ts';
@@ -19,6 +20,7 @@ import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
+import { fakeDialog } from '../support/fake-dialog.ts';
 
 // 一个不能出现在任何输出里的值：运行时拼出来，不写成字面量。
 const secret = ['pw', 'Zq7', 'x91', 'Lk'].join('-');
@@ -64,7 +66,7 @@ const fake = new FakeDriver({ pages: pages() });
 let k: KernelHandle;
 
 before(async () => {
-  k = await startKernel({ home: kernelTmp.home, driver: fake });
+  k = await startKernel({ home: kernelTmp.home, driver: fake, dialog: fakeDialog() });
 });
 
 after(async () => {
@@ -75,7 +77,7 @@ after(async () => {
 interface TestIo extends Io { outText(): string; errText(): string; fireStopSignal(): void; exits: number[] }
 
 // 收集输出的测试替身。stdinText 不给时，读标准输入得到空串。
-function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: () => Promise<Driver>;
+function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: () => Promise<Driver>; startKernel?: Io['startKernel'];
   readAll?: (maxBytes: number) => Promise<string> } = {}): TestIo {
   const out: string[] = [];
   const err: string[] = [];
@@ -96,6 +98,7 @@ function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; m
       }),
     },
     makeDriver: o.makeDriver ?? (async () => new FakeDriver({ pages: pages() })),
+    startKernel: o.startKernel ?? ((ko) => startKernel({ dialog: fakeDialog(), ...ko })),   // start 命令也不用真的对话框
     onStopSignal: (cb) => { stops.push(cb); },
     exit: (code) => { exits.push(code); },
     exits,
@@ -159,7 +162,7 @@ test('step text output prints each notice on its own line; a reply without notic
 
 test('open on a broken rules file is refused with exit 2 and a pointer to rule list; fixing the file lets it through', async () => {
   await withRules(GOOD_RULES, async (h) => {
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }) });
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog() });
     try {
       writeFileSync(h.home.rulesFile, '{"version":1,"rules":null}');
       const t = io({ env: h.env }); assert.equal(await main(['open', 'http://localhost:5173/'], t), 2);
@@ -384,6 +387,31 @@ test('start without a terminal runs until the stop signal', async () => {
   assert.equal(await done, 0); assert.ok(!existsSync(fresh.socket)); assert.ok(!existsSync(fresh.pidFile));
 });
 
+test('there is no approve command, and no start option that approves anything', async () => {
+  const t = io();
+  assert.equal(await main(['approve'], t), 2);
+  assert.equal(await main(['approve', 'a-123456'], t), 2);
+  for (const opt of ['--approve', '--auto-approve', '--yes', '--dialogs']) assert.equal(await main(['start', opt], io({ env: freshEnv })), 2, opt);
+  const help = io(); await main(['help'], help);
+  assert.ok(!/approve/i.test(help.outText()));
+  assert.match(help.outText(), /start \[--no-dialogs\]/);
+  assert.match(help.outText(), /21 等人在弹框里批准（原样重试）/);
+});
+
+test('start --no-dialogs hands the kernel noDialog; plain start leaves the default dialog alone', async () => {
+  for (const flag of [true, false]) {
+    const seen: Parameters<NonNullable<Io['startKernel']>>[0][] = [];
+    const t = io({ env: freshEnv, startKernel: async (ko) => { seen.push(ko); return startKernel({ dialog: fakeDialog(), ...ko }); } });
+    const done = main(flag ? ['start', '--no-dialogs'] : ['start'], t);
+    await until(() => existsSync(fresh.socket)); t.fireStopSignal();
+    assert.equal(await done, 0);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]!.dialog, flag ? noDialog : undefined);
+    assert.equal(/--no-dialogs/.test(t.outText()), flag);
+    assert.ok(!existsSync(fresh.socket));
+  }
+});
+
 test('login without a terminal is refused (22)', async () => {
   const before = fake.calls.length;
   const t = io({ isTTY: false });
@@ -404,7 +432,7 @@ async function loginWithBlockedWrites(posts: number): Promise<string> {
   const h = makeTmpHome();
   const f = new FakeDriver({ pages: pages() });
   writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] }));
-  const kernel = await startKernel({ home: h.home, driver: f });
+  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog() });
   try {
     const t = io({ env: h.env, isTTY: true });
     t.stdin.readLine = async () => {
@@ -585,7 +613,7 @@ test('status from an older kernel (no rules field) still formats', () => {
 
 test('status carries rules; the text format adds a line only when the file is broken', async () => {
   await withRules(GOOD_RULES, async (h) => {
-    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }) });
+    const kk = await startKernel({ home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog() });
     try {
       const j = io({ env: h.env }); assert.equal(await main(['status', '--json'], j), 0);
       const r = JSON.parse(j.outText()) as { rules: { count: number; hash: string; error: unknown } };

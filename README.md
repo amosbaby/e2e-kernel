@@ -28,6 +28,8 @@ Commands below are written as `node bin/e2k.js <command>` and run from the repos
 node bin/e2k.js start
 ```
 
+`start --no-dialogs` starts a kernel that never shows a confirmation dialog: whatever needs a person's approval then cannot be approved and ends in exit code 22. It can only make results stricter; there is no flag, environment variable or command that approves anything automatically (there is deliberately no `approve` command). Without the flag the kernel shows native macOS dialogs (through `osascript`, only in a graphical login session): at most one on screen at a time, a kind of request that was just denied is not asked again for 60 seconds, and more than 6 dialogs in 10 minutes make further requests fail with 22. The dialog text is shown as is (never shortened); a request whose text is too long is refused as a usage error. `approvals.json` in the state directory is the kernel's own state file: only the kernel writes it, do not read or edit it.
+
 2. Open a page. This returns a session id and a first snapshot. `--name` groups reports (default `session`; lowercase letters, digits and `-`, starting with a letter or digit, at most 40 characters), `--viewport 1280x720` is optional, `--touch` emulates a touch screen on this session's page (see Known M1 gaps for what it does not cover), `--readonly` forces this session read-only whatever the rules say (see Read-only mode), `--json` prints one JSON line.
 
 ```sh
@@ -102,7 +104,7 @@ Supported `css` assertion forms:
 | 10 | at least one assertion mismatched |
 | 11 | an action failed (a batch with both a mismatch and a failed action reports 11); a refused password fill is also 11 (but 20 when the page is a login wall). `open` also exits 11 when the page cannot be opened, or when `--touch` cannot be emulated; no session is created then |
 | 20 | after `open` or `step`, the top page shows a visible password-like field; a person should run `login`. Takes precedence over 10 and 11 |
-| 21 | waiting for an approval (reserved, not used in M1) |
+| 21 | waiting for a person to approve in a dialog box; retry the same command unchanged once they have clicked (reserved: the commands that ask for approval arrive in later M2b steps) |
 | 22 | no kernel running, `login` without a terminal, a state-directory problem a person must fix (see `next`), or `doctor` found a failing check |
 
 ## Where things live

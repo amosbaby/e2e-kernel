@@ -67,7 +67,9 @@ test('only src/drivers/playwright imports playwright or playwright-core', () => 
   assert.deepEqual(importsOf([{ path: 'stable.ts', text: readFileSync('src/drivers/playwright/stable.ts', 'utf8') }], 'playwright'), []);
 });
 
-test('src uses neither child_process nor page-exposed functions nor bringToFront', () => {
+test('src uses neither page-exposed functions nor bringToFront, and child_process only where the kernel talks to the desktop', () => {
   const src = readSources('src');
-  for (const needle of ['child_process', 'exposeFunction', 'exposeBinding', 'bringToFront']) assert.deepEqual(mentions(src, needle), [], needle);
+  for (const needle of ['exposeFunction', 'exposeBinding', 'bringToFront']) assert.deepEqual(mentions(src, needle), [], needle);
+  // 弹确认框要起 osascript（src/kernel/approval.ts）；别的文件不得起子进程。
+  assert.deepEqual(mentions(src, 'child_process'), ['src/kernel/approval.ts']);
 });
