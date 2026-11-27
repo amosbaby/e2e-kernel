@@ -30,6 +30,7 @@ export interface Io {
   selfCmd: string;                        // 这个 CLI 实际该怎么调用，用在提示里
   stdin: { isTTY: boolean; readLine(): Promise<string>; readAll(maxBytes: number): Promise<string> };   // 超过 maxBytes 抛 E2kError('usage')
   makeDriver(): Promise<Driver>;
+  managerName?(): Promise<string | null>;   // doctor 取 launchctl managername 的办法；缺省是真的，测试注入假的
   startKernel?(o: KernelOptions): Promise<KernelHandle>;   // 缺省是真的 startKernel；测试用它看 start 传了什么
   onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP；每收到一次调用一次 cb
   exit(code: number): void;               // 真实实现是 process.exit：第二次停止信号时不再等收尾
@@ -184,7 +185,7 @@ async function status(ctx: Ctx, args: string[]): Promise<number> {
 async function doctor(ctx: Ctx, args: string[]): Promise<number> {
   positionals(ctx, parse(ctx, args, JSON_OPTION), 0, '无');
   const home = resolveHome(ctx.io.env);
-  const checks = await runDoctor(home, await ctx.io.makeDriver(), ctx.io.selfCmd);
+  const checks = await runDoctor(home, await ctx.io.makeDriver(), ctx.io.selfCmd, ctx.io.managerName);
   print(ctx, checks, formatChecks);
   return checks.every((c) => c.ok) ? ExitCode.OK : ExitCode.NEEDS_HUMAN;
 }

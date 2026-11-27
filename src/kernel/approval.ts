@@ -57,7 +57,7 @@ export const defaultExec: ExecFn =(file, args, o) => new Promise((resolve, rejec
   });
 });
 
-async function defaultManagerName(): Promise<string | null> {
+export async function defaultManagerName(): Promise<string | null> {
   try {
     return (await defaultExec('launchctl', ['managername'], { timeout: 5000 })).stdout.trim();
   } catch {

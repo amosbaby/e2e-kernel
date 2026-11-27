@@ -1,7 +1,8 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
@@ -81,7 +82,7 @@ interface TestIo extends Io { outText(): string; errText(): string; fireStopSign
 
 // 收集输出的测试替身。stdinText 不给时，读标准输入得到空串。
 function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: () => Promise<Driver>; startKernel?: Io['startKernel'];
-  readAll?: (maxBytes: number) => Promise<string>; onSleep?: (n: number) => void } = {}): TestIo {
+  readAll?: (maxBytes: number) => Promise<string>; onSleep?: (n: number) => void; managerName?: () => Promise<string | null> } = {}): TestIo {
   const out: string[] = [];
   const err: string[] = [];
   const stops: (() => void)[] = [];
@@ -106,6 +107,7 @@ function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; m
       }),
     },
     makeDriver: o.makeDriver ?? (async () => new FakeDriver({ pages: pages() })),
+    managerName: o.managerName ?? (async () => 'Aqua'),   // doctor 不去问真的 launchctl
     startKernel: o.startKernel ?? ((ko) => startKernel({ focus: noFocus, dialog: fakeDialog(), ...ko })),   // start 命令也不用真的对话框
     onStopSignal: (cb) => { stops.push(cb); },
     exit: (code) => { exits.push(code); },
@@ -846,6 +848,48 @@ test('doctor fails the rules check on a bad file, with a fix that points at rule
   });
 });
 
+const NO_DIALOG_HINT = '弹不出批准框，需要批准的操作会返回 22';
+
+async function approvalDialogCheck(managerName: () => Promise<string | null>): Promise<{ code: number; check: DocCheck | undefined; all: DocCheck[] }> {
+  const t = io({ managerName }); const code = await main(['doctor', '--json'], t);
+  const all = JSON.parse(t.outText()) as DocCheck[];
+  return { code, check: all.find((c) => c.name === 'approval-dialog'), all };
+}
+
+test('doctor: the approval dialog check is ok on an Aqua session and has no fix', async () => {
+  const { code, check } = await approvalDialogCheck(async () => 'Aqua');
+  assert.equal(check?.ok, true); assert.equal(check?.fix, undefined); assert.ok(!(check?.detail ?? '').includes('22')); assert.equal(code, 0);
+});
+
+test('doctor: a non-Aqua session (Background) says approvals cannot pop up, and still does not fail the exit code', async () => {
+  const { code, check } = await approvalDialogCheck(async () => 'Background');
+  assert.ok((check?.detail ?? '').includes(NO_DIALOG_HINT), check?.detail);
+  assert.equal(code, 0);                                              // 其余检查都过：这一项不让 doctor 变成 22
+});
+
+test('doctor: when managername cannot be read (null or throws) it gives the same hint as a non-Aqua session', async () => {
+  for (const f of [async () => null, async (): Promise<string | null> => { throw new Error('boom'); }]) {
+    const { code, check } = await approvalDialogCheck(f);
+    assert.ok((check?.detail ?? '').includes(NO_DIALOG_HINT), check?.detail);
+    assert.equal(code, 0);
+  }
+});
+
+test('doctor: the approval dialog check never calls osascript', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'e2k-fake-osa-'));
+  const marker = join(dir, 'called');
+  writeFileSync(join(dir, 'osascript'), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+  const oldPath = process.env['PATH'];
+  process.env['PATH'] = `${dir}:${oldPath ?? ''}`;
+  try {
+    for (const name of ['Aqua', 'Background']) await approvalDialogCheck(async () => name);
+    assert.ok(!existsSync(marker), 'doctor 调了 osascript');
+  } finally {
+    if (oldPath === undefined) delete process.env['PATH']; else process.env['PATH'] = oldPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('doctor without a kernel says how to start one', async () => {
   const t = io({ env: emptyEnv });
   assert.equal(await main(['doctor', '--json'], t), 22);
@@ -854,7 +898,7 @@ test('doctor without a kernel says how to start one', async () => {
   assert.equal(running?.ok, false); assert.equal(running?.fix, 'node bin/e2k.js start');
   assert.equal(checks.find((c) => c.name === 'kernel-version')?.ok, true);
   assert.deepEqual(checks.map((c) => c.name),
-    ['node-version', 'platform', 'home-permissions', 'socket-path-length', 'profile-default', 'rules', 'fake', 'kernel-running', 'kernel-version']);
+    ['node-version', 'platform', 'home-permissions', 'socket-path-length', 'profile-default', 'rules', 'approval-dialog', 'fake', 'kernel-running', 'kernel-version']);
 });
 
 test('start runs until the stop signal and cleans up', async () => {

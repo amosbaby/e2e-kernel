@@ -5,6 +5,7 @@ import type { StatusResult } from '../kernel/server.ts';
 import { call } from '../shared/client.ts';
 import { redactText, safely } from '../shared/redact.ts';
 import { PROFILE_STATE_TEXT, lastLoginText } from './format.ts';
+import { defaultManagerName } from '../kernel/approval.ts';
 import { DEFAULT_PROFILE, listProfiles } from '../kernel/profiles.ts';
 import { inspectRules } from '../kernel/rules.ts';
 import { E2kError } from '../shared/errors.ts';
@@ -110,6 +111,20 @@ function rulesCheck(home: Home, selfCmd: string): Check {
   return { name, ok: true, detail: r.file.hash === null ? '没有规则' : `${r.file.rules.length} 条，已批准` };
 }
 
+// 批准框：只问 launchctl 当前在不在图形登录会话（Aqua）里，不弹框、不调 osascript。取不到、出错都当作弹不出（失败关闭方向：
+// 告诉人需要批准的操作会返回 22）；这一项只是提示，ok 恒为 true，不让 doctor 的退出码变失败。
+async function approvalDialogCheck(managerName: () => Promise<string | null>, selfCmd: string): Promise<Check> {
+  const name = 'approval-dialog';
+  let manager: string | null;
+  try {
+    manager = await managerName();
+  } catch {
+    manager = null;
+  }
+  if (manager === 'Aqua') return { name, ok: true, detail: '在图形登录会话里，批准框可以弹出' };
+  return { name, ok: true, detail: '弹不出批准框，需要批准的操作会返回 22', fix: `在本机桌面的终端里运行 ${selfCmd} start（远程登录、后台任务里没有桌面）` };
+}
+
 async function kernelChecks(home: Home, selfCmd: string): Promise<Check[]> {
   let status: StatusResult;
   try {
@@ -134,8 +149,8 @@ async function kernelChecks(home: Home, selfCmd: string): Promise<Check[]> {
   ];
 }
 
-// selfCmd：这个 CLI 实际该怎么调用，写进 fix 里。
-export async function runDoctor(home: Home, driver: Driver, selfCmd = 'e2k'): Promise<Check[]> {
+// selfCmd：这个 CLI 实际该怎么调用，写进 fix 里；managerName：取 launchctl managername 的办法，测试注入假的。
+export async function runDoctor(home: Home, driver: Driver, selfCmd = 'e2k', managerName: () => Promise<string | null> = defaultManagerName): Promise<Check[]> {
   return [
     nodeVersionCheck(),
     platformCheck(),
@@ -143,6 +158,7 @@ export async function runDoctor(home: Home, driver: Driver, selfCmd = 'e2k'): Pr
     socketCheck(home),
     ...profileChecks(home),
     rulesCheck(home, selfCmd),
+    await approvalDialogCheck(managerName, selfCmd),
     ...await driver.selfCheck(),
     ...await kernelChecks(home, selfCmd),
   ];
