@@ -168,6 +168,11 @@ export class Approvals {
     return { status: 'pending', id: entry.id };
   }
 
+  // 只读：这个键现在的状态（没有这个键是 undefined）。调用方用它发现自己问过的框已经被拒了，不改变任何状态。
+  stateOf(key: string): 'queued' | 'showing' | 'approved' | 'denied' | undefined {
+    return this.entries.get(key)?.state;
+  }
+
   // 调用方把批准的结果落盘之后调：之后同一个键重新来问就是一件新事。
   forget(key: string): void {
     const e = this.entries.get(key);

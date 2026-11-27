@@ -215,7 +215,9 @@ export class SessionManager {
   // 每个 profile（key）一个浏览器实例，懒启动。
   private readonly slots = new Map<string, InstanceSlot>();
   // 被人拒绝过的放行声明集合（不含会话名，所以换个会话也不重新弹框）；键 = sha256(组、页面主机、声明集合)，内核重启前一直有效。
+  // askedWrites：这个集合问过的待批表键（带会话名）。拒绝是人在框里点的，不等原会话重试：每次问之前先看问过的框有没有被拒，被拒了就记进 deniedWrites。
   private readonly deniedWrites = new Set<string>();
+  private readonly askedWrites = new Map<string, Set<string>>();
   private hopSeq = 0;   // 冻结时造的导航记录的编号
   private useClock = 0;   // 给 lastUsed 用的单调序号：比时间戳稳，同一毫秒里的先后也分得清
   // 关停是终态：一旦开始，不再接受任何调用，也不再启动浏览器。
@@ -368,8 +370,11 @@ export class SessionManager {
     if (pending.length > 0) {
       const denyKey = sha256(JSON.stringify([s.group, host, pending.map(declarationKey)]));
       const refused = new E2kError('usage', '人拒绝了这些放行声明', '内核重启前同一组声明不会再问；要放行请换成别的声明');
-      if (this.deniedWrites.has(denyKey)) throw refused;
       const key = `writes:${sha256(JSON.stringify([s.name, s.group, host, pending.map(declarationKey)]))}`;
+      const earlier = this.askedWrites.get(denyKey) ?? new Set<string>();
+      if ([...earlier].some((k) => approvals.stateOf(k) === 'denied')) { this.deniedWrites.add(denyKey); this.askedWrites.delete(denyKey); }
+      if (this.deniedWrites.has(denyKey)) throw refused;
+      this.askedWrites.set(denyKey, earlier.add(key));
       const request: DialogRequest = {
         title: 'e2k：放行写请求',
         lines: [`会话：${s.name}（组 ${s.group}）`, `页面所在主机：${host}`, '要放行这些写请求（批准后，只读主机上也能发出）：',
@@ -396,6 +401,7 @@ export class SessionManager {
           });
           approvals.forget(key);
           approvals.forgetApproved((k) => k.startsWith('writes:'));
+          this.askedWrites.delete(denyKey);
           break;
       }
     }

@@ -1084,8 +1084,9 @@ test('step --allow: unreadable or non-write declarations are usage errors that s
       assert.equal(dialog.requests.length, 0, 'nothing reached the dialog');
       const first = io({ env: h.env }); assert.equal(await main(['step', sid, ops, '--allow', allow], first), 21);
       assert.match(first.errText(), /等人在弹框里批准：放行写请求的声明/);
-      await sleep(20);                                                                                                 // 假对话框在后台答复
-      const again = io({ env: h.env }); assert.equal(await main(['step', sid, ops, '--allow', allow, '--json'], again), 0);
+      let again = io({ env: h.env });                                                                                  // 假对话框在后台答复：重试到成功为止
+      for (let i = 0; i < 200 && await main(['step', sid, ops, '--allow', allow, '--json'], again = io({ env: h.env })) !== 0; i++) await sleep(10);
+      assert.equal(JSON.parse(again.outText()).exit, 0);
       assert.equal(dialog.requests.length, 1);
       assert.match(dialog.requests[0]!.lines.join('\n'), /POST http:\/\/localhost:5173\/api\/items（只放行 operation Save）/);
       assert.equal(await main(['step', sid, '--stdin', '--allow', allow], io({ env: h.env, stdinText: ops })), 0);   // 已批准：不再弹框

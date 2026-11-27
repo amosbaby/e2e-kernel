@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { E2kError } from '../../src/shared/errors.ts';
-import { DECLARABLE_METHODS, MAX_DECLARATIONS, normalizeDeclarations } from '../../src/kernel/declarations.ts';
+import { DECLARABLE_METHODS, MAX_DECLARATIONS, declarationKey, normalizeDeclarations, sameDeclaration } from '../../src/kernel/declarations.ts';
 
 const isUsage = (e: unknown): boolean => e instanceof E2kError && e.code === 'usage';
 const item = (method: string, url: string, operation?: string) => (operation === undefined ? { method, url } : { method, url, operation });
@@ -57,4 +57,12 @@ test('the usage message names the field and never echoes the given value', () =>
     assert.ok(isUsage(e));
     assert.ok(!(e as Error).message.includes('Zq7x91Lk') && /allow\[0\]/.test((e as Error).message));
   }
+});
+
+test('the operation is part of a declaration\'s identity: same method and address with different operations (or none) are different entries', () => {
+  const url = 'http://api.example.com/graphql';
+  const out = normalizeDeclarations([item('POST', url), item('POST', url, 'Save'), item('POST', url, 'Other'), item('POST', url, 'Save')]);
+  assert.deepEqual(out.map((d) => d.operation).sort(), ['Other', 'Save', null]);
+  assert.notEqual(declarationKey({ method: 'POST', url, operation: null }), declarationKey({ method: 'POST', url, operation: 'Save' }));
+  assert.equal(sameDeclaration({ method: 'POST', url, operation: 'Save' }, { method: 'POST', url, operation: 'Other' }), false);
 });

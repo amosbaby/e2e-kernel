@@ -2773,3 +2773,56 @@ test('declared writes: a box that would be too long is refused before it is show
   await c.sm.step({ session, ops: SNAP, allow: [] });   // 空的声明就是没有声明
   assert.equal(dialog.requests.length, 0);
 });
+
+test('declared writes: a refusal is remembered when it is given, even if the session that asked never retries: another session asking the same set later gets no dialog', async () => {
+  let t = 1_000_000;
+  const dialog = fakeDialog(() => ({ kind: 'button', button: '拒绝' }));
+  const c = setupDecl(dialog, ['example.com'], () => t);
+  const one = await openAt(c, 'one');
+  const two = await openAt(c, 'two');
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();                       // 人拒绝了；one 不再重试
+  t += 61_000;                                // 冷却过去
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] }), usageWith(/人拒绝了这些放行声明/));
+  assert.equal(dialog.requests.length, 1);
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_B] }), isCode('wait-approval'), 'a different set is still asked');
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+});
+
+test('declared writes: a refusal is tied to the page host: the same set on another page host is asked again', async () => {
+  let t = 1_000_000;
+  const dialog = fakeDialog(() => ({ kind: 'button', button: '拒绝' }));
+  const c = setupDecl(dialog, ['example.com', 'example.org'], () => t);
+  const one = await openAt(c, 'one');
+  const two = await openAt(c, 'two', 'http://example.org/');
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(c.sm.step({ session: one.session, ops: SNAP, allow: [D_A] }), usageWith(/人拒绝了这些放行声明/));
+  t += 61_000;
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [D_A] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  assert.equal(dialog.requests[1]!.lines[1], '页面所在主机：example.org');
+});
+
+test('declared writes: the operation is part of a declaration\'s identity: approving one with operation Save does not cover the same address without an operation or with another one', async () => {
+  const dialog = fakeDialog(allowing);
+  const c = setupDecl(dialog);
+  const one = await openAt(c, 'one');
+  await declare(c, one.session, [D_SAVE]);
+  assert.equal(dialog.requests.length, 1);
+  const two = await openAt(c, 'two');
+  await c.sm.step({ session: two.session, ops: SNAP, allow: [D_SAVE] });   // 全等：不问
+  assert.equal(dialog.requests.length, 1);
+  const noOp: AllowItem = { method: 'POST', url: D_GQL };
+  const other: AllowItem = { method: 'POST', url: D_GQL, operation: 'Other' };
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [noOp] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 2);
+  assert.ok(dialog.requests[1]!.lines.includes(lineOf(noOp)));
+  await assert.rejects(c.sm.step({ session: two.session, ops: SNAP, allow: [other] }), isCode('wait-approval'));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 3);
+  assert.ok(dialog.requests[2]!.lines.includes(lineOf(other)));
+});
