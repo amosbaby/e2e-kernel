@@ -70,7 +70,7 @@ test('osascriptDialog: anything but the exact shape is unavailable', async () =>
   }
 });
 
-// osascript 用户取消（点了被当作系统取消键的按钮，或按 Esc）：非 0 退出，stderr 里是 "User canceled. (-128)"。
+// osascript 用户取消（点了被当作系统取消键的按钮；真机实测按 Esc 对框没有作用）：非 0 退出，stderr 里是 "User canceled. (-128)"。
 const canceled = (): Error => Object.assign(new Error('Command failed: osascript'), { code: 1, stderr: '0:130: execution error: User canceled. (-128)\n' });
 
 test('osascriptDialog: the user canceling (-128, "User canceled") counts as pressing the default button, not as a broken dialog', async () => {

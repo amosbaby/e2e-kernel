@@ -3742,7 +3742,7 @@ test('focus: a popup whose event arrives after the step returned still gets the 
   await sm.close({ session });
 });
 
-test('focus: a grab that comes after the step ended waits until the browser is really in front, then hands back once', async () => {
+test('focus: a grab that comes after the step ended waits until the browser is really in front, then hands back', async () => {
   const clock = manualClock();
   const focus = fakeFocus('com.example.app');
   const { sm, fake } = setup({ focus, focusTiming: clock.timing });
@@ -3759,9 +3759,34 @@ test('focus: a grab that comes after the step ended waits until the browser is r
   focus.chromiumFront = true;   // 现在抢到了
   await clock.advance(100);
   assert.deepEqual(focus.handedBack, ['com.example.app']);
+  await sm.close({ session });
+});
+
+test('focus: a popup that grabs the foreground a second time is handed back again, until the deadline', async () => {
+  const clock = manualClock();
+  const focus = fakeFocus('com.example.app');
+  const { sm, fake } = setup({ focus, focusTiming: clock.timing });
+  const { session, pageId } = await opened(sm, fake);
+  focus.reset();
+  assert.equal((await stepNow(sm, session)).exit, 0);
+  fake.emitPopup(pageId, 'http://localhost:5173/popup');
+  await clock.advance(100);
+  assert.deepEqual(focus.handedBack, ['com.example.app'], 'first grab');
+  await clock.advance(300);
+  assert.deepEqual(focus.handedBack, ['com.example.app'], 'user’s app is in front: nothing more');
+  focus.chromiumFront = true;   // 第二次被抢
+  await clock.advance(100);
+  assert.deepEqual(focus.handedBack, ['com.example.app', 'com.example.app'], 'second grab');
+  focus.chromiumFront = true;   // 第三次
+  await clock.advance(100);
+  assert.equal(focus.handedBack.length, 3);
+  await clock.advance(1500);   // 过了截止（从 step 结束起 2 秒）
   const attempts = focus.restores.length;
-  await clock.advance(1500);
-  assert.equal(focus.restores.length, attempts, 'no further attempts after it was handed back');
+  focus.chromiumFront = true;   // 截止之后再被抢（或用户自己切过去）：不再还
+  await clock.advance(1000);
+  assert.equal(focus.restores.length, attempts, 'no attempts after the deadline');
+  assert.equal(focus.handedBack.length, 3);
+  assert.equal(clock.pending(), 0);
   await sm.close({ session });
 });
 
@@ -3849,7 +3874,7 @@ test('focus: a second step does not cancel a pending hand-back and the two never
   await clock.advance(200);
   focus.chromiumFront = true;
   await clock.advance(100);
-  assert.deepEqual(focus.handedBack, ['com.example.app'], 'the first step’s hand-back still ran, exactly once');
+  assert.deepEqual(focus.handedBack, ['com.example.app'], 'the first step’s hand-back still ran, once for that one grab');
   assert.ok(!focus.calls.includes('restore:null'), 'the second step never called restore with null');
   await clock.advance(2000);
   assert.deepEqual(focus.handedBack, ['com.example.app']);
@@ -3858,7 +3883,6 @@ test('focus: a second step does not cancel a pending hand-back and the two never
 
 test('focus: shutdown ends a pending hand-back; the real timers are unref’d and cleared', async () => {
   const focus = fakeFocus('com.example.app');
-  focus.chromiumFront = false;
   const made: { ms: number | undefined; t: NodeJS.Timeout }[] = [];   // Node 的 Timeout 对象（有 hasRef）
   const realSetTimeout = globalThis.setTimeout;
   globalThis.setTimeout = ((fn: () => void, ms?: number, ...a: unknown[]) => {
@@ -3870,6 +3894,7 @@ test('focus: shutdown ends a pending hand-back; the real timers are unref’d an
     const { sm, fake } = setup({ focus });
     const { session, pageId } = await opened(sm, fake);
     focus.reset();
+    focus.chromiumFront = false;
     assert.equal((await stepNow(sm, session)).exit, 0);
     fake.emitPopup(pageId, 'http://localhost:5173/popup');
     await until(() => focus.restores.length >= 1);

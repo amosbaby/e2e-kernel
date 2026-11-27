@@ -330,10 +330,10 @@ export class SessionManager {
 
   // step 结束后的后台还前台（不阻塞 step；错误吞掉记日志；整个过程不返回 promise 给调用方）。
   // 每 pollMs 一轮：本会话在 step 期间或结束后 graceMs 之内新开了页（pagesOpened 比 step 开始时多）才进入「等前台」；
-  // 一直没开页，graceMs 一到就结束，什么也不碰。开了页之后，每轮让管家试一次 restore：前台还不是 e2k 的 Chromium 它返回 false（不动手），
-  // 下一轮再试；真还了（返回 true）就结束，只还一次；deadlineMs 到了前台还不是就放弃。任何一轮看到登录窗口在进行（含正在开）就放弃：那是人要操作的窗口。
-  // 同一会话的下一个 step 不取消上一次还没结束的后台还焦点：它只会在「前台是 e2k 的 Chromium」时动手，且每次动手后就结束，
-  // 两次先后触发时第二次看到前台已不是 Chromium，什么也不做，不会冲突；取消反而会丢掉第一次要还的应用
+  // 一直没开页，graceMs 一到就结束，什么也不碰。开了页之后，每轮让管家试一次 restore：前台不是 e2k 的 Chromium 它什么也不做，是就还一次；
+  // 还过之后不结束：直到截止，每次看到前台又是 e2k 的 Chromium 都再还一次（弹窗会把浏览器激活不止一次，真机实测）；deadlineMs 到了就放弃，不管前台是什么。任何一轮看到登录窗口在进行（含正在开）就放弃：那是人要操作的窗口。
+  // 同一会话的下一个 step 不取消上一次还没结束的后台还焦点：它只会在「前台是 e2k 的 Chromium」时动手，且只在看到 Chromium 在前台时才动手，
+  // 两个同时在跑时，一个还过之后另一个看到前台已不是 Chromium，什么也不做，不会冲突；取消反而会丢掉第一次要还的应用
   // （第二个 step 开始时前台还是 Chromium，它自己 capture 到的是 null）。关停时 stopping 为真，所有睡着的轮询被叫醒后结束。
   private handBackLater(s: Session, token: string, pagesBefore: number): void {
     const t = { ...DEFAULT_FOCUS_TIMING, sleep: (ms: number) => this.focusSleep(ms), nowMs: () => Date.now(), ...this.deps.focusTiming };
@@ -348,7 +348,7 @@ export class SessionManager {
             if (s.pagesOpened > pagesBefore) opened = true;
             else if (elapsed >= t.graceMs) return;
           }
-          if (opened && await this.deps.focus.restore(token)) return;
+          if (opened) await this.deps.focus.restore(token);   // 返回值不看：还过之后接着轮询，弹窗可能把浏览器再激活一次
           if (t.nowMs() - started >= t.deadlineMs) return;
           await t.sleep(t.pollMs);
         }
