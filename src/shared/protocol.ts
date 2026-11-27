@@ -82,6 +82,8 @@ export interface OpenResult {
   // 身份探针对首屏的结果：组没配身份为 null；前提不满足（页面不在本组的主机上、借用、身份元素 0 个匹配且页面有密码框）为 skipped；mismatch 时会话照样开着，下一次 step 起是 22。
   // 页面有密码框也照常比较（登录墙只是提示，不关探针），所以 blocked 为 'login' 时 identity 也可能是 mismatch。
   identity: 'ok' | 'mismatch' | 'skipped' | null;
+  // 不允许的域名经人批准打开时：人选的是只读还是可写（放行 allow 条）；不是 deny 主机（或老内核的回应）没有这个键或为 null。
+  grant?: { mode: 'readonly' | 'writable'; allow: number } | null;
 }
 export interface StepResult {
   session: string; results: OpResult[]; tallies: Tallies; exit: 0 | 10 | 11 | 20; blocked: 'login' | null; next: string | null;

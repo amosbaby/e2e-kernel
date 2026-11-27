@@ -60,9 +60,10 @@ function helpText(selfCmd: string): string {
     '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
     '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则，注明是否已批准（只读，不需要内核；规则文件只由人维护）',
     '  rule diff [--json]                     规则文件和已批准的规则之间的完整差异（只读，不需要内核；批准只能由人在内核弹出的框里做）',
-    '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--profile <组>[/<槽>]] [--json]',
+    '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--profile <组>[/<槽>]] [--allow <JSON>] [--json]',
     '                                          --profile 选 profile：不写就用域名所在的组；域名没编组时可借用某个组的登录（不能带槽）；域名属于别的组则拒绝',
     '                                          --readonly 强制这个会话只读（不管域名规则）：只放行读和严格的 GraphQL query，其余写请求一律拦下；驱动不能拦网络时 open 失败',
+    '                                          --allow 只用在「不允许」的域名上：放行清单（格式同 step --allow），人在弹框里选「可写」才生效，只放行清单里的写，不记住；选「只读」则清单不生效',
     '                                          --touch 只让这个会话页模拟触屏（(pointer: coarse)、触摸事件）；click 仍发鼠标事件，弹窗和新标签页不继承；不能模拟时 open 失败（11）',
     '  step <会话> <JSON 数组> [--keep-going] [--allow <JSON>] [--json]    失败默认拦住后面的操作；--keep-going 让后面的照跑',
     '  step <会话> --stdin [--keep-going] [--allow <JSON>] [--json]        从标准输入读 JSON 数组',
@@ -237,7 +238,7 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function open(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' }, readonly: { type: 'boolean' }, profile: { type: 'string' } });
+  const p = parse(ctx, args, { ...JSON_OPTION, viewport: { type: 'string' }, name: { type: 'string' }, touch: { type: 'boolean' }, readonly: { type: 'boolean' }, profile: { type: 'string' }, allow: { type: 'string' } });
   const [url] = positionals(ctx, p, 1, '<url>');
   const raw: Record<string, unknown> = { url };
   const viewport = optString(p, 'viewport');
@@ -248,6 +249,8 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
   if (profile !== undefined) raw.profile = profile;
   if (p.values.touch === true) raw.touch = true;
   if (p.values.readonly === true) raw.readonly = true;
+  const allow = optString(p, 'allow');
+  if (allow !== undefined) raw.allow = parseJson(allow, '--allow 必须是 JSON 数组');
   const params = validateParams('open', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'open', params) as OpenResult;
   print(ctx, result, formatOpen);

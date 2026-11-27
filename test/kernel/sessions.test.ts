@@ -17,7 +17,7 @@ import { RUN_DIR_RE, runDirName } from '../../src/report/store.ts';
 import type { RunResult } from '../../src/report/result.ts';
 import { E2kError } from '../../src/shared/errors.ts';
 import type { Op } from '../../src/shared/ops.ts';
-import type { Mode, StepParams } from '../../src/shared/protocol.ts';
+import type { Mode, OpenParams, StepParams } from '../../src/shared/protocol.ts';
 import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
@@ -813,7 +813,7 @@ test('changed rules: the first open gets 21 and asks once; approving lets the re
   assert.match(req.title, /^e2k：域名规则改了（请求 a-[0-9a-f]{6}）$/);
   assert.match(req.lines[0]!, /^规则文件有改动（sha256:[0-9a-f]{16}），批准后才生效：$/);
   assert.ok(req.lines.includes('+ 顶层登录主机：sso.example.com') && req.lines.includes('+ 规则 example.com（只读）'));
-  assert.deepEqual(req.lines.slice(-2), ['', '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）']);
+  assert.deepEqual(req.lines.slice(-2), ['', '拒绝：继续按上一次批准的规则（只有新增或改严（只读、不允许）的规则条目已先生效，其余等批准）']);
   release();
   await settleDialog();
   const r = await sm.open({ url: RO });
@@ -886,7 +886,7 @@ test('an open session keeps working while a change is pending: step carries the 
   await assert.rejects(sm.open({ url: RO }), isCode('wait-approval'));
   const r = await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] });
   assert.equal(r.exit, 0);
-  assert.ok(r.notices.includes('规则文件有未批准的改动（只有新增或改成只读的规则条目已先生效，其余改动要等批准）'), r.notices.join('|'));
+  assert.ok(r.notices.includes('规则文件有未批准的改动（只有新增或改严（只读、不允许）的规则条目已先生效，其余改动要等批准）'), r.notices.join('|'));
   await settleDialog();
   await sm.open({ url: RO });   // 批准、重试：待批清掉了
   assert.ok(!(await sm.step({ session: a.session, ops: [{ op: 'snapshot' }] })).notices.some((n) => n.includes('未批准的改动')));
@@ -3971,9 +3971,10 @@ const ALLOW_DROP = { method: 'DELETE', url: 'http://127.0.0.1:5173/api/x', opera
 const denyBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter((r) => r.title.startsWith(DENY_TITLE));
 
 // 真的规则解析器（规则文件里 127.0.0.1 是 deny）、真的写策略、假驱动、可编排的假对话框。approveRules 为 false 时规则文件还在待批。
-function setupDeny(script: (r: DialogRequest) => DialogResult | Promise<DialogResult>, o: { now?: () => number; approveRules?: boolean; capabilities?: { networkInterception: boolean } } = {}) {
+function setupDeny(script: (r: DialogRequest) => DialogResult | Promise<DialogResult>,
+  o: { now?: () => number; approveRules?: boolean; capabilities?: { networkInterception: boolean }; rules?: unknown } = {}) {
   const tmp = makeTmpHome();
-  writeFileSync(tmp.home.rulesFile, JSON.stringify(DENY_RULES));
+  writeFileSync(tmp.home.rulesFile, JSON.stringify(o.rules ?? DENY_RULES));
   if (o.approveRules !== false) approveRulesFile(tmp.home);
   const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
   const modes = listedAll(createRulesResolver(tmp.home.rulesFile, store));
@@ -3981,7 +3982,7 @@ function setupDeny(script: (r: DialogRequest) => DialogResult | Promise<DialogRe
   const fake = new FakeDriver({ pages: { [DENY_URL]: HOME_PAGE, 'http://localhost:5173/': HOME_PAGE }, ...(o.capabilities === undefined ? {} : { capabilities: o.capabilities }) });
   const s = setup({ driver: fake, modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}, o.now === undefined ? {} : { now: o.now }) });
   cleanups.push(async () => { tmp.cleanup(); });
-  return { ...s, fake, dialog, modes, store };
+  return { ...s, fake, dialog, modes, store, home: tmp.home };
 }
 
 const grantOf = (sm: SessionManager, id: string): { host: string | null; mode: string | null; allow: unknown[]; borrowGroup: string | null } => (inner(sm, id) as unknown as { grant: never }).grant;
@@ -4129,4 +4130,182 @@ test('an open that needs two gates (rules waiting for approval, then the deny ho
   const r = await sm.open({ url: DENY_URL });   // 两个都批准了：一次走通，没有哪一道再被问
   assert.equal(r.mode, 'readonly');
   assert.deepEqual(dialog.requests.map((d) => d.title.replace(/（请求 .*$/, '')), ['e2k：域名规则改了', DENY_TITLE]);
+});
+
+// ---- 会话的有效模式、授权的范围、deny 主机上的声明（M3 任务 4） ----
+
+const PAIR_RULES = { version: 1, rules: [{ match: '*.deny.example.com', mode: 'deny' }] };
+const HOST_A = 'http://a.deny.example.com/';
+const HOST_B = 'http://b.deny.example.com/';
+const MIXED_RULES = { version: 1, rules: [{ match: '127.0.0.1', mode: 'deny' }, { match: 'example.com', mode: 'readonly' }] };
+
+// 弹框、点完、原样重试：返回开出来的会话和它的页面 id。
+async function openDenied(sm: SessionManager, fake: FakeDriver, p: OpenParams) {
+  await assert.rejects(sm.open(p), isCode('wait-approval'));
+  await settleDialog();
+  const r = await sm.open(p);
+  return { ...r, pageId: fake.openPages().at(-1)! };
+}
+const status = (d: { action: string }): number | null => (d.action === 'fulfill' ? (d as unknown as { status: number }).status : null);
+const POST_JSON = { method: 'POST', body: '{}', contentType: 'application/json' };
+const blockedReasons = (runDir: string): (string | null)[] => readResult(runDir).writes.blocked.map((w) => w.reason);
+
+test('answered 只读: a write is blocked with reason method, a GET passes, and the open result says what was granted', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'));
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  assert.deepEqual(r.grant, { mode: 'readonly', allow: 0 });
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, method: 'GET', url: 'http://127.0.0.1:5173/api' })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: 'http://127.0.0.1:5173/api', ...POST_JSON })), 403);
+  assert.deepEqual(blockedReasons((await sm.close({ session: r.session })).runDir), ['method']);
+});
+
+test('answered 可写: exactly the listed write passes with allowedBy declared; another write is blocked; 只读 blocks the listed one too', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('可写'));
+  const p = { url: DENY_URL, allow: [ALLOW_SAVE, ALLOW_DROP] };
+  const r = await openDenied(sm, fake, p);
+  assert.deepEqual(r.grant, { mode: 'writable', allow: 2 });
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, url: 'http://127.0.0.1:5173/api/save', ...POST_JSON })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: 'http://127.0.0.1:5173/api/other', ...POST_JSON })), 403);
+  // 带 operation 的清单项：请求体的 operationName 对不上就不放行
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, method: 'DELETE', url: 'http://127.0.0.1:5173/api/x', body: '{"operationName":"Other"}', contentType: 'application/json' })), 403);
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, method: 'DELETE', url: 'http://127.0.0.1:5173/api/x', body: '{"operationName":"Drop"}', contentType: 'application/json' })).action, 'continue');
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.writes.allowed.map((w) => [w.method, w.allowedBy]), [['POST', 'declared'], ['DELETE', 'declared']]);
+  assert.deepEqual(res.writes.blocked.map((w) => w.reason), ['method', 'method']);
+  const ro = setupDeny(answeringDeny('只读'));
+  const q = await openDenied(ro.sm, ro.fake, p);   // 框里选了「只读」：清单不生效
+  assert.deepEqual(q.grant, { mode: 'readonly', allow: 0 });
+  assert.equal(status(await ro.fake.emitRequest({ pageId: q.pageId, url: 'http://127.0.0.1:5173/api/save', ...POST_JSON })), 403);
+});
+
+test('a session that was not opened on a deny host reports grant null', async () => {
+  const { sm } = setupDeny(answeringDeny('只读'));
+  assert.equal((await sm.open({ url: 'http://localhost:5173/' })).grant, null);
+});
+
+test('the grant covers only the opened host: with two deny hosts under one wildcard, a request to the other one gets 403 denied', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'), { rules: PAIR_RULES });
+  const r = await openDenied(sm, fake, { url: HOST_A });
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, method: 'GET', url: `${HOST_A}x` })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, method: 'GET', url: `${HOST_B}x` })), 403);
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: `${HOST_B}x`, ...POST_JSON })), 403);
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.host, w.reason]), [['b.deny.example.com', 'denied'], ['b.deny.example.com', 'denied']]);
+});
+
+test('a page on a default host requesting a deny host is answered 403 whatever the method (R18); a write to a read-only host still passes and is only recorded', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'), { rules: MIXED_RULES });
+  const { session, pageId } = await opened(sm, fake);
+  assert.equal(status(await fake.emitRequest({ pageId, method: 'GET', url: 'http://127.0.0.1:5173/api' })), 403);
+  assert.equal(status(await fake.emitRequest({ pageId, url: 'http://127.0.0.1:5173/api', ...POST_JSON })), 403);
+  assert.equal((await fake.emitRequest({ pageId, url: 'http://example.com/api', ...POST_JSON })).action, 'continue');
+  const res = readResult((await sm.close({ session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => w.reason), ['denied', 'denied']);
+  assert.deepEqual(res.writes.allowed.map((w) => w.targetMode), ['readonly']);
+});
+
+test('a --readonly session whose page host turns deny gets 403 on every request, and the next step says so; denied beats the forced read-only (R9)', async () => {
+  const { sm, fake, home, modes } = setupDeny(answeringDeny('只读'));
+  const { session, pageId } = await opened(sm, fake);
+  await sm.close({ session });
+  const ro = await sm.open({ url: 'http://localhost:5173/', readonly: true });
+  const roPage = fake.openPages().at(-1)!;
+  assert.equal(ro.mode, 'readonly');
+  assert.equal((await fake.emitRequest({ pageId: roPage, method: 'GET', url: 'http://localhost:5173/api' })).action, 'continue');
+  writeFileSync(home.rulesFile, JSON.stringify({ ...DENY_RULES, rules: [...DENY_RULES.rules, { match: 'localhost', mode: 'deny' }] }));
+  modes.refresh();   // 待批：新增的 deny 条目按更严合并立刻生效
+  assert.equal(status(await fake.emitRequest({ pageId: roPage, method: 'GET', url: 'http://localhost:5173/api' })), 403);
+  const st = await sm.step({ session: ro.session, ops: [{ op: 'snapshot' }] });
+  assert.ok(st.notices.includes('页面所在的域名现在是「不允许」：所有请求被拦，请关掉会话'), st.notices.join('|'));
+  assert.ok(st.notices.includes('规则文件有未批准的改动（只有新增或改严（只读、不允许）的规则条目已先生效，其余改动要等批准）'));
+  assert.equal(pageId === roPage, false);
+  assert.deepEqual(blockedReasons((await sm.close({ session: ro.session })).runDir), ['denied']);
+});
+
+test('remembered declarations for a deny target are not used (R21): a grant-covered target is judged read-only and the stored entry does not let the write through', async () => {
+  const { sm, fake, store } = setupDeny(answeringDeny('只读'));
+  const r = await openDenied(sm, fake, { url: DENY_URL });
+  await sm.step({ session: r.session, ops: [{ op: 'goto', url: 'http://localhost:5173/' }] });   // 页面回到默认主机，授权的主机成了请求的目标
+  assert.equal(inner(sm, r.session).topHost, 'localhost');
+  const toDeny = { method: 'POST', url: 'http://127.0.0.1:5173/api/save' };
+  const toSelf = { method: 'POST', url: 'http://localhost:5173/api/ok' };
+  store.update((rec) => { rec.writes['default/localhost'] = [{ ...toDeny, operation: null }, { ...toSelf, operation: null }]; return rec; });
+  assert.equal((await sm.step({ session: r.session, ops: [{ op: 'snapshot' }], allow: [toDeny, toSelf] })).exit, 0);   // 都是「已记住」：不弹框
+  const declared = (sm as unknown as { declaredFor(s: unknown): { url: string }[] }).declaredFor(inner(sm, r.session));
+  assert.deepEqual(declared.map((d) => d.url), [toSelf.url]);
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: toDeny.url, ...POST_JSON })), 403);
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, url: toSelf.url, ...POST_JSON })).action, 'continue');
+});
+
+test('a host that cannot be normalized is a usage error before any gate: no dialog, no page, also with the rules waiting for approval', async () => {
+  const { sm, dialog, fake } = setupDeny(answeringDeny('只读'), { approveRules: false });
+  await assert.rejects(sm.open({ url: 'http://a.example.com../' }), (e: E2kError) => e.code === 'usage' && !e.message.includes('example.com'));
+  assert.equal(dialog.requests.length, 0);
+  assert.deepEqual(fake.openPages(), []); assert.deepEqual(sm.list(), []);
+});
+
+test('an open --allow entry that points at a different, ungranted deny host does not let that write through: 403 denied comes first', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('可写'), { rules: PAIR_RULES });
+  const other = { method: 'POST', url: `${HOST_B}api/save` };
+  const r = await openDenied(sm, fake, { url: HOST_A, allow: [{ method: 'POST', url: `${HOST_A}api/save` }, other] });
+  assert.deepEqual(r.grant, { mode: 'writable', allow: 2 });
+  assert.equal(status(await fake.emitRequest({ pageId: r.pageId, url: other.url, ...POST_JSON })), 403);
+  assert.equal((await fake.emitRequest({ pageId: r.pageId, url: `${HOST_A}api/save`, ...POST_JSON })).action, 'continue');
+  const res = readResult((await sm.close({ session: r.session })).runDir);
+  assert.deepEqual(res.writes.blocked.map((w) => [w.host, w.reason]), [['b.deny.example.com', 'denied']]);
+});
+
+test('host spelling variants (upper case, trailing dot) are one grant: the approval is found again and the grant covers every spelling', async () => {
+  const { sm, fake, dialog } = setupDeny(answeringDeny('只读'), { rules: PAIR_RULES });
+  await assert.rejects(sm.open({ url: 'http://A.Deny.Example.com./' }), isCode('wait-approval'));
+  await settleDialog();
+  const r = await sm.open({ url: 'http://a.deny.example.com/' });   // 换个写法重试：同一个框的答复
+  assert.equal(denyBoxes(dialog).length, 1);
+  assert.equal(grantOf(sm, r.session).host, 'a.deny.example.com');
+  const pageId = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId, method: 'GET', url: 'http://a.deny.example.com./x' })).action, 'continue');
+  assert.equal(status(await fake.emitRequest({ pageId, url: 'http://A.DENY.EXAMPLE.COM/y', ...POST_JSON })), 403);
+  assert.deepEqual(blockedReasons((await sm.close({ session: r.session })).runDir), ['method']);
+  const dotted = await openDenied(sm, fake, { url: 'http://a.deny.example.com./' });   // 页面自己就在带点的写法上
+  assert.equal(dotted.mode, 'readonly');
+  assert.equal((await fake.emitRequest({ pageId: dotted.pageId, method: 'GET', url: 'http://a.deny.example.com/x' })).action, 'continue');
+});
+
+test('a host that is deny only through a wildcard rule goes through the gate, and the approval is bound to the session name', async () => {
+  const { sm, dialog } = setupDeny(answeringDeny('只读'), { rules: PAIR_RULES });
+  await assert.rejects(sm.open({ url: HOST_A, name: 'one' }), isCode('wait-approval'));
+  await settleDialog();
+  assert.deepEqual(denyBoxes(dialog)[0]!.lines.slice(0, 2), ['会话：one（profile default）', '要打开不允许的域名：a.deny.example.com']);
+  await assert.rejects(sm.open({ url: HOST_A, name: 'two' }), isCode('wait-approval'));   // 换了名字：另一个框
+  assert.equal(denyBoxes(dialog).length, 2);
+  await settleDialog();
+  assert.equal((await sm.open({ url: HOST_A, name: 'two' })).mode, 'readonly');
+  assert.equal(denyBoxes(dialog).length, 2);
+});
+
+test('a popup the kernel can attribute (its opener is the session page) is judged like the session page: a request to an ungranted deny host gets 403 denied', async () => {
+  const { sm, fake } = setupDeny(answeringDeny('只读'), { rules: PAIR_RULES });
+  const r = await openDenied(sm, fake, { url: HOST_A });
+  const popup = fake.emitPopup(r.pageId, `${HOST_A}popup`);
+  assert.equal(status(await fake.emitRequest({ pageId: popup.id, method: 'GET', url: `${HOST_B}x` })), 403);
+  assert.equal(status(await fake.emitRequest({ pageId: 'p-early', openerPageId: r.pageId, method: 'GET', url: `${HOST_B}y` })), 403);
+  assert.equal((await fake.emitRequest({ pageId: popup.id, method: 'GET', url: `${HOST_A}x` })).action, 'continue');
+  assert.deepEqual(blockedReasons((await sm.close({ session: r.session })).runDir), ['denied', 'denied']);
+});
+
+test('while a session whose mode is denied, or a granted read-only one, is alive, unattributed writes are blocked; they pass again after it closes', async () => {
+  const UNATTRIBUTED = { pageId: null, url: 'http://example.org/api', topUrl: null, ...POST_JSON };
+  const granted = setupDeny(answeringDeny('只读'));
+  const r = await openDenied(granted.sm, granted.fake, { url: DENY_URL });
+  assert.equal(status(await granted.fake.emitRequest({ ...UNATTRIBUTED, id: 'g1' } as never)), 403);
+  await granted.sm.close({ session: r.session });
+  assert.equal((await granted.fake.emitRequest({ ...UNATTRIBUTED, id: 'g2' } as never)).action, 'continue');
+  const { sm, fake, home, modes } = setupDeny(answeringDeny('只读'));
+  const ro = await sm.open({ url: 'http://localhost:5173/', readonly: true });
+  writeFileSync(home.rulesFile, JSON.stringify({ ...DENY_RULES, rules: [...DENY_RULES.rules, { match: 'localhost', mode: 'deny' }] }));
+  modes.refresh();
+  assert.equal((sm as unknown as { sessionMode(s: unknown, e: string[]): string }).sessionMode(inner(sm, ro.session), []), 'denied');
+  assert.equal(status(await fake.emitRequest({ ...UNATTRIBUTED, id: 'd1' } as never)), 403);
+  await sm.close({ session: ro.session });
+  assert.equal((await fake.emitRequest({ ...UNATTRIBUTED, id: 'd2' } as never)).action, 'continue');
 });

@@ -131,15 +131,6 @@ const noGrant = (): DenyGrant => ({ host: null, mode: null, allow: [], borrowGro
 // scope：批准是在哪个组、哪个页面主机上给的（`组/主机`；主机名里不会有 `/`，也不会撞上 `constructor` 一类原型上的名字）。
 interface DeclaredEntry { readonly scope: string; readonly decl: Declaration; readonly approved: DeclarationRecord['approved'] }
 
-// 两个主机写法规范化后是否相同；规范化不了就当不同（失败关闭）。
-function sameNormalizedHost(a: string, b: string): boolean {
-  try {
-    return normalizeHost(a) === normalizeHost(b);
-  } catch {
-    return false;
-  }
-}
-
 const sha256 = (text: string): string => createHash('sha256').update(text, 'utf8').digest('hex');
 
 // 登录页（设计 5.5）：内核开的那一页，加上它弹出的窗口。这些页的请求不进任何会话记录；
@@ -297,6 +288,8 @@ export class SessionManager {
     // profile 参数的写法先查（不对就 usage）：要在 gateRules 之前，不能为一个写错的参数弹规则批准框。
     const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
     const host = new URL(p.url).hostname;
+    // 规范化不了的主机名（比如末尾两个点）是用法错误：要在任何闸门之前拒掉，否则 resolve 把它当只读、跳过 deny 闸门。报错不回显主机名。
+    normalizeHost(host);
     // 规则先刷新一遍：文件有错就不开新会话（已开的会话按旧规则继续）。
     this.deps.modes.refresh();
     if (this.deps.modes.state().error !== null) throw new E2kError('usage', '规则文件有错，修好之前不能 open', 'e2k rule list 看错误');
@@ -315,7 +308,7 @@ export class SessionManager {
     const deny = this.gateDeny(p, host, profile);
     if (deny !== null) this.deps.approvals.forget(deny.key);
     const grant: DenyGrant = deny === null ? noGrant() : { ...deny.grant, borrowGroup: null };
-    // 授权覆盖的 denied 先映射成 readonly（R9）；Task 4 之后由 sessionMode 统一算。
+    // 授权覆盖的 denied 先映射成 readonly（R9）；会话建成后的有效模式由 sessionMode 统一算。
     const mode: Mode = forced ? 'readonly' : hostMode === 'denied' && grant.host !== null ? 'readonly' : hostMode;
     // 浏览器启动和开页会抢前台：启动之前先记下用户在用的应用，开完再还（失败时也还：浏览器可能已经起来抢过了）。
     // 开始或结束时任一刻有登录窗口开着就不还：那是人要操作的窗口。
@@ -515,7 +508,9 @@ export class SessionManager {
       s.crossNotices.clear();
       const rules = this.deps.modes.state();
       if (rules.error !== null) notices.push('规则文件有错：已开的会话按旧规则继续，新的 open 会被拒绝');
-      if (rules.pending !== null) notices.push('规则文件有未批准的改动（只有新增或改成只读的规则条目已先生效，其余改动要等批准）');
+      if (rules.pending !== null) notices.push('规则文件有未批准的改动（只有新增或改严（只读、不允许）的规则条目已先生效，其余改动要等批准）');
+      // 页面所在的域名在这一批里（或之前）变成了没授权的不允许：所有请求都被拦，会话没有用了。
+      if (this.sessionMode(s, []) === 'denied') notices.push('页面所在的域名现在是「不允许」：所有请求被拦，请关掉会话');
       if (rules.approvalsChanged) notices.push('批准记录被内核以外的进程改过，已忽略');
       // 登录墙优先于不符和失败：人得先登录，别的结果之后再看。会话状态不变。退出码不受 notices 影响。
       return { session: s.id, results, tallies, exit: wall.blocked === 'login' ? 20 : exitFor(tallies), ...wall, writesBlocked, notices };
@@ -676,11 +671,36 @@ export class SessionManager {
   }
 
   // 判定用的放行声明 = 会话提过的 ∩ 批准记录里当前的，而且要是在会话现在的组和页面主机上批准的（判定时再核对：记录里没了、页面搬了主机都失效）。
+  // 页面在不允许的域名上（已授权，否则请求早被 denied 拦了）：声明只活在会话里（R7、R21）——open 时人批准的可写清单（只在授权的那个主机上），
+  // 加上 step --allow 在这个主机上批准的（denyAllow，Task 6 写入）；批准记录一律不看。其余主机照旧，但目标是 deny 主机的记住过的声明不用（R21）。
   private declaredFor(s: Session): Declaration[] {
+    if (this.deps.modes.resolve(s.topHost) === 'denied') {
+      const top = this.normalizedOrNull(s.topHost);
+      if (top === null) return [];
+      const own = s.grant.mode === 'writable' && top === s.grant.host ? s.grant.allow : [];
+      return [...own, ...s.denyAllow.filter((e) => this.normalizedOrNull(e.host) === top).map((e) => e.decl)];
+    }
     if (s.declared.length === 0) return [];
     const scope = `${s.group}/${s.topHost}`;
     const stored = this.deps.store.writesFor(scope);
-    return s.declared.filter((e) => e.scope === scope && stored.some((d) => sameDeclaration(d, e.decl))).map((e) => e.decl);
+    return s.declared.filter((e) => e.scope === scope && stored.some((d) => sameDeclaration(d, e.decl)) && !this.targetsDenied(e.decl)).map((e) => e.decl);
+  }
+
+  private normalizedOrNull(host: string): string | null {
+    try {
+      return normalizeHost(host);
+    } catch {
+      return null;
+    }
+  }
+
+  // 声明的目标主机是不允许的域名（读不出主机也算：失败关闭）。
+  private targetsDenied(d: Declaration): boolean {
+    try {
+      return this.deps.modes.resolve(new URL(d.url).hostname) === 'denied';
+    } catch {
+      return true;
+    }
   }
 
   // 报告里的放行声明：同一条（方法、地址、operation）只列一次，先提的在前。
@@ -697,7 +717,7 @@ export class SessionManager {
   }
 
   // 入口闸门（设计 5.4）：规则文件有待批的改动时，新的 open 和 login 先过人工批准，含收紧、含删文件。
-  // 批准前只有 rules 里新增或改成只读的条目按「更严合并」生效；组、登录主机、白名单、登出、身份的改动（哪怕是收紧）都要等批准才生效。批准的是内存里待批的那份（完整哈希），不重读磁盘。
+  // 批准前只有 rules 里新增或改严（只读、不允许）的条目按「更严合并」生效；组、登录主机、白名单、登出、身份的改动（哪怕是收紧）都要等批准才生效。批准的是内存里待批的那份（完整哈希），不重读磁盘。
   // 弹框在后台，这里同步返回：没批准就抛错，调用方等人点完再原样重试（重试靠内容键对上同一个框）。
   private gateRules(): void {
     const { modes, approvals } = this.deps;
@@ -710,7 +730,7 @@ export class SessionManager {
       const key = `rules:${pending.baseHash ?? 'none'}:${pending.hash ?? 'deleted'}`;
       // 改动太多框里放不下（按字符判：差异超过 1300 字符或有一行超过 200 字符，见 rules.ts 的 summaryTooLong）：只给「拒绝」一个按钮，必然 denied，
       // 让人先看完整差异、拆开再改。框架文字加上差异万一仍超出弹框的限制（approval.ts 的 checkDialogText），也走这条路，不从 ask 抛「内容太长」。
-      const FOOT = '拒绝：继续按上一次批准的规则（只有新增或改成只读的规则条目已先生效，其余等批准）';
+      const FOOT = '拒绝：继续按上一次批准的规则（只有新增或改严（只读、不允许）的规则条目已先生效，其余等批准）';
       const shortRequest: DialogRequest = { title: 'e2k：域名规则改了', lines: [`规则文件有改动（${short}），批准后才生效：`, ...pending.summary, '', FOOT],
         buttons: ['拒绝', '批准'], defaultButton: '拒绝', timeoutSec: APPROVAL_TIMEOUT_SEC };
       let tooLong = pending.tooLong;
@@ -1137,6 +1157,7 @@ export class SessionManager {
       return {
         session: s.id, name: s.name, url: s.url, title: safely(() => redactText(loc.title)), mode: this.sessionMode(s, []), runDir: s.runDir,
         snapshot: cappedSnapshot(snapshot), ...wall, next, profile: o.profile, borrowed: o.borrowed, identity,
+        grant: o.grant.host === null || o.grant.mode === null ? null : { mode: o.grant.mode, allow: o.grant.allow.length },
       };
     } catch (e) {
       // 先清理（关页、删空的报告目录、撤销登记），会话不建立；再把驱动的错误换成 action-failed，别的原样抛。
@@ -1634,7 +1655,11 @@ export class SessionManager {
     // 发起页已提交的地址是主页面在哪的直接证据：先据此定下 topHost（待定的丢掉），再算模式。
     if (mainNav && req.initiatorUrl !== null) this.converge(s, hostOf(req.initiatorUrl));
     // 本组登录态下、顶层不在本组的页面（借用的本地页面，或先开本组、再跳到没编组的主机）发往本组的请求：有效模式再并上目标主机自己的模式。
-    const mode = this.sessionMode(s, [topHost, ...this.groupTargets(s.group, host, topHost)]);
+    // 目标主机是不允许的域名时也并进来（R18）：没授权的就是 denied，一律 403；授权覆盖的按只读判。
+    // 顶层导航的主机（导航目标）走 nav:true：借用只放行子请求的目标，不放行去那里的顶层导航（R2）。
+    const nav = req.isNavigation && req.topFrame;
+    const mode = this.sessionMode(s, [...(nav ? [] : [topHost]), ...this.groupTargets(s.group, host, topHost), ...(targetMode === 'denied' && !nav ? [host] : [])],
+      nav ? [topHost, ...(targetMode === 'denied' ? [host] : [])] : []);
     const verdict: PolicyVerdict = this.deps.policy.decide(req, this.policyCtx(mode, s.group, host, true, this.declaredFor(s)));
     s.recorder.addRequest(req, verdict, { mode, targetMode }, this.deps.now());
     if (req.isNavigation && req.topFrame) s.recorder.addHost(host, targetMode);
@@ -1646,16 +1671,30 @@ export class SessionManager {
     return verdict.decision;
   }
 
-  // 会话的有效模式：被 --readonly 强制，或 [主页面顶层主机, ...extraHosts] 里任一只读 → readonly；任一 denied → denied；否则 default。
-  private sessionMode(s: Session, extraHosts: string[]): Mode {
-    if (s.forced) return 'readonly';
-    // 授权覆盖的主机上 denied 先映射成 readonly（R2、R9）：只认 open 时批准的那个主机，规范化后精确相等；其余 deny 主机照旧是 denied。
-    const modes = [s.topHost, ...s.pendingHosts, ...extraHosts].map((h) => {
+  // 授权覆盖这个主机吗（R2）：规范化后和 open 时批准的主机精确相等；nav 为 false（子请求的目标）时，借用的组里的主机也算。
+  // 借用不覆盖顶层导航，也不覆盖通配规则下的别的主机。规范化不了就不覆盖（失败关闭）。
+  private grantCovers(s: Session, host: string, o: { nav: boolean }): boolean {
+    const h = this.normalizedOrNull(host);
+    if (h === null) return false;
+    if (h === s.grant.host) return true;
+    return !o.nav && s.grant.borrowGroup !== null && this.deps.modes.groupOf(h).name === s.grant.borrowGroup;
+  }
+
+  // 会话的有效模式（R9）：成员 = 主页面顶层主机、待定主机、extraHosts（子请求的目标和请求所在页的顶层主机）、navHosts（顶层导航的目标），
+  // 各自按规则解析；被授权覆盖的 denied 先映射成 readonly；--readonly 算一个 readonly 成员。取并：denied > readonly > default。
+  // 主页面的顶层主机和待定主机一律按 nav:true 算：授权之外只有借用的子请求目标才放宽，顶层不放宽。
+  private sessionMode(s: Session, extraHosts: string[], navHosts: string[] = []): Mode {
+    const judge = (h: string, nav: boolean): Mode => {
       const m = this.deps.modes.resolve(h);
-      return m === 'denied' && s.grant.host !== null && sameNormalizedHost(h, s.grant.host) ? 'readonly' : m;
-    });
-    if (modes.includes('readonly')) return 'readonly';
+      return m === 'denied' && this.grantCovers(s, h, { nav }) ? 'readonly' : m;
+    };
+    const modes: Mode[] = [
+      ...(s.forced ? ['readonly' as const] : []),
+      ...[s.topHost, ...s.pendingHosts, ...navHosts].map((h) => judge(h, true)),
+      ...extraHosts.map((h) => judge(h, false)),
+    ];
     if (modes.includes('denied')) return 'denied';
+    if (modes.includes('readonly')) return 'readonly';
     return 'default';
   }
 

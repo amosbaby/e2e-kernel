@@ -91,9 +91,16 @@ function identityLine(r: OpenResult): string[] {
     : [];
 }
 
+// 经人批准打开了不允许的域名：多一行说人批的是只读还是可写（放行几条）。老内核的回应没有 grant：不打。
+function grantLine(r: OpenResult): string[] {
+  const g = r.grant;
+  if (g === undefined || g === null) return [];
+  return [`不允许的域名：经人批准，${g.mode === 'writable' ? `可写（放行 ${Number(g.allow)} 条）` : '只读'}`];
+}
+
 export function formatOpen(r: OpenResult): string {
   return [...identityLine(r), `${inline(r.session)} ${inline(r.name)} 模式 ${inline(r.mode)}`, `地址 ${inline(r.url)}`, `标题 ${inline(r.title)}`, `记录目录 ${inline(r.runDir)}`,
-    ...openProfileLine(r), ...borrowedLine(r), ...waitLine(r), block(r.snapshot)].join('\n');
+    ...openProfileLine(r), ...borrowedLine(r), ...grantLine(r), ...waitLine(r), block(r.snapshot)].join('\n');
 }
 
 export function formatStep(r: StepResult): string {
@@ -132,7 +139,7 @@ function rulesLines(rules: StatusResult['rules'] | undefined): string[] {
   return [
     rules.hash === null ? `规则 ${rules.count} 条` : `规则 ${rules.count} 条 ${inline(rules.hash)}`,
     ...(rules.error === null ? [] : [`规则文件有错，open 会被拒绝：${inline(rules.error)}`]),
-    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，只有新增或改成只读的规则条目已先生效，新增或改成不允许的也一样（rule diff 查看）']),
+    ...(rules.pending == null ? [] : ['规则文件有未批准的改动：生效的仍是已批准的那份，只有新增或改严（只读、不允许）的规则条目已先生效（rule diff 查看）']),
     ...(rules.approvals === 'unreadable' ? ['批准记录读不了：现有规则全部要重新批准'] : []),
     ...(rules.approvalsChanged === true ? ['批准记录文件被外部改过：运行中仍按内存里的批准，重启内核时以磁盘上的为准'] : []),
   ];

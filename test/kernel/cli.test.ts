@@ -21,7 +21,7 @@ import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { approving, choosingMode, choosingModeOnly, denying, fakeDialog } from '../support/fake-dialog.ts';
+import { answeringDeny, approving, choosingMode, choosingModeOnly, denying, fakeDialog } from '../support/fake-dialog.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { approveRulesFile } from '../support/approve-rules.ts';
 import { noFocus } from '../../src/kernel/focus.ts';
@@ -836,7 +836,7 @@ test('status carries rules (the approved ones); the text format adds a line for 
       assert.match(t.outText(), /^规则 2 条 sha256:[0-9a-f]{16}$/m); assert.ok(!t.outText().includes('规则文件有错') && !t.outText().includes('未批准'));
       writeFileSync(h.home.rulesFile, GOOD_RULES.replace('"readonly"', '"default"'));   // status 之前会先重读文件
       const pend = io({ env: h.env }); assert.equal(await main(['status'], pend), 0);
-      assert.match(pend.outText(), /^规则文件有未批准的改动：.*只有新增或改成只读的规则条目已先生效.*rule diff 查看/m); assert.match(pend.outText(), /^规则 2 条 sha256:/m);
+      assert.match(pend.outText(), /^规则文件有未批准的改动：.*只有新增或改严（只读、不允许）的规则条目已先生效.*rule diff 查看/m); assert.match(pend.outText(), /^规则 2 条 sha256:/m);
       const pj = io({ env: h.env }); await main(['status', '--json'], pj);
       const pr = JSON.parse(pj.outText()) as { rules: { count: number; hash: string; pending: { hash: string; tooLong: boolean } } };
       assert.equal(pr.rules.count, 2); assert.equal(pr.rules.hash, r.rules.hash); assert.match(pr.rules.pending.hash, /^sha256:[0-9a-f]{16}$/); assert.equal(pr.rules.pending.tooLong, false);
@@ -1328,4 +1328,52 @@ test('rule list shows the host choices and the remembered write declarations (te
     assert.ok(!j.outText().includes(label));
     assert.equal(readFileSync(h.home.approvalsFile, 'utf8'), before, 'rule list wrote nothing');
   });
+});
+
+// ---- open --allow：不允许的域名上的放行清单（M3 任务 4） ----
+
+async function withDenyKernel(fn: (h: ReturnType<typeof makeTmpHome>) => Promise<void>): Promise<void> {
+  const h = makeTmpHome();
+  writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'localhost', mode: 'deny' }] }));
+  approveRulesFile(h.home);
+  const kernel = await startKernel({ focus: noFocus, home: h.home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(answeringDeny('可写')) });
+  try { await fn(h); } finally { await kernel.stop(); h.cleanup(); }
+}
+
+test('open --allow passes the declarations and prints the grant line (text and --json)', async () => {
+  await withDenyKernel(async (h) => {
+    const allow = JSON.stringify([{ method: 'POST', url: 'http://localhost:5173/api/save' }, { method: 'DELETE', url: 'http://localhost:5173/api/x', operation: 'Drop' }]);
+    const first = io({ env: h.env });
+    assert.equal(await main(['open', 'http://localhost:5173/', '--allow', allow], first), 21);   // 弹框，等人点
+    await sleep(50);
+    const text = io({ env: h.env });
+    assert.equal(await main(['open', 'http://localhost:5173/', '--allow', allow], text), 0);
+    assert.ok(text.outText().split('\n').includes('不允许的域名：经人批准，可写（放行 2 条）'), text.outText());
+    await sleep(50);
+    const json = io({ env: h.env });
+    assert.equal(await main(['open', 'http://localhost:5173/', '--allow', allow, '--json'], json), 21);
+    await sleep(50);
+    const again = io({ env: h.env });
+    assert.equal(await main(['open', 'http://localhost:5173/', '--allow', allow, '--json'], again), 0);
+    assert.deepEqual((JSON.parse(again.outText()) as OpenResult).grant, { mode: 'writable', allow: 2 });
+    const help = io(); assert.equal(await main(['help'], help), 0);
+    assert.match(help.outText(), /open <url> .*--allow <JSON>/);
+  });
+});
+
+test('formatOpen: the grant line says 只读 or 可写 with the count, and an open without a grant (or from an older kernel) prints none', () => {
+  const base = { session: 's-aaaaaa', name: 'session', url: 'http://localhost/', title: 't', mode: 'readonly' as const, runDir: '/r', snapshot: '', blocked: null, next: null, identity: null, profile: 'default', borrowed: false };
+  assert.ok(formatOpen({ ...base, grant: { mode: 'readonly', allow: 0 } }).split('\n').includes('不允许的域名：经人批准，只读'));
+  assert.ok(formatOpen({ ...base, grant: { mode: 'writable', allow: 3 } }).split('\n').includes('不允许的域名：经人批准，可写（放行 3 条）'));
+  assert.ok(!formatOpen({ ...base, grant: null }).includes('不允许的域名'));
+  assert.ok(!formatOpen(base).includes('不允许的域名'));
+});
+
+test('open --allow with bad JSON, a wrong shape, or a missing value is a usage error that does not echo the input', async () => {
+  for (const bad of [`[{"method":"POST","url":"http://localhost:5173/${secret}"`, secret, `{"method":"${secret}"}`, `[{"method":"POST","url":"http://localhost:5173/a","extra":"${secret}"}]`]) {
+    const t = io(); assert.equal(await main(['open', 'http://localhost:5173/', '--allow', bad], t), 2);
+    const all = t.outText() + t.errText();
+    assert.ok(!all.includes(secret) && t.errText().length > 0, bad);
+  }
+  assert.equal(await main(['open', 'http://localhost:5173/', '--allow'], io()), 2);   // 缺值
 });
