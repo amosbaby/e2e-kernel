@@ -10,6 +10,7 @@ import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, 
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
 import { createTargetParams, startBrowser } from './browser-process.ts';
+import { isSameOriginRequest } from './origin.ts';
 import type { BrowserProcess } from './browser-process.ts';
 import { parseRoleTarget, stableCandidates } from './stable.ts';
 import type { ElementInfo } from './stable.ts';
@@ -141,12 +142,11 @@ export async function guardedHints(collect: () => Promise<string[]>, timeoutMs: 
   }
 }
 
-// 请求的目标和发出它的 frame 同源。判断不出（Worker 的请求没有 frame、frame 地址不是 http(s)、解析失败、源是 null）按跨源算。
+// 请求的目标和发出它的 frame 同源，且请求自己的 Origin 头（有的话）也是目标的 origin（判定见 origin.ts：沙箱 iframe 的 Origin 是 null，按跨源算）。
+// 判断不出（Worker 的请求没有 frame、frame 地址不是 http(s)、解析失败、源是 null）按跨源算。
 function isSameOrigin(request: PwRequest): boolean {
   try {
-    const from = new URL(request.frame().url());
-    const to = new URL(request.url());
-    return from.origin !== 'null' && from.origin === to.origin;
+    return isSameOriginRequest(request.frame().url(), request.url(), request.headers()['origin']);
   } catch {
     return false;
   }

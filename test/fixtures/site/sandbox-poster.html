@@ -1,0 +1,8 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>sandbox poster</title>
+<p>posts to /api/cookie from a sandboxed (opaque-origin) frame</p>
+<script>
+// 在 sandbox="allow-scripts" 的 iframe 里加载：frame 地址和宿主同源，但文档的 origin 是 null。no-cors 的 POST：请求会发，响应读不到。
+fetch('/api/cookie', { method: 'POST', body: 'x', mode: 'no-cors', credentials: 'include' }).catch(() => {});
+</script>

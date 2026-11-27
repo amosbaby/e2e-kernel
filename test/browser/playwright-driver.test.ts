@@ -705,6 +705,31 @@ test('followRedirects: false on a cross-origin write is continued natively, so S
   assert.doesNotMatch(server.cookieSeen.at(-1) ?? '', /strict_c/, 'a SameSite=Strict cookie must not ride along on a cross-site request');
 });
 
+// 终审 I-5：沙箱 iframe（sandbox 不带 allow-same-origin）的 frame 地址和宿主同源，但文档的 origin 是 null：浏览器按跨源处理（SameSite cookie 不带）。
+// 驱动不能把它当同源走 route.fetch（Node 代发会带上全部 cookie）；请求的 Origin 头是 null，就照跨源 continue。
+test('followRedirects: false on a write from a sandboxed iframe (opaque origin) is continued natively: a SameSite=Strict cookie does not ride along', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/set-strict'); await settle();   // 127.0.0.1 上的 Strict cookie
+  await page.goto(server.origin + '/index.html'); await settle();
+  const first = server.cookieSeen.length;
+  decide = r => noRedirect(r, '/api/cookie');
+  await page.evaluate(`new Promise(resolve => { const f = document.createElement('iframe'); f.setAttribute('sandbox', 'allow-scripts'); f.onload = () => resolve(1); f.src = '/sandbox-poster.html'; document.body.appendChild(f); })`);
+  await settle();
+  assert.equal(server.cookieSeen.length, first + 1, 'the sandboxed write reached the server');
+  assert.doesNotMatch(server.cookieSeen.at(-1) ?? '', /strict_c/, 'an opaque-origin request is cross-site: the SameSite=Strict cookie must not ride along');
+  const posted = seen.find(r => r.method === 'POST' && r.url.endsWith('/api/cookie'))!;
+  assert.ok(posted, 'the write went through the request handler');
+});
+
+test('followRedirects: false on a same-origin write from the page itself still goes through route.fetch (the cookie rides along)', { timeout: 60_000 }, async () => {
+  await page.goto(server.origin + '/set-strict'); await settle();
+  await page.goto(server.origin + '/index.html'); await settle();
+  const first = server.cookieSeen.length;
+  decide = r => noRedirect(r, '/api/cookie');
+  await page.evaluate(`fetch('/api/cookie', { method: 'POST', body: 'x' }).then(r => r.status)`);
+  assert.equal(server.cookieSeen.length, first + 1);
+  assert.match(server.cookieSeen.at(-1) ?? '', /strict_c=1/, 'a same-origin request is sent by the kernel with the page\'s cookies');
+});
+
 test('followRedirects: false does not call a failed fetch a refused redirect just because the message mentions redirect', { timeout: 60_000 }, async () => {
   const done: Done[] = [];
   inst.onRequestDone(e => { done.push(e); });
