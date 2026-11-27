@@ -156,8 +156,11 @@ export interface RuleGroupSummary {
   name: string; hosts: string[]; loginHosts: string[];
   readPosts: number; persistedQueries: number; logout: number; identity: boolean; approved: boolean;
 }
+// hostModes：登录时在没列明的主机上选的模式（批准记录里的）；writes：记住的放行声明（批准记录里的，scope 是 `组/页面主机`）。
+export interface HostModeRow { host: string; mode: string }
+export interface WriteDeclRow { scope: string; method: string; url: string; operation: string | null }
 export interface RuleListResult extends Omit<RulesFile, 'groups' | 'rules'> {
-  path: string; rules: (Rule & { approved: boolean })[]; groups: RuleGroupSummary[];
+  path: string; rules: (Rule & { approved: boolean })[]; groups: RuleGroupSummary[]; hostModes: HostModeRow[]; writes: WriteDeclRow[];
   approved: boolean; pending: boolean; approvals: ApprovalsStatus;
 }
 
@@ -165,10 +168,16 @@ const APPROVED_TEXT = (ok: boolean): string => (ok ? '（已批准）' : '（未
 const PENDING_LINE = '有未批准的改动（rule diff 查看）';
 const UNREADABLE_LINE = '批准记录读不了：现有规则全部要重新批准';
 
+const MODE_TEXT: Record<string, string> = { readonly: '只读', default: '默认' };
+
 export function formatRuleList(r: RuleListResult): string {
   if (r.error !== null) return [`规则文件 ${inline(r.path)}`, inline(r.error)].join('\n');
   const notes = [...(r.pending ? [PENDING_LINE] : []), ...(r.approvals === 'unreadable' ? [UNREADABLE_LINE] : [])];
-  if (r.hash === null) return [r.pending ? '没有 rules.json，但批准记录里还有规则，生效的仍是已批准的那份' : '没有 rules.json，所有域名都是默认模式', ...notes].join('\n');
+  const remembered = [
+    ...r.hostModes.map((x) => `登录时选的模式  ${inline(x.host)}  ${inline(MODE_TEXT[x.mode] ?? x.mode)}`),
+    ...r.writes.map((x) => `放行声明  ${inline(x.scope)}  ${inline(x.method)} ${inline(x.url)}  ${x.operation === null ? '整个地址' : `operation ${inline(x.operation)}`}`),
+  ];
+  if (r.hash === null) return [r.pending ? '没有 rules.json，但批准记录里还有规则，生效的仍是已批准的那份' : '没有 rules.json，所有域名都是默认模式', ...remembered, ...notes].join('\n');
   return [
     `规则文件 ${inline(r.path)}`,
     ...(r.rules.length === 0 ? ['（没有规则）'] : r.rules.map((x) => `${inline(x.match)}  ${inline(x.mode)}  ${APPROVED_TEXT(x.approved)}`)),
@@ -176,6 +185,7 @@ export function formatRuleList(r: RuleListResult): string {
     ...r.groups.map((g) => `组 ${inline(g.name)}  hosts ${g.hosts.map(inline).join(', ')}  loginHosts ${g.loginHosts.length === 0 ? '（无）' : g.loginHosts.map(inline).join(', ')}`
       + `  readPosts ${g.readPosts}  persistedQueries ${g.persistedQueries}  logout ${g.logout}  identity ${g.identity ? '有' : '无'}  ${APPROVED_TEXT(g.approved)}`),
     `hash  ${inline(r.hash)}`,
+    ...remembered,
     ...notes,
   ].join('\n');
 }

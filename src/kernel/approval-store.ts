@@ -162,6 +162,11 @@ export class ApprovalStore {
     return Object.hasOwn(this.record.writes, key) ? structuredClone(this.record.writes[key]!) : [];
   }
 
+  // 某个主机（规范化后的）在登录时选的模式；没有为 null。键不一定是自己人写的：只认自己的属性（'constructor' 之类不算）。
+  hostModeFor(host: string): HostMode | null {
+    return Object.hasOwn(this.record.hostModes, host) ? this.record.hostModes[host]! : null;
+  }
+
   // f 拿到副本，返回新记录。先落盘、成功了才换内存里的：太大、形状不对、写不出去，内存和磁盘都不变。
   update(f: (r: ApprovalRecord) => ApprovalRecord): void {
     const next = f(structuredClone(this.record));

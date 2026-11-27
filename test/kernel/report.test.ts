@@ -445,6 +445,7 @@ test('the mode section lists time, host, mode and reason, and the rules in force
       { at: '2026-11-26T15:30:01.000Z', host: 'localhost', mode: 'default', reason: 'no-rule', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: null },
       { at: '2026-11-26T15:30:09.000Z', host: 'app.example.com', mode: 'readonly', reason: 'rule', rulesHash: 'sha256:0123456789abcdef', pendingRulesHash: null },
       { at: '2026-11-26T15:30:20.000Z', host: 'x.example.com', mode: 'readonly', reason: 'forced', rulesHash: null, pendingRulesHash: null },
+      { at: '2026-11-26T15:30:30.000Z', host: 'y.example.com', mode: 'readonly', reason: 'host-choice', rulesHash: null, pendingRulesHash: null },
     ],
     rules: { hash: 'sha256:0123456789abcdef', count: 2, pendingHash: null },
   }));
@@ -455,6 +456,7 @@ test('the mode section lists time, host, mode and reason, and the rules in force
     ['2026-11-26T15:30:01.000Z', 'localhost', 'default', '无规则命中'],
     ['2026-11-26T15:30:09.000Z', 'app.example.com', 'readonly', '规则命中'],
     ['2026-11-26T15:30:20.000Z', 'x.example.com', 'readonly', '--readonly 强制'],
+    ['2026-11-26T15:30:30.000Z', 'y.example.com', 'readonly', '登录时选的模式'],
   ]);
   assert.ok(sec.includes('规则 2 条') && sec.includes('sha256:0123456789abcdef'), sec);
   assert.ok(section(renderReport(buildResult(input({ modes: [] }))), 'modes').includes('没有已批准的规则'));

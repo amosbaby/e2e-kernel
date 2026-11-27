@@ -159,7 +159,7 @@ node bin/e2k.js close s-1a2b3c --verdict pass --because "the item was added" \
 20 是启发式提示，不是故障：会话还在运行，记录原样保留。
 
 1. 停下，不要尝试填密码，也不要用 `press` 一个键一个键地输入，更不要用 `eval` 给输入框赋值去绕开。
-2. 告诉人：需要在专用 profile 里登录，请在终端运行 `node bin/e2k.js login <起始 URL>`，登录后按回车。
+2. 告诉人：需要在专用 profile 里登录，请在终端运行 `node bin/e2k.js login <起始 URL>`，登录后按回车。没列进规则的主机，人第一次登录会弹框选「默认 / 只读」，`login` 等最多 120 秒；不要替人选。
 3. 人登录完，再 `open` 一个新会话继续（cookie 留在 profile 里）。
 4. 如果页面本来就该有密码框（比如改密码页），20 可以忽略，继续验证。
 

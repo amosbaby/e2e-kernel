@@ -11,7 +11,7 @@ import { call } from '../../src/shared/client.ts';
 import { startFixtureServer } from '../support/fixture-server.ts';
 import type { FixtureServer } from '../support/fixture-server.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { approving, fakeDialog } from '../support/fake-dialog.ts';
+import { approving, choosingMode, fakeDialog } from '../support/fake-dialog.ts';
 
 // 端到端验收：真浏览器（有头 Chromium）、真 fixture 服务、测试进程内的内核，CLI 走 bin/e2k.js 子进程。
 // 这份文件里的测试按书写顺序执行，共用模块级的 sid 和 ref。
@@ -77,14 +77,32 @@ after(async () => {
   }
 });
 
+// 没列明的主机上第一次登录要问模式（三键框）：用自己的内核和 home，不占共用内核的弹框额度（10 分钟 6 个，已被规则测试用满）。
+// 21 → 假对话框回「默认」→ 原样重试；这条路和线上一样，测试从不直接写批准记录。
+async function loginAfterChoice(h: typeof home, url: string): Promise<{ loginId: string }> {
+  const first = await call(h, 'login.begin', { url });
+  assert.ok(!first.ok && first.error.code === 'wait-approval', 'the first login on an unlisted host asks for a mode');
+  await settle();
+  const again = await call(h, 'login.begin', { url });
+  assert.ok(again.ok);
+  return (again as { result: { loginId: string } }).result;
+}
+
 test('a page opened by login leaves its cookie for later sessions', { timeout: 180_000 }, async () => {
-  const begin = await call(home, 'login.begin', { url: origin + '/login.html' });
-  assert.ok(begin.ok);
-  await call(home, 'login.end', (begin as { result: unknown }).result);
-  const open = JSON.parse((await e2k('open', origin + '/index.html', '--name', 'cookie', '--json')).out);
-  const asserted = await e2k('step', open.session, JSON.stringify([{ op: 'assert', kind: 'text', target: '#login-state', cmp: 'eq', expected: 'signed-in' }]));
-  assert.equal(asserted.code, 0);
-  assert.equal((await e2k('close', open.session)).code, 0);
+  const own = makeTmpHome();
+  const k = await startKernel({ home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('默认')) });
+  try {
+    const begin = await loginAfterChoice(own.home, origin + '/login.html');
+    assert.ok((await call(own.home, 'login.end', begin)).ok);
+    const open = JSON.parse((await e2kAt(own.home, undefined, 'open', origin + '/index.html', '--name', 'cookie', '--json')).out);
+    assert.equal(open.mode, 'default', 'the choice was "默认"');
+    const asserted = await e2kAt(own.home, JSON.stringify([{ op: 'assert', kind: 'text', target: '#login-state', cmp: 'eq', expected: 'signed-in' }]), 'step', open.session, '--stdin');
+    assert.equal(asserted.code, 0);
+    assert.equal((await e2kAt(own.home, undefined, 'close', open.session)).code, 0);
+  } finally {
+    await k.stop();
+    own.cleanup();
+  }
 });
 
 test('open, act by ref and by selector, assert, screenshot', { timeout: 180_000 }, async () => {
@@ -497,6 +515,28 @@ test('a click that is redirected into another group freezes the session: step ex
     assert.ok(result.writes.blocked.every((w: any) => w.reason === 'other-group' && w.decision === 'blocked'));
     assert.deepEqual(result.actions.map((a: any) => [a.op.op, a.outcome]), [['assert', 'match'], ['click', 'ok'], ['snapshot', 'not-run']]);
     assert.ok(!result.hosts.some((h: any) => h.host === 'localhost'), 'the landing host does not count as visited');
+  } finally {
+    await k.stop();
+    own.cleanup();
+  }
+});
+
+// 登录时选「只读」：这个登录窗口自己发出的写（发往 localhost 的 /api/login，和发回本主机的 /api/x）都被拦，之后开这个主机也是只读。
+test('login on an unlisted host answered read-only: the window\'s own writes are blocked and counted, and a later open of that host is read-only with the reason on record', { timeout: 180_000 }, async () => {
+  const own = makeTmpHome();
+  const k = await startKernel({ home: own.home, driver: createPlaywrightDriver(), dialog: fakeDialog(choosingMode('只读')) });
+  try {
+    const from = server.hits.length;
+    const begin = await loginAfterChoice(own.home, server.altOrigin + '/login-writes.html');
+    await settle(1500);
+    const end = await call(own.home, 'login.end', begin);
+    assert.ok(end.ok);
+    assert.equal((end as { result: { writesBlocked: number } }).result.writesBlocked, 2, 'both automatic POSTs were blocked');
+    assert.deepEqual(server.hits.slice(from).map((h) => h.path), [], 'neither write reached the server');
+    const open = JSON.parse((await e2kAt(own.home, undefined, 'open', server.altOrigin + '/index.html', '--json')).out);
+    assert.equal(open.mode, 'readonly');
+    const close = JSON.parse((await e2kAt(own.home, undefined, 'close', open.session, '--verdict', 'undetermined', '--because', 'e2e probe', '--json')).out);
+    assert.equal(JSON.parse(readFileSync(close.resultPath, 'utf8')).modes[0].reason, 'host-choice');
   } finally {
     await k.stop();
     own.cleanup();

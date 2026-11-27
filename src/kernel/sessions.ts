@@ -24,7 +24,7 @@ import { checkProfileKey, parseProfileArg, prepareProfileDir, profileKey, record
 import type { ProfileRef } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
-import { DEFAULT_GROUP_NAME } from './rules.ts';
+import { DEFAULT_GROUP_NAME, normalizeHost } from './rules.ts';
 import { blockFrozen, blockOtherGroup, otherGroupMessage } from './write-policy.ts';
 import type { PolicyCtx, PolicyVerdict, WritePolicy } from './write-policy.ts';
 
@@ -587,6 +587,57 @@ export class SessionManager {
     return this.track(() => this.beginLogin(p));
   }
 
+  // 登录前的弹框确认（设计 5.2「第一次登录问模式」）：主机没列明（已批准的规则、登录时选过、组、任何 loginHosts 都没有）就先问人：
+  // 取消 / 默认 / 只读，选择记进批准记录的 hostModes（不改 rules.json）。要在规则闸门之后、算 login.mode 之前，窗口也还没开。
+  // 答复（待批表的键 `login:` + 规范化主机）绑定框里显示的全部内容：框里只有这个主机和三个选项，所以键已经绑定了。
+  // 各主机的键彼此独立，没有「基线」会变，所以用掉之后只 forget 自己，不作废别的 login: 答复。被拒的保留到内核重启，同类 60 秒冷却。
+  // 规范化不了的主机（含取不到主机）不弹框，直接 usage：失败关闭。写盘失败时 needs-human 原样往上走，答复还留着，重试会再写一次。
+  private gateLoginHost(rawHost: string): void {
+    const { modes, approvals, store } = this.deps;
+    if (modes.isListed(rawHost)) {
+      // 已列明（比如规则后来批准了）：之前没用掉的答复不能留着，免得以后又没列明时直接生效。
+      try {
+        const stale = `login:${normalizeHost(rawHost)}`;
+        if (approvals.stateOf(stale) === 'approved') approvals.forget(stale);
+      } catch {
+        // 规范化不了的主机谈不上有旧答复
+      }
+      return;
+    }
+    let host: string;
+    try {
+      host = normalizeHost(rawHost);
+    } catch {
+      throw new E2kError('usage', '登录地址里取不到可用的主机名，不能问模式', '换成完整的 http(s) 地址');
+    }
+    // `__proto__` 作键写不进批准记录（读回来会被当成坏文件）。
+    if (host === '__proto__') throw new E2kError('usage', '这个主机名不能用', '换成别的地址');
+    const key = `login:${host}`;
+    const request: DialogRequest = {
+      title: 'e2k：在新域名上登录',
+      lines: [`要在 ${host} 上打开登录窗口。`, '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '取消：不打开'],
+      buttons: ['取消', '默认', '只读'], defaultButton: '取消', timeoutSec: APPROVAL_TIMEOUT_SEC,
+    };
+    const asked = approvals.ask(key, 'login', request, ['默认', '只读']);
+    switch (asked.status) {
+      case 'pending':
+        throw pendingError(asked.id, '在新域名上登录，选模式');
+      case 'denied':
+        if (asked.cooling) throw new E2kError('usage', '刚被人拒过，过一会儿再试', '等一分钟再试，或换一个已列进规则的域名');
+        throw new E2kError('usage', '人取消了这次登录', '内核重启前同一个域名不会再问；要登录请重启内核再试，或把它列进 rules.json');
+      case 'unavailable':
+        throw new E2kError('needs-human', `要在新域名上登录但弹不出确认框：${asked.why}`, '在有桌面的终端里起内核');
+      case 'approved': {
+        const mode = asked.button === '只读' ? 'readonly' : asked.button === '默认' ? 'default' : null;
+        if (mode === null) throw new E2kError('internal', '登录的答复对不上');   // 不放行
+        // 写盘失败时 update 抛 needs-human，原样往上走；答复还留着，重试会再写一次。
+        store.update((r) => { r.hostModes[host] = mode; return r; });
+        approvals.forget(key);
+        break;
+      }
+    }
+  }
+
   private async beginLogin(p: LoginBeginParams): Promise<{ loginId: string }> {
     // profile 参数的写法先查：要在 gateRules 之前。
     const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
@@ -602,6 +653,7 @@ export class SessionManager {
       // 取不到主机：host 留空
     }
     const { ref } = this.pickProfile(host, arg);
+    this.gateLoginHost(host);
     const profile = profileKey(ref);
     const slot = this.pin(profile);
     try {
@@ -1398,13 +1450,13 @@ export class SessionManager {
     return 'default';
   }
 
-  // 记一条模式变更（和上一条同模式的由 Recorder 去重）：reason 看这个主机有没有命中规则。
+  // 记一条模式变更（和上一条同模式的由 Recorder 去重）：reason 看这个主机有没有命中规则、或只是登录时选过模式。
   private recordMode(s: Session): void {
     const { modes } = this.deps;
     const { hash, pendingHash } = modes.state();
     s.recorder.noteMode({
       at: this.deps.now().toISOString(), host: s.topHost, mode: this.sessionMode(s, []),
-      reason: s.forced ? 'forced' : modes.ruleFor(s.topHost) === null ? 'no-rule' : 'rule', rulesHash: hash, pendingRulesHash: pendingHash,
+      reason: s.forced ? 'forced' : modes.hostChoice(s.topHost) !== null ? 'host-choice' : modes.ruleFor(s.topHost) === null ? 'no-rule' : 'rule', rulesHash: hash, pendingRulesHash: pendingHash,
     });
   }
 

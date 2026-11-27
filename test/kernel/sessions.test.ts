@@ -25,7 +25,7 @@ import { Approvals, noDialog } from '../../src/kernel/approval.ts';
 import type { Dialog, DialogRequest, DialogResult } from '../../src/kernel/approval.ts';
 import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { contentHash, createRulesResolver } from '../../src/kernel/rules.ts';
-import { approving, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { approving, choosingMode, denying, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 
 const CONTINUE: PolicyVerdict = { decision: { action: 'continue' }, reason: null, allowedBy: null };
 
@@ -713,6 +713,8 @@ function mutableRules(readonlyHosts: string[], loginHosts: string[] = []) {
   const resolver: ModeResolver = {
     resolve: (h) => (isRo(h) ? 'readonly' : 'default'),
     ruleFor: (h) => (isRo(h) ? 'readonly' : null),
+    hostChoice: () => null,
+    isListed: () => true,
     groupOf: defaultOnlyResolver.groupOf,
     group: defaultOnlyResolver.group,
     allLogout: () => [],
@@ -737,7 +739,7 @@ function inner(sm: SessionManager, id: string): { topHost: string; pendingHosts:
 
 test('a readonly rule in an unapproved rules.json is already in force: the timeline says rule and carries the pending hash, result.json.rules carries it too', async () => {
   const tmp = makeTmpHome();
-  const modes = createRulesResolver(tmp.home.rulesFile, ApprovalStore.open(tmp.home.approvalsFile, () => {}));
+  const modes = listedAll(createRulesResolver(tmp.home.rulesFile, ApprovalStore.open(tmp.home.approvalsFile, () => {})));
   const { sm, fake } = setup({ modes, policy, home: tmp.home });
   cleanups.push(async () => { tmp.cleanup(); });
   const a = await sm.open({ url: 'http://localhost:5173/' });   // 开的时候还没有规则文件
@@ -762,12 +764,17 @@ test('a readonly rule in an unapproved rules.json is already in force: the timel
 const GATE_RULES = { version: 1, rules: [{ match: 'example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] };
 const LOGIN_URL = 'http://localhost:5173/login.html';
 
+// 旧的登录测试不关心「没列明的主机登录前先问」：把 isListed 盖成 true（resolve 仍是真的）。测这条的用例要用真的 isListed。
+const listedAll = (m: ModeResolver): ModeResolver => ({ ...m, isListed: () => true });
+
 // 真的规则解析器和批准记录、假驱动、可编排的假对话框；规则文件由测试自己写。
-function setupGate(dialog: Dialog, rules: unknown = GATE_RULES, now?: () => number) {
+// realListing 为 true 时登录前的「问模式」闸门是真的（默认关，免得别的测试被多问一个框）。
+function setupGate(dialog: Dialog, rules: unknown = GATE_RULES, now?: () => number, realListing = false) {
   const tmp = makeTmpHome();
   if (rules !== null) writeFileSync(tmp.home.rulesFile, JSON.stringify(rules));
   const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
-  const modes = createRulesResolver(tmp.home.rulesFile, store);
+  const real = createRulesResolver(tmp.home.rulesFile, store);
+  const modes = realListing ? real : listedAll(real);
   const s = setup({ modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}, now === undefined ? {} : { now }) });
   cleanups.push(async () => { tmp.cleanup(); });
   return { ...s, modes, store, home: tmp.home };
@@ -1081,7 +1088,7 @@ test('an approvals record that cannot be read at start puts the existing rules.j
   writeRules(tmp.home, GATE_RULES);
   mkdirSync(tmp.home.approvalsFile);   // 读不了（不是普通文件），也写不进去（rename 不能盖掉目录）；不是在伪造批准
   const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
-  const modes = createRulesResolver(tmp.home.rulesFile, store);
+  const modes = listedAll(createRulesResolver(tmp.home.rulesFile, store));
   const dialog = fakeDialog(approving);
   const { sm } = setup({ modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}) });
   cleanups.push(async () => { tmp.cleanup(); });
@@ -2868,7 +2875,7 @@ async function setupIdent(pages: Record<string, FakePageSpec>, extra: Partial<Se
   const tmp = makeTmpHome();
   writeFileSync(tmp.home.rulesFile, JSON.stringify(rules));
   const store = ApprovalStore.open(tmp.home.approvalsFile, () => {});
-  const modes = createRulesResolver(tmp.home.rulesFile, store);
+  const modes = listedAll(createRulesResolver(tmp.home.rulesFile, store));
   const dialog = fakeDialog(approving);
   const s = setup({ modes, policy, home: tmp.home, store, approvals: new Approvals(dialog, () => {}), ...extra });
   cleanups.push(async () => { tmp.cleanup(); });
@@ -3114,4 +3121,217 @@ test('identity probe: a main page that closes while the probe is awaiting it is 
   await until(() => sm.list().length === 0);
   const out = readResult(r.runDir);   // 报告在探针落定之前就收尾了，所以这里只看没有记不符；不符的话上面的 step 会抛身份错误
   assert.deepEqual([out.identity?.mismatch, out.closedBy], [false, 'page-gone']);
+});
+
+// ---- 登录前的弹框确认和「问一句模式」（M2b 任务 11） ----
+
+const NEW_URL = 'http://app.example.com/login.html';
+const NEW_API = 'http://app.example.com/api/login';
+const isLoginBox = (r: DialogRequest): boolean => r.buttons.includes('只读');
+const loginBoxes = (d: { requests: DialogRequest[] }): DialogRequest[] => d.requests.filter(isLoginBox);
+const usageMatch = (re: RegExp) => (e: unknown): boolean => e instanceof E2kError && e.code === 'usage' && re.test(e.message);
+const openedPages = (fake: FakeDriver): number => methodCount(fake, 'openPage');
+
+// 登录前弹框：真的规则解析器、批准记录、真的写策略，假对话框按 script 答；没有规则文件。
+function setupChoice(script: (r: DialogRequest) => DialogResult | Promise<DialogResult>) {
+  const dialog = fakeDialog(script);
+  return { dialog, ...setupGate(dialog, null, undefined, true) };
+}
+
+test('login on a host nobody listed: 21, one three-button box that shows the host and the options, and no page is opened', async () => {
+  const { sm, fake, dialog, store } = setupChoice(() => new Promise<DialogResult>(() => {}));   // 人一直没点
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), (e: E2kError) => e.code === 'wait-approval' && /等人在弹框里批准：在新域名上登录/.test(e.message));
+  assert.equal(dialog.requests.length, 1, 'the retry meets the same box');
+  const req = dialog.requests[0]!;
+  assert.match(req.title, /^e2k：在新域名上登录（请求 a-[0-9a-f]{6}）$/);
+  assert.deepEqual(req.lines, ['要在 app.example.com 上打开登录窗口。', '这个域名还没配模式，请选：', '默认：写请求照常放行（仍记录）', '只读：写请求会被拦下', '取消：不打开']);
+  assert.deepEqual([req.buttons, req.defaultButton, req.timeoutSec], [['取消', '默认', '只读'], '取消', 120]);
+  assert.equal(openedPages(fake), 0);
+  assert.deepEqual(store.get().hostModes, {});
+});
+
+test('login answered "只读": the retry opens the window, the choice is stored, the login window\'s own POST is blocked, and later opens of that host are read-only', async () => {
+  const { sm, fake, dialog, store } = setupChoice(choosingMode('只读'));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();
+  const { loginId } = await sm.loginBegin({ url: NEW_URL });
+  const loginPage = fake.openPages().at(-1)!;
+  assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly' });
+  assert.equal((await fake.emitRequest({ pageId: loginPage, method: 'POST', url: NEW_API, topUrl: NEW_URL })).action, 'fulfill', 'the login window itself is read-only');
+  assert.equal((await fake.emitRequest({ pageId: loginPage, method: 'GET', url: NEW_URL, topUrl: NEW_URL })).action, 'continue');
+  assert.deepEqual(await sm.loginEnd({ loginId }), { writesBlocked: 1 });
+  const o = await sm.open({ url: 'http://app.example.com/' });
+  assert.equal(o.mode, 'readonly');
+  const page = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId: page, method: 'POST', url: NEW_API, topUrl: 'http://app.example.com/' })).action, 'fulfill');
+  assert.equal(readResult((await sm.close({ session: o.session })).runDir).modes[0]?.reason, 'host-choice');
+  assert.equal(loginBoxes(dialog).length, 1, 'asked once');
+});
+
+test('login answered "默认": the window opens, the choice is stored, writes pass as before, and the host is not asked about again', async () => {
+  const { sm, fake, dialog, store } = setupChoice(choosingMode('默认'));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();
+  const { loginId } = await sm.loginBegin({ url: NEW_URL });
+  assert.deepEqual(store.get().hostModes, { 'app.example.com': 'default' });
+  assert.equal((await fake.emitRequest({ pageId: fake.openPages().at(-1)!, method: 'POST', url: NEW_API, topUrl: NEW_URL })).action, 'continue');
+  await sm.loginEnd({ loginId });
+  const again = await sm.loginBegin({ url: NEW_URL });   // 已经问过：不再弹框
+  await sm.loginEnd({ loginId: again.loginId });
+  assert.equal(loginBoxes(dialog).length, 1);
+  const o = await sm.open({ url: 'http://app.example.com/' });
+  assert.equal(o.mode, 'default');
+  await sm.close({ session: o.session });
+});
+
+test('login cancelled: usage with nothing stored and no window; the same host stays refused without asking again; another host within a minute says it was refused just now', async () => {
+  const { sm, fake, dialog, store } = setupChoice(choosingMode('取消'));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();
+  for (let i = 0; i < 2; i++) await assert.rejects(sm.loginBegin({ url: NEW_URL }), usageMatch(/人取消了这次登录/));
+  await assert.rejects(sm.loginBegin({ url: 'http://other.example.org/login' }), usageMatch(/刚被人拒过/));
+  assert.equal(openedPages(fake), 0);
+  assert.deepEqual(store.get().hostModes, {});
+  assert.equal(dialog.requests.length, 1);
+});
+
+test('login on a host the approved rules list (rule, loginHosts, group host, group loginHosts) does not ask; a host listed by a changed rules file only after that file is approved', async () => {
+  const rules = { version: 1, rules: [{ match: 'app.example.com', mode: 'default' }], loginHosts: ['sso.example.com'],
+    groups: [{ name: 'g', hosts: ['g.example.com'], loginHosts: ['gsso.example.com'] }] };
+  const dialog = fakeDialog(choosingMode('只读'));
+  const { sm, home } = setupGate(dialog, rules, undefined, true);
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));   // 规则文件是新的：先批准规则
+  await settleDialog();
+  for (const url of [NEW_URL, 'http://sso.example.com/login', 'http://g.example.com/login', 'http://gsso.example.com/login']) {
+    const { loginId } = await sm.loginBegin({ url, ...(url.includes('gsso') ? { profile: 'g' } : {}) });
+    await sm.loginEnd({ loginId });
+  }
+  assert.equal(loginBoxes(dialog).length, 0, 'none of them asked');
+  writeRules(home, { ...rules, loginHosts: ['sso.example.com', 'new.example.com'] });   // 待批的改动里新列了一个主机：先要批准规则
+  await assert.rejects(sm.loginBegin({ url: 'http://new.example.com/login' }), isCode('wait-approval'));
+  await settleDialog();
+  await sm.loginEnd(await sm.loginBegin({ url: 'http://new.example.com/login' }));   // 规则批准后它就列明了：不再问模式
+  assert.equal(loginBoxes(dialog).length, 0);
+});
+
+test('a login on an unlisted host with no dialog available is needs-human (22): the window is never opened and nothing is stored', async () => {
+  const { sm, fake, store } = setupGate(noDialog, null, undefined, true);
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();
+  for (let i = 0; i < 2; i++) await assert.rejects(sm.loginBegin({ url: NEW_URL }), (e: E2kError) => e.code === 'needs-human' && /弹不出确认框：内核以 --no-dialogs 启动/.test(e.message) && e.next === '在有桌面的终端里起内核');
+  assert.equal(openedPages(fake), 0);
+  assert.deepEqual(store.get().hostModes, {});
+});
+
+test('the answer is bound to the host: answering for one host does not let another one in, and each box shows only its own host', async () => {
+  const asked: string[] = [];
+  const { sm, dialog, store } = setupChoice((r) => { asked.push(r.lines[0]!); return { kind: 'button', button: r.lines[0]!.includes('a.example.com') ? '只读' : '默认' }; });
+  await assert.rejects(sm.loginBegin({ url: 'http://a.example.com/login' }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm.loginBegin({ url: 'http://b.example.com/login' }), isCode('wait-approval'));   // a 的答复不算 b 的
+  await settleDialog();
+  await sm.loginEnd(await sm.loginBegin({ url: 'http://a.example.com/login' }));
+  await sm.loginEnd(await sm.loginBegin({ url: 'http://b.example.com/login' }));
+  assert.deepEqual(asked, ['要在 a.example.com 上打开登录窗口。', '要在 b.example.com 上打开登录窗口。']);
+  assert.deepEqual(store.get().hostModes, { 'a.example.com': 'readonly', 'b.example.com': 'default' });
+  assert.equal(dialog.requests.length, 2);
+});
+
+test('the box and the stored key use the normalized host (lower case, no port, no trailing dot, IPv6 in brackets)', async () => {
+  const { sm, dialog, store } = setupChoice(choosingMode('只读'));
+  for (const url of ['http://App.Example.COM.:8080/login.html', 'http://[::1]:5173/login.html']) {
+    await assert.rejects(sm.loginBegin({ url }), isCode('wait-approval'));
+    await settleDialog();
+    await sm.loginEnd(await sm.loginBegin({ url }));
+  }
+  assert.deepEqual(dialog.requests.map((r) => r.lines[0]), ['要在 app.example.com 上打开登录窗口。', '要在 [::1] 上打开登录窗口。']);
+  assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly', '[::1]': 'readonly' });
+  assert.equal((await sm.open({ url: 'http://app.example.com/' })).mode, 'readonly');
+  assert.equal((await sm.open({ url: 'http://[::1]:5173/' })).mode, 'readonly');
+});
+
+test('a host that cannot be normalized, is __proto__, or is too long for the box is a usage error: no box, no window', async () => {
+  const { sm, fake, dialog } = setupChoice(choosingMode('默认'));
+  for (const url of ['not a url', 'http://__proto__/login.html']) await assert.rejects(sm.loginBegin({ url }), usageMatch(/./), url);
+  await assert.rejects(sm.loginBegin({ url: `http://${'a'.repeat(210)}.example.com/login` }), usageMatch(/内容太长，框里显示不全/));
+  await settleDialog();
+  assert.equal(dialog.requests.length, 0);
+  assert.equal(openedPages(fake), 0);
+});
+
+test('a login that cannot be recorded (the approval file does not take it) is needs-human, the answer is kept, and the retry writes it without a second box', async () => {
+  const { sm, dialog, store } = setupChoice(choosingMode('只读'));
+  const update = store.update.bind(store);
+  store.update = () => { throw new E2kError('needs-human', '批准记录写不进磁盘'); };
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('needs-human'));
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('needs-human'));
+  assert.deepEqual(store.get().hostModes, {});
+  store.update = update;
+  await sm.loginEnd(await sm.loginBegin({ url: NEW_URL }));
+  assert.deepEqual(store.get().hostModes, { 'app.example.com': 'readonly' });
+  assert.equal(dialog.requests.length, 1);
+});
+
+test('changed rules come first: the rules box is answered before the login box, and both are needed', async () => {
+  const { sm, dialog } = (() => { const d = fakeDialog(choosingMode('默认')); return { dialog: d, ...setupGate(d, GATE_RULES, undefined, true) }; })();
+  await assert.rejects(sm.loginBegin({ url: LOGIN_URL }), isCode('wait-approval'));
+  await settleDialog();
+  assert.match(dialog.requests[0]!.title, /域名规则改了/);
+  await assert.rejects(sm.loginBegin({ url: LOGIN_URL }), isCode('wait-approval'));   // 规则批准了，轮到登录框
+  await settleDialog();
+  assert.match(dialog.requests[1]!.title, /在新域名上登录/);
+  await sm.loginEnd(await sm.loginBegin({ url: LOGIN_URL }));
+  assert.equal(dialog.requests.length, 2);
+});
+
+test('an answer that was never used is dropped once the host is listed, so a later unlisting asks again', async () => {
+  const dialog = fakeDialog(choosingMode('只读'));
+  const { sm, home, store } = setupGate(dialog, null, undefined, true);
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));
+  await settleDialog();   // 答复是「只读」，但没有重试
+  writeRules(home, { version: 1, rules: [{ match: 'app.example.com', mode: 'default' }] });
+  await assert.rejects(sm.loginBegin({ url: NEW_URL }), isCode('wait-approval'));   // 规则要批准
+  await settleDialog();
+  await sm.loginEnd(await sm.loginBegin({ url: NEW_URL }));   // 规则批准后主机已列明：不用旧答复，也不弹框
+  assert.deepEqual(store.get().hostModes, {}, 'the unused "只读" was not applied');
+  const approvals = (sm as unknown as { deps: { approvals: Approvals } }).deps.approvals;
+  assert.equal(approvals.stateOf('login:app.example.com'), undefined, 'the unused answer was dropped, so it cannot apply if the host is ever unlisted again');
+  assert.equal(loginBoxes(dialog).length, 1);
+});
+
+test('the stored host choice reaches all four request paths: session page, session popup, login window, unattributed request (the mode follows the page, as with rules)', async () => {
+  const { sm, fake } = setupChoice((r) => ({ kind: 'button', button: r.lines[0]!.includes('app.example.com') ? '只读' : '默认' }));
+  const login = async (url: string): Promise<{ loginId: string }> => {
+    await assert.rejects(sm.loginBegin({ url }), isCode('wait-approval'));
+    await settleDialog();
+    return sm.loginBegin({ url });
+  };
+  await sm.loginEnd(await login(NEW_URL));   // app.example.com 选了「只读」
+  const HOME = 'http://localhost:5173/';
+  const H = 'http://app.example.com/';
+  const post = (pageId: string | null, extra: object = {}) => fake.emitRequest({ pageId, method: 'POST', url: NEW_API, ...extra });
+  // 1) 会话页：页面在只读主机上，写被拦；对照：页面在没配过的默认主机上，写照常
+  const ro = await sm.open({ url: H }); const roPage = fake.openPages().at(-1)!;
+  assert.equal(ro.mode, 'readonly');
+  assert.equal((await post(roPage, { topUrl: H })).action, 'fulfill');
+  const s = await sm.open({ url: HOME }); const page = fake.openPages().at(-1)!;
+  assert.equal(s.mode, 'default');
+  assert.equal((await fake.emitRequest({ pageId: page, method: 'POST', url: 'http://localhost:5173/api', topUrl: HOME })).action, 'continue');
+  // 2) 会话弹窗：默认主机上的会话弹出的窗口，第一个导航（表单 POST）落在只读主机上：弹窗归会话，顶层在只读主机上，拦
+  const popup = fake.emitPopup(page, 'about:blank');
+  assert.equal((await post(popup.id, { topUrl: NEW_API, isNavigation: true, topFrame: true, initiatorUrl: HOME, contentType: 'application/x-www-form-urlencoded', body: 'x=1' })).action, 'fulfill');
+  // 3) 登录窗口：起点是默认主机（localhost 选了「默认」）；页面在只读主机上时，写被拦；在 localhost 上照常
+  const { loginId } = await login('http://localhost:5173/login.html'); const loginPage = fake.openPages().at(-1)!;
+  assert.equal((await fake.emitRequest({ pageId: loginPage, method: 'POST', url: 'http://localhost:5173/api/login', topUrl: 'http://localhost:5173/login.html' })).action, 'continue');
+  assert.equal((await post(loginPage, { topUrl: NEW_URL })).action, 'fulfill');
+  await sm.loginEnd({ loginId });
+  await sm.close({ session: s.session });
+  await sm.close({ session: ro.session });
+  // 4) 未归属的请求（没有会话也没有登录窗口）：请求所在页的顶层主机或目标主机只读就拦
+  assert.equal((await post(null, { topUrl: NEW_URL })).action, 'fulfill');
+  assert.equal((await post(null, {})).action, 'fulfill');
+  assert.equal((await fake.emitRequest({ pageId: null, method: 'POST', url: 'http://localhost:5173/api' })).action, 'continue');
 });

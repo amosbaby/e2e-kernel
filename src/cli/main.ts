@@ -33,6 +33,7 @@ export interface Io {
   startKernel?(o: KernelOptions): Promise<KernelHandle>;   // 缺省是真的 startKernel；测试用它看 start 传了什么
   onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP；每收到一次调用一次 cb
   exit(code: number): void;               // 真实实现是 process.exit：第二次停止信号时不再等收尾
+  clock?: { now(): number; sleep(ms: number): Promise<void> };   // login 等弹框时重试用的时钟；缺省是真的时间，测试用假的，不真等
 }
 
 type Options = Record<string, { type: 'string' | 'boolean' }>;
@@ -225,6 +226,8 @@ async function rule(ctx: Ctx, args: string[]): Promise<number> {
       readPosts: g.readPosts.length, persistedQueries: g.persistedQueries.length, logout: g.logout.length, identity: g.identity !== null,
       approved: approvedGroup(g),
     })),
+    hostModes: Object.entries(r.hostModes).map(([host, mode]) => ({ host: redactText(host), mode })),
+    writes: Object.entries(r.writes).flatMap(([scope, ds]) => ds.map((d) => ({ scope: redactText(scope), method: d.method, url: redactText(d.url), operation: d.operation === null ? null : redactText(d.operation) }))),
     hash: f.hash, error: redactError(f.error),
     approved: f.error === null && !r.pending && r.approvals !== 'unreadable', pending: r.pending, approvals: r.approvals,
   };
@@ -247,7 +250,7 @@ async function open(ctx: Ctx, args: string[]): Promise<number> {
   const params = validateParams('open', raw);
   const result = await send(ctx, resolveHome(ctx.io.env), 'open', params) as OpenResult;
   print(ctx, result, formatOpen);
-  // 身份不符优先：会话开着，但账号不对，要人处理（22）；登录墙上不探身份，两者不会同时出现。
+  // 身份不符优先：会话开着，但账号不对，要人处理（22）；有密码框的页面也会先计数、再探身份，所以 blocked:'login' 和 identity:'mismatch' 可能同时出现，这时 22 优先。
   if (result.identity === 'mismatch') return ExitCode.NEEDS_HUMAN;
   return result.blocked === 'login' ? ExitCode.WAIT_LOGIN : ExitCode.OK;
 }
@@ -294,6 +297,31 @@ async function close(ctx: Ctx, args: string[]): Promise<number> {
   return result.exit;
 }
 
+const LOGIN_WAIT_MS = 120_000;
+const LOGIN_RETRY_MS = 2000;
+
+// login.begin 收到 21（等人在弹框里批准或选模式）就每 2 秒原样重试，最多等 120 秒；其他错误原样往上抛。
+// 提示只打印一次。等到时间了返回 null。
+async function beginLogin(ctx: Ctx, home: Home, params: unknown): Promise<unknown> {
+  const clock = ctx.io.clock ?? { now: () => Date.now(), sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }) };
+  const deadline = clock.now() + LOGIN_WAIT_MS;
+  let told = false;
+  for (;;) {
+    try {
+      return await send(ctx, home, 'login.begin', params);
+    } catch (e) {
+      if (!(e instanceof E2kError) || e.code !== 'wait-approval') throw e;
+      if (!told) {
+        told = true;
+        const id = /请求 (a-[0-9a-f]{6})/.exec(e.message)?.[1];
+        ctx.io.out(id === undefined ? '请在弹出的对话框里选择' : `请在弹出的对话框里选择（请求 ${id}）`);
+      }
+      if (clock.now() >= deadline) return null;
+      await clock.sleep(LOGIN_RETRY_MS);
+    }
+  }
+}
+
 async function login(ctx: Ctx, args: string[]): Promise<number> {
   needsTerminal(ctx, 'login');
   const p = parse(ctx, args, { profile: { type: 'string' } });
@@ -301,7 +329,11 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   const profile = optString(p, 'profile');
   const params = validateParams('login.begin', profile === undefined ? { url } : { url, profile });
   const home = resolveHome(ctx.io.env);
-  const begun = await send(ctx, home, 'login.begin', params);
+  const begun = await beginLogin(ctx, home, params);
+  if (begun === null) {
+    ctx.io.out('对话框超时，请重新运行 login');
+    return ExitCode.WAIT_APPROVAL;
+  }
   let end: { loginId: string };
   try {
     end = validateParams('login.end', { loginId: isObject(begun) ? begun.loginId : undefined });

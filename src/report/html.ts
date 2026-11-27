@@ -26,7 +26,7 @@ const CLOSED_BY_TEXT: Record<ClosedBy, string> = {
 };
 
 const MODE_REASON_TEXT: Record<ModeChange['reason'], string> = {
-  'rule': '规则命中', 'forced': '--readonly 强制', 'no-rule': '无规则命中',
+  'rule': '规则命中', 'forced': '--readonly 强制', 'no-rule': '无规则命中', 'host-choice': '登录时选的模式',
 };
 const BLOCK_REASON_TEXT: Record<BlockedSummaryRow['reason'], string> = {
   'method': '非读方法', 'graphql-mutation': 'GraphQL mutation', 'persisted-query': '持久化查询',

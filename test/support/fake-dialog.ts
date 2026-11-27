@@ -25,3 +25,11 @@ export function holdingDialog(): { dialog: FakeDialog; release: () => void } {
   const dialog = fakeDialog((r) => new Promise((resolve) => { release = () => { resolve(approving(r)); }; }));
   return { dialog, release: () => { release(); } };
 }
+
+// 登录前「问模式」的三键框（取消 / 默认 / 只读）：见到就按 button；别的框照 approving。只在测试里用。
+export const choosingMode = (button: '取消' | '默认' | '只读') => (r: DialogRequest): DialogResult =>
+  r.buttons.includes('只读') ? { kind: 'button', button } : approving(r);
+
+// 只答登录前「问模式」的框，别的框照 fakeDialog() 缺省回 unavailable：给共用内核的老测试用（不改变它们对别的框的行为）。
+export const choosingModeOnly = (button: '取消' | '默认' | '只读') => (r: DialogRequest): DialogResult =>
+  r.buttons.includes('只读') ? { kind: 'button', button } : { kind: 'unavailable', why: '测试里没有编排这个对话框' };

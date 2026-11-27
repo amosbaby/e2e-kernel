@@ -1,7 +1,7 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { main } from '../../src/cli/main.ts';
@@ -20,7 +20,8 @@ import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { approving, denying, fakeDialog } from '../support/fake-dialog.ts';
+import { approving, choosingMode, choosingModeOnly, denying, fakeDialog } from '../support/fake-dialog.ts';
+import { ApprovalStore } from '../../src/kernel/approval-store.ts';
 import { approveRulesFile } from '../support/approve-rules.ts';
 
 // 一个不能出现在任何输出里的值：运行时拼出来，不写成字面量。
@@ -67,7 +68,7 @@ const fake = new FakeDriver({ pages: pages() });
 let k: KernelHandle;
 
 before(async () => {
-  k = await startKernel({ home: kernelTmp.home, driver: fake, dialog: fakeDialog() });
+  k = await startKernel({ home: kernelTmp.home, driver: fake, dialog: fakeDialog(choosingModeOnly('默认')) });   // 登录前问模式的框回「默认」；别的框弹不出
 });
 
 after(async () => {
@@ -75,17 +76,22 @@ after(async () => {
   for (const t of [kernelTmp, empty, freshTmp]) t.cleanup();
 });
 
-interface TestIo extends Io { outText(): string; errText(): string; fireStopSignal(): void; exits: number[] }
+interface TestIo extends Io { outText(): string; errText(): string; fireStopSignal(): void; exits: number[]; clockLog: { slept: number[]; elapsed(): number } }
 
 // 收集输出的测试替身。stdinText 不给时，读标准输入得到空串。
 function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: () => Promise<Driver>; startKernel?: Io['startKernel'];
-  readAll?: (maxBytes: number) => Promise<string> } = {}): TestIo {
+  readAll?: (maxBytes: number) => Promise<string>; onSleep?: (n: number) => void } = {}): TestIo {
   const out: string[] = [];
   const err: string[] = [];
   const stops: (() => void)[] = [];
   const exits: number[] = [];
   const text = o.stdinText ?? '';
+  // 假时钟：sleep 只让出一小会儿（好让内核后台的弹框落定），并把假时间拨前 ms；测试从不真等 2 秒。
+  let fakeNow = 0;
+  const slept: number[] = [];
   return {
+    clock: { now: () => fakeNow, sleep: async (ms) => { slept.push(ms); o.onSleep?.(slept.length); await sleep(10); fakeNow += ms; } },
+    clockLog: { slept, elapsed: () => fakeNow },
     out: (s) => { out.push(s); },
     err: (s) => { err.push(s); },
     env: o.env ?? env,
@@ -440,7 +446,8 @@ async function loginWithBlockedWrites(posts: number): Promise<string> {
   writeFileSync(h.home.rulesFile, JSON.stringify({ version: 1, rules: [{ match: 'app.example.com', mode: 'readonly' }], loginHosts: ['sso.example.com'] }));
   const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog(approving) });
   try {
-    assert.equal(await main(['login', 'http://app.example.com/login'], io({ env: h.env, isTTY: true })), 21);   // 规则文件是新的：先要人批准，再原样重试
+    // 规则文件是新的：先要人批准（login 收到 21 自己重试），再因为 app.example.com 已在规则里，不再问模式
+    assert.equal(await main(['login', 'http://app.example.com/login'], io({ env: h.env, isTTY: true })), 0);
     const t = io({ env: h.env, isTTY: true });
     t.stdin.readLine = async () => {
       const pageId = f.openPages().at(-1)!;
@@ -591,7 +598,7 @@ test('rule list without a rules file: says every host is default, exit 0, and cr
     assert.equal(t.outText(), '没有 rules.json，所有域名都是默认模式');
     assert.ok(!existsSync(h.home.root));
     const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
-    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], groups: [], hash: null, error: null, approved: true, pending: false, approvals: 'absent' });
+    assert.deepEqual(JSON.parse(j.outText()), { path: h.home.rulesFile, rules: [], loginHosts: [], groups: [], hostModes: [], writes: [], hash: null, error: null, approved: true, pending: false, approvals: 'absent' });
   });
 });
 
@@ -989,7 +996,7 @@ async function withGroupKernel(fn: (h: ReturnType<typeof makeTmpHome>, f: FakeDr
   const f = new FakeDriver({ pages: pages() });
   writeFileSync(h.home.rulesFile, PROFILE_RULES);
   approveRulesFile(h.home);
-  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog() });
+  const kernel = await startKernel({ home: h.home, driver: f, dialog: fakeDialog(choosingModeOnly('默认')) });   // localhost 上第一次登录问模式：回「默认」
   try { await fn(h, f); } finally { await kernel.stop(); h.cleanup(); }
 }
 
@@ -1125,5 +1132,99 @@ test('step --allow: unreadable or non-write declarations are usage errors that s
       assert.equal(dialog.requests.length, 1);
       assert.equal((await call(h.home, 'close', { session: sid })).ok, true);
     } finally { await kk.stop(); }
+  });
+});
+
+// ---- 登录前的弹框确认和「问一句模式」（M2b 任务 11） ----
+
+const PROMPT_RE = /^请在弹出的对话框里选择（请求 a-[0-9a-f]{6}）$/gm;
+const NEW_LOGIN = 'http://app.example.com/login.html';
+
+// 一个自己的内核和 home（没有规则文件）：对话框的答复由 answer 决定；fn 跑完停内核。
+async function withChoiceKernel(dialog: ReturnType<typeof fakeDialog> | typeof noDialog, fn: (h: ReturnType<typeof makeTmpHome>, f: FakeDriver, store: () => ApprovalStore) => Promise<void>): Promise<void> {
+  const h = makeTmpHome();
+  const f = new FakeDriver({ pages: pages() });
+  const kk = await startKernel({ home: h.home, driver: f, dialog });
+  try { await fn(h, f, () => ApprovalStore.open(h.home.approvalsFile, () => {})); } finally { await kk.stop(); h.cleanup(); }
+}
+
+test('login on an unlisted host: two 21s then the person answers: the prompt is printed once, the window opens after the third try, Enter ends it', async () => {
+  let release = (): void => {};
+  const dialog = fakeDialog(() => new Promise((resolve) => { release = () => { resolve({ kind: 'button', button: '默认' }); }; }));
+  await withChoiceKernel(dialog, async (h, f) => {
+    const t = io({ env: h.env, isTTY: true, stdinText: '\n', onSleep: (n) => { if (n === 2) release(); } });
+    assert.equal(await main(['login', NEW_LOGIN], t), 0);
+    assert.deepEqual(t.clockLog.slept, [2000, 2000], 'two waits of two seconds, then it went through');
+    assert.equal((t.outText().match(PROMPT_RE) ?? []).length, 1, t.outText());
+    assert.match(t.outText(), /按回车/); assert.match(t.outText(), /登录页已关闭/);
+    assert.equal(dialog.requests.length, 1);
+    assert.equal(f.openPages().length, 0, 'the login page was closed again');
+  });
+});
+
+test('login on an unlisted host and nobody answers: it retries every 2 seconds for 120 seconds (fake clock), says so, and exits 21 without a window', async () => {
+  const dialog = fakeDialog(() => new Promise(() => {}));
+  await withChoiceKernel(dialog, async (h, f) => {
+    const t = io({ env: h.env, isTTY: true });
+    assert.equal(await main(['login', NEW_LOGIN], t), 21);
+    assert.equal(t.clockLog.slept.length, 60); assert.ok(t.clockLog.slept.every((ms) => ms === 2000));
+    assert.equal(t.clockLog.elapsed(), 120_000);
+    assert.equal((t.outText().match(PROMPT_RE) ?? []).length, 1);
+    assert.match(t.outText(), /^对话框超时，请重新运行 login$/m);
+    assert.ok(!t.outText().includes('按回车'));
+    assert.equal(dialog.requests.length, 1);
+    assert.equal(f.calls.filter((c) => c.method === 'openPage').length, 0);
+  });
+});
+
+test('login on an unlisted host: cancel is exit 2 and a kernel without dialogs is exit 22, both on the first retry; neither opens a window', async () => {
+  for (const [dialog, want, text] of [[fakeDialog(choosingMode('取消')), 2, /人取消了这次登录/], [noDialog, 22, /弹不出确认框/]] as const) {
+    await withChoiceKernel(dialog, async (h, f) => {
+      const t = io({ env: h.env, isTTY: true });
+      assert.equal(await main(['login', NEW_LOGIN], t), want);
+      assert.deepEqual(t.clockLog.slept, [2000]);
+      assert.match(t.errText(), text);
+      assert.equal((t.outText().match(PROMPT_RE) ?? []).length, 1);
+      assert.equal(f.calls.filter((c) => c.method === 'openPage').length, 0);
+    });
+  }
+});
+
+test('login picks the host mode once: the first login asks, the second one does not, and rule list shows the choice', async () => {
+  const dialog = fakeDialog(choosingMode('只读'));
+  await withChoiceKernel(dialog, async (h) => {
+    assert.equal(await main(['login', NEW_LOGIN], io({ env: h.env, isTTY: true, stdinText: '\n' })), 0);
+    const again = io({ env: h.env, isTTY: true, stdinText: '\n' });
+    assert.equal(await main(['login', NEW_LOGIN], again), 0);
+    assert.deepEqual(again.clockLog.slept, [], 'no 21 the second time');
+    assert.equal(dialog.requests.length, 1);
+    const list = io({ env: h.env }); assert.equal(await main(['rule', 'list'], list), 0);
+    assert.match(list.outText(), /^登录时选的模式 {2}app\.example\.com {2}只读$/m);
+  });
+});
+
+test('rule list shows the host choices and the remembered write declarations (text and --json), redacted, from the files only; nothing is written', async () => {
+  const label = 'Ab1'.repeat(14);
+  await withRules(null, async (h) => {
+    ApprovalStore.open(h.home.approvalsFile, () => {}).update((r) => {
+      r.hostModes['app.example.com'] = 'readonly'; r.hostModes[`${label}.example.org`] = 'default';
+      r.writes['default/app.example.com'] = [{ method: 'POST', url: 'https://app.example.com/api/save', operation: null }, { method: 'POST', url: 'https://app.example.com/graphql', operation: 'SaveItem' }];
+      return r;
+    });
+    const before = readFileSync(h.home.approvalsFile, 'utf8');
+    const t = io({ env: h.env }); assert.equal(await main(['rule', 'list'], t), 0);
+    assert.match(t.outText(), /^没有 rules\.json，所有域名都是默认模式$/m);
+    assert.match(t.outText(), /^登录时选的模式 {2}app\.example\.com {2}只读$/m);
+    assert.match(t.outText(), /^登录时选的模式 {2}\[REDACTED\]\.example\.org {2}默认$/m);
+    assert.match(t.outText(), /^放行声明 {2}default\/app\.example\.com {2}POST https:\/\/app\.example\.com\/api\/save {2}整个地址$/m);
+    assert.match(t.outText(), /^放行声明 {2}default\/app\.example\.com {2}POST https:\/\/app\.example\.com\/graphql {2}operation SaveItem$/m);
+    assert.ok(!t.outText().includes(label));
+    const j = io({ env: h.env }); assert.equal(await main(['rule', 'list', '--json'], j), 0);
+    const r = JSON.parse(j.outText()) as { hostModes: unknown; writes: unknown };
+    assert.deepEqual(r.hostModes, [{ host: 'app.example.com', mode: 'readonly' }, { host: '[REDACTED].example.org', mode: 'default' }]);
+    assert.deepEqual(r.writes, [{ scope: 'default/app.example.com', method: 'POST', url: 'https://app.example.com/api/save', operation: null },
+      { scope: 'default/app.example.com', method: 'POST', url: 'https://app.example.com/graphql', operation: 'SaveItem' }]);
+    assert.ok(!j.outText().includes(label));
+    assert.equal(readFileSync(h.home.approvalsFile, 'utf8'), before, 'rule list wrote nothing');
   });
 });

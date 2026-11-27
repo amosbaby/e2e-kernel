@@ -4,7 +4,7 @@ import { E2kError } from '../shared/errors.ts';
 import { oneOf, plainObject, str } from '../shared/validate.ts';
 import type { Mode } from '../shared/protocol.ts';
 import { readApprovals } from './approval-store.ts';
-import type { ApprovalRecord, ApprovalStore, ApprovalsStatus } from './approval-store.ts';
+import type { ApprovalRecord, ApprovalStore, ApprovalsStatus, Declaration } from './approval-store.ts';
 import type { ModeResolver, PendingRules, RuleMode, RulesState } from './mode.ts';
 
 // $E2K_HOME/rules.json：哪些主机默认只读、哪些是登录主机（设计 5.2）。格式见 README。
@@ -595,6 +595,8 @@ export interface RulesInspection {
   fileDeleted: boolean;            // 待批的改动是「文件被删了」
   hash: string | null;             // 待批文件的短哈希（显示用）；删文件为 null
   summary: string[];               // 完整差异；没有待批为空
+  hostModes: Record<string, 'default' | 'readonly'>;   // 批准记录里登录时选的模式（读不了为空）
+  writes: Record<string, Declaration[]>;               // 批准记录里记住的放行声明（读不了为空）
 }
 
 export function inspectRules(rulesFile: string, approvalsFile: string, io: RulesIo = defaultIo): RulesInspection {
@@ -603,7 +605,7 @@ export function inspectRules(rulesFile: string, approvalsFile: string, io: Rules
   const snap = snapshotOf(record.rules);
   const c = compareWithApproved(loaded, snap);
   const approvals: ApprovalsStatus = snap.valid ? status : 'unreadable';
-  const base = { file: toRulesFile(loaded), approvals, approvedRules: snap.rules, approvedCount: snap.rules.rules.length };
+  const base = { file: toRulesFile(loaded), approvals, approvedRules: snap.rules, approvedCount: snap.rules.rules.length, hostModes: record.hostModes, writes: record.writes };
   if (c.kind !== 'changed') return { ...base, pending: false, fileDeleted: false, hash: null, summary: [] };
   return { ...base, pending: true, fileDeleted: c.text === null, hash: c.shortHash, summary: c.summary };
 }
@@ -634,11 +636,36 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
     return a === 'readonly' || p === 'readonly' ? 'readonly' : a;
   };
 
+  // 登录时选的模式：精确的规范化主机；只在没有任何规则覆盖（含待批里的只读）时才轮到它。主机不合格时抛出。
+  const modeOf = (host: string): RuleMode | null => effective(host) ?? store.hostModeFor(normalizeHost(host));
+
   const ruleFor = (host: string): RuleMode | null => {
     try {
-      return effective(host);
+      return modeOf(host);
     } catch {
       return null;
+    }
+  };
+
+  const hostChoice = (host: string): RuleMode | null => {
+    try {
+      return effective(host) === null ? store.hostModeFor(normalizeHost(host)) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  // 列明：已批准的规则、登录时选过、组的 hosts、任何组的 loginHosts、顶层 loginHosts；待批的不算，出错为 false。
+  const isListed = (host: string): boolean => {
+    try {
+      const h = normalizeHost(host);
+      const { rules, groups, loginHosts } = snap.rules;
+      return matchRule(rules, h) !== null
+        || store.hostModeFor(h) !== null
+        || groups.some((g) => hostListed(g.hosts, h) || hostListed(g.loginHosts, h))
+        || hostListed(loginHosts, h);
+    } catch {
+      return false;
     }
   };
 
@@ -649,12 +676,14 @@ export function createRulesResolver(file: string, store: ApprovalStore, io: Rule
   return {
     resolve(host): Mode {
       try {
-        return effective(host) === 'readonly' ? 'readonly' : 'default';
+        return modeOf(host) === 'readonly' ? 'readonly' : 'default';
       } catch {
         return 'readonly';   // 失败关闭
       }
     },
     ruleFor,
+    hostChoice,
+    isListed,
     groupOf: (host) => groupOf(snap.rules, host),
     group: (name) => (name === DEFAULT_GROUP_NAME ? defaultGroup(snap.rules) : snap.rules.groups.find((g) => g.name === name) ?? null),
     allLogout: () => snap.rules.groups.flatMap((g) => g.logout),

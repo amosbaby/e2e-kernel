@@ -779,3 +779,88 @@ test('resolver: group() and groupOf() hand out frozen objects of the approved sn
   assert.deepEqual([m.group('admin')?.hosts, m.isLoginHost('evil.example.org', 'admin'), m.isLoginHost('evil.example.org', 'default'), m.groupOf('evil.example.com').name],
     [['admin.example.com', 'api.example.com'], false, false, 'default']);
 });
+
+// ---- 登录前问一句模式：isListed、hostModes 和规则的先后（M2b 任务 11） ----
+
+const LISTED_FILE = { version: 1, rules: [{ match: 'ruled.example.com', mode: 'default' }, { match: '*.wild.example.com', mode: 'readonly' }], loginHosts: ['top-sso.example.com'],
+  groups: [{ name: 'g', hosts: ['grouped.example.com'], loginHosts: ['group-sso.example.com'] }] };
+
+function chooseNow(store: ApprovalStore, host: string, mode: 'default' | 'readonly'): void {
+  store.update((r) => { r.hostModes[host] = mode; return r; });
+}
+
+test('isListed: an approved rule, a stored host choice, a group host, a group loginHost and a top-level loginHost all count; anything else, a pending-only rule and a bad host do not', () => {
+  const { f, io } = fakeIo(JSON.stringify(LISTED_FILE));
+  const store = newStore();
+  const m = resolverOf(io, store);
+  for (const h of ['ruled.example.com', 'x.wild.example.com', 'top-sso.example.com', 'grouped.example.com', 'group-sso.example.com', 'chosen.example.com']) assert.equal(m.isListed(h), false, `${h} before approval`);
+  approveNow(m);
+  chooseNow(store, 'chosen.example.com', 'readonly');
+  for (const h of ['ruled.example.com', 'RULED.example.com.', 'x.wild.example.com', 'top-sso.example.com', 'grouped.example.com', 'group-sso.example.com', 'chosen.example.com', 'chosen.example.com:8443']) assert.equal(m.isListed(h), true, h);
+  for (const h of ['other.example.com', 'wild.example.com', 'evilruled.example.com', 'ruled.example.com.evil.org', '', 'a b', 'a/b', '[::1]']) assert.equal(m.isListed(h), false, JSON.stringify(h));
+  f.text = JSON.stringify({ ...LISTED_FILE, rules: [...LISTED_FILE.rules, { match: 'pending.example.com', mode: 'readonly' }] });
+  m.refresh();
+  assert.equal(m.isListed('pending.example.com'), false, 'a rule that is only pending does not list the host');
+});
+
+test('resolver: the stored host choice applies to an unlisted host only, and an approved rule always wins over it (both directions)', () => {
+  const { io } = fakeIo(JSON.stringify({ version: 1, rules: [{ match: 'ro.example.com', mode: 'readonly' }, { match: 'rw.example.com', mode: 'default' }] }));
+  const store = newStore();
+  const m = resolverOf(io, store);
+  approveNow(m);
+  chooseNow(store, 'ro.example.com', 'default');
+  chooseNow(store, 'rw.example.com', 'readonly');
+  chooseNow(store, 'free.example.com', 'readonly');
+  assert.equal(m.resolve('ro.example.com'), 'readonly', 'a "default" choice does not relax an approved read-only rule');
+  assert.equal(m.resolve('rw.example.com'), 'default', 'a "readonly" choice does not override an approved default rule');
+  assert.equal(m.ruleFor('rw.example.com'), 'default');
+  assert.equal(m.hostChoice('rw.example.com'), null);
+  assert.equal(m.resolve('free.example.com'), 'readonly');
+  assert.equal(m.resolve('FREE.example.com.'), 'readonly');
+  assert.equal(m.ruleFor('free.example.com'), 'readonly');
+  assert.equal(m.hostChoice('free.example.com'), 'readonly');
+  assert.equal(m.resolve('www.free.example.com'), 'default', 'exact host only: a choice for free.example.com is not a wildcard');
+  assert.equal(m.resolve('other.example.org'), 'default');
+  assert.equal(m.hostChoice('other.example.org'), null);
+});
+
+test('resolver: with a rules change pending, the stricter wins over the stored choice too, and a pending relaxation does not lift a stored read-only choice', () => {
+  const { f, io } = fakeIo(null);
+  const store = newStore();
+  const m = resolverOf(io, store);
+  chooseNow(store, 'chosen-ro.example.com', 'readonly');
+  chooseNow(store, 'chosen-rw.example.com', 'default');
+  f.text = JSON.stringify({ version: 1, rules: [{ match: 'chosen-rw.example.com', mode: 'readonly' }, { match: 'chosen-ro.example.com', mode: 'default' }] });
+  m.refresh();
+  assert.equal(m.resolve('chosen-rw.example.com'), 'readonly', 'a pending tightening is in force at once');
+  assert.equal(m.resolve('chosen-ro.example.com'), 'readonly', 'a pending relaxation waits for approval; the stored choice stays');
+  assert.equal(m.hostChoice('chosen-ro.example.com'), 'readonly');
+  approveNow(m);
+  assert.equal(m.resolve('chosen-ro.example.com'), 'default', 'once approved the rule is in charge');
+  assert.equal(m.hostChoice('chosen-ro.example.com'), null);
+});
+
+test('resolver: a host that cannot be normalized is read-only, unlisted and has no choice (fail closed: the login asks)', () => {
+  const { io } = fakeIo(null);
+  const m = resolverOf(io);
+  for (const bad of ['', 'a b', 'a/b', 'a@b']) {
+    assert.equal(m.resolve(bad), 'readonly', JSON.stringify(bad));
+    assert.equal(m.isListed(bad), false);
+    assert.equal(m.hostChoice(bad), null);
+    assert.equal(m.ruleFor(bad), null);
+  }
+});
+
+test('resolver: a stored choice is read live from the store, and a key such as __proto__ or constructor is not an inherited property', () => {
+  const { io } = fakeIo(null);
+  const store = newStore();
+  const m = resolverOf(io, store);
+  assert.equal(m.resolve('later.example.com'), 'default');
+  chooseNow(store, 'later.example.com', 'readonly');
+  assert.equal(m.resolve('later.example.com'), 'readonly');
+  for (const h of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    assert.equal(m.isListed(h), false, h);
+    assert.equal(m.hostChoice(h), null, h);
+    assert.equal(m.resolve(h), 'default', h);
+  }
+});

@@ -19,7 +19,7 @@ import { FakeDriver } from '../support/fake-driver.ts';
 import type { FakePageSpec } from '../support/fake-driver.ts';
 import { hangingDriver } from '../support/hanging-driver.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
-import { approving, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
+import { approving, choosingModeOnly, fakeDialog, holdingDialog } from '../support/fake-dialog.ts';
 
 // 长得像 token 的串在运行时拼出来，不写成字面量。
 const jwt = ['eyJ' + 'hbGciOiJIUzI1NiJ9', 'eyJ' + 'zdWIiOiIxMjM0NSJ9', 'c2lnbmF0dXJl' + 'LXZhbHVlLWZvci10ZXN0'].join('.');
@@ -62,7 +62,7 @@ async function started(o: KernelOptions): Promise<KernelHandle> {
 
 beforeEach(async () => {
   home = tmpHome();
-  k = await startKernel({ home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog() });
+  k = await startKernel({ home, driver: new FakeDriver({ pages: pages() }), dialog: fakeDialog(choosingModeOnly('默认')) });   // 登录前问模式的框回「默认」；别的框弹不出
 });
 
 afterEach(async () => {
@@ -171,6 +171,9 @@ test('status reports pid, driver and sessions, and no key in it is a sensitive k
   assert.equal(s.driver.name, 'fake'); assert.equal(s.driver.capabilities.selectorDialect, 'playwright');
   assert.deepEqual(s.sessions.map((x) => x.name), ['orders']);
   assert.deepEqual(s.profiles, [{ name: 'default', state: 'never-launched', lastLogin: null }]);
+  const first = await call(home, 'login.begin', { url: 'http://localhost:5173/' });
+  assert.ok(!first.ok && first.error.code === 'wait-approval', 'localhost is not listed: the first login asks which mode');
+  await sleep(5);   // 假对话框在后台回「默认」
   const lb = await call(home, 'login.begin', { url: 'http://localhost:5173/' });
   assert.ok(lb.ok); assert.ok((await call(home, 'login.end', { loginId: (lb.result as { loginId: string }).loginId })).ok);
   const after = await call(home, 'status', {});

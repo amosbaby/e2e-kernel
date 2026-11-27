@@ -28,9 +28,15 @@ export interface PendingRules { hash: string | null; baseHash: string | null; te
 export interface ModeResolver {
   // 入口先规范化主机；规范化失败按 'readonly'（失败关闭）。用缓存，不碰文件。
   // 只认批准快照；规则文件有待批的改动时，取「已批准」和「待批文件」里更严的那份（待批是删文件则只看已批准的）。
+  // 规则没命中（含待批里的只读）才看登录时选的模式（hostModes，精确主机）：它只管没列明的主机，压不过任何已批准的规则；都没有为 'default'。
   resolve(host: string): Mode;
-  // 命中的规则模式，没命中（或主机不合格）为 null。给 ModeChange.reason 用。
+  // 命中的规则模式（没有规则命中时，是登录时选的模式），都没有（或主机不合格）为 null。
   ruleFor(host: string): RuleMode | null;
+  // 没有任何规则覆盖、只因为登录时选过才有的模式（精确主机）；给 ModeChange.reason（'host-choice'）用。没有为 null。
+  hostChoice(host: string): RuleMode | null;
+  // 这个主机「列明」了吗：命中已批准的规则、在登录时选过模式的主机里、属于某个组、或在任何组（含顶层）的 loginHosts 里。
+  // 待批的规则不算；出错（主机不合格）为 false：登录前会多问一句，失败关闭的方向是「多问」。
+  isListed(host: string): boolean;
   // 主机所在的域名组；没编组、或主机不合格，是合成的 'default' 组。
   groupOf(host: string): Group;
   // 按名字取组；'default' 总有，没有这个名字为 null。
@@ -52,10 +58,12 @@ export interface ModeResolver {
 
 const emptyDefaultGroup = (): Group => ({ name: 'default', hosts: [], loginHosts: [], readPosts: [], persistedQueries: [], logout: [], identity: null });
 
-// 测试用：永远「默认」、没有登录主机、没有组。
+// 测试用：永远「默认」、没有登录主机、没有组；所有主机都算列明（登录前不弹框）。
 export const defaultOnlyResolver: ModeResolver = Object.freeze({
   resolve: (): Mode => 'default',
   ruleFor: (): RuleMode | null => null,
+  hostChoice: (): RuleMode | null => null,
+  isListed: (): boolean => true,   // 旧登录测试不用被问；要测「没列明」的测试显式覆盖成 false
   groupOf: emptyDefaultGroup,
   group: (name: string): Group | null => (name === 'default' ? emptyDefaultGroup() : null),
   allLogout: (): readonly Endpoint[] => [],
