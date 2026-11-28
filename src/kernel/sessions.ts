@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstatSync, rmdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { DriverError } from '../driver/types.ts';
-import type { Decision, Driver, Instance, Page, RequestInfo } from '../driver/types.ts';
+import type { Decision, Driver, Instance, LaunchOptions, Page, RequestInfo } from '../driver/types.ts';
 import { buildResult, resolveSuperseded } from '../report/result.ts';
 import type { ClosedBy, DeclarationRecord, DenyGrantRecord, RunResult } from '../report/result.ts';
 import { pruneRuns, runDirName, writeRun } from '../report/store.ts';
@@ -1060,7 +1060,7 @@ export class SessionManager {
     try {
       const slot = this.pin(profile);
       try {
-        return await this.loginOn(await this.acquireInstance(profile, slot), p, { profile, group: ref.group });
+        return await this.loginOn(await this.acquireInstance(profile, slot, { keepOnboarding: true }), p, { profile, group: ref.group });
       } finally {
         this.unpin(slot);
       }
@@ -1235,11 +1235,11 @@ export class SessionManager {
   }
 
   // 冷启动串行化：同一个 key 正在启动（或正在检查健康）时再来的调用等同一个结果，不 launch 第二次。
-  private acquireInstance(key: string, slot: InstanceSlot): Promise<Instance> {
+  private acquireInstance(key: string, slot: InstanceSlot, opts?: LaunchOptions): Promise<Instance> {
     if (slot.acquiring !== undefined) return slot.acquiring;
     const after = slot.after;
     slot.after = undefined;
-    slot.acquiring = this.ensureInstance(key, slot, after).finally(() => {
+    slot.acquiring = this.ensureInstance(key, slot, after, opts).finally(() => {
       slot.acquiring = undefined;
       this.dropIfEmpty(key, slot);
     });
@@ -1251,7 +1251,7 @@ export class SessionManager {
     if (!this.isRunning(slot) && this.slots.get(key) === slot) this.slots.delete(key);
   }
 
-  private async ensureInstance(key: string, slot: InstanceSlot, after: Promise<void> | undefined): Promise<Instance> {
+  private async ensureInstance(key: string, slot: InstanceSlot, after: Promise<void> | undefined, opts?: LaunchOptions): Promise<Instance> {
     if (after !== undefined) await after;   // 被回收的实例（可能就是这个 key 自己的）停完才启动
     const current = slot.instance;
     if (current !== undefined) {
@@ -1265,7 +1265,7 @@ export class SessionManager {
     const wasUsed = provider !== undefined && profileInfo(this.deps.home, key).state === 'launched';
     const profileDir = prepareProfileDir(this.deps.home, key);
     if (provider !== undefined) checkBrowserBinding(this.deps.home, key, provider, wasUsed);
-    const inst = await this.deps.driver.launch({ name: key, userDataDir: profileDir });
+    const inst = await this.deps.driver.launch({ name: key, userDataDir: profileDir }, opts);
     if (provider !== undefined) {
       try {
         recordBrowserBinding(this.deps.home, key, provider);

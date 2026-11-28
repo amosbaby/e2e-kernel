@@ -120,6 +120,17 @@ test('the login window is opened in front (foreground), every session page in th
   await sm.loginEnd({ loginId }).catch(() => {});
 });
 
+test('a login cold-starts the browser with keepOnboarding (a human can finish the first-run page once); open does not', async () => {
+  const { sm, fake } = setup();
+  const { loginId } = await sm.loginBegin({ url: 'http://localhost:5173/' });
+  await sm.loginEnd({ loginId }).catch(() => {});
+  assert.deepEqual(fake.launchOpts, [{ keepOnboarding: true }]);
+  const { sm: sm2, fake: fake2 } = setup();
+  const s = await sm2.open({ url: 'http://localhost:5173/', name: 'ob' });
+  assert.deepEqual(fake2.launchOpts, [undefined]);
+  await sm2.close({ session: s.session });
+});
+
 test('open --touch fails cleanly when the driver cannot emulate touch: no session, no page, no run dir', async () => {
   const { sm, fake, home } = setup({ failOpenWith: new DriverError('other', 'touch emulation is not available') });
   await assert.rejects(sm.open({ url: 'http://localhost:5173/', name: 'nt', touch: true }), (e: E2kError) => e.code === 'action-failed');

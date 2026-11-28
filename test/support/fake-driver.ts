@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DriverError } from '../../src/driver/types.ts';
-import type { BrowserInfo, Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
+import type { BrowserInfo, Capabilities, Check, Decision, Described, Driver, Instance, LaunchOptions, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../src/driver/types.ts';
 import { isRef } from '../../src/shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/ops.ts';
@@ -326,6 +326,7 @@ export class FakeDriver implements Driver {
   readonly noRedirectIds: string[] = [];   // handler 回了 continue 且带 followRedirects: false 的请求 id
   // 每次 launch 收到的 profile，按启动顺序；下标就是 closeInstance 的参数。
   readonly launched: { name: string; userDataDir: string }[] = [];
+  readonly launchOpts: (LaunchOptions | undefined)[] = [];   // 与 launched 同下标
 
   private readonly pageSpecs: Record<string, FakePageSpec>;
   private readonly checks: Check[];
@@ -374,9 +375,10 @@ export class FakeDriver implements Driver {
     return this.launched.length;
   }
 
-  async launch(profile: { name: string; userDataDir: string }): Promise<Instance> {
+  async launch(profile: { name: string; userDataDir: string }, opts?: LaunchOptions): Promise<Instance> {
     await sleep(this.launchDelayMs);
     this.launched.push({ ...profile });
+    this.launchOpts.push(opts);
     const inst = new FakeInstance((i, o) => this.openPageIn(i, o));
     this.instances.push(inst);
     return inst;

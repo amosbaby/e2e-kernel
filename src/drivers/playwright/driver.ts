@@ -5,6 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
 import type { APIResponse, Browser, BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
+import type { LaunchOptions } from '../../driver/types.ts';
 import type { BrowserInfo, BrowserSelector, Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
@@ -1289,7 +1290,7 @@ class PlaywrightDriver implements Driver {
     return [base, { name: 'browser-provider', ok: true, detail: notes.join('；') }];
   }
 
-  async launch(profile: { name: string; userDataDir: string }): Promise<Instance> {
+  async launch(profile: { name: string; userDataDir: string }, opts: LaunchOptions = {}): Promise<Instance> {
     // 空串会被 Playwright 当成「用临时目录」，相对路径看当前目录：都不是调用方想要的。
     if (profile.userDataDir === '' || !isAbsolute(profile.userDataDir)) throw new DriverError('other', 'userDataDir must be an absolute path');
     // 浏览器由我们自己 spawn，管道通信（browser-process.ts）；信号归内核自己：关停时由内核停实例，不让 Playwright 或终端的信号直接打到浏览器。
@@ -1326,7 +1327,7 @@ class PlaywrightDriver implements Driver {
     instance.flushOnPageClose = this.provider.flushOnPageClose;
     try {
       await instance.attach();
-      if (this.provider.closeOnboarding) await instance.closeOnboarding();
+      if (this.provider.closeOnboarding && opts.keepOnboarding !== true) await instance.closeOnboarding();   // 登录时留着，让人走完一次（见 LaunchOptions）
       if (this.provider.id !== DEFAULT_PROVIDER) {
         const failures = await instance.conformanceCheck();
         if (failures.length > 0) {

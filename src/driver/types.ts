@@ -92,6 +92,8 @@ export interface PageLocation { url: string; title: string; frames: { url: strin
 
 // 人在 `e2k start` / `e2k doctor` 时选浏览器：preset 是预置名，path 是自定义的可执行文件绝对路径；两个都没给就是缺省。
 export interface BrowserSelector { preset?: string; path?: string }
+// 启动选项。keepOnboarding：不自动关浏览器自己的首次引导页（人工登录时用，让人走完一次，之后这个 profile 不再出现）。
+export interface LaunchOptions { keepOnboarding?: boolean }
 
 // 驱动实际用的浏览器，写进 status、doctor 和报告。version 在第一次启动成功后才有。
 export interface BrowserInfo {
@@ -107,7 +109,7 @@ export interface Driver {
   readonly capabilities: Capabilities;
   readonly browser?: BrowserInfo;   // 可选：假驱动没有
   selfCheck(): Promise<Check[]>;
-  launch(profile: { name: string; userDataDir: string }): Promise<Instance>;        // 实例：启动
+  launch(profile: { name: string; userDataDir: string }, opts?: LaunchOptions): Promise<Instance>;        // 实例：启动
 }
 
 export interface Instance {
