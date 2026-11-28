@@ -1043,3 +1043,20 @@ test('declarations carry the seq they were given and it is copied into result.js
   const out = writeRun(join(tmp, 'r-seq'), r);
   assert.equal(JSON.parse(readFileSync(out.resultPath, 'utf8')).declarations[0].seq, 4);
 });
+
+test('the environment names the browser, names a custom one and flags one that opens an extra window; no browser, no line', () => {
+  const env = (browser?: NonNullable<RunInput['driver']['browser']>): string =>
+    section(renderReport(buildResult(input({ driver: { ...driverWith(), ...(browser === undefined ? {} : { browser }) } }))), 'env');
+  assert.ok(!env().includes('浏览器：'));
+  const ego = env({ provider: 'ego-lite', label: 'ego lite', version: 'Chrome/156.0.0.0', honorsNoStartupWindow: false });
+  assert.ok(ego.includes('浏览器：ego lite（Chrome/156.0.0.0）') && ego.includes('启动时有额外窗口') && !ego.includes('自定义浏览器'));
+  const custom = env({ provider: 'custom', label: '自定义浏览器', honorsNoStartupWindow: true });
+  assert.ok(custom.includes('浏览器：自定义浏览器') && !custom.includes('自定义浏览器；') && !custom.includes('额外窗口'));
+  assert.ok(env({ provider: 'playwright-chromium', label: 'Playwright Chromium', honorsNoStartupWindow: true }).includes('浏览器：Playwright Chromium'));
+});
+
+test('result.json carries the browser, and a result without it (old kernel) is unchanged', () => {
+  const withB = buildResult(input({ driver: { ...driverWith(), browser: { provider: 'ego-lite', label: 'ego lite', honorsNoStartupWindow: false } } }));
+  assert.equal(withB.driver.browser?.provider, 'ego-lite');
+  assert.equal('browser' in buildResult(input()).driver, false);
+});

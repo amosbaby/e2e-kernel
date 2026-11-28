@@ -5,11 +5,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium } from 'playwright';
 import type { APIResponse, Browser, BrowserContext, CDPSession, Frame, Locator, Page as PwPage, Request as PwRequest, Route } from 'playwright';
 import { ACTION_TIMEOUT_MS, DriverError, NAVIGATION_TIMEOUT_MS } from '../../driver/types.ts';
-import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
+import type { BrowserInfo, BrowserSelector, Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../driver/types.ts';
 import { isRef } from '../../shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../shared/ops.ts';
 import { createTargetParams, startBrowser } from './browser-process.ts';
+import { DEFAULT_PROVIDER, resolveProvider } from './providers.ts';
+import type { Provider } from './providers.ts';
 import { isSameOriginRequest } from './origin.ts';
 import type { BrowserProcess } from './browser-process.ts';
 import { parseRoleTarget, stableCandidates } from './stable.ts';
@@ -36,6 +38,9 @@ const LAUNCH_TIMEOUT_MS = 30_000;       // 连上浏览器的上限
 const OPEN_PAGE_TIMEOUT_MS = 15_000;    // 等新开的页出现的上限
 const PAGE_READY_TIMEOUT_MS = 5000;     // 认领到的页，页内 evaluate 要多久内通
 const OPEN_PAGE_POLL_MS = 50;           // 页出现了但地址还没提交时，隔多久再看
+const ONBOARDING_APPEAR_MS = 2000;      // 等浏览器自己的引导页出现的上限（见 closeOnboarding）
+const ONBOARDING_SETTLE_MS = 1500;      // 关掉引导页之后再等多久才开页（实测 0 秒会让第一个新页起不来）
+const PAGE_CLOSE_FLUSH_MS = 500;        // 关掉还开着的页之后等多久再关浏览器（见 stop）
 const BROWSER_CLOSE_TIMEOUT_MS = 5000;  // 优雅关闭（Browser.close）的上限；超了由 terminate 兜底
 // 页面的默认视口：launchPersistentContext 原来默认就是 1280x720；连接已有浏览器的默认 context 不带视口，这里补上，开页时设。
 const DEFAULT_VIEWPORT: Viewport = { width: 1280, height: 720 };
@@ -185,6 +190,8 @@ export interface DriverOptions {
   actionTimeoutMs?: number;
   // 浏览器可执行文件的路径；不给就用 Playwright 自带的 Chromium。内核从不传它，测试用来造「启动不了」的情形。
   executablePath?: string;
+  // 人选的浏览器（见 providers.ts）；不给就是 Playwright 自带的 Chromium。executablePath 给了就以它为准（只换路径，不换 provider）。
+  browser?: BrowserSelector;
 }
 
 // 密码类输入框的选择器：不要求可见，宁可多判成「有」，少记一条请求体。
@@ -746,6 +753,7 @@ class PlaywrightInstance implements Instance, Host {
   private readonly deferred = new Set<PwPage>();
   private readonly arrivals = new Set<() => void>();   // 在等「有新页出现」的 openPage
 
+  flushOnPageClose = false;   // provider 的设置：stop 之前先关掉还开着的页（见 stop）
   readonly actionTimeoutMs: number;
 
   constructor(browser: Browser, context: BrowserContext, proc: BrowserProcess, counters: Counters, reportListenerError: (e: unknown) => void, actionTimeoutMs: number) {
@@ -785,6 +793,76 @@ class PlaywrightInstance implements Instance, Host {
     await this.context.route('**/*', (route) => this.handleRoute(route));
   }
 
+  // 浏览器自报的产品和版本（CDP Browser.getVersion），读不到返回 undefined。
+  async browserVersion(): Promise<string | undefined> {
+    try {
+      const v = await this.browserSession?.send('Browser.getVersion') as { product?: unknown } | undefined;
+      return typeof v?.product === 'string' && v.product.length <= 100 ? v.product : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // 关掉浏览器自己的首次引导页（chrome://onboarding/，browser_ui 目标，不是普通页面，驱动本来看不到它）。
+  // 引导页每次启动都会再出现（实测：关掉不完成，下次启动还在），而且出现得比连上浏览器晚一点：先等它出现，关掉，等它真的消失，
+  // 再多等一会儿——实测关掉之后马上 Target.createTarget 开页，新页里的脚本跑不起来（4 次 4 次失败），隔 1.5 秒就都正常。
+  // 引导页没出现（比如这个 profile 的引导已经完成）就最多多等 ONBOARDING_APPEAR_MS，不拖慢启动太久。
+  async closeOnboarding(): Promise<void> {
+    const session = this.browserSession;
+    if (session === undefined) return;
+    type T = { targetId: string; type: string; url: string };
+    const onboarding = async (): Promise<T[]> =>
+      ((await session.send('Target.getTargets')) as { targetInfos: T[] }).targetInfos
+        .filter((t) => t.type === 'browser_ui' && t.url.startsWith('chrome://onboarding/'));
+    const deadline = Date.now() + ONBOARDING_APPEAR_MS;
+    let closed = false;
+    while (Date.now() < deadline) {
+      const found = await onboarding();
+      if (found.length === 0) {
+        if (closed) break;
+      } else {
+        for (const t of found) await session.send('Target.closeTarget', { targetId: t.targetId }).catch(() => {});
+        closed = true;
+      }
+      await sleep(100);
+    }
+    if (closed) await sleep(ONBOARDING_SETTLE_MS);
+  }
+
+  // 拦截一致性自检（只对非缺省 provider 做）：换了浏览器内核，写策略的前提（路由对子资源生效、Service Worker 注册被禁、
+  // SharedWorker 被删）不能靠假设。用一个不存在的 https 主机，全部由路由自己应答，不发任何网络请求。返回不符的项，空数组是全过。
+  async conformanceCheck(): Promise<string[]> {
+    const origin = 'https://e2k-selftest.invalid';
+    const previous = this.handler;
+    this.setRequestHandler((r) => r.url === `${origin}/`
+      ? { action: 'fulfill', status: 200, contentType: 'text/html', body: '<!doctype html><title>selftest</title>' }
+      : r.url.startsWith(`${origin}/`)
+        ? { action: 'fulfill', status: 200, contentType: r.url.endsWith('.js') ? 'text/javascript' : 'application/json', body: r.url.endsWith('.js') ? '' : '{"selftest":"fulfilled"}' }
+        : { action: 'abort' });
+    const failures: string[] = [];
+    let page: Page | undefined;
+    try {
+      page = await this.openPage({});
+      await page.goto(`${origin}/`);
+      const got = await page.evaluate(`(async () => {
+        const r = {};
+        try { r.fetch = await (await fetch('/x')).text(); } catch (e) { r.fetch = 'error'; }
+        try { await navigator.serviceWorker.register('/sw.js'); r.sw = (await navigator.serviceWorker.getRegistrations()).length; } catch (e) { r.sw = 0; }
+        r.shared = typeof SharedWorker;
+        return r;
+      })()`) as { fetch?: unknown; sw?: unknown; shared?: unknown };
+      if (got.fetch !== '{"selftest":"fulfilled"}') failures.push('请求拦截对子资源不生效');
+      if (got.sw !== 0) failures.push('Service Worker 注册没有被禁');
+      if (got.shared !== 'undefined') failures.push('SharedWorker 没有被删');
+    } catch (e) {
+      failures.push(`自检页打不开或脚本跑不了（${(e instanceof Error ? e.message : String(e)).replace(/\s+/g, ' ').slice(0, 160)}）`);
+    } finally {
+      this.handler = previous;
+      await page?.close().catch(() => {});
+    }
+    return failures;
+  }
+
   async health(): Promise<Check> {
     return { name: 'browser', ok: !this.closed, detail: this.closed ? 'browser is closed' : 'browser is running' };
   }
@@ -793,6 +871,12 @@ class PlaywrightInstance implements Instance, Host {
     if (this.stopping === undefined) {
       this.stopping = (async () => {
         try {
+          // 有的浏览器（ego lite）不理 Browser.close、管道一断就退出，最近 30 秒内写的 cookie 没落盘就丢了；实测只有「关掉写过 cookie 的那个页」
+          // 才会落盘（关别的页、等几秒、读 cookie 都没用），关掉之后再等 0.3 秒就够。所以先把还开着的页关掉，再等一会儿。
+          if (this.flushOnPageClose && this.open.size > 0) {
+            await Promise.all([...this.open].map((p) => p.close().catch(() => {})));
+            await sleep(PAGE_CLOSE_FLUSH_MS);
+          }
           // 先请浏览器自己退（会把 cookie 等落盘），再断管道；超时或失败都不要紧，terminate 会兜底。
           await this.browserSession?.send('Browser.close', undefined, { timeout: BROWSER_CLOSE_TIMEOUT_MS }).catch(() => {});
           await this.browser.close();
@@ -1172,26 +1256,37 @@ class PlaywrightInstance implements Instance, Host {
 class PlaywrightDriver implements Driver {
   readonly name = 'playwright';
   readonly capabilities: Capabilities = { ...CAPABILITIES };
+  readonly browser: BrowserInfo;
   private readonly counters: Counters = { page: 0, request: 0 };
   private readonly reportListenerError: (e: unknown) => void;
   private readonly actionTimeoutMs: number;
-  private readonly executablePath: string | undefined;
+  private readonly executablePath: string;
+  private readonly provider: Provider;
 
   constructor(opts: DriverOptions) {
-    this.executablePath = opts.executablePath;
+    // 选的浏览器不合格（路径检查、找不到预置）在这里抛 usage，内核还没启动。
+    this.provider = resolveProvider(opts.browser);
+    this.executablePath = opts.executablePath ?? this.provider.executable;
+    this.browser = {
+      provider: this.provider.id, label: this.provider.label, honorsNoStartupWindow: this.provider.honorsNoStartupWindow,
+      ...(this.provider.bundleId === undefined ? {} : { bundleId: this.provider.bundleId }),
+    };
     this.reportListenerError = opts.onListenerError ?? rethrowAsync;
     this.actionTimeoutMs = opts.actionTimeoutMs ?? ACTION_TIMEOUT_MS;
   }
 
   async selfCheck(): Promise<Check[]> {
-    let path = '';
-    try {
-      path = chromium.executablePath();
-    } catch { /* 取不到路径就当没装 */ }
-    const ok = path !== '' && existsSync(path);
-    return [ok
-      ? { name: 'chromium-installed', ok: true, detail: 'Playwright chromium is installed' }
-      : { name: 'chromium-installed', ok: false, detail: 'Playwright chromium is not installed', fix: 'npx playwright install chromium' }];
+    const ok = this.executablePath !== '' && existsSync(this.executablePath);
+    const base: Check = ok
+      ? { name: 'chromium-installed', ok: true, detail: `${this.provider.label} is installed` }
+      : this.provider.id === DEFAULT_PROVIDER
+        ? { name: 'chromium-installed', ok: false, detail: 'Playwright chromium is not installed', fix: 'npx playwright install chromium' }
+        : { name: 'chromium-installed', ok: false, detail: `${this.provider.label} is not available` };
+    if (this.provider.id === DEFAULT_PROVIDER) return [base];
+    const notes = [`浏览器：${this.provider.label}（${this.provider.id}）`];
+    if (!this.provider.honorsNoStartupWindow) notes.push('启动时会多出一个窗口（自动关掉它的首次引导页）');
+    if (this.provider.bundleId === undefined) notes.push('读不到 bundle id：启动抢走的前台不会还回去');
+    return [base, { name: 'browser-provider', ok: true, detail: notes.join('；') }];
   }
 
   async launch(profile: { name: string; userDataDir: string }): Promise<Instance> {
@@ -1200,7 +1295,7 @@ class PlaywrightDriver implements Driver {
     // 浏览器由我们自己 spawn，管道通信（browser-process.ts）；信号归内核自己：关停时由内核停实例，不让 Playwright 或终端的信号直接打到浏览器。
     let proc: BrowserProcess;
     try {
-      proc = startBrowser(this.executablePath ?? chromium.executablePath(), profile.userDataDir);
+      proc = startBrowser(this.executablePath, profile.userDataDir);
     } catch (e) {
       throw mapError(e);
     }
@@ -1228,8 +1323,20 @@ class PlaywrightDriver implements Driver {
     context.setDefaultTimeout(this.actionTimeoutMs);
     context.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
     const instance = new PlaywrightInstance(browser, context, proc, this.counters, this.reportListenerError, this.actionTimeoutMs);
+    instance.flushOnPageClose = this.provider.flushOnPageClose;
     try {
       await instance.attach();
+      if (this.provider.closeOnboarding) await instance.closeOnboarding();
+      if (this.provider.id !== DEFAULT_PROVIDER) {
+        const failures = await instance.conformanceCheck();
+        if (failures.length > 0) {
+          throw new DriverError('other', `${this.provider.label} did not pass the interception self-check: ${failures.join('; ')}`);
+        }
+      }
+      if (this.browser.version === undefined) {
+        const product = await instance.browserVersion();
+        if (product !== undefined) this.browser.version = product;
+      }
     } catch (e) {
       await proc.terminate();
       throw mapError(e);

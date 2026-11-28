@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn } from 'node:child_process';
+import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { DriverError } from '../../driver/types.ts';
@@ -244,3 +244,20 @@ export function startBrowser(executable: string, userDataDir: string, deps: Brow
     },
   };
 }
+
+// ---- macOS 应用的 bundle id ----
+// 放在这里是因为 child_process 只允许出现在这个文件和 approval.ts（test/unit/driver-boundary.test.ts）。
+const BUNDLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$/;
+// 从可执行文件往上找 .app 的 Info.plist，读 CFBundleIdentifier；只在 macOS 上，读不到返回 undefined。
+export function macBundleId(executable: string): string | undefined {
+  const m = /^(.*?\.app)\/Contents\/MacOS\//.exec(executable);
+  if (m === null) return undefined;
+  try {
+    const out = execFileSync('plutil', ['-extract', 'CFBundleIdentifier', 'raw', '-o', '-', `${m[1]!}/Contents/Info.plist`],
+      { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return BUNDLE_ID_RE.test(out) ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+

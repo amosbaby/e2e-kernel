@@ -20,7 +20,7 @@
 
 ## 快速上手
 
-需要 macOS 图形登录会话（浏览器总是有头的）和 Node >= 24.12。
+需要 macOS 图形登录会话（浏览器总是有头的）和 Node >= 24.12。浏览器缺省是 Playwright 自带的 Chromium；人启动内核时可以用 `--browser ego-lite` 或 `--browser-path <路径>` 换成另一个 Chromium 内核浏览器（见 [docs/reference.md](docs/reference.md)）。
 
 ```sh
 npm install                     # 会经 prepare 脚本顺带构建 dist/

@@ -176,3 +176,71 @@ export function recordLogin(home: Home, name: string, at: Date, host: string): v
     closeSync(fd);
   }
 }
+
+// ---- profile 和浏览器 provider 的绑定 ----
+// 同一个 profile 目录被不同的浏览器（不同内核版本、不同的 Cookie 加密）轮流打开，登录态可能失效，降级时还可能损坏数据，
+// 所以第一次启动时记下是哪个 provider，之后换了就拒绝（不自动迁移、不自动删）。记录文件和 login.json 一样放在 profile 目录旁边。
+// 没有记录但目录已经用过（早于这个功能）：当作缺省的 playwright-chromium。
+const PROVIDER_RE = /^[a-z0-9-]{1,32}$/;
+const DEFAULT_PROVIDER_ID = 'playwright-chromium';
+
+function browserFile(home: Home, name: string): string {
+  return join(home.profilesDir, `${name}.browser.json`);
+}
+
+// null：没有记录；'unreadable'：有但读不了或形状不对（失败关闭，调用方当作不一致）。
+function readBinding(file: string): string | null | 'unreadable' {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? null : 'unreadable';
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_RECORD_BYTES) return 'unreadable';
+    const buf = Buffer.alloc(st.size);
+    let got = 0;
+    while (got < buf.length) {
+      const n = readSync(fd, buf, got, buf.length - got, got);
+      if (n === 0) break;
+      got += n;
+    }
+    const v: unknown = JSON.parse(buf.subarray(0, got).toString('utf8'));
+    if (typeof v !== 'object' || v === null || Array.isArray(v) || Object.keys(v).sort().join(',') !== 'provider,schema') return 'unreadable';
+    const r = v as Record<string, unknown>;
+    return r.schema === 1 && typeof r.provider === 'string' && PROVIDER_RE.test(r.provider) ? r.provider : 'unreadable';
+  } catch {
+    return 'unreadable';
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// 启动前调用。wasUsed：这个 profile 目录在 prepareProfileDir 之前就已经用过。不一致一律 needs-human。
+export function checkBrowserBinding(home: Home, name: string, provider: string, wasUsed: boolean): void {
+  checkName(name);
+  const bound = readBinding(browserFile(home, name));
+  if (bound === null && (!wasUsed || provider === DEFAULT_PROVIDER_ID)) return;
+  if (bound === provider) return;
+  const was = bound === 'unreadable' ? null : bound ?? DEFAULT_PROVIDER_ID;
+  throw new E2kError('needs-human',
+    was === null ? '这个 profile 的浏览器记录读不了，不能确定它是哪个浏览器用的' : `这个 profile 是用 ${was} 登录过的，换浏览器会让登录态失效或损坏`,
+    '用 --profile <组>/<槽> 另开一个 profile，或者由人删掉这个 profile 目录和它旁边的 .browser.json 再来');
+}
+
+// 启动成功后调用：还没有记录就写；已经有且一致不动。写不了就抛错，调用方停掉实例（失败关闭）。
+export function recordBrowserBinding(home: Home, name: string, provider: string): void {
+  checkName(name);
+  if (!PROVIDER_RE.test(provider)) throw new Error('invalid provider id');
+  if (readBinding(browserFile(home, name)) === provider) return;
+  ensurePrivateDir(home.profilesDir);
+  const path = resolveInside(home.profilesDir, `${name}.browser.json`);
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    writeSync(fd, `${JSON.stringify({ schema: 1, provider })}\n`);
+  } finally {
+    closeSync(fd);
+  }
+}

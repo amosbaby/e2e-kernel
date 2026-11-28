@@ -1,7 +1,7 @@
 import { writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { DriverError } from '../../src/driver/types.ts';
-import type { Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
+import type { BrowserInfo, Capabilities, Check, Decision, Described, Driver, Instance, Page, PageLocation, PasswordProbe, RequestInfo, Stable }
   from '../../src/driver/types.ts';
 import { isRef } from '../../src/shared/ops.ts';
 import type { AssertKind, Target, Viewport, WaitCond } from '../../src/shared/ops.ts';
@@ -322,6 +322,7 @@ export class FakeDriver implements Driver {
   readonly name = 'fake';
   readonly capabilities: Capabilities;
   readonly calls: Call[] = [];
+  browser?: BrowserInfo;                   // 测试里设上就像真驱动：profile 和 provider 的绑定检查才会生效
   readonly noRedirectIds: string[] = [];   // handler 回了 continue 且带 followRedirects: false 的请求 id
   // 每次 launch 收到的 profile，按启动顺序；下标就是 closeInstance 的参数。
   readonly launched: { name: string; userDataDir: string }[] = [];

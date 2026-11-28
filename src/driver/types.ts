@@ -90,9 +90,22 @@ export interface PasswordProbe { found: boolean | null; frames: string[] }
 
 export interface PageLocation { url: string; title: string; frames: { url: string; name: string }[]; popups: string[]; webSockets: number }
 
+// 人在 `e2k start` / `e2k doctor` 时选浏览器：preset 是预置名，path 是自定义的可执行文件绝对路径；两个都没给就是缺省。
+export interface BrowserSelector { preset?: string; path?: string }
+
+// 驱动实际用的浏览器，写进 status、doctor 和报告。version 在第一次启动成功后才有。
+export interface BrowserInfo {
+  provider: string;                // playwright-chromium / ego-lite / custom
+  label: string;
+  version?: string;
+  bundleId?: string;               // macOS 应用的 bundle id（焦点管家用）；没有或不是应用为 undefined
+  honorsNoStartupWindow: boolean;  // false：启动时浏览器自己会多开一个窗口
+}
+
 export interface Driver {
   readonly name: string;
   readonly capabilities: Capabilities;
+  readonly browser?: BrowserInfo;   // 可选：假驱动没有
   selfCheck(): Promise<Check[]>;
   launch(profile: { name: string; userDataDir: string }): Promise<Instance>;        // 实例：启动
 }

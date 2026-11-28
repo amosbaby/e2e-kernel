@@ -315,3 +315,25 @@ M2a 的实测（Playwright 1.65.1，`test/browser/playwright-driver.test.ts` 里
 ## 10. 复测
 
 运行 `npm run m0`（route-coverage 之后接 worker-probe）。Playwright 升级后必须重跑并更新本文件。`node scripts/m0/dialog-probe.ts` 和 `node scripts/m0/focus-restore-probe.ts` 要人在场，不在 `npm run m0` 里，需要时手动跑。
+
+## 11. 另一个 Chromium 内核浏览器（ego lite）作为 provider（M4，2026-11-28）
+
+方法：把 `DriverOptions.executablePath` 指向它的可执行文件，用全新的临时 user-data-dir，走和缺省完全一样的启动路径（自己 spawn、管道、`connectOverCDP`）；只终止自己起的进程。它是改过的 Chromium（自有 framework 和帮手进程），内核主版本 156，Playwright 1.65.1。日常的那个 ego lite 全程开着，没受影响。
+
+| 项 | 结果 |
+|---|---|
+| 管道接入 | 通过，0.5–1.7 秒连上，`contexts()` 恰好 1 个 |
+| 不开端口 | 通过：这棵进程树上 TCP 监听、UDP 都没有；只有 Chromium 的单例 Unix 套接字（系统临时目录里） |
+| 日常实例在跑时再起一个 | 通过：独立进程，不被转交 |
+| 开页、导航、视口、截图、弹窗 | 通过，弹窗被驱动认出 |
+| 路由拦截、Service Worker 注册被禁、`SharedWorker` 被删 | 通过（和缺省 Chromium 的现象一致：`register()` 成功返回，但注册数是 0） |
+| 触屏模拟 | 通过：`(pointer: coarse)` 为真，`maxTouchPoints` 为 5 |
+| `--no-startup-window` | **不遵守**：启动时它自己开一个窗口，里面是首次引导页（`browser_ui` 目标，`chrome://onboarding/`），`context.pages()` 看不到它 |
+| 抢前台 | 启动时抢一次（500 毫秒内）；`open -b <原应用>` 还回去之后保持；之后 `Target.createTarget background:true` 开页不再抢；页面 `window.open` 的弹窗没有二次抢 |
+| 引导页 | 关掉但不完成，同一个 profile 再启动**每次都还会出现**，`Preferences` 里没写任何引导相关的键；没找到跳过它的命令行开关 |
+| 关掉引导页 | `Target.closeTarget` 可以，实例不退出；**关掉后立刻开页，新页里的脚本跑不起来**（`the new page did not become ready`，4 次 4 次失败），隔 1.5 秒就都正常（8 次 8 次通过，之后 5 次 5 次通过） |
+| 启动的副作用 | 每次启动都会重建用户目录下它自己的几个软链接（`~/.local/share/ego/` 下的 `active_version_dir`、`ego-skills`，以及 `~/.local/bin/ego-browser`）；目前指向和已安装版本一致、内容没变。这是专用 profile 之外的、对用户日常环境的写入 |
+
+| 停止时 cookie 落盘 | **会丢**：它不理 `Browser.close`，管道一断就退出，最近 30 秒内写的 cookie 没落盘（同一个 profile 再启动读不到；写完等 35 秒再停就在）。试过：停止前等 2–6 秒、`SIGTERM`、`Storage.getCookies`、关别的页，都没用；**关掉写过 cookie 的那个页，再等 0.3 秒**就落盘（每种做法各 1–3 次）。驱动在 provider 的 `flushOnPageClose` 为真时，停止前先关掉还开着的页再等 0.5 秒 |
+
+整份驱动测试（`test/browser/playwright-driver.test.ts` 的副本，只把浏览器换成 ego lite 预置）：128 条里 126 条通过。失败的两条：`selfCheck reports the bundled chromium`（这条测试本身断言缺省的 Playwright Chromium，不是不兼容）和上面的 cookie 落盘（修复后单独重跑通过，**修复之后整份没有再重跑**）。另外在真内核上用 `e2k start --browser ego-lite` 走了 `open`、`step`（含 `assert` 和截图）、`close`：报告里写着浏览器和版本，profile 的 `.browser.json` 绑定已写入。脚本不进仓库（它们依赖本机装了这个浏览器）。

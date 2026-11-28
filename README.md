@@ -20,7 +20,7 @@ If you are an AI agent, read [docs/agent-guide.md](docs/agent-guide.md) first. T
 
 ## Quick start
 
-macOS with a graphical login session (the browser is always headed) and Node >= 24.12.
+macOS with a graphical login session (the browser is always headed) and Node >= 24.12. The browser is Playwright's Chromium by default; a person can start the kernel with `--browser ego-lite` or `--browser-path <path>` to use another Chromium-based browser (see [docs/reference.md](docs/reference.md)).
 
 ```sh
 npm install                     # also builds dist/ through the prepare script

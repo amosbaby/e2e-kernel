@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { DEFAULT_PROFILE, listProfiles, parseProfileArg, prepareProfileDir, profileInfo, profileKey, recordLogin } from '../../src/kernel/profiles.ts';
+import { DEFAULT_PROFILE, checkBrowserBinding, listProfiles, recordBrowserBinding, parseProfileArg, prepareProfileDir, profileInfo, profileKey, recordLogin } from '../../src/kernel/profiles.ts';
 import type { E2kError } from '../../src/shared/errors.ts';
 import { isSensitiveKey } from '../../src/shared/redact.ts';
 import { makeTmpHome } from '../support/tmp-home.ts';
@@ -258,4 +258,60 @@ test('prepareProfileDir refuses a profiles directory that is a link or too open'
   mkdirSync(home2.profilesDir, { mode: 0o755 });
   chmodSync(home2.profilesDir, 0o755);
   assert.throws(() => prepareProfileDir(home2, 'admin'), (e: E2kError) => e.code === 'needs-human');
+});
+
+// ---- 浏览器 provider 绑定 ----
+
+test('a new profile can be bound to any provider, and the record is private and next to the profile', () => {
+  const home = tmp();
+  checkBrowserBinding(home, 'default', 'ego-lite', false);
+  prepareProfileDir(home, 'default');
+  recordBrowserBinding(home, 'default', 'ego-lite');
+  const file = join(home.profilesDir, 'default.browser.json');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { schema: 1, provider: 'ego-lite' });
+  assert.equal(lstatSync(file).mode & 0o777, 0o600);
+  assert.deepEqual(listProfiles(home).map((p) => p.name), ['default']);   // 记录文件不会被当成 profile
+});
+
+test('a profile bound to one provider refuses another, and the refusal needs a person', () => {
+  const home = tmp();
+  prepareProfileDir(home, 'g');
+  recordBrowserBinding(home, 'g', 'playwright-chromium');
+  checkBrowserBinding(home, 'g', 'playwright-chromium', true);
+  assert.throws(() => checkBrowserBinding(home, 'g', 'ego-lite', true), (e: E2kError) => e.code === 'needs-human' && /playwright-chromium/.test(e.message));
+});
+
+test('a profile that was used before the record existed counts as playwright-chromium', () => {
+  const home = tmp();
+  const dir = prepareProfileDir(home, 'old');
+  writeFileSync(join(dir, 'Cookies'), 'x');
+  checkBrowserBinding(home, 'old', 'playwright-chromium', true);
+  assert.throws(() => checkBrowserBinding(home, 'old', 'ego-lite', true), (e: E2kError) => e.code === 'needs-human');
+  checkBrowserBinding(home, 'old', 'ego-lite', false);   // 目录没用过：随便
+});
+
+test('an unreadable or malformed binding record fails closed', () => {
+  const home = tmp();
+  prepareProfileDir(home, 'g');
+  const file = join(home.profilesDir, 'g.browser.json');
+  for (const bad of ['not json', '{"schema":1}', '{"schema":1,"provider":"ego lite"}', '{"schema":1,"provider":"x","extra":1}', '[]']) {
+    writeFileSync(file, bad);
+    assert.throws(() => checkBrowserBinding(home, 'g', 'playwright-chromium', false), (e: E2kError) => e.code === 'needs-human', bad);
+  }
+});
+
+test('the binding record is never written through a symbolic link', () => {
+  const home = tmp();
+  prepareProfileDir(home, 'g');
+  const target = join(home.root, 'elsewhere');
+  writeFileSync(target, 'keep');
+  symlinkSync(target, join(home.profilesDir, 'g.browser.json'));
+  assert.throws(() => recordBrowserBinding(home, 'g', 'ego-lite'));
+  assert.equal(readFileSync(target, 'utf8'), 'keep');
+});
+
+test('binding names and provider ids are validated', () => {
+  const home = tmp();
+  assert.throws(() => recordBrowserBinding(home, '../x', 'ego-lite'));
+  assert.throws(() => recordBrowserBinding(home, 'g', 'Ego Lite'));
 });

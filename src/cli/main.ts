@@ -1,7 +1,7 @@
 import { basename, relative } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import type { Driver } from '../driver/types.ts';
+import type { BrowserSelector, Driver } from '../driver/types.ts';
 import { noDialog } from '../kernel/approval.ts';
 import { inspectRules } from '../kernel/rules.ts';
 import { startMcp } from '../mcp/tools.ts';
@@ -29,7 +29,7 @@ export interface Io {
   out(s: string): void; err(s: string): void; env: NodeJS.ProcessEnv;
   selfCmd: string;                        // 这个 CLI 实际该怎么调用，用在提示里
   stdin: { isTTY: boolean; readLine(): Promise<string>; readAll(maxBytes: number): Promise<string> };   // 超过 maxBytes 抛 E2kError('usage')
-  makeDriver(): Promise<Driver>;
+  makeDriver(browser?: BrowserSelector): Promise<Driver>;   // browser：人在 start / doctor 时选的浏览器；不给是缺省
   managerName?(): Promise<string | null>;   // doctor 取 launchctl managername 的办法；缺省是真的，测试注入假的
   startKernel?(o: KernelOptions): Promise<KernelHandle>;   // 缺省是真的 startKernel；测试用它看 start 传了什么
   onStopSignal(cb: () => void): void;     // 真实实现挂 SIGINT、SIGTERM 和 SIGHUP；每收到一次调用一次 cb
@@ -56,9 +56,10 @@ function helpText(selfCmd: string): string {
   return [
     `用法：${selfCmd} <命令>`,
     '',
-    '  start [--no-dialogs]                   前台运行内核（Ctrl-C 或 SIGTERM 停止）；--no-dialogs 不弹确认框，需要人批准的事一律走不通（22）',
+    '  start [--no-dialogs] [--browser <预置>] [--browser-path <路径>]   前台运行内核（Ctrl-C 或 SIGTERM 停止）；--no-dialogs 不弹确认框，需要人批准的事一律走不通（22）',
+    '                                          --browser 选预置浏览器（ego-lite、playwright-chromium，缺省后者）；--browser-path 用自己安装的 Chromium 内核浏览器（绝对路径）；也可用环境变量 E2K_BROWSER、E2K_BROWSER_PATH。只能在启动内核时由人指定，会话里不能换',
     '  status [--json]                        版本、驱动、浏览器、会话、profile（含最近一次 login）和域名规则',
-    '  doctor [--json]                        自检（含 profile 状态和域名规则；只读）',
+    '  doctor [--json] [--browser <预置>] [--browser-path <路径>]   自检（含 profile 状态和域名规则；只读）',
     '  rule list [--json]                     读 $E2K_HOME/rules.json 列出域名规则，注明是否已批准（只读，不需要内核；规则文件只由人维护）',
     '  rule diff [--json]                     规则文件和已批准的规则之间的完整差异（只读，不需要内核；批准只能由人在内核弹出的框里做）',
     '  open <url> [--viewport <宽>x<高>] [--touch] [--readonly] [--name <名字>] [--profile <组>[/<槽>]] [--allow <JSON>] [--json]',
@@ -151,8 +152,24 @@ function needsTerminal(ctx: Ctx, command: string): void {
 
 // ---- 命令 ----
 
+const BROWSER_OPTIONS: Options = { browser: { type: 'string' }, 'browser-path': { type: 'string' } };
+
+// 选浏览器：命令行优先，环境变量作后备；都没给就是缺省。两个同时给由 resolveProvider 拒绝。值不回显。
+function browserSelector(ctx: Ctx, p: Parsed): BrowserSelector | undefined {
+  const pick = (flag: string, envName: string): string | undefined => {
+    const v = p.values[flag];
+    if (typeof v === 'string') return v;
+    const e = ctx.io.env[envName];
+    return e !== undefined && e !== '' ? e : undefined;
+  };
+  const preset = pick('browser', 'E2K_BROWSER');
+  const path = pick('browser-path', 'E2K_BROWSER_PATH');
+  if (preset === undefined && path === undefined) return undefined;
+  return { ...(preset === undefined ? {} : { preset }), ...(path === undefined ? {} : { path }) };
+}
+
 async function start(ctx: Ctx, args: string[]): Promise<number> {
-  const p = parse(ctx, args, { 'no-dialogs': { type: 'boolean' } });
+  const p = parse(ctx, args, { 'no-dialogs': { type: 'boolean' }, ...BROWSER_OPTIONS });
   positionals(ctx, p, 0, '无');
   const home = resolveHome(ctx.io.env);
   let wake = (): void => {};
@@ -169,7 +186,7 @@ async function start(ctx: Ctx, args: string[]): Promise<number> {
     void (kernel?.abort() ?? Promise.resolve()).finally(() => { ctx.io.exit(ExitCode.INTERNAL); });
   });
   const noDialogs = p.values['no-dialogs'] === true;
-  kernel = await (ctx.io.startKernel ?? startKernel)({ home, driver: await ctx.io.makeDriver(), ...(noDialogs ? { dialog: noDialog } : {}) });
+  kernel = await (ctx.io.startKernel ?? startKernel)({ home, driver: await ctx.io.makeDriver(browserSelector(ctx, p)), ...(noDialogs ? { dialog: noDialog } : {}) });
   ctx.io.out(`内核已启动，状态目录 ${home.root}`);
   if (noDialogs) ctx.io.out('已用 --no-dialogs 启动：不弹确认框，需要人批准的事一律走不通');
   ctx.io.out('按 Ctrl-C 或发送 SIGTERM 停止（收尾期间再按一次立即退出）');
@@ -188,8 +205,10 @@ async function status(ctx: Ctx, args: string[]): Promise<number> {
 }
 
 async function doctor(ctx: Ctx, args: string[]): Promise<number> {
-  positionals(ctx, parse(ctx, args, JSON_OPTION), 0, '无');
-  return settle(ctx, await doctorChecks(resolveHome(ctx.io.env), ctx.io.makeDriver, ctx.io.selfCmd, ctx.io.managerName), formatChecks);
+  const p = parse(ctx, args, { ...JSON_OPTION, ...BROWSER_OPTIONS });
+  positionals(ctx, p, 0, '无');
+  const selector = browserSelector(ctx, p);
+  return settle(ctx, await doctorChecks(resolveHome(ctx.io.env), () => ctx.io.makeDriver(selector), ctx.io.selfCmd, ctx.io.managerName), formatChecks);
 }
 
 // 规则文件和批准记录由 CLI 自己读，不需要内核。文件有错：照样打印（--json 里在 error 字段），退出码 2。
@@ -459,8 +478,15 @@ export function realIo(): Io {
     selfCmd: selfCmdFor(process.argv[1], process.cwd()),
     stdin: { isTTY: process.stdin.isTTY === true, readLine, readAll },
     // 动态引入：只有真要驱动浏览器的命令才加载 Playwright。监听器的错误脱敏后进 kernel.log。
-    makeDriver: async () => (await import('../drivers/playwright/driver.ts'))
-      .createPlaywrightDriver({ onListenerError: listenerErrorLogger(resolveHome(env)) }),
+    // 没给浏览器（MCP 的 doctor 走这条）就看环境变量，和命令行的后备一致。
+    makeDriver: async (browser) => {
+      const fromEnv: BrowserSelector = {
+        ...(env.E2K_BROWSER ? { preset: env.E2K_BROWSER } : {}), ...(env.E2K_BROWSER_PATH ? { path: env.E2K_BROWSER_PATH } : {}),
+      };
+      const chosen = browser ?? (Object.keys(fromEnv).length > 0 ? fromEnv : undefined);
+      return (await import('../drivers/playwright/driver.ts'))
+        .createPlaywrightDriver({ onListenerError: listenerErrorLogger(resolveHome(env)), ...(chosen === undefined ? {} : { browser: chosen }) });
+    },
     onStopSignal: (cb) => {
       process.on('SIGINT', cb);
       process.on('SIGTERM', cb);

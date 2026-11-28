@@ -1,4 +1,4 @@
-import type { Capabilities } from '../driver/types.ts';
+import type { BrowserInfo, Capabilities } from '../driver/types.ts';
 import type { ActionRecord, ModeChange, WriteRecord } from '../kernel/recorder.ts';
 import type { BlockReason } from '../kernel/write-policy.ts';
 import { E2kError } from '../shared/errors.ts';
@@ -18,7 +18,7 @@ export interface RunInput {
   // borrowed：借用了别的组的登录（没给就是 false）；deny：open 时人批准的不允许的域名授权（没有或没给是 null）；
   // borrowDeny：借用授权覆盖的组名（借的组里有不允许的域名、人批准了借用；没有或没给是 null）。
   start: { url: string; viewport: Viewport | null; touch: boolean; profile: string; borrowed?: boolean; deny?: DenyGrantRecord | null; borrowDeny?: string | null };
-  driver: { name: string; capabilities: Capabilities };
+  driver: { name: string; capabilities: Capabilities; browser?: BrowserInfo };   // browser：驱动实际用的浏览器（假驱动没有）
   actions: ActionRecord[]; writes: WriteRecord[]; unattributedWrites: WriteRecord[];
   hosts: { host: string; mode: Mode }[]; webSockets: number;
   verdict: Verdict | null; findings: Finding[]; notDone: string[];
@@ -207,7 +207,7 @@ export function buildResult(input: RunInput): RunResult {
       deny: input.start.deny === undefined || input.start.deny === null ? null : { ...input.start.deny, allow: input.start.deny.allow.map((a) => ({ ...a })) },
       borrowDeny: input.start.borrowDeny ?? null,
     },
-    driver: { name: input.driver.name, capabilities: { ...input.driver.capabilities } },
+    driver: { name: input.driver.name, capabilities: { ...input.driver.capabilities }, ...(input.driver.browser === undefined ? {} : { browser: { ...input.driver.browser } }) },
     hosts: input.hosts.map((h) => ({ ...h })),
     modes: input.modes.map((m) => ({ ...m })),
     rules: { ...input.rules },

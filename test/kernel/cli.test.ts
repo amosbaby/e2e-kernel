@@ -82,7 +82,7 @@ after(async () => {
 interface TestIo extends Io { outText(): string; errText(): string; fireStopSignal(): void; exits: number[]; clockLog: { slept: number[]; elapsed(): number } }
 
 // 收集输出的测试替身。stdinText 不给时，读标准输入得到空串。
-function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: () => Promise<Driver>; startKernel?: Io['startKernel'];
+function io(o: { env?: NodeJS.ProcessEnv; isTTY?: boolean; stdinText?: string; makeDriver?: Io['makeDriver']; startKernel?: Io['startKernel'];
   readAll?: (maxBytes: number) => Promise<string>; onSleep?: (n: number) => void; managerName?: () => Promise<string | null> } = {}): TestIo {
   const out: string[] = [];
   const err: string[] = [];
@@ -426,6 +426,36 @@ test('start --no-dialogs hands the kernel noDialog; plain start leaves the defau
     assert.equal(/--no-dialogs/.test(t.outText()), flag);
     assert.ok(!existsSync(fresh.socket));
   }
+});
+
+test('start and doctor hand makeDriver the browser the person chose: flags first, environment as the fallback, nothing when neither is given', async () => {
+  const chosen = async (args: string[], envExtra: NodeJS.ProcessEnv = {}) => {
+    const seen: unknown[] = [];
+    const t = io({ env: { ...freshEnv, ...envExtra }, makeDriver: async (b) => { seen.push(b); return new FakeDriver({ pages: pages() }); },
+      startKernel: async (ko) => startKernel({ focus: noFocus, dialog: fakeDialog(), ...ko }) });
+    if (args[0] === 'start') {
+      const done = main(args, t);
+      await until(() => existsSync(fresh.socket)); t.fireStopSignal();
+      assert.equal(await done, 0);
+    } else {
+      await main(args, t);
+    }
+    return seen;
+  };
+  assert.deepEqual(await chosen(['start']), [undefined]);
+  assert.deepEqual(await chosen(['start', '--browser', 'ego-lite']), [{ preset: 'ego-lite' }]);
+  assert.deepEqual(await chosen(['start', '--browser-path', '/opt/x/browser']), [{ path: '/opt/x/browser' }]);
+  assert.deepEqual(await chosen(['start'], { E2K_BROWSER: 'ego-lite' }), [{ preset: 'ego-lite' }]);
+  assert.deepEqual(await chosen(['start', '--browser', 'playwright-chromium'], { E2K_BROWSER: 'ego-lite' }), [{ preset: 'playwright-chromium' }]);
+  assert.deepEqual(await chosen(['doctor', '--browser', 'ego-lite']), [{ preset: 'ego-lite' }]);
+  assert.deepEqual(await chosen(['doctor'], { E2K_BROWSER_PATH: '/opt/x/browser' }), [{ path: '/opt/x/browser' }]);
+});
+
+test('no protocol method, MCP tool or open/step option can pick the browser', async () => {
+  for (const opt of ['--browser', '--browser-path']) assert.equal(await main(['open', 'http://localhost:5173/', opt, 'x'], io()), 2, opt);
+  const help = io(); await main(['help'], help);
+  assert.match(help.outText(), /start \[--no-dialogs\] \[--browser <预置>\] \[--browser-path <路径>\]/);
+  assert.match(help.outText(), /会话里不能换/);
 });
 
 test('login without a terminal is refused (22)', async () => {

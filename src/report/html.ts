@@ -296,6 +296,14 @@ function stepsSection(r: RunResult): string {
   return `<section id="steps"><h2>步骤</h2><table>${head}${body}</table></section>`;
 }
 
+// 驱动实际用的浏览器（老记录和假驱动没有这个字段，整行不出现）；自定义浏览器的 label 本身就是「自定义浏览器」，启动有额外窗口的另写明。
+function browserLine(r: RunResult): string {
+  const b = r.driver.browser;
+  if (b === undefined) return '';
+  const notes = [b.honorsNoStartupWindow ? '' : '启动时有额外窗口'].filter((n) => n !== '');
+  return `<p>浏览器：${own(b.label)}${b.version === undefined ? '' : `（${own(b.version)}）`}${notes.length > 0 ? `；${own(notes.join('；'))}` : ''}</p>`;
+}
+
 function envSection(r: RunResult): string {
   const caps = r.driver.capabilities;
   const hosts = r.hosts.map((h) => `<li>${page(h.host)}：${own(h.mode)}</li>`);
@@ -309,7 +317,7 @@ function envSection(r: RunResult): string {
   const vp = r.start.viewport === null ? '默认' : `${own(r.start.viewport.width)}×${own(r.start.viewport.height)}`;
   return '<section id="env"><h2>环境</h2>'
     + `<h3>域名和当时的模式</h3>${listOrNone(hosts)}`
-    + `<h3>驱动和能力</h3><p>${own(r.driver.name)}</p>${listOrNone(capLines)}`
+    + `<h3>驱动和能力</h3><p>${own(r.driver.name)}</p>${browserLine(r)}${listOrNone(capLines)}`
     + `<h3>覆盖说明</h3>${listOrNone(notes)}`
     + `<p>起始地址 ${pageUrl(r.start.url)}，视口 ${vp}，触屏模拟 ${r.start.touch ? '是' : '否'}</p>`
     + `<p>开始 ${own(r.startedAt)}，结束 ${own(r.endedAt)}，结束方式 ${CLOSED_BY_TEXT[r.closedBy] ?? '未知'}，内核版本 ${own(r.kernelVersion)}</p>`

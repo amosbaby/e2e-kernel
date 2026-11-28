@@ -4,7 +4,7 @@ import type { Server, Socket } from 'node:net';
 import { relative } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { NAVIGATION_TIMEOUT_MS } from '../driver/types.ts';
-import type { Capabilities, Driver, Instance } from '../driver/types.ts';
+import type { BrowserInfo, Capabilities, Driver, Instance } from '../driver/types.ts';
 import { E2kError } from '../shared/errors.ts';
 import { assertSocketPathFits, ensurePrivateDir, resolveInside } from '../shared/paths.ts';
 import type { Home } from '../shared/paths.ts';
@@ -35,7 +35,7 @@ export interface KernelOptions {
 // abort()：关停进行中时再来一次停止信号用——不再等任何期限，直接停浏览器实例、断开连接、清理文件。
 export interface KernelHandle { stop(): Promise<void>; abort(): Promise<void> }
 export interface StatusResult { version: string; pid: number; home: string;
-  driver: { name: string; capabilities: Capabilities }; instance: 'stopped' | 'running'; sessions: SessionInfo[]; profiles: ProfileInfo[]; rules: RulesState }
+  driver: { name: string; capabilities: Capabilities; browser?: BrowserInfo }; instance: 'stopped' | 'running'; sessions: SessionInfo[]; profiles: ProfileInfo[]; rules: RulesState }
 
 const DEFAULT_IDLE_MS = 15 * 60_000;
 const DEFAULT_KEEP_RUNS = 20;
@@ -211,6 +211,7 @@ function trackInstances(driver: Driver, live: Set<Instance>): Driver {
   return {
     name: driver.name,
     capabilities: driver.capabilities,
+    get browser() { return driver.browser; },
     selfCheck: () => driver.selfCheck(),
     async launch(profile) {
       const inst = await driver.launch(profile);
@@ -270,7 +271,7 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
     idleMs: o.idleMs ?? DEFAULT_IDLE_MS, keepRuns: o.keepRuns ?? DEFAULT_KEEP_RUNS, now: () => new Date(),
     kernelVersion: version, log: (line) => { log.write(line); },
     approvals: new Approvals(o.dialog ?? osascriptDialog(), (line) => { log.write(line); }),
-    focus: o.focus ?? macFocus({ log: (line) => { log.write(line); } }),
+    focus: o.focus ?? macFocus({ log: (line) => { log.write(line); }, isOurBrowser: (id) => id === driver.browser?.bundleId }),
   });
   const connections = new Set<Socket>();
   const answering = new Set<Promise<void>>();
@@ -279,7 +280,7 @@ function serve(o: KernelOptions, server: Server, log: KernelLog, pidFile: string
   const status = (): StatusResult => {
     modes.refresh();
     return {
-      version, pid: process.pid, home: home.root, driver: { name: driver.name, capabilities: { ...driver.capabilities } },
+      version, pid: process.pid, home: home.root, driver: { name: driver.name, capabilities: { ...driver.capabilities }, ...(driver.browser === undefined ? {} : { browser: { ...driver.browser } }) },
       instance: sessions.instanceState(), sessions: sessions.list(),
       profiles: listProfiles(home), rules: modes.state(),
     };

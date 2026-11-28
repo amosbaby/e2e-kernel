@@ -192,3 +192,29 @@ test('every startKernel and new SessionManager call in the tests passes a focus 
   assert.ok(seen >= 20, `scanned ${seen} calls`);
   assert.deepEqual(offenders, []);
 });
+
+// ---- 换 provider：bundle id 不含 chromium 的浏览器也算 e2k 的浏览器 ----
+
+test('a front app that is the provider browser (no "chromium" in its id) is handed back from, and others still are not', async () => {
+  const run = async (frontId: string, ours: (id: string) => boolean) => {
+    const calls: Call[] = [];
+    const exec: ExecFn = async (file, args, opts) => {
+      calls.push({ file, args, timeout: opts.timeout });
+      if (file === 'lsappinfo' && args[0] === 'front') return { stdout: `${ASN}\n` };
+      if (file === 'lsappinfo') return { stdout: info(frontId) };
+      return { stdout: '' };
+    };
+    const focus = macFocus({ exec, platform: 'darwin', isOurBrowser: ours });
+    return { focus, calls };
+  };
+  const isEgo = (id: string): boolean => id === 'com.example.ego';
+  const a = await run('com.example.ego', isEgo);
+  assert.equal(await a.focus.capture(), null);                       // 前台已经是 e2k 的浏览器：不记
+  assert.equal(await a.focus.restore('com.example.app'), true);      // 前台是它：还回去
+  assert.equal(a.calls.filter((c) => c.file === 'open').length, 1);
+  const b = await run('com.example.other', isEgo);
+  assert.equal(await b.focus.capture(), 'com.example.other');
+  assert.equal(await b.focus.restore('com.example.app'), false);     // 前台不是它：不动
+  const c = await run('com.example.ego', () => false);               // 没告诉焦点管家：认不出（现状）
+  assert.equal(await c.focus.restore('com.example.app'), false);
+});

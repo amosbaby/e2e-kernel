@@ -5209,3 +5209,40 @@ test('declarations carry the seq of the first operation of the step that declare
   const res2 = readResult((await deny.sm.close({ session: r.session })).runDir);
   assert.deepEqual(res2.declarations.map((d) => [d.url, d.seq]), [[ALLOW_SAVE.url, 3]]);
 });
+
+// ---- 浏览器 provider：profile 绑定、报告里的浏览器 ----
+
+const EGO = { provider: 'ego-lite', label: 'ego lite', version: 'Chrome/156.0.0.0', honorsNoStartupWindow: false } as const;
+
+test('a driver with a browser binds a new profile on first launch, and the report names the browser', async () => {
+  const t = setup();
+  t.fake.browser = { ...EGO };
+  const { session } = await opened(t.sm, t.fake);
+  assert.deepEqual(JSON.parse(readFileSync(join(t.home.profilesDir, 'default.browser.json'), 'utf8')), { schema: 1, provider: 'ego-lite' });
+  const closed = await t.sm.close({ session });
+  const result = readResult(closed.runDir);
+  assert.deepEqual(result.driver.browser, { ...EGO });
+});
+
+test('a profile bound to another provider is refused before any browser starts (22), and nothing is launched', async () => {
+  const t = setup();
+  t.fake.browser = { ...EGO };
+  const first = await opened(t.sm, t.fake);
+  await t.sm.close({ session: first.session });
+  await t.sm.shutdown();
+  const launches = t.fake.launched.length;
+  t.fake.browser = { provider: 'playwright-chromium', label: 'Playwright Chromium', honorsNoStartupWindow: true };
+  const sm2 = new SessionManager({
+    driver: t.fake, home: t.home, modes: defaultOnlyResolver, policy: allowAllPolicy, idleMs: 15 * 60_000, keepRuns: 20, now: () => new Date(),
+    kernelVersion: '0.1.0', log: () => {}, approvals: new Approvals(fakeDialog(), () => {}), store: ApprovalStore.open(t.home.approvalsFile, () => {}), focus: noFocus,
+  });
+  cleanups.push(async () => { await sm2.shutdown(); });
+  await assert.rejects(sm2.open({ url: 'http://localhost:5173/' }), (e: E2kError) => e.code === 'needs-human' && /ego-lite/.test(e.message));
+  assert.equal(t.fake.launched.length, launches);
+});
+
+test('a driver without a browser (the fake default) writes no binding record', async () => {
+  const t = setup();
+  await opened(t.sm, t.fake);
+  assert.equal(existsSync(join(t.home.profilesDir, 'default.browser.json')), false);
+});

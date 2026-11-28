@@ -21,7 +21,7 @@ import type { FocusKeeper } from './focus.ts';
 import type { ApprovalStore, Declaration, HostMode } from './approval-store.ts';
 import { declarationKey, normalizeDeclarations, sameDeclaration } from './declarations.ts';
 import type { ModeResolver } from './mode.ts';
-import { checkProfileKey, parseProfileArg, prepareProfileDir, profileKey, recordLogin } from './profiles.ts';
+import { checkBrowserBinding, checkProfileKey, parseProfileArg, prepareProfileDir, profileInfo, profileKey, recordBrowserBinding, recordLogin } from './profiles.ts';
 import type { ProfileRef } from './profiles.ts';
 import { Recorder, isWrite, toWriteRecord } from './recorder.ts';
 import type { WriteRecord } from './recorder.ts';
@@ -1261,8 +1261,19 @@ export class SessionManager {
     }
     if (this.stopping) throw stopping();
     // 名字、目录类型、权限、不逃出 profiles 的检查都在启动之前：不对就不启动浏览器。
+    const provider = this.deps.driver.browser?.provider;
+    const wasUsed = provider !== undefined && profileInfo(this.deps.home, key).state === 'launched';
     const profileDir = prepareProfileDir(this.deps.home, key);
+    if (provider !== undefined) checkBrowserBinding(this.deps.home, key, provider, wasUsed);
     const inst = await this.deps.driver.launch({ name: key, userDataDir: profileDir });
+    if (provider !== undefined) {
+      try {
+        recordBrowserBinding(this.deps.home, key, provider);
+      } catch {
+        await this.stopQuietly(inst);
+        throw new E2kError('needs-human', '写不了这个 profile 的浏览器记录，没有启动', '检查 $E2K_HOME/profiles 的权限');
+      }
+    }
     // 回调都挂在这个实例上：别的实例的事不会走到这里，这个实例的事也不会碰别的实例的会话。
     inst.setRequestHandler((r) => this.onRequest(r, inst));
     inst.onRequestDone((e) => { this.onRequestDone(e); });
@@ -1410,7 +1421,7 @@ export class SessionManager {
       result = buildResult({
         kernelVersion: this.deps.kernelVersion, session: s.id, name: s.name, startedAt: s.startedAt, endedAt, closedBy,
         start: { ...s.start, deny: this.denyRecord(s), borrowDeny: s.grant.borrowGroup },
-        deniedNavigations: s.deniedCount, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities },
+        deniedNavigations: s.deniedCount, driver: { name: this.deps.driver.name, capabilities: this.deps.driver.capabilities, ...(this.deps.driver.browser === undefined ? {} : { browser: this.deps.driver.browser }) },
         actions: s.recorder.actions, writes: s.recorder.writes, unattributedWrites: this.unattributedDuring(s.startedAt, endedAt), hosts: s.recorder.hosts, webSockets,
         verdict: p?.verdict ?? null, findings: p?.findings ?? [], notDone: p?.notDone ?? [], superseded: p?.superseded ?? [], declarations: this.declarationRecords(s),
         modes: s.recorder.modes, rules: this.rulesInForce(), blocked: s.lastWall, forced: s.forced,

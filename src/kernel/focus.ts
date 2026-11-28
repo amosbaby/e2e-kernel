@@ -33,9 +33,11 @@ function isOurChromium(bundleId: string): boolean {
   return id.includes('chromium') || id.includes('chrome.for.testing');
 }
 
-export function macFocus(o: { exec?: ExecFn; platform?: NodeJS.Platform; log?: (line: string) => void } = {}): FocusKeeper {
+// isOurBrowser：除了默认的 Chromium，还有哪些 bundle id 算 e2k 的浏览器（换了 provider 时用，比如 ego lite 的 bundle id 不含 chromium）。
+export function macFocus(o: { exec?: ExecFn; platform?: NodeJS.Platform; log?: (line: string) => void; isOurBrowser?: (bundleId: string) => boolean } = {}): FocusKeeper {
   if ((o.platform ?? process.platform) !== 'darwin') return noFocus;
   const exec = o.exec ?? defaultExec;
+  const ours = (id: string): boolean => isOurChromium(id) || o.isOurBrowser?.(id) === true;
 
   const note = (what: string, e: unknown): void => {
     try {
@@ -58,7 +60,7 @@ export function macFocus(o: { exec?: ExecFn; platform?: NodeJS.Platform; log?: (
     async capture() {
       try {
         const id = await frontBundleId();
-        return id === null || isOurChromium(id) ? null : id;
+        return id === null || ours(id) ? null : id;
       } catch (e) {
         note('读取前台应用', e);
         return null;
@@ -70,7 +72,7 @@ export function macFocus(o: { exec?: ExecFn; platform?: NodeJS.Platform; log?: (
       try {
         if (!TOKEN_SHAPE.test(token)) return false;
         const now = await frontBundleId();
-        if (now === null || !isOurChromium(now)) return false;   // 前台已经不是 e2k 的浏览器（用户自己切走了）：不抢回来
+        if (now === null || !ours(now)) return false;   // 前台已经不是 e2k 的浏览器（用户自己切走了）：不抢回来
         opening = true;
         await exec('open', ['-b', token], { timeout: CALL_TIMEOUT_MS });
         return true;
