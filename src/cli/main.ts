@@ -335,6 +335,7 @@ async function login(ctx: Ctx, args: string[]): Promise<number> {
   } catch {
     throw malformed();
   }
+  if (isObject(begun) && typeof begun.note === 'string') ctx.io.out(begun.note);
   ctx.io.out('请在浏览器窗口里登录，完成后回到这里按回车');
   await ctx.io.stdin.readLine();
   const ended = await send(ctx, home, 'login.end', end);

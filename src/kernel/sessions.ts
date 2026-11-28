@@ -933,7 +933,7 @@ export class SessionManager {
   }
 
   // 在选定的 profile 里开一个不属于任何会话的页让人登录（设计 5.5）。登录窗口里 loginHosts 之外的写照只读规则拦。
-  loginBegin(p: LoginBeginParams): Promise<{ loginId: string }> {
+  loginBegin(p: LoginBeginParams): Promise<{ loginId: string; note?: string }> {
     return this.track(() => this.beginLogin(p));
   }
 
@@ -1035,7 +1035,7 @@ export class SessionManager {
     }
   }
 
-  private async beginLogin(p: LoginBeginParams): Promise<{ loginId: string }> {
+  private async beginLogin(p: LoginBeginParams): Promise<{ loginId: string; note?: string }> {
     // profile 参数的写法先查：要在 gateRules 之前。
     const arg = p.profile === undefined ? null : parseProfileArg(p.profile);
     // 取不到主机不挡登录（后面也一样）：按没编组的 default 组算。
@@ -1060,7 +1060,12 @@ export class SessionManager {
     try {
       const slot = this.pin(profile);
       try {
-        return await this.loginOn(await this.acquireInstance(profile, slot, { keepOnboarding: true }), p, { profile, group: ref.group });
+        // 浏览器已经在跑（早先的 open 拉起的）：它启动时的首次引导页已被自动关掉，这次 login 没法让人走完它，告诉人。
+        const alreadyRunning = slot.instance !== undefined || slot.acquiring !== undefined;
+        const begun = await this.loginOn(await this.acquireInstance(profile, slot, { keepOnboarding: true }), p, { profile, group: ref.group });
+        return alreadyRunning && this.deps.driver.browser?.honorsNoStartupWindow === false
+          ? { ...begun, note: '这个 profile 的浏览器早已在运行，它的首次引导页启动时已被自动关掉，这次没法在里面走完；要走完引导页，重启内核后先对这个 profile 运行 login' }
+          : begun;
       } finally {
         this.unpin(slot);
       }

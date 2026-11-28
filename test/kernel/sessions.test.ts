@@ -131,6 +131,22 @@ test('a login cold-starts the browser with keepOnboarding (a human can finish th
   await sm2.close({ session: s.session });
 });
 
+test('login on a profile whose browser is already running says the first-run page was closed; a cold login says nothing', async () => {
+  const { sm, fake } = setup();
+  fake.browser = { provider: 'ego-lite', label: 'ego lite', honorsNoStartupWindow: false };
+  const cold = await sm.loginBegin({ url: 'http://localhost:5173/' });
+  assert.equal(cold.note, undefined);
+  await sm.loginEnd({ loginId: cold.loginId }).catch(() => {});
+  const warm = await sm.loginBegin({ url: 'http://localhost:5173/' });
+  assert.match(warm.note ?? '', /引导页/);
+  await sm.loginEnd({ loginId: warm.loginId }).catch(() => {});
+  const { sm: sm2, fake: fake2 } = setup();
+  fake2.browser = { provider: 'playwright-chromium', label: 'Playwright Chromium', honorsNoStartupWindow: true };
+  const o = await sm2.loginBegin({ url: 'http://localhost:5173/' });
+  await sm2.loginEnd({ loginId: o.loginId }).catch(() => {});
+  assert.equal((await sm2.loginBegin({ url: 'http://localhost:5173/' })).note, undefined);
+});
+
 test('open --touch fails cleanly when the driver cannot emulate touch: no session, no page, no run dir', async () => {
   const { sm, fake, home } = setup({ failOpenWith: new DriverError('other', 'touch emulation is not available') });
   await assert.rejects(sm.open({ url: 'http://localhost:5173/', name: 'nt', touch: true }), (e: E2kError) => e.code === 'action-failed');
